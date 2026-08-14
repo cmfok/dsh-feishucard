@@ -36,3 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resuming a session DSH still marks live (e.g. after a hard kill) is rejected
   by the platform (`cannot prepare session ... while it is live`); the plugin
   now automatically creates a fallback session so messages always get a reply.
+- Live sessions (restored by DSH on boot, or held by the GUI) are now reused
+  directly from `agents.list()` instead of failing to resume, so conversation
+  context survives restarts.
+
+### Changed
+
+- Config/state moved from the legacy `~/.cc-connect/` location to the
+  project's own `~/.dsh-feishucard/` directory; a one-time automatic
+  migration preserves an existing legacy config.
+- README rewritten in naturally mixed Chinese/English; added CI workflow
+  (syntax check + secret scan + smoke test).

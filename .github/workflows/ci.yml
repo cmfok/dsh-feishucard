@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax check
+        run: node --check index.js && node --check helper.cjs
+
+      - name: Install deps
+        run: npm i --no-save
+
+      - name: Smoke test
+        run: npm run smoke
+
+      - name: Secret scan
+        run: |
+          if grep -rEn 'cli_[a-zA-Z0-9]{16,}|appSecret[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{8,}|sk-[a-zA-Z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE|ghp_[a-zA-Z0-9]{20,}' \
+            --include='*.js' --include='*.cjs' --include='*.mjs' \
+            --include='*.json' --include='*.md' --include='*.yml' --include='*.yaml' . \
+            | grep -v 'cli_xxxxxxxxxxxxxxxx' || true | grep . ; then
+            echo "::error::Potential secret found in repository"
+            exit 1
+          fi
+          echo "Secret scan clean"
