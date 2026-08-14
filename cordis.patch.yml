@@ -1,0 +1,8 @@
+# dsh-feishu-stream bundle patch: applied automatically when this package is
+# listed in a profile's dsh.profile.bundles (or the row is copied into the
+# profile's cordis.patch.yml). One row drives the host half; the plugin id
+# must be unique per profile (do not install together with dsh-feishu-connect
+# or any other bundle registering the same id).
+- insert:
+    - id: feishu-stream
+      name: dsh-feishu-stream
