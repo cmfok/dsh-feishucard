@@ -1,0 +1,11 @@
+{
+  "bots": [
+    {
+      "name": "我的飞书机器人",
+      "workspace": "C:\\path\\to\\your\\workspace",
+      "appId": "cli_xxxxxxxxxxxxxxxx",
+      "appSecret": "your_app_secret",
+      "reactionEmoji": "OnIt"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "name": "dsh-feishu-stream",
+  "version": "0.1.0",
+  "description": "Self-developed DeepSeek Harness <-> Feishu (Lark) bridge: official-SDK long connection (no public URL), per-chat dedicated agent sessions, /new /switch /list /help commands, and a ZCode-style streaming reply card (tool-call fold panels, status symbols, inline agent notes, rate-limit / backoff / circuit-breaker / text fallback).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./helper": "./helper.cjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "helper.cjs",
+    "cordis.patch.yml",
+    "feishu.config.example.json",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check helper.cjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.73.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "feishu",
+    "lark",
+    "cordis",
+    "bot",
+    "streaming-card"
+  ],
+  "license": "MIT"
+}
