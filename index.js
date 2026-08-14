@@ -1,4 +1,4 @@
-﻿// dsh-feishucard — host plugin (node half), self-developed.
+// dsh-feishucard — host plugin (node half), self-developed.
 // Bridges Feishu (Lark) chats with dedicated per-chat DeepSeek Harness agent
 // sessions via the official SDK long connection (helper.cjs subprocess per
 // bot), with /new /switch /list /help commands, a typing reaction, and a
@@ -729,8 +729,24 @@ export function apply(ctx) {
     } else {
       agent = await resolveAgent(bot, chat)
       if (!agent) {
-        await sendPlainText(bot, chatId, '会话恢复失败，请发送 /new 新建会话。')
-        return
+        // The previous session could not be resumed (DSH refuses to prepare a
+        // session still marked live, e.g. after a hard kill of dsh web). Fall
+        // back to creating a fresh session automatically so the user's message
+        // always gets a reply; keep the old entry in the list for reference.
+        const sessionId = 'fs-main-' + Date.now().toString(36)
+        try {
+          const handle = await createDedicated(bot, sessionId)
+          chat.sessions.push({ id: sessionId, label: '会话 ' + (chat.sessions.length + 1), type: 'dedicated', handle })
+          chat.activeIndex = chat.sessions.length - 1
+          persistChats(bot, bot.chats)
+          agent = handle.agent
+          console.log('[fs] old session not resumable (live), created fallback ' + sessionId)
+        } catch (error) {
+          console.log('[fs] fallback create failed: ' + String(error && error.stack || error))
+          await sendPlainText(bot, chatId, '会话创建失败：'
+            + (bot.cfg.workspace || workspaceRoot() || '?') + '。请检查工作区配置后重试。')
+          return
+        }
       }
     }
 
@@ -849,6 +865,7 @@ export function apply(ctx) {
     const key = appId + '|' + appSecret + '|' + String(cfg.workspace || '')
     if (bot.proc && bot.proc.status === 'running' && bot.procKey === key) return
     lastSpawnAt = Date.now()
+    bot.spawningAt = Date.now()
     if (bot.proc) {
       try { bot.proc.kill() } catch { /* ignore */ }
     }
@@ -884,6 +901,7 @@ export function apply(ctx) {
           cfg,
           proc: undefined,
           procKey: '',
+          spawningAt: 0,       // cooldown: last spawnHelper() timestamp for this bot
           status: '',
           chain: Promise.resolve(),
           token: undefined,
@@ -909,6 +927,10 @@ export function apply(ctx) {
       if (!refresh && bot.proc && bot.proc.status === 'running') continue
       if (now - lastSpawnAt < 5000 && bot.proc && bot.proc.status === 'running') continue
       if (bot.proc && bot.proc.status === 'running' && bot.procKey === key) continue
+      // Per-bot spawn cooldown: a just-spawned helper may not yet report
+      // status 'running', which would otherwise trigger a duplicate spawn on
+      // the next 500ms tick (observed: 5x "helper spawned" in a row).
+      if (now - bot.spawningAt < 5000) continue
       spawnHelper(bot)
     }
   }
