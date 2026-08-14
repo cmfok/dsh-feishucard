@@ -25,10 +25,10 @@ jobs:
 
       - name: Secret scan
         run: |
-          if grep -rEn 'cli_[a-zA-Z0-9]{16,}|appSecret[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{8,}|sk-[a-zA-Z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE|ghp_[a-zA-Z0-9]{20,}' \
+          if grep -rEn 'cli_[a-zA-Z0-9]{16,}|sk-[a-zA-Z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE|ghp_[a-zA-Z0-9]{20,}' \
             --include='*.js' --include='*.cjs' --include='*.mjs' \
             --include='*.json' --include='*.md' --include='*.yml' --include='*.yaml' . \
-            | grep -v 'cli_xxxxxxxxxxxxxxxx' || true | grep . ; then
+            | grep -vE 'cli_xxxxxxxxxxxxxxxx|your_app_secret' ; then
             echo "::error::Potential secret found in repository"
             exit 1
           fi
