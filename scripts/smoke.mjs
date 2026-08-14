@@ -1,4 +1,4 @@
-﻿// dsh-feishucard smoke test: boots the real host plugin against a mocked
+// dsh-feishucard smoke test: boots the real host plugin against a mocked
 // DSH context and a mocked Feishu REST API, feeds one inbound message through
 // the helper protocol, and asserts the full turn pipeline:
 //   event -> dedicated session create -> agent.send -> streaming card
@@ -16,12 +16,12 @@ const CHAT_ID = 'oc_smoke_chat_001'
 const MSG_ID = 'om_smoke_msg_001'
 
 // Point the plugin at a throwaway config dir so the test never touches the
-// real ~/.cc-connect (the plugin honours process.env.FS_CONFIG_DIR).
+// real ~/.dsh-feishucard (the plugin honours process.env.FS_CONFIG_DIR).
 const FAKE_HOME = join(tmpdir(), 'fs-smoke-' + Date.now())
-mkdirSync(join(FAKE_HOME, '.cc-connect'), { recursive: true })
-writeFileSync(join(FAKE_HOME, '.cc-connect', 'feishu.config.json'),
+mkdirSync(join(FAKE_HOME, '.dsh-feishucard'), { recursive: true })
+writeFileSync(join(FAKE_HOME, '.dsh-feishucard', 'feishu.config.json'),
   JSON.stringify({ bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET }] }, null, 2))
-process.env.FS_CONFIG_DIR = join(FAKE_HOME, '.cc-connect')
+process.env.FS_CONFIG_DIR = join(FAKE_HOME, '.dsh-feishucard')
 
 let failures = 0
 function ok(cond, label) {

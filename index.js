@@ -2,16 +2,15 @@
 // Bridges Feishu (Lark) chats with dedicated per-chat DeepSeek Harness agent
 // sessions via the official SDK long connection (helper.cjs subprocess per
 // bot), with /new /switch /list /help commands, a typing reaction, and a
-// ZCode-style streaming reply card: one card per turn, PATCH-updated as the
-// agent works (inline agent notes + collapsible tool-call panels), sealed
-// with the final reply. Reliability: serialized sync queue, rate-limit
-// coalescing, exponential backoff, circuit breaker, and a plain-text
-// fallback when the card pipeline dies.
+// streaming reply card: one card per turn, PATCH-updated as the agent works
+// (inline agent notes + collapsible tool-call panels), sealed with the final
+// reply. Reliability: serialized sync queue, rate-limit coalescing,
+// exponential backoff, circuit breaker, and a plain-text fallback when the
+// card pipeline dies.
 //
-// Config: ~/.cc-connect/feishu.config.json   ({ bots: [...] }, same
-// convention as the wider agent-IM ecosystem, zero migration from the
-// existing dsh-feishu-connect config).
-// State:  ~/.cc-connect/state-<appId>.json   (per-bot chat/session map).
+// Config: ~/.dsh-feishucard/feishu.config.json  ({ bots: [...] }).
+// State:  ~/.dsh-feishucard/state-<appId>.json  (per-bot chat/session map).
+// A one-time migration copies a legacy config from ~/.cc-connect if present.
 
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
@@ -44,13 +43,33 @@ export function apply(ctx) {
   const bots = new Map()             // appId -> Bot runtime
 
   // ---- config -------------------------------------------------------------
-  // Config/state live under ~/.cc-connect by default; FS_CONFIG_DIR overrides
-  // the base directory (used by tests, and useful for multi-profile setups).
-  const configDir = () => process.env.FS_CONFIG_DIR || join(homedir(), '.cc-connect')
+  // Config/state live under ~/.dsh-feishucard by default; FS_CONFIG_DIR
+  // overrides the base directory (used by tests, and for multi-profile
+  // setups).
+  const configDir = () => process.env.FS_CONFIG_DIR || join(homedir(), '.dsh-feishucard')
   const configPath = () => join(configDir(), 'feishu.config.json')
   const statePathFor = (appId) => join(
     configDir(), 'state-' + String(appId).replace(/[^a-zA-Z0-9]/g, '') + '.json',
   )
+
+  // One-time migration: if our own config dir has no config yet but the
+  // legacy ecosystem path (~/.cc-connect, used by the third-party plugin we
+  // replaced) has one, copy it over so users keep their bots without
+  // re-entering credentials. Runs once at boot.
+  function migrateLegacyConfig() {
+    try {
+      const own = configPath()
+      if (existsSync(own)) return
+      const legacy = join(homedir(), '.cc-connect', 'feishu.config.json')
+      if (!existsSync(legacy)) return
+      mkdirSync(configDir(), { recursive: true })
+      writeFileSync(own, readFileSync(legacy, 'utf8'))
+      console.log('[fs] migrated config from legacy ' + legacy + ' to ' + own)
+    } catch (error) {
+      console.log('[fs] legacy config migration skipped: ' + String(error && error.message || error))
+    }
+  }
+  migrateLegacyConfig()
 
   const workspaceRoot = () => {
     const sp = ctx.get('sandboxPolicy')
@@ -189,7 +208,7 @@ export function apply(ctx) {
     const cfg = bot.cfg
     const hasCreds = typeof cfg.appId === 'string' && cfg.appId
       && typeof cfg.appSecret === 'string' && cfg.appSecret
-    if (!hasCreds) return { status: 0, text: '未配置 appId/appSecret（~/.cc-connect/feishu.config.json）' }
+    if (!hasCreds) return { status: 0, text: '未配置 appId/appSecret（~/.dsh-feishucard/feishu.config.json）' }
     const target = chatId || bot.lastChatId || ''
     let receiveIdType = 'chat_id'
     if (!target) {
@@ -1092,7 +1111,7 @@ export function apply(ctx) {
   // ---- model tool: proactive send -------------------------------------------------
   const tool = defineTool({
     name: 'feishu_send',
-    description: 'Send a text message to a Feishu chat through a configured app bot (~/.cc-connect/feishu.config.json). chatId is optional: it defaults to the most recent chat that messaged the bot. appId is optional: it selects which bot to use (defaults to the bot that last received a message).',
+    description: 'Send a text message to a Feishu chat through a configured app bot (~/.dsh-feishucard/feishu.config.json). chatId is optional: it defaults to the most recent chat that messaged the bot. appId is optional: it selects which bot to use (defaults to the bot that last received a message).',
     parameters: {
       text: { type: 'string', required: true, description: 'Text content to send.' },
       chatId: { type: 'string', description: 'Target chat id (oc_...). Omit to send to the most recent chat that messaged the bot.' },
