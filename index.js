@@ -1,4 +1,4 @@
-// dsh-feishu-stream — host plugin (node half), self-developed.
+﻿// dsh-feishucard — host plugin (node half), self-developed.
 // Bridges Feishu (Lark) chats with dedicated per-chat DeepSeek Harness agent
 // sessions via the official SDK long connection (helper.cjs subprocess per
 // bot), with /new /switch /list /help commands, a typing reaction, and a

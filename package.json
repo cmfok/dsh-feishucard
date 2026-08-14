@@ -1,7 +1,7 @@
 {
-  "name": "dsh-feishu-stream",
+  "name": "dsh-feishucard",
   "version": "0.1.0",
-  "description": "Self-developed DeepSeek Harness <-> Feishu (Lark) bridge: official-SDK long connection (no public URL), per-chat dedicated agent sessions, /new /switch /list /help commands, and a ZCode-style streaming reply card (tool-call fold panels, status symbols, inline agent notes, rate-limit / backoff / circuit-breaker / text fallback).",
+  "description": "DeepSeek Harness <-> Feishu (Lark) bridge with a ZCode-style streaming reply card: official-SDK long connection (no public URL), per-chat dedicated agent sessions, /new /switch /list /help commands, collapsible tool-call panels with status symbols, inline agent notes, rate-limit / backoff / circuit-breaker / text fallback. Self-developed (not a fork).",
   "type": "module",
   "main": "index.js",
   "exports": {

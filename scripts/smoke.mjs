@@ -1,4 +1,4 @@
-// dsh-feishu-stream smoke test: boots the real host plugin against a mocked
+﻿// dsh-feishucard smoke test: boots the real host plugin against a mocked
 // DSH context and a mocked Feishu REST API, feeds one inbound message through
 // the helper protocol, and asserts the full turn pipeline:
 //   event -> dedicated session create -> agent.send -> streaming card
