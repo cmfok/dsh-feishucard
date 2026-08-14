@@ -17,8 +17,8 @@ fix and coordinated disclosure. Please include:
 ## Scope
 
 This plugin runs as a DeepSeek Harness bundle and holds Feishu app
-credentials (`~/.cc-connect/feishu.config.json`). Never commit `appSecret` /
-tokens to git, and do not share the config file.
+credentials (`~/.dsh-feishucard/feishu.config.json`). Never commit
+`appSecret` / tokens to git, and do not share the config file.
 
 ## Supported Versions
 
