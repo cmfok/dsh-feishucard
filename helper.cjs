@@ -1,4 +1,4 @@
-// dsh-feishu-stream helper: keeps the Feishu (Lark) official-SDK WebSocket
+﻿// dsh-feishucard helper: keeps the Feishu (Lark) official-SDK WebSocket
 // long connection alive and streams events to the host plugin over stdout.
 //
 // Protocol: one JSON object per line on stdout.

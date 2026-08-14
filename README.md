@@ -1,6 +1,6 @@
-# dsh-feishu-stream
+# dsh-feishucard
 
-把飞书（Lark）机器人接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 会话——**自研实现**：官方 SDK **长连接**接收消息（无需公网 IP/域名/隧道）、每聊天独立专属会话、`/new /switch /list /help` 命令、处理中表情回执，以及 **ZCode 式流式回复卡片**（工具调用折叠面板 + 状态符号 + 过程话语内联 + 限流/退避/熔断/文本兜底）。
+把飞书（Lark）机器人接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 会话——**自研实现**（非 fork）：官方 SDK **长连接**接收消息（无需公网 IP/域名/隧道）、每聊天独立专属会话、`/new /switch /list /help` 命令、处理中表情回执，以及 **ZCode 式流式回复卡片**（Streaming Card：工具调用折叠面板 + 状态符号 + 过程话语内联 + 限流/退避/熔断/文本兜底）。
 
 单包即用：Host 插件（桥接逻辑）+ helper 子进程（长连接）+ bundle 补丁（自动注册）。
 
@@ -24,7 +24,7 @@
 ## 安装
 
 ```sh
-dsh plugin --profile web add dsh-feishu-stream
+dsh plugin --profile web add dsh-feishucard
 dsh web   # 重启
 ```
 
