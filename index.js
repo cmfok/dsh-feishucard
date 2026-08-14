@@ -586,6 +586,24 @@ export function apply(ctx) {
     if (!entry) return undefined
     if (entry.type === 'main') return undefined          // legacy marker -> recreate
     if (entry.handle) return entry.handle.agent
+    // (1) The session may already be LIVE in this process: DSH restores
+    //     sessions on boot (and the GUI may hold them). resume would be
+    //     rejected with "cannot prepare session while it is live", but the
+    //     live agent still carries the full conversation — reuse it directly
+    //     so context is preserved across restarts.
+    try {
+      const agents = ctx.get('agents')
+      const list = agents && typeof agents.list === 'function' ? agents.list() : []
+      const live = list.find((a) => a && a.id === entry.id)
+      if (live) {
+        entry.handle = { agent: live }
+        console.log('[fs] reused live session ' + entry.id + ' (context preserved)')
+        return live
+      }
+    } catch (error) {
+      console.log('[fs] live lookup failed: ' + String(error && error.message || error))
+    }
+    // (2) Otherwise try resume (prepares the persisted session).
     try {
       const handle = await resumeDedicated(bot, entry.id, mainAgent)
       entry.handle = handle
