@@ -18,8 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GUI answerer (2026-08-15).
 - User questions: `ask_user_question` tool calls from Feishu-owned agents are
   intercepted on the `tools/execute` waterfall (stock DSH, no source patches)
-  and answered in the chat — the next plain message is the answer, returned as
-  a normal tool success. Also covers plan-review questions (2026-08-16).
+  and answered in the chat — options render as an interactive button card
+  (ZCode-style, up to 5 buttons; plain-text fallback for more), free-text
+  replies work too; the answer is returned as a normal tool success. The
+  reply also bypasses the serial chain (the chain is held by the turn waiting
+  on the answer) so a question can never hang (2026-08-17).
 - `/stop` command: cancels the CURRENT live agent (resolved via `agents.list()`
   instead of a possibly stale cached handle), processed immediately (bypasses
   the serial message chain so it can interrupt a running turn) (2026-08-16).
