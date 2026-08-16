@@ -827,6 +827,17 @@ export function apply(ctx) {
       if (handled) return
     }
 
+    // A pending user-question (ask_user_question / plan review) is answered
+    // by the next plain message in this chat (F-04).
+    const pendingQ = pendingQuestions.get(chatId)
+    if (pendingQ) {
+      pendingQuestions.delete(chatId)
+      if (pendingQ.timer) clearTimeout(pendingQ.timer)
+      pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
+      await sendPlainText(bot, chatId, '✅ 已收到你的回答。')
+      return
+    }
+
     // Ensure a dedicated session exists for this chat.
     let chat = bot.chats.get(chatId)
     let agent
@@ -1308,6 +1319,85 @@ export function apply(ctx) {
     }
     console.log('[fs] approval/request: owner found, asking via card')
     return askApprovalCard(owner.bot, owner.chatId, request)
+  })
+
+  // ---- user questions (ask_user_question over Feishu, plugin-only) ----------
+  // We intercept the ask_user_question tool dispatch on the tools/execute
+  // waterfall — no harness source changes needed, so the open-source plugin
+  // works on stock DSH builds. The question goes out as a plain message; the
+  // next message in the chat is the answer, returned as the tool result.
+  const pendingQuestions = new Map()    // chatId -> { resolve, reject, questions, timer }
+
+  function buildQuestionAnswer(questions, text) {
+    return {
+      answers: questions.map((q) => {
+        const opts = q.options || []
+        if (opts.length === 0) return { id: q.id, selected: [], custom: text }
+        const trimmed = String(text || '').trim()
+        const num = parseInt(trimmed, 10)
+        if (Number.isFinite(num) && num >= 1 && num <= opts.length) {
+          return { id: q.id, selected: [opts[num - 1].label] }
+        }
+        const hit = opts.find((o) => o.label === trimmed
+          || o.label.includes(trimmed) || trimmed.includes(o.label))
+        if (hit) return { id: q.id, selected: [hit.label] }
+        return { id: q.id, selected: [], custom: trimmed }
+      }),
+    }
+  }
+
+  function askUserQuestion(bot, chatId, questions, signal) {
+    return new Promise((resolve, reject) => {
+      const q = questions[0]
+      const lines = ['❓ **需要你的回答**', '', '**' + q.question + '**']
+      if (q.detail) lines.push('', q.detail)
+      if (q.options && q.options.length) {
+        lines.push('', '选项：')
+        q.options.forEach((o, i) => {
+          lines.push((i + 1) + '. ' + o.label + (o.description ? '（' + o.description + '）' : ''))
+        })
+        lines.push('', '回复序号或直接输入内容即可。')
+      } else {
+        lines.push('', '直接回复即可。')
+      }
+      const record = { resolve, reject, questions, timer: undefined }
+      pendingQuestions.set(chatId, record)
+      record.timer = setTimeout(() => {
+        if (pendingQuestions.get(chatId) === record) pendingQuestions.delete(chatId)
+        reject(new Error('question timed out (30 min, no reply)'))
+      }, 30 * 60 * 1000)
+      if (signal && typeof signal.addEventListener === 'function') {
+        const onAbort = () => {
+          if (pendingQuestions.get(chatId) === record) pendingQuestions.delete(chatId)
+          clearTimeout(record.timer)
+          reject(new Error('ask_user_question aborted'))
+        }
+        signal.addEventListener('abort', onAbort)
+      }
+      sendPlainText(bot, chatId, lines.join('\n')).catch((error) => {
+        if (pendingQuestions.get(chatId) === record) pendingQuestions.delete(chatId)
+        clearTimeout(record.timer)
+        reject(new Error('question send failed: ' + String(error && error.message || error)))
+      })
+    })
+  }
+
+  // Take over ask_user_question for Feishu-owned agents: answer the question
+  // in the chat and return a normal tool success, so stock DSH works as-is.
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name !== 'ask_user_question') return next()
+    const owner = findChatForAgent(exec.agent)
+    if (!owner) return next()
+    console.log('[fs] ask_user_question intercepted for ' + exec.agent.id)
+    const args = exec.arguments || {}
+    const questions = Array.isArray(args.questions) ? args.questions : []
+    if (questions.length === 0) return next()
+    const answer = await askUserQuestion(owner.bot, owner.chatId, questions, exec.signal)
+    return {
+      isError: false,
+      value: answer,
+      content: [{ type: 'text', text: JSON.stringify(answer) }],
+    }
   })
 
   // ---- admin routes (same-origin RPC) -----------------------------------------
