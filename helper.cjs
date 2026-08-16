@@ -35,12 +35,25 @@ const dispatcher = new lark.EventDispatcher({}).register({
     emit({ type: 'event', eventType: 'im.message.receive_v1', data })
     return {}
   },
+  'card.action.trigger': (data) => {
+    emit({ type: 'event', eventType: 'card.action.trigger', data })
+    return {}
+  },
 })
+
+// Debug: surface ANY event the long connection delivers (including unknown
+// event types) so we can tell whether callbacks arrive over the WS at all.
+const origInvoke = dispatcher.invoke.bind(dispatcher)
+dispatcher.invoke = (data, opts) => {
+  const t = data && (data.type || (data.header && data.header.event_type)) || 'unknown'
+  emit({ type: 'event', eventType: String(t), data, raw: true })
+  return origInvoke(data, opts)
+}
 
 const client = new lark.WSClient({
   appId,
   appSecret,
-  loggerLevel: lark.LoggerLevel.error,
+  loggerLevel: lark.LoggerLevel.info,
   onReady: () => emit({ type: 'ready' }),
   onReconnecting: () => emit({ type: 'reconnecting' }),
   onReconnected: () => emit({ type: 'ready' }),

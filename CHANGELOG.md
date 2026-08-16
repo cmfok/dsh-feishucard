@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Approval cards: dsh `approval/request` for plugin-owned Feishu sessions is
+  answered via an interactive Feishu card with `✅ 允许一次` / `❌ 拒绝` buttons
+  (`card.action.trigger` long-connection events); 3-minute timeout auto-rejects
+  (rule shown on the card),
+  agent abort settles as cancelled; card shows the final outcome after the user
+  clicks. Fixes sessions hanging forever when audit sentinels ask without a
+  GUI answerer (2026-08-15).
+
 ## [0.1.0] - 2026-08-15
 
 ### Added
