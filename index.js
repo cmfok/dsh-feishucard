@@ -1110,6 +1110,20 @@ export function apply(ctx) {
         })
         return
       }
+      // A pending user-question (ask_user_question) is answered by the next
+      // plain message. This MUST bypass the chain too: the chain is held by
+      // the turn waiting for the answer, so a queued reply would never be
+      // processed and the question would hang forever (2026-08-16).
+      const chatId = evt.chat_id
+      const pendingQ = pendingQuestions.get(chatId)
+      if (pendingQ && text) {
+        pendingQuestions.delete(chatId)
+        if (pendingQ.timer) clearTimeout(pendingQ.timer)
+        pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
+        console.log('[fs] question answered via chat: ' + chatId)
+        sendPlainText(bot, chatId, '✅ 已收到你的回答。').catch(() => {})
+        return
+      }
       bot.chain = bot.chain.then(() => handleInbound(bot, evt)).catch((error) => {
         console.log('[fs] handler error: ' + String(error && error.stack || error))
       })
@@ -1285,6 +1299,33 @@ export function apply(ctx) {
     console.log('[fs] card action event received: tag=' + (data && data.action && data.action.tag || '?'))
     const action = data && data.action ? data.action : {}
     const value = action.value || {}
+    // Question-option buttons (ask_user_question card).
+    if (value.fs_question !== undefined && value.fs_option !== undefined) {
+      const chatId = data && data.context && data.context.open_chat_id
+      const record = chatId ? pendingQuestions.get(chatId) : undefined
+      if (!record || record.token !== value.fs_question) {
+        console.log('[fs] question button: record not found for chat ' + chatId)
+        return
+      }
+      const q = record.questions[0]
+      const opts = (q.options || []).slice(0, QUESTION_MAX_BUTTONS)
+      const opt = opts[Number(value.fs_option)]
+      if (!opt) {
+        console.log('[fs] question button: bad option index ' + value.fs_option)
+        return
+      }
+      pendingQuestions.delete(chatId)
+      if (record.timer) clearTimeout(record.timer)
+      console.log('[fs] question answered via button: ' + q.id + ' -> ' + opt.label)
+      record.resolve(buildQuestionAnswer(record.questions, opt.label))
+      if (record.cardId) {
+        updateInteractive(record.bot, record.cardId, questionResultCardPayload(q, opt.label))
+          .catch((error) => {
+            console.log('[fs] question card update failed: ' + String(error && error.message || error))
+          })
+      }
+      return
+    }
     const token = value.fs_approval
     if (!token) {
       console.log('[fs] card action: no fs_approval token in value, ignoring')
@@ -1346,21 +1387,58 @@ export function apply(ctx) {
     }
   }
 
+  // Question card (option buttons, ZCode-style). Feishu action rows hold up
+  // to 5 buttons; more options fall back to the plain-text list.
+  const QUESTION_MAX_BUTTONS = 5
+
+  function questionCardPayload(q, token) {
+    const opts = (q.options || []).slice(0, QUESTION_MAX_BUTTONS)
+    return {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '❓ 需要你的回答' }, template: 'blue' },
+      elements: [
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: '**' + q.question + '**'
+              + (q.detail ? '\n\n' + q.detail : '')
+              + '\n\n点击选项，或直接回复文字。',
+          },
+        },
+        {
+          tag: 'action',
+          actions: opts.map((o, i) => ({
+            tag: 'button',
+            text: { tag: 'plain_text', content: o.label },
+            value: { fs_question: token, fs_option: i },
+          })),
+        },
+      ],
+    }
+  }
+
+  function questionResultCardPayload(q, label) {
+    return {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '❓ 需要你的回答' }, template: 'green' },
+      elements: [
+        {
+          tag: 'div',
+          text: { tag: 'lark_md', content: '**' + q.question + '**\n\n✅ 已收到：' + label },
+        },
+      ],
+    }
+  }
+
   function askUserQuestion(bot, chatId, questions, signal) {
     return new Promise((resolve, reject) => {
       const q = questions[0]
-      const lines = ['❓ **需要你的回答**', '', '**' + q.question + '**']
-      if (q.detail) lines.push('', q.detail)
-      if (q.options && q.options.length) {
-        lines.push('', '选项：')
-        q.options.forEach((o, i) => {
-          lines.push((i + 1) + '. ' + o.label + (o.description ? '（' + o.description + '）' : ''))
-        })
-        lines.push('', '回复序号或直接输入内容即可。')
-      } else {
-        lines.push('', '直接回复即可。')
+      const opts = (q.options || []).slice(0, QUESTION_MAX_BUTTONS)
+      const record = {
+        resolve, reject, questions, timer: undefined, token: randomUUID(),
+        cardId: undefined, bot, chatId, q,
       }
-      const record = { resolve, reject, questions, timer: undefined }
       pendingQuestions.set(chatId, record)
       record.timer = setTimeout(() => {
         if (pendingQuestions.get(chatId) === record) pendingQuestions.delete(chatId)
@@ -1374,6 +1452,24 @@ export function apply(ctx) {
         }
         signal.addEventListener('abort', onAbort)
       }
+      // Options fit on buttons -> interactive card; otherwise plain text.
+      if (opts.length > 0) {
+        sendInteractive(bot, chatId, questionCardPayload(q, record.token))
+          .then((msgId) => {
+            record.cardId = msgId
+            console.log('[fs] question card sent: ' + q.id + ' token=' + record.token)
+          })
+          .catch((error) => {
+            console.log('[fs] question card send failed: ' + String(error && error.message || error))
+            if (pendingQuestions.get(chatId) === record) pendingQuestions.delete(chatId)
+            clearTimeout(record.timer)
+            reject(new Error('question card send failed: ' + String(error && error.message || error)))
+          })
+        return
+      }
+      const lines = ['❓ **需要你的回答**', '', '**' + q.question + '**']
+      if (q.detail) lines.push('', q.detail)
+      lines.push('', '直接回复即可。')
       sendPlainText(bot, chatId, lines.join('\n')).catch((error) => {
         if (pendingQuestions.get(chatId) === record) pendingQuestions.delete(chatId)
         clearTimeout(record.timer)
