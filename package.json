@@ -2,6 +2,14 @@
   "name": "dsh-feishucard",
   "version": "0.1.0",
   "description": "DeepSeek Harness <-> Feishu (Lark) bridge with a streaming reply card: official-SDK long connection (no public URL), per-chat dedicated agent sessions, /new /switch /list /help commands, collapsible tool-call panels with status symbols, inline agent notes, rate-limit / backoff / circuit-breaker / text fallback. Self-developed (not a fork).",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cmfok/dsh-feishucard.git"
+  },
+  "homepage": "https://github.com/cmfok/dsh-feishucard",
+  "bugs": {
+    "url": "https://github.com/cmfok/dsh-feishucard/issues"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -14,7 +22,10 @@
     "helper.cjs",
     "cordis.patch.yml",
     "feishu.config.example.json",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SECURITY.md"
   ],
   "scripts": {
     "check": "node --check index.js && node --check helper.cjs",

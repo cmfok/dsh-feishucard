@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'feishu-stream'
@@ -37,6 +38,9 @@ const CONFIG_REFRESH_MS = 10000      // config hot-reload cadence
 const STATUS_INTERVAL = 10000        // helper status line cadence
 
 export function apply(ctx) {
+  if (globalThis.__dshFeishucardApplyCount === undefined) globalThis.__dshFeishucardApplyCount = 0
+  globalThis.__dshFeishucardApplyCount += 1
+  console.log('[fs] plugin apply #' + globalThis.__dshFeishucardApplyCount + ' @ ' + new Date().toISOString())
   let stopping = false
   let lastConfigCheck = 0
   let lastSpawnAt = 0
@@ -355,6 +359,9 @@ export function apply(ctx) {
   // keep headroom at 40), overflow folded into one "更多过程" panel.
   function buildCardPayload(card) {
     const elements = []
+    console.log('[fs] buildCardPayload: blocks=' + card.blocks.length
+      + ' notes=' + card.blocks.filter((b) => b.type === 'note').length
+      + ' tools=' + card.tools.size)
     for (const block of card.blocks) {
       if (block.type === 'message' || block.type === 'note') {
         const text = (block.text || '').trim()
@@ -386,12 +393,16 @@ export function apply(ctx) {
         })
       }
     }
+    // Window fold: keep the NEWEST content visible (live progress + conclusion
+    // at the bottom), fold the ALREADY-SEEN history into one panel at the TOP.
+    // The last KEEP_TAIL elements are never folded (2026-08-15 CM design).
     if (elements.length > 40) {
-      const head = elements.slice(0, 38)
-      const tail = elements.slice(38)
+      const KEEP_TAIL = 10
+      const head = elements.slice(0, elements.length - KEEP_TAIL)
+      const tail = elements.slice(elements.length - KEEP_TAIL)
       const extraLines = []
       let extraPanels = 0
-      for (const el of tail) {
+      for (const el of head) {
         if (el.tag === 'markdown') {
           if (el.content) extraLines.push(el.content)
         } else {
@@ -401,25 +412,25 @@ export function apply(ctx) {
         }
       }
       if (extraLines.length > 0) {
-        head.push({
+        tail.unshift({
           tag: 'collapsible_panel',
           expanded: false,
           background_color: 'grey-50',
           border: { color: 'grey', corner_radius: '8px' },
           padding: '8px 8px 8px 8px',
           header: {
-            title: { tag: 'plain_text', content: '📎 更多过程 (' + extraPanels + ')' },
+            title: { tag: 'plain_text', content: '📎 更早过程 (' + (elements.length - KEEP_TAIL) + ')' },
             vertical_align: 'center',
             padding: '8px 8px 8px 8px',
             icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', color: 'grey', size: '16px 16px' },
             icon_position: 'right',
             icon_expanded_angle: -180,
           },
-          elements: [{ tag: 'markdown', content: extraLines.join('\n\n').slice(0, 2000) }],
+          elements: [{ tag: 'markdown', content: extraLines.join('\n\n').slice(0, 3000) }],
         })
       }
       elements.length = 0
-      for (const el of head) elements.push(el)
+      for (const el of tail) elements.push(el)
     }
     if (elements.length === 0) elements.push({ tag: 'markdown', content: ' ' })
     if (card.status !== 'sealed') {
@@ -634,7 +645,7 @@ export function apply(ctx) {
   }
 
   // ---- commands --------------------------------------------------------------
-  const COMMANDS = ['help', 'new', 'switch', 'list']
+  const COMMANDS = ['help', 'new', 'switch', 'list', 'plan', 'stop']
 
   function splitCommand(text) {
     const trimmed = (text || '').trim()
@@ -656,7 +667,79 @@ export function apply(ctx) {
     if (!resolved) return false
     if (resolved === 'help') {
       await sendPlainText(bot, chatId,
-        '/new [名称] 新建会话\n/switch <序号> 切换会话\n/list 列出会话\n/help 帮助')
+        '/new [名称] 新建会话\n/switch <序号> 切换会话\n/list 列出会话\n/plan [off] 计划模式开关\n/stop 停止当前任务\n/help 帮助')
+      return true
+    }
+    if (resolved === 'stop') {
+      const active = chat.sessions[chat.activeIndex]
+      if (!active) {
+        await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /stop。')
+        return true
+      }
+      // Resolve the CURRENT live agent (a cached handle may point at a stale
+      // instance after hmr reloads) — mirror resolveAgent's live lookup so
+      // cancel() hits the agent actually running the turn.
+      let agent
+      try {
+        const agents = ctx.get('agents')
+        const list = agents && typeof agents.list === 'function' ? agents.list() : []
+        agent = list.find((a) => a && a.id === active.id) || null
+      } catch (error) {
+        console.log('[fs] /stop live lookup failed: ' + String(error && error.message || error))
+        agent = null
+      }
+      if (!agent && active.handle) agent = active.handle.agent
+      if (!agent) {
+        await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /stop。')
+        return true
+      }
+      try {
+        console.log('[fs] /stop: cancelling live agent ' + agent.id)
+        agent.cancel({ kind: 'user' })
+        console.log('[fs] /stop: cancel() returned without throwing')
+        await sendPlainText(bot, chatId, '已发送停止指令。')
+      } catch (error) {
+        console.log('[fs] /stop: cancel threw: ' + String(error && error.stack || error))
+        await sendPlainText(bot, chatId, '停止失败：' + String(error && error.message || error))
+      }
+      return true
+    }
+    if (resolved === 'plan') {
+      const active = chat.sessions[chat.activeIndex]
+      const agent = active && active.handle && active.handle.agent
+      if (!agent) {
+        await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /plan。')
+        return true
+      }
+      // Prefer the harness commands registry (plan-mode registers /plan
+      // there); fall back to the injected planMode service directly.
+      // ctx.get('planMode') misses the service across bundle scopes (2026-08-15).
+      let planMode
+      try {
+        const commands = ctx.get('commands')
+        if (commands && typeof commands.execute === 'function') {
+          const line = cmd.arg ? '/plan ' + cmd.arg : '/plan'
+          const exec = await commands.execute(agent, line, new AbortController().signal)
+          if (exec !== undefined) {
+            const text = exec.result && exec.result.text ? exec.result.text : 'ok'
+            await sendPlainText(bot, chatId, text)
+            return true
+          }
+          console.log('[fs] /plan: commands.execute resolved nothing, falling back')
+        }
+      } catch (error) {
+        console.log('[fs] /plan via commands failed: ' + String(error && error.message || error))
+      }
+      planMode = planModeRef
+      if (!planMode || typeof planMode.set !== 'function') {
+        await sendPlainText(bot, chatId, '计划模式不可用（plan-mode 插件未装载）。')
+        return true
+      }
+      const off = cmd.arg === 'off'
+      const outcome = planMode.set(agent, !off)
+      await sendPlainText(bot, chatId, off
+        ? '已退出计划模式（' + outcome + '）。'
+        : '已进入计划模式（' + outcome + '）。提交计划时我会通过评审卡片请你确认。')
       return true
     }
     if (resolved === 'new') {
@@ -994,11 +1077,48 @@ export function apply(ctx) {
 
   function handleHelperMessage(bot, msg) {
     if (!msg || typeof msg !== 'object') return
+    // Raw debug events from the helper's invoke hook are observation-only —
+    // the same event is re-emitted by the registered handler right after.
+    if (msg.raw) {
+      console.log('[fs] helper event (raw debug): ' + msg.eventType)
+      return
+    }
     if (msg.type === 'event' && msg.eventType === 'im.message.receive_v1') {
       const evt = normalizeEvent(msg.data)
+      // Control commands (/stop etc.) bypass the serial chain so they can
+      // interrupt a running turn immediately — queuing them behind the turn
+      // makes /stop arrive only after the turn finished (2026-08-15).
+      const text = extractText(evt.content)
+      const cmd = text ? splitCommand(text) : undefined
+      if (cmd) {
+        const chatId = evt.chat_id
+        const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
+        bot.chats.set(chatId, chat)
+        handleCommand(bot, chat, chatId, cmd).catch((error) => {
+          console.log('[fs] command error: ' + String(error && error.stack || error))
+        })
+        return
+      }
       bot.chain = bot.chain.then(() => handleInbound(bot, evt)).catch((error) => {
         console.log('[fs] handler error: ' + String(error && error.stack || error))
       })
+      return
+    }
+    if (msg.type === 'event' && msg.eventType === 'card.action.trigger') {
+      // Card clicks MUST bypass the serial chain: the chain is held by the
+      // turn waiting on the approval, so a queued click would only be
+      // processed after the approval times out (2026-08-16).
+      try {
+        handleCardAction(msg.data)
+      } catch (error) {
+        console.log('[fs] card action error: ' + String(error && error.stack || error))
+      }
+      return
+    }
+    if (msg.type === 'event') {
+      // Anything else that arrives over the long connection (debug hook in
+      // helper.cjs marks raw events) — shows whether callbacks reach us at all.
+      console.log('[fs] helper event (unhandled): ' + msg.eventType + (msg.raw ? ' [raw]' : ''))
       return
     }
     if (msg.type === 'ready') {
@@ -1020,6 +1140,175 @@ export function apply(ctx) {
       }
     }
   }
+
+  // ---- approval cards (dsh approval/request -> Feishu card with buttons) -----
+  const pendingApprovals = new Map()     // token -> record { bot, chatId, request, settle, timer, cardId }
+  const APPROVAL_TIMEOUT_MS = 3 * 60 * 1000
+
+  // planMode service arrives via dependency injection (cordis scopes make a
+  // plain ctx.get miss cross-bundle services; the commands registry is
+  // preferred at call time and this is the fallback).
+  let planModeRef = null
+  ctx.inject(['planMode'], (scope) => { planModeRef = scope.planMode })
+
+  function findChatForAgent(agent) {
+    for (const bot of bots.values()) {
+      for (const [chatId, chat] of bot.chats) {
+        for (const s of chat.sessions || []) {
+          if (s.handle && s.handle.agent === agent) return { bot, chatId }
+        }
+      }
+    }
+    return undefined
+  }
+
+  function approvalCardPayload(toolName, reason, token) {
+    return {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'orange' },
+      elements: [
+          {
+            tag: 'div',
+            text: {
+              tag: 'lark_md',
+              content: '**工具**：`' + toolName + '`\n**说明**：' + (reason || '（无说明）')
+                + '\n\n是否允许执行（仅本次）？\n⏰ 3 分钟内未操作将自动拒绝。',
+            },
+          },
+        {
+          tag: 'action',
+          actions: [
+            { tag: 'button', text: { tag: 'plain_text', content: '✅ 允许一次' }, type: 'primary', value: { fs_approval: token, fs_action: 'allow' } },
+            { tag: 'button', text: { tag: 'plain_text', content: '❌ 拒绝' }, type: 'danger', value: { fs_approval: token, fs_action: 'reject' } },
+          ],
+        },
+      ],
+    }
+  }
+
+  function approvalResultCardPayload(toolName, label) {
+    return {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'blue' },
+      elements: [
+        {
+          tag: 'div',
+          text: { tag: 'lark_md', content: '**工具**：`' + toolName + '`\n**结果**：' + label },
+        },
+      ],
+    }
+  }
+
+  // Withdraw the approval card once it is decided so it does not linger at the
+  // bottom of the chat while the reply card keeps updating (2026-08-16 CM
+  // design, mirroring ZCode's in-flow permission UX). Falls back to updating
+  // the card in place when recall is unavailable.
+  async function dismissApprovalCard(bot, record, label) {
+    if (!record || !record.cardId) return
+    try {
+      const accessToken = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
+      const res = await httpJson(
+        'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(record.cardId),
+        'DELETE',
+        { Authorization: 'Bearer ' + accessToken },
+      )
+      const parsed = parseJson(res.text)
+      if (!(res.status >= 200 && res.status < 300) || !parsed || parsed.code !== 0) {
+        throw new Error('recall failed: ' + (res.text || JSON.stringify(res)))
+      }
+      console.log('[fs] approval card recalled: ' + record.request.toolName)
+    } catch (error) {
+      console.log('[fs] approval card recall failed, updating in place: ' + String(error && error.message || error))
+      await updateApprovalCard(bot, record, label)
+    }
+  }
+
+  function askApprovalCard(bot, chatId, request) {
+    const token = randomUUID()
+    const record = {
+      bot, chatId, request,
+      settle: undefined, timer: undefined, signalOff: undefined, cardId: undefined,
+    }
+    return new Promise((resolve) => {
+      let settled = false
+      const settle = (outcome) => {
+        if (settled) return
+        settled = true
+        if (record.timer) clearTimeout(record.timer)
+        if (record.signalOff) record.signalOff()
+        pendingApprovals.delete(token)
+        resolve(outcome)
+      }
+      record.settle = settle
+      pendingApprovals.set(token, record)
+      record.timer = setTimeout(() => {
+        console.log('[fs] approval timed out, auto-reject: ' + request.toolName)
+        dismissApprovalCard(bot, record, '⏰ 已超时（自动拒绝）')
+        settle('rejected')
+      }, APPROVAL_TIMEOUT_MS)
+      if (request.signal && typeof request.signal.addEventListener === 'function') {
+        const onAbort = () => {
+          console.log('[fs] approval cancelled (agent aborted): ' + request.toolName)
+          settle('cancelled')
+        }
+        request.signal.addEventListener('abort', onAbort)
+        record.signalOff = () => request.signal.removeEventListener('abort', onAbort)
+      }
+      sendInteractive(bot, chatId, approvalCardPayload(request.toolName, request.reason, token))
+        .then((msgId) => {
+          record.cardId = msgId
+          console.log('[fs] approval card sent: ' + request.toolName + ' token=' + token)
+        })
+        .catch((error) => {
+          console.log('[fs] approval card send failed: ' + String(error && error.message || error))
+          // Text fallback (same policy as the streaming card): never silently
+          // grant, but tell the user the approval could not be delivered.
+          sendPlainText(bot, chatId, '⚠️ 审批卡片发送失败（已自动拒绝该操作）——工具：' + request.toolName)
+            .catch(() => {})
+          settle('rejected')
+        })
+    })
+  }
+
+  function handleCardAction(data) {
+    console.log('[fs] card action event received: tag=' + (data && data.action && data.action.tag || '?'))
+    const action = data && data.action ? data.action : {}
+    const value = action.value || {}
+    const token = value.fs_approval
+    if (!token) {
+      console.log('[fs] card action: no fs_approval token in value, ignoring')
+      return
+    }
+    const record = pendingApprovals.get(token)
+    if (!record) {
+      console.log('[fs] card action: token not found (already settled?) ' + token)
+      return
+    }
+    if (value.fs_action === 'allow') {
+      console.log('[fs] approval allowed (once): ' + record.request.toolName)
+      record.settle('allowed-once')
+      dismissApprovalCard(record.bot, record, '✅ 已允许（仅本次）')
+    } else if (value.fs_action === 'reject') {
+      console.log('[fs] approval rejected: ' + record.request.toolName)
+      record.settle('rejected')
+      dismissApprovalCard(record.bot, record, '❌ 已拒绝')
+    }
+  }
+
+  // Answer dsh approval/request for agents owned by this plugin's Feishu chats;
+  // everything else (GUI sessions etc.) delegates via next().
+  ctx.on('approval/request', (request, next) => {
+    const agentId = request && request.agent ? request.agent.id : '?'
+    console.log('[fs] approval/request received: tool=' + (request && request.toolName)
+      + ' agent=' + agentId + ' callId=' + (request && request.callId || 'none'))
+    const owner = findChatForAgent(request.agent)
+    if (!owner) {
+      console.log('[fs] approval/request: no chat owner for agent ' + agentId + ', delegating')
+      return next()
+    }
+    console.log('[fs] approval/request: owner found, asking via card')
+    return askApprovalCard(owner.bot, owner.chatId, request)
+  })
 
   // ---- admin routes (same-origin RPC) -----------------------------------------
   function respondJson(res, status, obj) {

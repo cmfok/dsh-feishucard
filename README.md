@@ -9,6 +9,8 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 > 独立自研，不依赖任何第三方 DSH 飞书插件。配置独立存放于 `~/.dsh-feishucard/`；检测到旧生态路径（`~/.cc-connect/`）有配置时启动自动迁移一次。不要与其他 DSH 飞书插件同时安装（同一飞书 App 的 WS 长连接互踢）。
 > Fully independent. Config lives in `~/.dsh-feishucard/`; a legacy config found at `~/.cc-connect/` is auto-migrated once on boot. Do not install alongside other DSH Feishu plugins (two WS long connections on one app kick each other).
 
+> ⚠️ **Windows 开发陷阱（2026-08-15 实测）**：本包以 `file:` 依赖安装后，DSH profile 的 `node_modules/dsh-feishucard/` 是**实体副本而非软链**——改源文件后 dsh 仍加载旧副本，改动"重启也不生效"。改代码后必须同步副本：`cp index.js helper.cjs <profile>/node_modules/dsh-feishucard/`（或重新 `dsh plugin --profile web add dsh-feishucard`），再重启 dsh。排查"改了没生效"先 `md5sum` 对比源与副本。
+
 ## 功能 / Features
 
 - **长连接收发 / Long-connection messaging**：`im.message.receive_v1` 官方 SDK WebSocket → 注入 Agent 会话 → 交互卡片回复同一会话，全程无需公网地址。Official SDK WebSocket; no public IP, domain, or tunnel required.
@@ -21,6 +23,7 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 - **每聊天独立会话 / Dedicated per-chat sessions**：每个飞书聊天专属 Agent 会话池（绝不串进 GUI 会话）；首条消息自动创建；持久化 + 重启恢复（live 会话直接复用、上下文不丢）；`/new [名称]`、`/switch <序号>`、`/list`、`/help`。Never shares GUI sessions; auto-created on first message; live sessions are reused across restarts so context is preserved.
 - **处理中表情 / Typing reaction**：消息到达加 `OnIt`，回复送达后撤销（`reactionEmoji` 可配，`none` 关闭）。`OnIt` reaction added on arrival, removed after delivery.
 - **工具 / Model tool**：`feishu_send`（agent 主动发消息，`appId` 指定机器人，缺省发到最近会话）。Proactive messaging from the agent.
+- **审批卡片 / Approval card**：dsh 会话的工具调用需要确认时（audit 哨兵等），飞书弹出交互卡片「✅ 允许一次 / ❌ 拒绝」按钮，点击即回决策（`card.action.trigger` 长连接事件）；5 分钟超时自动拒绝、会话取消自动取消——避免飞书通道下审批无人应答导致会话永久挂起。Approval `approval/request` for plugin-owned sessions is answered via a button card; timeout auto-rejects.
 - **保活 / Keep-alive**：helper 崩溃自动重启（5s 冷却防重复）+ 凭据变更自动重连 + SDK 自带重连 + 状态可观测。Crash-restart with spawn cooldown, auto-reconnect, observable connection status.
 - **多机器人 / Multi-bot**：一个实例多个机器人，各自绑定工作区。One instance, many bots, one workspace each.
 
