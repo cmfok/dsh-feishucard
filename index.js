@@ -486,7 +486,7 @@ export function apply(ctx) {
   // watcher and the seal-time catch-up scan so a fast turn still gets its
   // narration + tool panels on the card.
   function scanEvents(agent, fromRef, card) {
-    const events = agent.session.events
+    const events = agent.session.snapshotEvents()
     let changed = false
     for (let i = fromRef.from; i < events.length; i++) {
       const event = events[i]
@@ -791,16 +791,31 @@ export function apply(ctx) {
   function extractText(contentJson) {
     try {
       const parsed = JSON.parse(contentJson || '{}')
-      const text = typeof parsed.text === 'string' ? parsed.text : ''
-      const mentions = parsed.mentions
-      if (!mentions || !Array.isArray(mentions)) return text
-      let out = text
-      for (const m of mentions) {
-        if (m && typeof m.key === 'string' && typeof m.denote_text === 'string') {
-          out = out.split(m.key).join(m.denote_text)
+      // Plain text (mobile client): {"text":"...","mentions":[...]}
+      if (typeof parsed.text === 'string') {
+        const mentions = parsed.mentions
+        if (!mentions || !Array.isArray(mentions)) return parsed.text
+        let out = parsed.text
+        for (const m of mentions) {
+          if (m && typeof m.key === 'string' && typeof m.denote_text === 'string') {
+            out = out.split(m.key).join(m.denote_text)
+          }
         }
+        return out
       }
-      return out
+      // Rich-text post (desktop client): {"title":"...","content":[[{tag,text},...],...]}
+      // PC 端发的普通文本是 post 格式，不解析会被静默丢弃（2026-09-01 事故）。
+      if (Array.isArray(parsed.content)) {
+        const parts = []
+        for (const para of parsed.content) {
+          if (!Array.isArray(para)) continue
+          for (const el of para) {
+            if (el && typeof el === 'object' && typeof el.text === 'string') parts.push(el.text)
+          }
+        }
+        return parts.join(' ').trim()
+      }
+      return ''
     } catch {
       return ''
     }
@@ -883,7 +898,7 @@ export function apply(ctx) {
 
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     const label = openId ? '[飞书 ' + openId + '] ' : '[飞书消息] '
-    const seqBefore = agent.session.events.length
+    const seqBefore = agent.session.snapshotEvents().length
     const message = {
       id: 'fs-' + messageId,
       role: 'user',
@@ -938,7 +953,7 @@ export function apply(ctx) {
     // Seal: promote the last note (the final reply) to a message block so the
     // reply is not duplicated as narration; drop the placeholder; kill the
     // status line.
-    const events = agent.session.events
+    const events = agent.session.snapshotEvents()
     let reply = '（Agent 未产生文字回复）'
     let lastSeq
     for (let i = events.length - 1; i >= seqBefore; i--) {

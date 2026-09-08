@@ -37,6 +37,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - helper: registers `card.action.trigger`, `LoggerLevel.info`, and a raw-event
   debug hook; the host logs raw events for observability (2026-08-16).
 
+### Fixed
+
+- **DSH 0.1.2 API 适配（2026-09-08）**：`agent.session.events`（旧数组属性）在
+  DSH 0.1.2-rc.1 已废弃，改为 `agent.session.snapshotEvents()`——原代码在
+  0.1.2 上入站消息一到 `handleInbound` 就抛
+  `TypeError: Cannot read properties of undefined (reading 'length')`，机器人
+  收消息不回复（公司电脑实测）。适配后 smoke 全绿、真机入站→流式卡片闭环
+  恢复。涉及：`scanEvents` / `seqBefore` / seal 扫描三处读取点，均改用
+  `snapshotEvents()`（返回冻结数组，下标=seq，语义与原 `events` 一致）。
+- `extractText` now parses Feishu **post (rich-text)** message content
+  (`{"title","content":[[{tag,text},...],...]}`) in addition to plain text —
+  desktop-client messages (post) were silently dropped with zero logs, making
+  the bot appear dead (PC "在吗？" got no reply while mobile text messages
+  worked fine). Root cause confirmed 2026-09-01 by comparing chat history
+  (post vs text msg_type) against bridge logs; fix verified with unit cases
+  for text/post/mentions/empty/bad-json.
+
 ## [0.1.0] - 2026-08-15
 
 ### Added

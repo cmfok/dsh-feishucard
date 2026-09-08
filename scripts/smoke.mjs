@@ -64,7 +64,7 @@ const agent = {
   id: 'agent-smoke-1',
   session: {
     header: { cwd: WORKSPACE },
-    events: agentEvents,
+    snapshotEvents: () => agentEvents,
   },
   sent: [],
   send(message) {
@@ -128,6 +128,18 @@ const ctx = {
   effect(fn) { effects.push(fn); const cleanup = fn(); return cleanup },
   webServer: { register: (route) => registeredRoutes.push(route) },
   tools: { register: (t) => registeredTools.push(t) },
+  inject(keys, callback) {
+    // cordis service injection: only invoke when a known service is present.
+    // planMode is not provided by the smoke mock, so the callback is kept for
+    // API-shape compatibility and simply not fired.
+    void keys; void callback
+    return () => {}
+  },
+  on(event, listener) {
+    // cordis event subscription: recorded, never fired by the smoke mock.
+    void event; void listener
+    return () => {}
+  },
 }
 
 // ---- boot the real plugin -------------------------------------------------------
