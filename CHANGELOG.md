@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-08
+
 ### Added
 
 - Approval cards: dsh `approval/request` for plugin-owned Feishu sessions is
@@ -39,6 +41,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **问答后流式卡续更不可见 → 答题后自动开新卡（2026-09-08 CM 实测）**：`ask_user_question`
+  答题（点按钮/文字回复）后，agent 的后续输出仍写入本轮**旧**的流式回复卡（位置在
+  选项卡上方，用户看不到更新）。修复：新增 `activeTurns`（agentId → 当前 turn 卡上下文）
+  与 `entry.split()`——答题 resolve 前冻结旧卡（stop watcher + seal + 提示"已收到继续处理"），
+  从当前事件位置起另开**新卡**接管后续 narration；按钮路径（handleCardAction）与
+  文字回复路径（handleInbound）均接入。新 watcher 从 `snapshotEvents().length` 续扫，
+  避免旧事件重放。语法 + smoke 全绿（2026-09-08）。
+- **问题选项卡的失效点击静默丢弃 → 改为可见提示（2026-09-08 CM 实测）**：用户在
+  `ask_user_question` 按钮卡片上二次点击（卡片已回答/已过期）时，宿主只打印日志
+  「record not found」就静默 return，飞书端表现为"点了没反应/按钮灰掉"。修复：
+  ① 新增 `recentQuestions`（每 chat 最近一次已答卡 token）与 `findBotForChat`
+  （按 open_chat_id 反查 bot）；② record 缺失时按 token 是否命中最近卡，向用户
+  发可见提示（"该选项已处理过 / 这张卡片已过期，请看最新消息或直接回复"），不再
+  静默；③ 结果卡 `updateInteractive` 失败或缺失时降级发文本「✅ 已收到：xx」，
+  保证任何一次点击都有反馈。语法 + smoke 全绿（2026-09-08）。
+- **飞书新会话无标准工具（2026-09-08 公司电脑实锤修复）**：dedicated 会话由
+  `agents.create` 创建时未挂载 agent preset，模型只见 `feishu_send`，没有
+  fs/bash/web 等工具。修复：create/resume 的 `setup` 均调用
+  `agentPresets.mount(agentCtx)`（与 GUI 会话工厂同路径）；会话状态引入
+  `gen: 2` 标记，加载时自动丢弃旧世代（无工具）会话条目——聊天下一条消息
+  自动重建全工具会话，日志 `dropping N legacy session(s) ...` 留痕。冒烟全绿
+  （含 `standard agent preset mounted` 日志）+ 真机重启验证迁移生效。
 - **DSH 0.1.2 API 适配（2026-09-08）**：`agent.session.events`（旧数组属性）在
   DSH 0.1.2-rc.1 已废弃，改为 `agent.session.snapshotEvents()`——原代码在
   0.1.2 上入站消息一到 `handleInbound` 就抛

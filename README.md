@@ -11,6 +11,8 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 
 > ⚠️ **Windows 开发陷阱（2026-08-15 实测）**：本包以 `file:` 依赖安装后，DSH profile 的 `node_modules/dsh-feishucard/` 是**实体副本而非软链**——改源文件后 dsh 仍加载旧副本，改动"重启也不生效"。改代码后必须同步副本：`cp index.js helper.cjs <profile>/node_modules/dsh-feishucard/`（或重新 `dsh plugin --profile web add dsh-feishucard`），再重启 dsh。排查"改了没生效"先 `md5sum` 对比源与副本。
 
+> ⚠️ **重启 dsh web 必须走带 key 的启动器（2026-09-08 事故教训）**：部署机上 `DEEPSEEK_API_KEY` 通常放在**用户环境变量**（Windows 注册表 `HKCU\Environment`）——它不在 dsh 凭据文件里、dsh 也没有 .env 层去读它。**裸 `node <dsh包>/lib/bin.js web` 启动 = 进程没有 key = 所有 LLM 调用失败 = 飞书全部空白回复**。需要重启时，请通过你本机的 dsh 启动脚本/计划任务（会先注入用户环境变量再拉起 dsh）；**不要 kill 进程后用裸 node 拉起**。排查"为什么空白回复"先看进程环境里有没有 `DEEPSEEK_API_KEY`。
+
 ## 功能 / Features
 
 - **长连接收发 / Long-connection messaging**：`im.message.receive_v1` 官方 SDK WebSocket → 注入 Agent 会话 → 交互卡片回复同一会话，全程无需公网地址。Official SDK WebSocket; no public IP, domain, or tunnel required.
