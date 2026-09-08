@@ -33,6 +33,7 @@ const CARD_RETRY_BASE = 1000         // backoff base (exponential)
 const CARD_MAX_FAILURES = 5          // consecutive failures before breaker
 const CARD_TIMEOUT = 15000           // single card request timeout
 const CARD_POLL_INTERVAL = 300       // agent event poll interval
+const SESSION_GEN = 2                // session-state schema gen; gen<2 sessions predate the standard-preset mount and never saw file/shell tools
 const DRAIN_INTERVAL = 500           // helper stdout drain interval
 const CONFIG_REFRESH_MS = 10000      // config hot-reload cadence
 const STATUS_INTERVAL = 10000        // helper status line cadence
@@ -45,6 +46,13 @@ export function apply(ctx) {
   let lastConfigCheck = 0
   let lastSpawnAt = 0
   const bots = new Map()             // appId -> Bot runtime
+
+  // Agent -> live streaming-card context of its current turn. Lets the
+  // ask_user_question flow freeze the *old* card (the one sitting above the
+  // question card) and hand the agent's post-answer narration to a *new*
+  // card below it — otherwise updates land on the stale card the user can no
+  // longer see (2026-09-08 CM report).
+  const activeTurns = new Map()         // agentId -> { card, fromRef, bot, chatId, stop, sealing }
 
   // ---- config -------------------------------------------------------------
   // Config/state live under ~/.dsh-feishucard by default; FS_CONFIG_DIR
@@ -552,6 +560,21 @@ export function apply(ctx) {
     return selected ? { provider: selected.provider, model: selected.model } : undefined
   }
 
+  // Compose the standard agent preset (fs/bash/web/... bundles) onto an agent
+  // context — sessions created/resumed without it only expose plugin-owned
+  // tools (feishu_send): the "飞书新会话没有工具" failure (2026-09-08, dsh
+  // 0.1.2-rc.1). Mirrors the GUI session factory (presets.mount from setup).
+  async function mountStandardPreset(agentCtx) {
+    const presets = agentCtx.get('agentPresets')
+    if (!presets) return
+    try {
+      const preset = await presets.mount(agentCtx)
+      console.log('[fs] standard agent preset mounted: ' + String(preset && preset.id || 'default'))
+    } catch (error) {
+      console.log('[fs] preset mount failed: ' + String(error && error.message || error))
+    }
+  }
+
   async function createDedicated(bot, sessionId) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
@@ -560,15 +583,7 @@ export function apply(ctx) {
       sessionId,
       meta: { cwd: (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined },
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
-      setup: async (agentCtx) => {
-        const presets = agentCtx.get('agentPresets')
-        if (!presets) return
-        try {
-          await presets.mount(agentCtx)
-        } catch (error) {
-          console.log('[fs] preset mount failed: ' + String(error && error.message || error))
-        }
-      },
+      setup: mountStandardPreset,
     })
   }
 
@@ -578,6 +593,7 @@ export function apply(ctx) {
     return agents.resume({
       resumeSessionId: sessionId,
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
+      setup: mountStandardPreset,
     })
   }
 
@@ -586,7 +602,17 @@ export function apply(ctx) {
     const state = readState(bot.cfg.appId)
     const chats = new Map()
     for (const [chatId, record] of Object.entries(state.chats || {})) {
-      const sessions = Array.isArray(record && record.sessions) ? record.sessions : []
+      let sessions = Array.isArray(record && record.sessions) ? record.sessions : []
+      // Sessions persisted before SESSION_GEN 2 were created without the
+      // standard-preset mount and only expose feishu_send — reuse would keep
+      // them tool-less forever, so drop them once; the next inbound message
+      // auto-creates a fully tooled session for the chat.
+      const legacy = sessions.filter((s) => s && s.type === 'dedicated' && s.gen !== SESSION_GEN)
+      if (legacy.length > 0) {
+        console.log('[fs] dropping ' + legacy.length + ' legacy session(s) created without standard tools: '
+          + legacy.map((s) => s.id).join(', '))
+        sessions = sessions.filter((s) => !(s && s.type === 'dedicated' && s.gen !== SESSION_GEN))
+      }
       const activeId = record && record.active
       let activeIndex = 0
       if (activeId) {
@@ -603,7 +629,7 @@ export function apply(ctx) {
     for (const [chatId, chat] of chats) {
       const active = chat.sessions[chat.activeIndex]
       state.chats[chatId] = {
-        sessions: chat.sessions.map((s) => ({ id: s.id, label: s.label, type: s.type })),
+        sessions: chat.sessions.map((s) => ({ id: s.id, label: s.label, type: s.type, gen: s.gen })),
         active: active ? active.id : (chat.sessions[0] ? chat.sessions[0].id : 'main'),
       }
     }
@@ -745,7 +771,7 @@ export function apply(ctx) {
     if (resolved === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       const handle = await createDedicated(bot, sessionId)
-      chat.sessions.push({ id: sessionId, label: cmd.arg || ('会话 ' + (chat.sessions.length + 1)), type: 'dedicated', handle })
+      chat.sessions.push({ id: sessionId, label: cmd.arg || ('会话 ' + (chat.sessions.length + 1)), type: 'dedicated', gen: SESSION_GEN, handle })
       chat.activeIndex = chat.sessions.length - 1
       persistChats(bot, bot.chats)
       await sendPlainText(bot, chatId, '已新建会话' + (cmd.arg ? '「' + cmd.arg + '」' : '') + '并切换过去。')
@@ -848,6 +874,16 @@ export function apply(ctx) {
     if (pendingQ) {
       pendingQuestions.delete(chatId)
       if (pendingQ.timer) clearTimeout(pendingQ.timer)
+      // Free-text answers should also continue on a fresh card below the
+      // question card (same stale-card problem as button taps).
+      if (pendingQ.agentId) {
+        const turn = activeTurns.get(pendingQ.agentId)
+        if (turn && typeof turn.split === 'function') {
+          try { turn.split() } catch (error) {
+            console.log('[fs] question split failed (text path): ' + String(error && error.message || error))
+          }
+        }
+      }
       pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
       await sendPlainText(bot, chatId, '✅ 已收到你的回答。')
       return
@@ -856,13 +892,14 @@ export function apply(ctx) {
     // Ensure a dedicated session exists for this chat.
     let chat = bot.chats.get(chatId)
     let agent
+    let sessionReused = false
     if (!chat || chat.sessions.length === 0) {
       chat = { sessions: [], activeIndex: 0 }
       bot.chats.set(chatId, chat)
       const sessionId = 'fs-main-' + Date.now().toString(36)
       try {
         const handle = await createDedicated(bot, sessionId)
-        chat.sessions = [{ id: sessionId, label: '主会话', type: 'dedicated', handle }]
+        chat.sessions = [{ id: sessionId, label: '主会话', type: 'dedicated', gen: SESSION_GEN, handle }]
         chat.activeIndex = 0
         persistChats(bot, bot.chats)
         agent = handle.agent
@@ -873,6 +910,7 @@ export function apply(ctx) {
         return
       }
     } else {
+      sessionReused = true
       agent = await resolveAgent(bot, chat)
       if (!agent) {
         // The previous session could not be resumed (DSH refuses to prepare a
@@ -882,9 +920,10 @@ export function apply(ctx) {
         const sessionId = 'fs-main-' + Date.now().toString(36)
         try {
           const handle = await createDedicated(bot, sessionId)
-          chat.sessions.push({ id: sessionId, label: '会话 ' + (chat.sessions.length + 1), type: 'dedicated', handle })
+          chat.sessions.push({ id: sessionId, label: '会话 ' + (chat.sessions.length + 1), type: 'dedicated', gen: SESSION_GEN, handle })
           chat.activeIndex = chat.sessions.length - 1
           persistChats(bot, bot.chats)
+          sessionReused = false
           agent = handle.agent
           console.log('[fs] old session not resumable (live), created fallback ' + sessionId)
         } catch (error) {
@@ -898,14 +937,6 @@ export function apply(ctx) {
 
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     const label = openId ? '[飞书 ' + openId + '] ' : '[飞书消息] '
-    const seqBefore = agent.session.snapshotEvents().length
-    const message = {
-      id: 'fs-' + messageId,
-      role: 'user',
-      content: [{ type: 'text', text: label + text }],
-      source: { kind: 'user' },
-    }
-    agent.send(message, 'next-turn', true)
 
     // Typing reaction: added on arrival, removed after the reply is delivered.
     const emoji = (bot.cfg.reactionEmoji && String(bot.cfg.reactionEmoji).trim()) || 'OnIt'
@@ -927,67 +958,139 @@ export function apply(ctx) {
       })
     }
 
-    // Streaming reply card for this turn.
-    const card = makeCardState()
-    card.blocks.push({ type: 'message', text: '正在工作中…' })
-    void syncCard(bot, chatId, card, true).catch(() => {})
-    const stopCardWatcher = startCardWatcher(agent, seqBefore, card, bot, chatId)
-
-    try {
-      await agent.whenIdle()
-    } catch (error) {
-      console.log('[fs] turn wait failed for ' + messageId + ': ' + String(error && error.message || error))
-      stopCardWatcher()
-      card.status = 'error'
+    // Send -> wait -> scan -> seal. Delivery stays outside so a zombie session
+    // (answers nothing after a dsh web restart interrupted its turn) can be
+    // dropped and retried on a fresh session before an empty card is sent.
+    const runTurn = async (turnAgent) => {
+      const seqBefore = turnAgent.session.snapshotEvents().length
+      const message = {
+        id: 'fs-' + messageId,
+        role: 'user',
+        content: [{ type: 'text', text: label + text }],
+        source: { kind: 'user' },
+      }
+      turnAgent.send(message, 'next-turn', true)
+      let card = makeCardState()
+      card.blocks.push({ type: 'message', text: '正在工作中…' })
       void syncCard(bot, chatId, card, true).catch(() => {})
+      let stopCardWatcher = startCardWatcher(turnAgent, seqBefore, card, bot, chatId)
+      // Register this turn's live card so ask_user_question can split the
+      // stream: when the user answers, the old card (above the question card)
+      // is frozen and a fresh card takes over for the post-answer narration.
+      const entry = {
+        card, bot, chatId,
+        split: () => {
+          if (card.status === 'sealed' || card.status === 'error') return
+          // 1) Freeze the current card: stop its watcher, seal it in place.
+          stopCardWatcher()
+          card.status = 'sealed'
+          card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+          card.blocks.push({ type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
+          void syncCard(bot, chatId, card, true).catch(() => {})
+          // 2) Open a fresh card below for the rest of this turn. Resume the
+          // watcher from the CURRENT event position so events already shown
+          // on the old card are not replayed onto the fresh one.
+          const fresh = makeCardState()
+          fresh.blocks.push({ type: 'message', text: '继续处理中…' })
+          card = fresh
+          void syncCard(bot, chatId, fresh, true).catch(() => {})
+          const resumeFrom = turnAgent.session.snapshotEvents().length
+          stopCardWatcher = startCardWatcher(turnAgent, resumeFrom, fresh, bot, chatId)
+          entry.card = fresh
+        },
+      }
+      activeTurns.set(turnAgent.id, entry)
+      let waitError = null
+      try {
+        await turnAgent.whenIdle()
+      } catch (error) {
+        waitError = error
+        console.log('[fs] turn wait failed for ' + messageId + ': ' + String(error && error.message || error))
+      }
+      stopCardWatcher()
+      activeTurns.delete(turnAgent.id)
+      if (waitError) {
+        card.status = 'error'
+        void syncCard(bot, chatId, card, true).catch(() => {})
+        return { card, reply: '（Agent 未产生文字回复）', hadOutput: false, waitError }
+      }
+      // Catch-up scan: if the turn finished faster than the watcher's poll
+      // interval, fold every event into the card now so narration and tool
+      // panels are not lost.
+      scanEvents(turnAgent, { from: seqBefore }, card)
+      // Seal: promote the last note (the final reply) to a message block so
+      // the reply is not duplicated as narration; drop the placeholder; kill
+      // the status line.
+      const events = turnAgent.session.snapshotEvents()
+      let reply = '（Agent 未产生文字回复）'
+      let lastSeq
+      for (let i = events.length - 1; i >= seqBefore; i--) {
+        const event = events[i]
+        if (event && event.type === 'assistant/message') {
+          const spoken = extractProcessText(event.data && event.data.message)
+          if (spoken) { reply = spoken; lastSeq = event.seq; break }
+        }
+      }
+      card.status = 'sealed'
+      card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+      let replaced = false
+      if (lastSeq !== undefined) {
+        for (let i = card.blocks.length - 1; i >= 0; i--) {
+          const b = card.blocks[i]
+          if (b.type === 'note' && b.seq === lastSeq) {
+            card.blocks[i] = { type: 'message', text: reply }
+            replaced = true
+            break
+          }
+        }
+      }
+      if (!replaced) card.blocks.push({ type: 'message', text: reply })
+      return {
+        card,
+        reply,
+        hadOutput: lastSeq !== undefined || card.tools.size > 0,
+        waitError: null,
+      }
+    }
+
+    let turn = await runTurn(agent)
+    if (!turn.hadOutput && sessionReused) {
+      // Reused/resumed session produced nothing at all — the signature of a
+      // session whose turn was killed by a dsh web restart (2026-09-08). Drop
+      // it and answer from a brand-new session so the user never gets a blank
+      // reply; keep the old entry's history in DSH storage, just unbind it.
+      const stale = chat.sessions[chat.activeIndex]
+      console.log('[fs] session ' + (stale && stale.id || '?') + ' produced no output; recreating session and retrying once')
+      chat.sessions.splice(chat.activeIndex, 1)
+      if (chat.sessions.length === 0) chat.activeIndex = 0
+      else if (chat.activeIndex >= chat.sessions.length) chat.activeIndex = chat.sessions.length - 1
+      const sessionId = 'fs-main-' + Date.now().toString(36)
+      try {
+        const handle = await createDedicated(bot, sessionId)
+        chat.sessions.push({ id: sessionId, label: '主会话（自愈）', type: 'dedicated', gen: SESSION_GEN, handle })
+        chat.activeIndex = chat.sessions.length - 1
+        persistChats(bot, bot.chats)
+        turn = await runTurn(handle.agent)
+        turn.reply = '⚠️ 检测到上一会话无响应（可能被 dsh 重启打断），已自动重建会话。\n\n' + turn.reply
+        console.log('[fs] heal: recreated session ' + sessionId + ' and retried the message')
+      } catch (error) {
+        console.log('[fs] heal create failed: ' + String(error && error.message || error))
+      }
+    }
+    if (turn.waitError) {
       removeReactionOnce()
       return
     }
-    stopCardWatcher()
-
-    // Catch-up scan: if the turn finished faster than the watcher's poll
-    // interval, fold every event into the card now so narration and tool
-    // panels are not lost.
-    scanEvents(agent, { from: seqBefore }, card)
-
-    // Seal: promote the last note (the final reply) to a message block so the
-    // reply is not duplicated as narration; drop the placeholder; kill the
-    // status line.
-    const events = agent.session.snapshotEvents()
-    let reply = '（Agent 未产生文字回复）'
-    let lastSeq
-    for (let i = events.length - 1; i >= seqBefore; i--) {
-      const event = events[i]
-      if (event && event.type === 'assistant/message') {
-        const spoken = extractProcessText(event.data && event.data.message)
-        if (spoken) { reply = spoken; lastSeq = event.seq; break }
-      }
-    }
-    card.status = 'sealed'
-    card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
-    let replaced = false
-    if (lastSeq !== undefined) {
-      for (let i = card.blocks.length - 1; i >= 0; i--) {
-        const b = card.blocks[i]
-        if (b.type === 'note' && b.seq === lastSeq) {
-          card.blocks[i] = { type: 'message', text: reply }
-          replaced = true
-          break
-        }
-      }
-    }
-    if (!replaced) card.blocks.push({ type: 'message', text: reply })
-
     let cardDelivered = false
     try {
-      await syncCard(bot, chatId, card, true)
-      cardDelivered = !!card.token && !card.circuitOpen
+      await syncCard(bot, chatId, turn.card, true)
+      cardDelivered = !!turn.card.token && !turn.card.circuitOpen
     } catch {
       cardDelivered = false
     }
     if (!cardDelivered) {
       try {
-        const res = await sendPlainText(bot, chatId, reply)
+        const res = await sendPlainText(bot, chatId, turn.reply)
         console.log('[fs] fallback text reply to ' + chatId + ' status=' + String(res.status))
       } catch (error) {
         console.log('[fs] send failed for ' + messageId + ': ' + String(error && error.message || error))
@@ -1202,6 +1305,20 @@ export function apply(ctx) {
     return undefined
   }
 
+  // Look up which bot owns a chat id (for replying from card-action callbacks
+  // where we only know open_chat_id, e.g. stale question-card taps).
+  function findBotForChat(chatId) {
+    if (!chatId) return undefined
+    for (const bot of bots.values()) {
+      if (bot.chats && bot.chats.has(chatId)) return bot
+    }
+    // Fall back to the bot that most recently heard from this chat.
+    for (const bot of bots.values()) {
+      if (bot.lastChatId === chatId) return bot
+    }
+    return undefined
+  }
+
   function approvalCardPayload(toolName, reason, token) {
     return {
       config: { wide_screen_mode: true },
@@ -1319,7 +1436,20 @@ export function apply(ctx) {
       const chatId = data && data.context && data.context.open_chat_id
       const record = chatId ? pendingQuestions.get(chatId) : undefined
       if (!record || record.token !== value.fs_question) {
-        console.log('[fs] question button: record not found for chat ' + chatId)
+        // Stale-card click (already answered / superseded) must never be a
+        // silent no-op: tell the user visibly instead of dropping the tap.
+        // (2026-09-08 CM: clicked a stale card button -> nothing happened.)
+        console.log('[fs] question button: record not found for chat ' + chatId + ' token=' + value.fs_question)
+        const stale = chatId ? recentQuestions.get(chatId) : undefined
+        const hint = (stale && stale.token === value.fs_question)
+          ? '该选项已经处理过了（点过即生效）。请看我最新一条消息，或直接回复文字。'
+          : '这张卡片已过期（可能已经回答过）。请看我最新一条卡片，或直接回复文字即可。'
+        if (chatId) {
+          const ownerBot = findBotForChat(chatId)
+          if (ownerBot) {
+            sendPlainText(ownerBot, chatId, '⚠️ ' + hint).catch(() => {})
+          }
+        }
         return
       }
       const q = record.questions[0]
@@ -1327,17 +1457,42 @@ export function apply(ctx) {
       const opt = opts[Number(value.fs_option)]
       if (!opt) {
         console.log('[fs] question button: bad option index ' + value.fs_option)
+        if (chatId) {
+          const ownerBot = findBotForChat(chatId)
+          if (ownerBot) {
+            sendPlainText(ownerBot, chatId, '⚠️ 无法识别该选项，请直接回复文字。').catch(() => {})
+          }
+        }
         return
       }
       pendingQuestions.delete(chatId)
       if (record.timer) clearTimeout(record.timer)
       console.log('[fs] question answered via button: ' + q.id + ' -> ' + opt.label)
+      // Keep the last answered token per chat so a second tap on the same
+      // (now stale) card gets a friendly hint instead of silence.
+      recentQuestions.set(chatId, { token: value.fs_question, answeredAt: Date.now() })
+      // Split the streaming card: the old one sits above this question card,
+      // so the rest of the turn must continue on a NEW card below it
+      // (2026-09-08 CM report). Do this before resolve() so post-answer
+      // narration lands on the fresh card.
+      if (record.agentId) {
+        const turn = activeTurns.get(record.agentId)
+        if (turn && typeof turn.split === 'function') {
+          try { turn.split() } catch (error) {
+            console.log('[fs] question split failed: ' + String(error && error.message || error))
+          }
+        }
+      }
       record.resolve(buildQuestionAnswer(record.questions, opt.label))
       if (record.cardId) {
         updateInteractive(record.bot, record.cardId, questionResultCardPayload(q, opt.label))
           .catch((error) => {
             console.log('[fs] question card update failed: ' + String(error && error.message || error))
+            // Fallback: a visible text confirmation so the tap never looks dead.
+            sendPlainText(record.bot, chatId, '✅ 已收到：' + opt.label).catch(() => {})
           })
+      } else if (chatId) {
+        sendPlainText(record.bot, chatId, '✅ 已收到：' + opt.label).catch(() => {})
       }
       return
     }
@@ -1383,6 +1538,7 @@ export function apply(ctx) {
   // works on stock DSH builds. The question goes out as a plain message; the
   // next message in the chat is the answer, returned as the tool result.
   const pendingQuestions = new Map()    // chatId -> { resolve, reject, questions, timer }
+  const recentQuestions = new Map()     // chatId -> { token, answeredAt } (last answered question card, for stale-tap hints)
 
   function buildQuestionAnswer(questions, text) {
     return {
@@ -1446,13 +1602,13 @@ export function apply(ctx) {
     }
   }
 
-  function askUserQuestion(bot, chatId, questions, signal) {
+  function askUserQuestion(bot, chatId, questions, signal, agentId) {
     return new Promise((resolve, reject) => {
       const q = questions[0]
       const opts = (q.options || []).slice(0, QUESTION_MAX_BUTTONS)
       const record = {
         resolve, reject, questions, timer: undefined, token: randomUUID(),
-        cardId: undefined, bot, chatId, q,
+        cardId: undefined, bot, chatId, q, agentId,
       }
       pendingQuestions.set(chatId, record)
       record.timer = setTimeout(() => {
@@ -1503,7 +1659,7 @@ export function apply(ctx) {
     const args = exec.arguments || {}
     const questions = Array.isArray(args.questions) ? args.questions : []
     if (questions.length === 0) return next()
-    const answer = await askUserQuestion(owner.bot, owner.chatId, questions, exec.signal)
+    const answer = await askUserQuestion(owner.bot, owner.chatId, questions, exec.signal, exec.agent.id)
     return {
       isError: false,
       value: answer,
