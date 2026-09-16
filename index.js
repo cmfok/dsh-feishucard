@@ -2770,7 +2770,24 @@ export function apply(ctx) {
   // 开关：环境变量 DSH_FEISHU_GOAL_CARDS=0 全局关；per-bot 配置 notifyGoalRounds:false 单独关。
   // 范围（CM 拍板）：**只报目标轮**（精确匹配 source.kind==='goal'），不报其它自动回合，噪声最低。
   const GOAL_CARDS_ON = String(process.env.DSH_FEISHU_GOAL_CARDS ?? '1').trim() !== '0'
-  const autoCards = new Map()     // agentId -> { card, bot, chatId, current, stop }
+  const autoCards = new Map()     // agentId -> { card, bot, chatId, agent, openedAt, stop }
+
+  // 本轮最后一段"过程话语"（用于封口时提升为正式消息块）。
+  // 只从**本卡开始镜像的位置**往后找：本轮若一句话都没说，绝不能把上一轮的话搬过来。
+  function lastAssistantTextSince(agent, fromIndex) {
+    try {
+      const events = sessionEvents(agent.session)
+      for (let i = events.length - 1; i >= Math.max(0, fromIndex); i--) {
+        const event = events[i]
+        if (!event || event.type !== 'assistant/message') continue
+        const spoken = extractProcessText(event.data && event.data.message)
+        if (spoken) return { text: spoken, seq: event.seq }
+      }
+    } catch (error) {
+      console.log('[fs] goal seal scan failed: ' + String(error && error.message || error))
+    }
+    return { text: '', seq: undefined }
+  }
 
   // 本轮是否由目标轮驱动？看会话事件里**最后一条** user/message 的来源标记。
   function currentRoundIsGoal(agent) {
@@ -2826,6 +2843,28 @@ export function apply(ctx) {
         try { if (live.stop) live.stop() } catch {}
         const card = live.card
         if (card) {
+          // 封口前**必须补扫**（与普通回合 runTurn 的 catch-up scan 同源）：
+          // 目标轮的收尾话语（"进度（第 N 轮）…"）几乎与轮结束同时到达，
+          // watcher 一拍（300ms）常常来不及镜像 → 不补扫就会只剩工具记录、
+          // 一句话都没有（CM 2026-09-16 反馈，取证：会话里 seq 有整段文字，卡上 notes=0）。
+          try { scanCard(agent, card) } catch (error) {
+            console.log('[fs] goal catch-up scan failed: ' + String(error && error.message || error))
+          }
+          // 把本轮最后一段话提升为**正式消息块**：过程话语有 500 字截断，
+          // 轮次的进度汇报通常远超这个长度，截断后 CM 看不到实质内容。
+          const closing = lastAssistantTextSince(agent, live.openedAt || 0)
+          let promoted = false
+          if (closing.seq !== undefined) {
+            for (let i = card.blocks.length - 1; i >= 0; i--) {
+              const block = card.blocks[i]
+              if (block.type === 'note' && block.seq === closing.seq) {
+                card.blocks[i] = { type: 'message', text: closing.text }
+                promoted = true
+                break
+              }
+            }
+          }
+          if (!promoted && closing.text) card.blocks.push({ type: 'message', text: closing.text })
           card.status = 'sealed'
           card.blocks.push({ type: 'message', text: '✅ 本轮结束' })
           void syncCard(live.bot, live.chatId, card, true).catch(() => {})
@@ -2844,7 +2883,15 @@ export function apply(ctx) {
       const info = currentRoundIsGoal(agent)
       if (!info.isGoal) return                     // 只报目标轮（CM 拍板口径）
       const state = openGoalCard(agent, where.bot, where.chatId, info)
-      autoCards.set(agent.id, { card: state.card, bot: where.bot, chatId: where.chatId, stop: () => state.stop ? state.stop() : undefined })
+      autoCards.set(agent.id, {
+        card: state.card,
+        bot: where.bot,
+        chatId: where.chatId,
+        agent,
+        // 本卡开始镜像的位置：封口时用它界定"本轮说过的话"，防止把上一轮的文字搬过来
+        openedAt: Number.isFinite(state.card.cursor) ? state.card.cursor : 0,
+        stop: () => (state.stop ? state.stop() : undefined),
+      })
       console.log('[fs] goal card opened: agent=' + agent.id + ' round=' + (info.round || 1) + ' chat=' + where.chatId)
     } catch (error) {
       console.log('[fs] agent/status handler error: ' + String(error && error.stack || error))

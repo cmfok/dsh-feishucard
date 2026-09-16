@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed（2026-09-16，CM 实测反馈：目标轮卡片"只有工具记录、一句话都没有"）
+
+**根因：目标卡封口时缺少"补扫"（catch-up scan），每轮的收尾汇报被丢掉。**
+
+- **取证**：FU 机器人 `fs-main-mu2yt7oi` 目标模式 round 2~6 的卡片日志全程 `notes=0`（只有 `tools` 在涨）；
+  直接解码会话日志（多个独立 zstd 帧拼接，需逐帧解码）却能看到整段文本：
+  `seq=1901597 blocks=[reasoning,text] "**进度（第 4 轮）…"`、`seq=1906069`、`seq=1911432` … → **不是模型没说，是管道丢的**。
+- **机理**：工具调用在轮内陆续到达，被 300ms 的 card watcher 拍到；**每轮的"进度（第 N 轮）"汇报在轮结束前最后一刻才生成**
+  → 落在最后一拍之后。普通回合 `runTurn` 封口有补扫（注释原文：*"if the turn finished faster than the watcher's
+  poll interval, fold every event into the card now so narration and tool panels are not lost"*），
+  而目标卡的 `agent/status === 'idle'` 分支**直接封卡**——我写这段时只对齐了"建卡"，没对齐"封口"。
+  （round 1 之所以正常，是因为那张卡走的是普通回合路径。）
+- **修法（对齐既有路径，最小改动）**：目标卡封口前 ① `scanCard(agent, card)` 补扫；
+  ② 新增 `lastAssistantTextSince(agent, fromIndex)` 把本轮**最后一段话提升为正式消息块** ——
+  过程话语有 500 字截断，而进度汇报通常远超 500 字，截断后看不到实质内容；
+  搜索用 `live.openedAt`（本卡开始镜像的位置）界定"本轮说过的话"，**本轮没说话时绝不搬上一轮的文字**。
+- **验证**：`scripts/smoke.mjs` 用例 **16**（末刻到达的中途话语 + 工具调用 + 收尾汇报，中间不给 watcher 任何一拍）。
+  **保险丝验证（§10.2#6）**：把补扫那一行临时改成 `void 0` 重跑 → 恰好两条"只有补扫能做到"的断言失败，恢复后 SMOKE PASS。
+  证据链存档：`output/goal-card-missing-text-2026-09-16.md`。
+
 ### Added（2026-09-16，CM 需求：飞书里"切换会话/工作区"）
 
 CM 原话：「能不能在飞书里面做一个"切换会话"的命令？① 我打一个命令 ② 它能展示目前可切换的
