@@ -119,6 +119,8 @@ export function apply(ctx) {
         appSecret: typeof bot.appSecret === 'string' ? bot.appSecret : '',
         reactionEmoji: typeof bot.reactionEmoji === 'string' ? bot.reactionEmoji : undefined,
         ownerOpenId: typeof bot.ownerOpenId === 'string' ? bot.ownerOpenId : '',
+        // 2026-09-16：目标模式（goal round）过程卡开关；未设置=开（可用环境变量全局关）
+        notifyGoalRounds: typeof bot.notifyGoalRounds === 'boolean' ? bot.notifyGoalRounds : undefined,
       })
     }
     return cleaned
@@ -2333,6 +2335,101 @@ export function apply(ctx) {
     },
   })
   ctx.effect(() => ctx.tools.register(tool))
+
+  // ---- 目标模式（goal round）过程上飞书 · 2026-09-16 CM 要求 -------------------
+  // 背景：目标续轮由 `@deepseek-ai/dsh-goal-round-driver` 以「**同会话**注入一条
+  // user/message，source.kind === 'goal'、带 round 号、内容为 <goal_round> 提示词」驱动；
+  // 该轮产出的事件（assistant/message、tool/call、tool/result）与普通回合**完全同构**。
+  // 但本插件的建卡入口 `runTurn` **只从飞书入站消息调用** → 目标轮没有卡承接
+  // → CM 在飞书**完全看不到**目标模式在干什么（不是没发，是没有通道）。
+  // 做法：监听 DSH 的 `agent/status`（emit 处：packages/core/agent-loop/src/agent.ts）
+  //   · running 且该 agent 属于某个飞书聊天、当前**没有**活跃卡、且本轮触发消息是 goal 轮
+  //     → 建卡「🎯 目标模式 · 第 N 轮」，复用**与普通回合同一套** watcher / syncCard
+  //       → 过程话语内联、工具折叠面板、状态行、表格换卡全部照旧生效
+  //   · idle → seal 该卡并写「✅ 本轮结束」
+  // 开关：环境变量 DSH_FEISHU_GOAL_CARDS=0 全局关；per-bot 配置 notifyGoalRounds:false 单独关。
+  // 范围（CM 拍板）：**只报目标轮**（精确匹配 source.kind==='goal'），不报其它自动回合，噪声最低。
+  const GOAL_CARDS_ON = String(process.env.DSH_FEISHU_GOAL_CARDS ?? '1').trim() !== '0'
+  const autoCards = new Map()     // agentId -> { card, bot, chatId, current, stop }
+
+  // 本轮是否由目标轮驱动？看会话事件里**最后一条** user/message 的来源标记。
+  function currentRoundIsGoal(agent) {
+    try {
+      const events = sessionEvents(agent.session)
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i]
+        if (!e || e.type !== 'user/message') continue
+        const src = (e.data && e.data.source) || {}
+        return { isGoal: src.kind === 'goal', round: Number(src.round) || 0 }
+      }
+    } catch (error) {
+      console.log('[fs] goal round probe failed: ' + String(error && error.message || error))
+    }
+    return { isGoal: false, round: 0 }
+  }
+
+  function openGoalCard(agent, bot, chatId, info) {
+    const state = { card: null, stop: null }
+    // 表格额度换卡：与普通回合的 rotateTables 同机制（旧卡留表格，后续写新卡，游标接续不丢不重）
+    const rotate = () => {
+      if (!state.stop || !state.card || state.card.status !== 'running') return
+      const carry = Number.isFinite(state.card.cursor) ? state.card.cursor : 0
+      state.stop()
+      state.card.status = 'sealed'
+      void syncCard(bot, chatId, state.card, true).catch(() => {})
+      const fresh = makeCardState()
+      fresh.cursor = carry
+      fresh.blocks.push({ type: 'message', text: '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。' })
+      state.card = fresh
+      void syncCard(bot, chatId, fresh, true).catch(() => {})
+      state.stop = startCardWatcher(agent, fresh, bot, chatId, rotate)
+      const live = autoCards.get(agent.id)
+      if (live) live.card = fresh
+    }
+    const card = makeCardState()
+    card.cursor = sessionEvents(agent.session).length      // 只镜像本轮**后续**事件（goal 提示词本身不搬上卡）
+    card.blocks.push({ type: 'message', text: '🎯 目标模式 · 第 ' + (info.round || 1) + ' 轮开始，正在工作…' })
+    state.card = card
+    void syncCard(bot, chatId, card, true).catch(() => {})
+    state.stop = startCardWatcher(agent, card, bot, chatId, rotate)
+    return state
+  }
+
+  ctx.on('agent/status', ({ agent, status }) => {
+    try {
+      if (!agent || !agent.id) return
+
+      if (status === 'idle') {
+        const live = autoCards.get(agent.id)
+        if (!live) return
+        autoCards.delete(agent.id)
+        try { if (live.stop) live.stop() } catch {}
+        const card = live.card
+        if (card) {
+          card.status = 'sealed'
+          card.blocks.push({ type: 'message', text: '✅ 本轮结束' })
+          void syncCard(live.bot, live.chatId, card, true).catch(() => {})
+        }
+        console.log('[fs] goal card sealed: agent=' + agent.id)
+        return
+      }
+      if (status !== 'running') return
+      if (!GOAL_CARDS_ON) return
+      if (autoCards.has(agent.id)) return          // 已在跟踪这一轮
+      if (activeTurns.has(agent.id)) return        // 普通飞书回合持有卡，绝不抢
+      const where = findChatForAgent(agent)
+      if (!where) return                           // 不是飞书会话（GUI/其它通道）
+      const cfg = where.bot && where.bot.cfg
+      if (cfg && cfg.notifyGoalRounds === false) return
+      const info = currentRoundIsGoal(agent)
+      if (!info.isGoal) return                     // 只报目标轮（CM 拍板口径）
+      const state = openGoalCard(agent, where.bot, where.chatId, info)
+      autoCards.set(agent.id, { card: state.card, bot: where.bot, chatId: where.chatId, stop: () => state.stop ? state.stop() : undefined })
+      console.log('[fs] goal card opened: agent=' + agent.id + ' round=' + (info.round || 1) + ' chat=' + where.chatId)
+    } catch (error) {
+      console.log('[fs] agent/status handler error: ' + String(error && error.stack || error))
+    }
+  })
 
   console.log('[fs] bridge active. config: ' + configPath())
   void ensureHelpers()
