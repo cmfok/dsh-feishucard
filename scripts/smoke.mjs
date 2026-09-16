@@ -140,10 +140,18 @@ const ctx = {
     return () => {}
   },
   on(event, listener) {
-    // cordis event subscription: recorded, never fired by the smoke mock.
-    void event; void listener
+    // cordis event subscription: recorded so tests can emit lifecycle events
+    // (e.g. `agent/status` for the goal-round card) through emitCtx().
+    if (!ctxListeners.has(event)) ctxListeners.set(event, [])
+    ctxListeners.get(event).push(listener)
     return () => {}
   },
+}
+
+// Recorded cordis listeners + a tiny emitter so tests can drive plugin hooks.
+const ctxListeners = new Map()
+function emitCtx(event, payload) {
+  for (const listener of (ctxListeners.get(event) || [])) listener(payload)
 }
 
 // ---- boot the real plugin -------------------------------------------------------
@@ -239,6 +247,15 @@ async function drain() {
 }
 function cardsSince(n) {
   return sentCards.slice(n)
+}
+// 多轮 drain：卡片 watcher 走真实 setInterval(300ms)，跨 tick 的行为（换卡→镜像）
+// 需要多等几轮才能观察到，否则断言会跑在动作完成之前。
+async function settle(rounds = 3) {
+  for (let i = 0; i < rounds; i++) await drain()
+}
+// 只统计**流式卡**的 create（schema 2.0）；建卡失败后的兜底纯文本不在此列。
+function createsSince(n) {
+  return sentCards.slice(n).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
 }
 
 console.log('6) inbound dedup (same message_id must not run twice)')
@@ -403,6 +420,103 @@ console.log('12) 表格额度换卡：单卡满 5 张表后，后续内容换新
   ops.forEach((c, i) => { if (c.op === 'create' && c.payload && c.payload.schema === '2.0') createIdx.push(i) })
   const beforeSecond = createIdx.length >= 2 ? JSON.stringify(ops.slice(0, createIdx[1])) : ''
   ok(beforeSecond.includes('| 列5 |'), '换卡前旧卡已承载 1~5 张表（内容留在旧卡）')
+}
+
+console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
+{
+  // 背景（CM 反馈）：目标模式续轮由 @deepseek-ai/dsh-goal-round-driver 以**同会话**注入
+  // user/message（source.kind==='goal'）驱动，不经过飞书入站 → 原实现没有建卡入口，
+  // 飞书里**完全看不到**目标模式在干什么。本用例固化新行为：
+  //   agent/status=running 且本轮是 goal 轮 → 建「🎯 目标模式 · 第 N 轮」卡，复用同一套 watcher；
+  //   agent/status=idle → seal + 「✅ 本轮结束」；非 goal 的自动回合**不建卡**（不刷屏）。
+  const mark = sentCards.length
+  agent.send = function (message) { this.sent.push(message) }   // 目标轮不经过这条路径
+
+  // 1) 会话里注入目标轮触发消息（与 goal-round-driver 同构：data = { content, source }）
+  agentEvents.push({
+    type: 'user/message', seq: 400,
+    data: {
+      content: [{ type: 'text', text: '<goal_round>\nRound: 1/10\n</goal_round>' }],
+      source: { kind: 'goal', goalId: 'g_smoke', revision: 1, round: 1 },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+
+  const opened = createsSince(mark)
+  ok(opened.length === 1, '目标轮自动建了一张卡（create 次数 ' + opened.length + '）')
+  const openBody = JSON.stringify(opened)
+  ok(openBody.includes('目标模式'), '卡面标明是目标模式')
+  ok(openBody.includes('第 1 轮'), '卡面标明轮次')
+  ok(!openBody.includes('<goal_round>'), 'goal 提示词本身不搬上卡（只镜像本轮后续事件）')
+
+  // 2) 轮内产出（过程话语 + 工具调用）应当进卡 —— 这就是"中间过程可见"
+  agentEvents.push(
+    { type: 'assistant/message', seq: 401, data: { message: { content: [{ type: 'text', text: '我先盘点现状。' }] } } },
+    { type: 'tool/call', seq: 402, data: { callId: 'call_goal_1', name: 'grep', arguments: '{"pattern":"x"}' } },
+    { type: 'tool/result', seq: 403, data: { message: { content: [{ type: 'tool-result', content: [{ type: 'text', text: 'hit' }] }] } } },
+  )
+  await drain()
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('我先盘点现状'), '过程话语进了卡（中间过程可见）')
+  ok(body.includes('工具调用'), '工具调用以折叠面板进卡')
+
+  // 3) 轮结束 → 封口
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await drain()
+  ok(JSON.stringify(cardsSince(mark)).includes('本轮结束'), '轮结束封口并写明本轮结束')
+
+  // 4) 非 goal 的自动回合不建卡（噪声控制，CM 拍板口径）
+  const mark2 = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 410,
+    data: { content: [{ type: 'text', text: '普通消息' }], source: { kind: 'user' } },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await drain()
+  ok(createsSince(mark2).length === 0, '非 goal 的自动回合不自动建卡（不刷屏）')
+}
+
+console.log('13b) 目标卡照样享受表格换卡（新功能 × 既有换卡机制的组合验证）')
+{
+  const mark = sentCards.length
+  const mk = (n) => ['| 列' + n + ' | 值 |', '| --- | --- |', '| a | ' + n + ' |'].join('\n')
+  agentEvents.push({
+    type: 'user/message', seq: 500,
+    data: {
+      content: [{ type: 'text', text: '<goal_round>\nRound: 2/10\n</goal_round>' }],
+      source: { kind: 'goal', goalId: 'g_smoke', revision: 1, round: 2 },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  ok(createsSince(mark).length === 1, '第 2 轮重新建卡（上一轮已封口）')
+
+  for (let i = 1; i <= 5; i++) {
+    agentEvents.push({ type: 'assistant/message', seq: 500 + i, data: { message: { content: [{ type: 'text', text: mk(i) }] } } })
+  }
+  await drain()                                    // 第一波：5 张表 → 额度用满
+  agentEvents.push({ type: 'assistant/message', seq: 510, data: { message: { content: [{ type: 'text', text: mk(6) }] } } })
+  await settle()
+
+  const creates = createsSince(mark)
+  ok(creates.length >= 2, '目标卡满额后换新卡（create 次数 ' + creates.length + '）')
+  ok(JSON.stringify(cardsSince(mark)).includes('表格已满'), '新卡带换卡说明')
+
+  // 第 6 张表在**新卡**上的落地形态：轮结束的强制同步会把待写内容一次刷出去
+  //（换卡后头 400ms 内的普通同步会被 CARD_MIN_INTERVAL 限流跳过，属既有行为，不是目标卡缺陷）。
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+  const all = cardsSince(mark)
+  ok(JSON.stringify(all).includes('本轮结束'), '封口落在换卡后的新卡上（游标已接续，不断链）')
+  const hintAt = all.findIndex((c) => c.op === 'create' && JSON.stringify(c.payload).includes('表格已满'))
+  const onNewCard = hintAt >= 0 ? JSON.stringify(all.slice(hintAt)) : ''
+  ok(onNewCard.includes('| 列6 |') && !onNewCard.includes('**列6**：'),
+    '第 6 张表落在新卡且保持 markdown 原样（未被降级）')
+  ok(!JSON.stringify(all.slice(0, hintAt < 0 ? 0 : hintAt)).includes('| 列6 |'),
+    '第 6 张表没有跑到旧卡（游标接续不重不漏）')
 }
 
 console.log('')

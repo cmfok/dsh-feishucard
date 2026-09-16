@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added（2026-09-16，CM 拍板方案 A：目标模式的**工作过程**也发到飞书）
+
+CM 原话诉求：「你处在目标模式的时候，我在飞书上也能看到你工作的过程。」
+盘点发现：目标模式续轮由 `@deepseek-ai/dsh-goal-round-driver` 以**同会话**方式注入一条
+`user/message`（`source.kind === 'goal'`、带 `round` 号、正文是 `<goal_round>` 提示词）驱动，
+**不经过飞书入站**；而本插件的建卡入口 `runTurn` 只从飞书入站消息调用
+→ 目标轮根本**没有卡承接**（不是没发，是没通道）。
+
+- 新增 `agent/status` 订阅（DSH 侧 emit 处：`packages/core/agent-loop/src/agent.ts`）：
+  - `running` + 该 agent 属于某个飞书聊天 + 当前无活跃卡（`activeTurns` 不占用）+ 本轮触发消息是
+    **goal 轮** → 建卡「🎯 目标模式 · 第 N 轮开始，正在工作…」，复用**与普通回合完全同一套**
+    `startCardWatcher` / `syncCard` → 过程话语内联、工具折叠面板、诚实状态行、表格换卡全部照旧生效。
+  - `idle` → 停 watcher、封卡、写「✅ 本轮结束」。
+  - 卡游标 = 建卡时的会话事件长度 → **goal 提示词本身不搬上卡**（只镜像本轮后续事件）。
+- `currentRoundIsGoal(agent)`：倒序找会话里**最后一条** `user/message`，看 `source.kind === 'goal'`。
+- `openGoalCard()` 自带换卡闭包 `rotate()`：满 5 张表 → 旧卡封住、新卡游标接续（与 `rotateTables()` 同机制）。
+- 噪声控制（CM 拍板口径）：**只报目标轮**，其它自动回合（插件上下文、子代理等）一律不自动建卡。
+- 开关：环境变量 `DSH_FEISHU_GOAL_CARDS=0` 全局关；per-bot 配置 `notifyGoalRounds: false` 单独关
+  （`normalizeConfig` 已接受该字段）。
+
+**测试**（`scripts/smoke.mjs`，新增用例 13 / 13b；smoke mock 的 `ctx.on` 从"记录但不触发"
+升级为**可 emit**，否则新钩子无法回归）：
+- 13：goal 轮建卡 ×1、卡面写出轮次、`<goal_round>` 提示词不上卡、过程话语 + 工具面板进卡、
+  idle 封口写「本轮结束」、**非 goal 自动回合不建卡**。
+- 13b（新功能 × 既有换卡机制的组合验证）：goal 卡满 5 张表 → 换新卡、第 6 张表保持 markdown
+  **不被降级**、封口落在新卡上（游标接续不断链）。
+- 已知非缺陷：换卡后 ≤400ms 内普通同步会被 `CARD_MIN_INTERVAL` 限流跳过，待写内容在下一次
+  强制同步（下一事件 / 封口）刷出 —— 用例 13b 据此断言"封口时的最终形态"，不依赖真实计时。
+
 ### Changed（2026-09-16，CM 拍板：审批**默认关闭**）
 
 CM 原话：「正常来说 dsh 就不用我审批，现在为什么还需要点审批呢？连推送个仓库都要我审批。」

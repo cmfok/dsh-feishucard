@@ -36,6 +36,7 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 - **审批卡片 / Approval card**：dsh 会话的工具调用需要确认时（audit 哨兵等），飞书弹出交互卡片「✅ 允许一次 / ❌ 拒绝」按钮，点击即回决策（`card.action.trigger` 长连接事件）；**10 分钟**超时自动拒绝（2026-09-16 由 3 分钟延长；卡面文案由 `APPROVAL_TIMEOUT_MIN` 推导，不再写死）、会话取消自动取消——避免飞书通道下审批无人应答导致会话永久挂起。Approval `approval/request` for plugin-owned sessions is answered via a button card; timeout auto-rejects.
 - **保活 / Keep-alive**：helper 崩溃自动重启（5s 冷却防重复）+ 凭据变更自动重连 + SDK 自带重连 + 状态可观测。Crash-restart with spawn cooldown, auto-reconnect, observable connection status.
 - **多机器人 / Multi-bot**：一个实例多个机器人，各自绑定工作区。One instance, many bots, one workspace each.
+- **目标模式进度卡 / Goal-round progress cards（2026-09-16，CM 拍板方案 A）**：目标模式（goal 模式）的续轮**不经过飞书入站**，过去在飞书完全看不到它在干什么。现在插件订阅 `agent/status`：某轮由目标轮驱动 → 自动建卡「🎯 目标模式 · 第 N 轮开始，正在工作…」，**复用与普通回合同一套**流式卡（过程话语 / 工具面板 / 表格换卡全部生效），轮结束封口写「✅ 本轮结束」。只报目标轮，其它自动回合不建卡（不刷屏）。Goal-round continuations never pass through Feishu inbound, so they used to be invisible; an `agent/status` hook now opens the same streaming card per goal round.
 
 - **文件收件 / File inbox（2026-09-09）**：飞书文件/图片/语音消息不再被静默丢弃——自动下载到 ileInbox（配置项，缺省 <workspace>/downloaded_files），并向会话注入「收到文件+本地路径」，agent 可直接读取。Inbound Feishu file/image/audio messages are downloaded to ileInbox and surfaced to the agent with a local path.
 
@@ -70,6 +71,16 @@ dsh web   # 重启 / restart
 ```
 
 会话状态持久化在 `~/.dsh-feishucard/state-<appId>.json`。配置支持热更新（10 秒轮询），改完无需重启。Session state persists to `~/.dsh-feishucard/state-<appId>.json`; config is hot-reloaded every 10s.
+
+**开关 / Switches**（环境变量作用于整个插件进程 / env vars are process-wide）：
+
+| 变量 / Variable | 缺省 / Default | 作用 / Effect |
+| --- | --- | --- |
+| `DSH_FEISHU_GOAL_CARDS` | `1`（开） | 设 `0` 全局关闭「目标模式进度卡」。Set `0` to disable goal-round progress cards. |
+| `DSH_FEISHU_APPROVAL` | `0`（关） | 设 `1` 恢复飞书审批拦截卡片（**CM 2026-09-16 拍板默认关闭，不许改回**）。 |
+| `FS_CONFIG_DIR` | `~/.dsh-feishucard` | 配置文件目录（测试用）。 |
+
+per-bot 配置项 `notifyGoalRounds`（`false` 关闭该机器人的目标卡）写在 `feishu.config.json` 的对应 bot 里。Per-bot `notifyGoalRounds: false` disables goal cards for that bot only.
 
 > 从旧插件迁移 / migrating from the legacy plugin：无需手动操作。首次启动若新路径无配置而 `~/.cc-connect/feishu.config.json` 存在，自动复制迁移（日志 `migrated config from legacy ...`）。Nothing to do — the legacy config is copied automatically on first boot.
 
