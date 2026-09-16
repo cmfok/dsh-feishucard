@@ -1,4 +1,4 @@
-# dsh-feishucard — DSH ↔ Feishu Streaming Card Bridge
+﻿# dsh-feishucard — DSH ↔ Feishu Streaming Card Bridge
 
 把飞书（Lark）机器人接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 会话——完全自研（非 fork）。官方 SDK **长连接**收发（无需公网 IP/域名/隧道）、每聊天独立专属会话、`/new /switch /list /help` 命令、处理中表情回执，以及**流式回复卡片**：过程话语内联 + 工具调用折叠面板 + 限流/退避/熔断/文本兜底。
 
@@ -10,6 +10,16 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 > Fully independent. Config lives in `~/.dsh-feishucard/`; a legacy config found at `~/.cc-connect/` is auto-migrated once on boot. Do not install alongside other DSH Feishu plugins (two WS long connections on one app kick each other).
 
 > ⚠️ **Windows 开发陷阱（2026-08-15 实测）**：本包以 `file:` 依赖安装后，DSH profile 的 `node_modules/dsh-feishucard/` 是**实体副本而非软链**——改源文件后 dsh 仍加载旧副本，改动"重启也不生效"。改代码后必须同步副本：`cp index.js helper.cjs <profile>/node_modules/dsh-feishucard/`（或重新 `dsh plugin --profile web add dsh-feishucard`），再重启 dsh。排查"改了没生效"先 `md5sum` 对比源与副本。
+
+> ⚠️ **重启 dsh web 必须走带 key 的启动器（2026-09-08 事故教训）**：部署机上 `DEEPSEEK_API_KEY` 通常放在**用户环境变量**（Windows 注册表 `HKCU\Environment`）——它不在 dsh 凭据文件里、dsh 也没有 .env 层去读它。**裸 `node <dsh包>/lib/bin.js web` 启动 = 进程没有 key = 所有 LLM 调用失败 = 飞书全部空白回复**。需要重启时，请通过你本机的 dsh 启动脚本/计划任务（会先注入用户环境变量再拉起 dsh）；**不要 kill 进程后用裸 node 拉起**。排查"为什么空白回复"先看进程环境里有没有 `DEEPSEEK_API_KEY`。
+
+> ⚠️ **session 事件 API 跨版本差异（2026-09-14 事故教训）**：DSH **0.1.0-rc.5（公开版）**暴露的是
+> `agent.session.events`（数组，下标=seq）；**0.1.2-rc.1（内含 dev 版）**把它废弃为
+> `agent.session.snapshotEvents()`。两者不通用——写死任一版本都会在另一版本上炸
+> （0.1.0-rc.5 上写死 `snapshotEvents` 的症状 = 入站消息一进 `runTurn` 就
+> `TypeError: snapshotEvents is not a function`，**机器人收消息但永不回复**）。
+> 本包统一走 `sessionEvents(session)` 兼容取值（有 snapshot 用 snapshot，否则退回 events），
+> 改这块代码前先确认目标版本的**真实** API（以部署机上实际运行的那版为准，不是 dev 仓库）。
 
 ## 功能 / Features
 
@@ -26,6 +36,8 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 - **审批卡片 / Approval card**：dsh 会话的工具调用需要确认时（audit 哨兵等），飞书弹出交互卡片「✅ 允许一次 / ❌ 拒绝」按钮，点击即回决策（`card.action.trigger` 长连接事件）；5 分钟超时自动拒绝、会话取消自动取消——避免飞书通道下审批无人应答导致会话永久挂起。Approval `approval/request` for plugin-owned sessions is answered via a button card; timeout auto-rejects.
 - **保活 / Keep-alive**：helper 崩溃自动重启（5s 冷却防重复）+ 凭据变更自动重连 + SDK 自带重连 + 状态可观测。Crash-restart with spawn cooldown, auto-reconnect, observable connection status.
 - **多机器人 / Multi-bot**：一个实例多个机器人，各自绑定工作区。One instance, many bots, one workspace each.
+
+- **文件收件 / File inbox（2026-09-09）**：飞书文件/图片/语音消息不再被静默丢弃——自动下载到 ileInbox（配置项，缺省 <workspace>/downloaded_files），并向会话注入「收到文件+本地路径」，agent 可直接读取。Inbound Feishu file/image/audio messages are downloaded to ileInbox and surfaced to the agent with a local path.
 
 ## 快速开始 / Quick Start
 

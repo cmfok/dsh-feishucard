@@ -7,6 +7,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed（2026-09-16，CM 反馈「卡片隔很久才回 + 中间步骤看不到 + 表格只显示 | 符号」）
+
+**根因①（主凶）：`toolArgSummary()` 每次调用必抛 `ReferenceError: cmd is not defined`**
+- 现象：日志 `card watcher error: cmd is not defined` ×240+、`handler error: ReferenceError`。
+  卡片更新链每轮崩 → 插件退化成**最后一条纯文本回复**（纯文本不渲染 markdown）
+  → CM 看到的就是「隔好久才回、中间步骤全无、表格变回原始 `|`」三合一。
+- 成因：有人把 `approvalReasonFor` 里的「联网/外发命令」判断**误抄**进本函数（那里的 `cmd`
+  有定义，这里没有），且**同时删掉了 `const joined = picks.join(...)...` 一行** → `picks` 收集完没人用。
+- 修法：**按 git 历史（`5c800e5` 等提交）还原为已知正确实现**，不靠猜。职责不重复
+  （"联网/外发命令"提示本来就在 `approvalReasonFor`）。
+
+**根因②：表格超限的处理方式不对（CM 拍板：换卡，不是降级）**
+- 飞书单卡硬上限 5 张表（实测 `ErrCode 11310 / card table number over limit`）。
+- 一度改成"降级为可读清单"，**CM 否决**：「我就喜欢看表格。那你是不是应该去想，能不能超限了以后就换发一张新卡呀？
+  然后新的内容就在新卡更新，旧的内容就保留在旧卡呀」—— 采纳。
+- 实现：
+  - 新增 `cardTableCount(card)` —— 数本卡 `message` + `note` 两种块的 markdown 表格数。
+    ⚠️ **只数 `message` 会永远不触发**：agent 过程话语走 `appendNote` 存成 `type: 'note'`，
+    只有最终回复才被提升成 `message`（实测：用例 12 一度 create 次数停在 1）。
+  - `startCardWatcher(..., onTableBudget)` 增加额度检查：**本卡满 5 张且仍有待镜像事件**时先换卡。
+    检查必须在扫描**之前** —— 否则内容已写进旧卡，换卡就晚了。
+  - 新增 turn 级 `rotateTables()`：封旧卡 → 建新卡 → **新卡游标 = 旧卡当前游标**
+    （与答题专用 `split()` 的唯一差别：`split()` 把游标设到事件末尾，会跳过待处理事件）。
+    新卡带一行说明「📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。」
+  - `split()` 重建 watcher 时同样传入 `rotateTables`，保证答题拆卡后换卡能力不丢。
+- **降级降级为兜底**：单条消息内一次就来 >5 张表时换卡救不了，仍走 `demoteTableToLines()` 清单
+  （新增 `splitTableRow()`；比原来的代码块可读，也不再出现原始竖线，内容一字符不丢）。
+
+**根因④（排查中发现，一并修）：过程话语截断把表格切断**
+- `appendNote` 原实现 `slice(0, MAX_NOTE_CHARS) + '…'`（500 字符）—— 截断点落在表格中间时，
+  可能只剩表头没有分隔行 → 飞书判定不是表格 → **原样显示竖线**（CM 现象之一）。
+- 修法：新增 `clipNoteText()` —— 先退到整行边界；若末尾仍停留在表格行，把**不完整的表格整块丢弃**，
+  绝不留半张表。短文本行为不变。
+
+**根因③：审批正则过宽，误伤自家只读命令**
+- `EGRESS_CMD_RE` 尾部 `nc ` 只有**两个字母加一个空格**，多行命令拼接后极易误命中；
+  实测把一条纯读日志的命令判成「联网/外发命令」并弹审批，CM 未及时点 → **命令直接被拒**。
+- 修法：全部加 `\b` 词边界；`nc` 要求 `\bnc\s+-`（真实 netcat 形式）；补 `socat`/`telnet`/
+  `Test-NetConnection` 等真实外发命令。
+
+**测试**
+- `scripts/test-fold-tables.mjs`：`[tables]` 组重写（不再用代码块／清单可读／降级有说明／畸形表格不丢内容／空数组安全）；
+  新增 `[clip]` 组 4 条断言（短文本原样／有省略号／**不留半张表**／未超长不受影响） → **ALL PASS**。
+  ⚠️ 该测试用 `grab()` 从 `index.js` 抽函数，**新增函数必须同步加进 `grab()` 列表**，
+  否则 `new Function` 里 `ReferenceError`（本次已踩两次：`demoteTableToLines`、`clipNoteText`）。
+- `scripts/smoke.mjs`：新增用例 11（降级兜底 4 条）+ 用例 12（**换卡 5 条**：新建第二张卡／带换卡说明／
+  第 6 张表保持表格／未被降级／旧卡已承载 1~5 张表） → **SMOKE PASS**。
+
+**⚠️ 生效条件**：插件代码是**启动时加载**的；本次实测 `cordis-plugin-hmr` **未自动重载**
+（用"只在新正则下才放行"的探针命令验证：仍被旧正则拦下）→ 需重启 dsh web 才生效。
+
+### Fixed（2026-09-16，状态行真实性 —— 与 Hermes 侧同步）
+
+起因：CM 反馈 Hermes 卡片末行「回复中/已完成」不真实，追问「Dsh呢？」→ 按兄弟项目规则对照审计 DSH。
+**审计结果**：
+- ⚠️ **`completed` 是死状态**：全文件**从未**给 `status` 赋 `completed` → 渲染里的「已完成」分支永不执行；
+- ⚠️ **封口时状态行被直接删掉**（`if (card.status !== 'sealed')`）→ 回合结束后用户看不出"这轮结束了没有"；
+- ⚠️ **没有"无新动作"提示** → agent 卡住时永远显示 `_运行中…_`（= CM 说的症状①）；
+- ✅ **封口时机本来就是对的**：DSH 是**回合真结束时**才 seal（走 `whenIdle`），不是计时器猜 —— 这点优于
+  Hermes 原来的实现（Hermes 用 8 秒静默猜，已改）。
+
+**修法**：
+- 新增纯函数 `statusTextFor(card)`（便于离线断言）：`sealed → _✅ 已完成_`、
+  `error → _失败_`、**长时间无新事件 → `_运行中…（已 N 分钟无新动作）_`**（诚实，不宣称完成）。
+- 状态行渲染改用它 → **封口后也显示「✅ 已完成」**（不再删掉）。
+- `makeCardState()` 增加 `lastEventAt` / `idleMinutes`；watcher 里：有新事件 → 记录并清零空闲；
+  无新事件且仍在 running → 每满 1 分钟更新一次空闲提示（变化才同步，避免刷 PATCH）。
+  阈值 `DSH_IDLE_NOTICE_MIN = 3` 分钟。
+
+**测试**：`scripts/test-fold-tables.mjs` 新增 `[status]` 组 6 项断言
+（进行中 / 久无动静 / 封口必须显示已完成 / completed 分支 / 失败 / 空闲不宣称完成）→ `ALL PASS`；
+既有 `smoke.mjs` 仍 `SMOKE PASS`。
+> 注：写测试时又踩了一次"假保险丝"—— 断言最初被追加在 `process.exit()` **之后** → 永不执行。
+> 已移到汇总之前，确认真的在跑（Hermes 侧同一天也犯过同类错，见 [[开发标准]] §10.2）。
+
+**部署**：分发到运行时副本（源=副本逐字节一致）→ 空闲 140 分钟确认无腰斩风险 →
+走正规重启脚本（读 key 启动器）→ `restart done, web is up`、`plugin apply`、
+`helper spawned ×2`、`long connection ready ×2` 全部确认。
+
+### Fixed（2026-09-16，与 Hermes 侧同步的两个同类缺陷）
+
+从 Hermes 的飞书卡片项目（`output/hermes-feishu-card`）交叉审计后同步修复 —— 同一类机制，
+Hermes 侧踩过的坑 DSH 这边也有一份：
+
+- **折叠会静默丢弃内容（旧消息被吞）**：`buildCardPayload()` 把"更早过程"折进一个面板后，
+  用 `extraLines.join('
+
+').slice(0, 3000)` **把正文硬砍到 3000 字、其余直接丢弃**。
+  而 DSH 的卡片**没有容量上限**（没有 Hermes 那种换卡），会长到远超 3000 字
+  → 中间那一大段历史被删掉，用户看到"旧消息被吞"。
+  （Hermes 侧同款 bug 实测：50 个元素折叠后丢 **57%** 内容、28/50 段消失。）
+  **修法**：改为按 `FOLD_CHUNK_CHARS` 切成**多块面板**（新增 `chunkText()`，按段落切、
+  单段超长硬切，**一个字符都不丢**）；多块时标题显示 `📎 更早过程 (i/N)`。
+
+- **完全没有表格数量防护**：飞书单卡最多 5 张表（《表格组件》官方文档），
+  超出报 `ErrCode 11310 / card table number over limit`，**整张卡被拒**。
+  Hermes 侧 2026-09-15 实测单日 22 次 11310 全部来自这一条；DSH 此前 0 处表格处理。
+  **修法**：新增 `countMarkdownTables()` / `demoteOverflowTables()` —— 单卡第 6 张起的表格
+  **改成 ``` 代码块**（内容一个字符不丢，只是那几张不再按表格样式渲染）。
+  为什么不是折叠：**折叠降低不了表格数**（折叠只是把同样的文本挪进面板），只能改渲染方式。
+  为什么不是换卡：DSH 无容量换卡机制，这条改动保持最小。
+
+- **`countMarkdownTables` 必须跳过 ``` 代码块**：代码块里的 `| a | b |` 是普通文本，
+  飞书不算表格组件。否则"把超限表格降级成代码块"会被自己重新数进去、降级永不生效
+  （**这个 bug 是写测试时当场抓到的**：8 张表降级后仍数出 8 张）。
+
+### Tests
+
+- 新增 `scripts/test-fold-tables.mjs`（离线纯函数级，11 项断言，无需飞书凭据）：
+  折叠切成多块 / 每块 ≤ 单元素上限 / **50 段一段都没丢** / 无「已省略」丢弃标记 /
+  8 张表降级后恰好 5 张 / 超出部分变代码块 / **内容一个字符都没丢** /
+  代码块里的表格不再被计入 / 未超限时原样返回。
+  跑法：`node scripts/test-fold-tables.mjs`（`ALL PASS` = 通过）。
+- 既有 `scripts/smoke.mjs` 全绿（`SMOKE PASS`，sentCards=13，无回归）。
+
+### Deploy / Notes
+
+- **DSH 的加载方式是 HMR 直接监听项目目录**（启动日志 `hmr watching [ '<项目目录>' ]`），
+  不是 `~/.dsh/profiles/web/node_modules/dsh-feishucard` 副本；副本已同步保持一致以防万一。
+- 重启必须走**读环境变量注入 key 的启动器**（`output/dsh-install/restart-dsh-web.cmd`
+  → `start-dsh-web.cmd`）。**裸 `node` 启动会没有 `DEEPSEEK_API_KEY` → 所有回复空白**
+  （2026-09-08 踩过，详见教训 006/007）。本次重启走正规脚本，日志
+  `%TEMP%\dsh-restart.log` 显示 `restart done, web is up`，启动日志
+  `[fs] plugin apply` + `long connection ready` 齐全。
+
+### Fixed
+
+- **「两张卡片、内容重复」的真正根因：agent 自己调用了 `feishu_send`（2026-09-15 查实际对话定位）**。
+  证据（解压会话事件）：`seq=66336 tool/call name=feishu_send args={"text": "像，但不是一回事…"}`
+  紧接着 `seq=66986 assistant/message "**像，但不是一回事…**"` —— **同一段回复**先被 agent 主动发了一条
+  普通消息（`sendPlainText`，1.0 结构卡），随后又作为最终回复进了流式卡（JSON 2.0）。
+  用户侧就是"两张卡片、内容大部分重复"；API 里也能看到成对出现
+  （`interactive` 2.0 降级占位 + `interactive` 1.0 带正文）。
+  **这不是重复处理，而是两条独立路径各发一次** —— 与前面修的"同一轮内重复"（游标/去重/幂等）不同源。
+  修法：`feishu_send` 执行前检查**目标会话是否有未封口的活跃卡片**（`findActiveCardForChat`）——
+  有则**跳过**并明确告知 agent「当前对话的回复会自动显示为飞书卡片，无需调用本工具」；
+  同时更新工具 description，从源头减少误用。显式传 `chatId` 发到别的会话不受影响。
+
+### Fixed（早前）
+
+- **同一段内容分两张卡、内容大量重复（2026-09-15 CM 反馈，与 Hermes 侧同源但机理不同）**：
+  1. **seal 前补扫从本轮起点重放**：`scanEvents(turnAgent, { from: seqBefore }, card)` + `appendNote` 无去重
+     → `split()`（答题后开新卡）之后，新卡会把 split 前的内容重写一遍、split 后的写两遍。
+     改为 **一卡一游标**：游标挂在卡对象（`card.cursor`），`scanCard(agent, card)` 从本卡游标续扫；
+     `appendNote` 按 **seq 去重**（`card.seenSeqs`）；`split()` 的新卡游标 = 当前事件位置。
+  2. **建卡不幂等**：`sendInteractive` 返回体不校验就写进 `card.token`，且 15s 超时被 abort 时
+     飞书侧可能已建卡 → token 仍空 → 每次 sync 再建一张（孤儿卡）。现在：校验 `message_id` 必须为
+     非空字符串；建卡失败置 `createFailed`，**队列内外双重拦截**不再重复建卡；
+     `failCount` 只在**成功 PATCH** 时清零（create 成功不算"卡健康"）。
+  3. **入站无去重**：长连接 at-least-once 重投 / 双 helper 会让同一条消息跑两整轮 → 两张相同的卡。
+     新增按 `message_id` 的 LRU(200) 去重。
+- **正文里的长代码框不折叠（问题②的 DSH 侧）**：DSH 对 note/回复是平铺 markdown，代码框零折叠。
+  新增 `renderMessageElements()`（移植 Hermes 侧：>8 行或 >600 字符 → 折叠面板，未闭合围栏自动补全）。
+
+### Added
+
+- `scripts/smoke.mjs` 新增 4 组回归测试（共 8 项断言）：**入站去重**、**seq 去重**、
+  **长代码框折叠**、**建卡幂等**（用 `createReturnsEmptyId` 开关模拟返回体缺 message_id）。
+  这些断言在修复过程中直接抓出两处我自己的实现漏洞（入口检查漏掉并发排队的 create；断言把
+  兜底纯文本误计为重复建卡）。
+
+## [Unreleased]（早前）
+
+### Added
+
+- **飞书文件消息静默丢弃 → 自动收件（2026-09-09 CM 实测）**：`handleInbound` 对无文本的文件/图片消息直接 return，用户发文件 agent 无感知。修复：新增 `downloadInboundFile`——识别 file/image/audio/media 消息的 file_key，经消息资源 API 下载到 fileInbox（config 可选，缺省 <workspace>/downloaded_files）并注入「收到文件+本地路径」文本；语法 + smoke 全绿（2026-09-09）。
+
+## [0.2.0] - 2026-09-08
+
 ### Added
 
 - Approval cards: dsh `approval/request` for plugin-owned Feishu sessions is
@@ -36,6 +205,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10 elements stay visible — content scrolls forward as it grows (2026-08-15).
 - helper: registers `card.action.trigger`, `LoggerLevel.info`, and a raw-event
   debug hook; the host logs raw events for observability (2026-08-16).
+
+### Fixed
+
+- **问答后流式卡续更不可见 → 答题后自动开新卡（2026-09-08 CM 实测）**：`ask_user_question`
+  答题（点按钮/文字回复）后，agent 的后续输出仍写入本轮**旧**的流式回复卡（位置在
+  选项卡上方，用户看不到更新）。修复：新增 `activeTurns`（agentId → 当前 turn 卡上下文）
+  与 `entry.split()`——答题 resolve 前冻结旧卡（stop watcher + seal + 提示"已收到继续处理"），
+  从当前事件位置起另开**新卡**接管后续 narration；按钮路径（handleCardAction）与
+  文字回复路径（handleInbound）均接入。新 watcher 从 `snapshotEvents().length` 续扫，
+  避免旧事件重放。语法 + smoke 全绿（2026-09-08）。
+- **问题选项卡的失效点击静默丢弃 → 改为可见提示（2026-09-08 CM 实测）**：用户在
+  `ask_user_question` 按钮卡片上二次点击（卡片已回答/已过期）时，宿主只打印日志
+  「record not found」就静默 return，飞书端表现为"点了没反应/按钮灰掉"。修复：
+  ① 新增 `recentQuestions`（每 chat 最近一次已答卡 token）与 `findBotForChat`
+  （按 open_chat_id 反查 bot）；② record 缺失时按 token 是否命中最近卡，向用户
+  发可见提示（"该选项已处理过 / 这张卡片已过期，请看最新消息或直接回复"），不再
+  静默；③ 结果卡 `updateInteractive` 失败或缺失时降级发文本「✅ 已收到：xx」，
+  保证任何一次点击都有反馈。语法 + smoke 全绿（2026-09-08）。
+- **飞书新会话无标准工具（2026-09-08 公司电脑实锤修复）**：dedicated 会话由
+  `agents.create` 创建时未挂载 agent preset，模型只见 `feishu_send`，没有
+  fs/bash/web 等工具。修复：create/resume 的 `setup` 均调用
+  `agentPresets.mount(agentCtx)`（与 GUI 会话工厂同路径）；会话状态引入
+  `gen: 2` 标记，加载时自动丢弃旧世代（无工具）会话条目——聊天下一条消息
+  自动重建全工具会话，日志 `dropping N legacy session(s) ...` 留痕。冒烟全绿
+  （含 `standard agent preset mounted` 日志）+ 真机重启验证迁移生效。
+- **DSH 0.1.2 API 适配（2026-09-08）**：`agent.session.events`（旧数组属性）在
+  DSH 0.1.2-rc.1 已废弃，改为 `agent.session.snapshotEvents()`——原代码在
+  0.1.2 上入站消息一到 `handleInbound` 就抛
+  `TypeError: Cannot read properties of undefined (reading 'length')`，机器人
+  收消息不回复（公司电脑实测）。适配后 smoke 全绿、真机入站→流式卡片闭环
+  恢复。涉及：`scanEvents` / `seqBefore` / seal 扫描三处读取点，均改用
+  `snapshotEvents()`（返回冻结数组，下标=seq，语义与原 `events` 一致）。
+- `extractText` now parses Feishu **post (rich-text)** message content
+  (`{"title","content":[[{tag,text},...],...]}`) in addition to plain text —
+  desktop-client messages (post) were silently dropped with zero logs, making
+  the bot appear dead (PC "在吗？" got no reply while mobile text messages
+  worked fine). Root cause confirmed 2026-09-01 by comparing chat history
+  (post vs text msg_type) against bridge logs; fix verified with unit cases
+  for text/post/mentions/empty/bad-json.
 
 ## [0.1.0] - 2026-08-15
 

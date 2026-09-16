@@ -5,7 +5,11 @@
       "workspace": "C:\\path\\to\\your\\workspace",
       "appId": "cli_xxxxxxxxxxxxxxxx",
       "appSecret": "your_app_secret",
-      "reactionEmoji": "OnIt"
+      "reactionEmoji": "OnIt",
+      "fileInbox": "C:\\path\\to\\inbox"
     }
-  ]
+  ],
+  "_notes": {
+    "fileInbox": "optional: directory where inbound Feishu file/media messages are saved; defaults to <workspace>/downloaded_files"
+  }
 }
