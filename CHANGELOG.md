@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added（2026-09-16，CM 需求：飞书里"切换会话/工作区"）
+
+CM 原话：「能不能在飞书里面做一个"切换会话"的命令？① 我打一个命令 ② 它能展示目前可切换的
+一些会话或者工作区 ③ 然后我切换过去」。方案经 CM 拍板（"先按你的来"）。
+
+- **无参数 `/switch`** → 一张卡片，分三组列出候选，**每行两个按钮**：
+  ① 本聊天的会话（现有 `chat.sessions`，当前项标 ▶）② 本工作区的其它会话（含 GUI 里开的）
+  ③ 其它工作区（`P:\fu`、`Ai100` …）。卡面顶部常驻「当前会话 + 工作目录」，并写明图例
+  「🟢 空闲（可接管）｜🟡 运行中（只给"新建"）」。
+- **序号连续编号，从本聊天会话开始** → 老语义 `/switch 1`（主会话）不变；
+  文本兜底 `/switch <序号>`（接管）、`/switch <序号> new`（在该工作区新建）。
+- **数据来源**：`ctx.get('sessionPersistence').list()`（`SessionHeader`：id/cwd/createdAt/origin）
+  —— 过滤子代理子会话（`origin === 'subagent'` 或 `delegationDepth > 0`），按 `locate()` + `stat`
+  的 mtime 倒序（比 createdAt 更接近"最近动过"）；**已在本聊天的会话会被去重**。
+- **会话名**：DSH 的 `SessionHeader` 没有标题字段，所以显示优先级为
+  ① 活着的会话 → 内存里最后一条 `session/title` 事件；② 否则首条用户消息摘要
+  （`readFrom(id, 0)`，且**只对 < 4MB 的日志读**、1.5s 超时、并行执行 —— 绝不为列个表去解析几百 MB 历史）；
+  ③ 都没有才退回短 id。
+- **两条安全约束（都写进卡面，不让 CM 猜）**：
+  - **正在别处运行的会话（🟡）不给"接管"** —— DSH 里同一会话被两处同时驱动会写坏历史；
+    卡片只给"新建"，文字路径也会明确挡下并说明原因。
+  - **"新建"不碰任何旧会话**：只是在该工作区开一个全新会话（`createDedicated(bot, id, cwd)` 新增
+    cwd 参数，cwd = 那个工作区）。
+- 卡片回调：`handleCardAction` 新增 `fs_switch` 分支（复用既有 `card.action.trigger` 长连接通道），
+  卡片 15 分钟过期后点击会明确告知"卡片已过期，请重新 /switch"（不静默）。
+- `/help` 文案同步更新。
+- **测试**（`scripts/smoke.mjs` 用例 15）：mock 增加假 `sessionPersistence`（`list`/`locate`/`readFrom`）
+  与 `agents.list()`。覆盖：三组标题齐全、短 id、**首条消息摘要**、子代理子会话被排除、
+  行数正好（不去重就会多一行）、序号可读、"接管"按钮 → 走**真实卡片回调路径**真的 resume 了会话、
+  `/switch <n> new` 把新会话 cwd 设成目标工作区、🟡 标记 + 只给"新建" + 文字接管被挡下。
+
 ### Added（2026-09-16，CM 要求：飞书里直接开目标模式 —— `/goal` 命令）
 
 原来飞书里打 `/goal` 不生效：桥的命令白名单 `COMMANDS = ['help','new','switch','list','plan','stop']`

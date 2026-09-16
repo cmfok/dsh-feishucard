@@ -30,7 +30,7 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   - **工具调用折叠面板**：🛠️ 每工具一行「状态符号 · 工具名 · 参数摘要 · 失败原因」，默认折叠。Collapsible tool-call panels: status symbol, tool name, arg summary, failure reason per line.
   - 完成 sealed：最终回复入卡、状态行消失、面板保持折叠。Sealed with the final reply; status line removed.
   - 可靠性：串行更新队列 + 400ms 限流合并 + 指数退避 + 5 次熔断 + 15s 超时 + 卡片失败自动降级纯文本。Serialized queue, 400ms coalescing, exponential backoff, 5-failure breaker, 15s timeout, text fallback.
-- **每聊天独立会话 / Dedicated per-chat sessions**：每个飞书聊天专属 Agent 会话池（绝不串进 GUI 会话）；首条消息自动创建；持久化 + 重启恢复（live 会话直接复用、上下文不丢）；`/new [名称]`、`/switch <序号>`、`/list`、`/plan [off]`、`/goal`、`/stop`、`/help`。Never shares GUI sessions; auto-created on first message; live sessions are reused across restarts so context is preserved.
+- **每聊天独立会话 / Dedicated per-chat sessions**：每个飞书聊天专属 Agent 会话池（绝不串进 GUI 会话）；首条消息自动创建；持久化 + 重启恢复（live 会话直接复用、上下文不丢）；`/new [名称]`、`/switch`、`/list`、`/plan [off]`、`/goal`、`/stop`、`/help`。Never shares GUI sessions; auto-created on first message; live sessions are reused across restarts so context is preserved.
 - **处理中表情 / Typing reaction**：消息到达加 `OnIt`，回复送达后撤销（`reactionEmoji` 可配，`none` 关闭）。`OnIt` reaction added on arrival, removed after delivery.
 - **工具 / Model tool**：`feishu_send`（agent 主动发消息，`appId` 指定机器人，缺省发到最近会话）。Proactive messaging from the agent.
 - **审批卡片 / Approval card**：dsh 会话的工具调用需要确认时（audit 哨兵等），飞书弹出交互卡片「✅ 允许一次 / ❌ 拒绝」按钮，点击即回决策（`card.action.trigger` 长连接事件）；**10 分钟**超时自动拒绝（2026-09-16 由 3 分钟延长；卡面文案由 `APPROVAL_TIMEOUT_MIN` 推导，不再写死）、会话取消自动取消——避免飞书通道下审批无人应答导致会话永久挂起。Approval `approval/request` for plugin-owned sessions is answered via a button card; timeout auto-rejects.
@@ -38,6 +38,7 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 - **多机器人 / Multi-bot**：一个实例多个机器人，各自绑定工作区。One instance, many bots, one workspace each.
 - **目标模式进度卡 / Goal-round progress cards（2026-09-16，CM 拍板方案 A）**：目标模式（goal 模式）的续轮**不经过飞书入站**，过去在飞书完全看不到它在干什么。现在插件订阅 `agent/status`：某轮由目标轮驱动 → 自动建卡「🎯 目标模式 · 第 N 轮开始，正在工作…」，**复用与普通回合同一套**流式卡（过程话语 / 工具面板 / 表格换卡全部生效），轮结束封口写「✅ 本轮结束」。只报目标轮，其它自动回合不建卡（不刷屏）。Goal-round continuations never pass through Feishu inbound, so they used to be invisible; an `agent/status` hook now opens the same streaming card per goal round.
 - **`/goal` 命令 / Goal command**：飞书里直接 ` /goal <目标> ` 即可让当前会话进入目标模式（透传到 harness 的 `command-goal`，`pause`/`resume`/`clear`/`edit <新目标>` 子命令同样可用；无参数 = 查看状态）。命令注册表不可用时兜底直连 `goals` 服务创建目标。`/goal <objective>` starts goal mode for that chat's session from Feishu; subcommands pass through to the harness command.
+- **`/switch` 会话/工作区切换 / Session & workspace picker（2026-09-16）**：无参数 `/switch` 发一张卡片，分三组列出可切换目标 —— ① 本聊天的会话 ② 本工作区的其它会话（含 GUI 里开的）③ 其它工作区；每行「接管 / 新建」两个按钮，点一下即切。🟡 运行中的会话只给"新建"（同一会话被两处同时驱动会写坏历史）。序号从本聊天会话开始连续编号，`/switch <序号>`、`/switch <序号> new` 为文字兜底。会话名优先用 `session/title`，其次首条用户消息摘要（仅对 <4MB 日志读）。`/switch` with no argument posts a picker card grouping this chat's sessions, this workspace's other sessions (including GUI ones), and other workspaces; each row offers takeover/new buttons.
 
 - **文件收件 / File inbox（2026-09-09）**：飞书文件/图片/语音消息不再被静默丢弃——自动下载到 ileInbox（配置项，缺省 <workspace>/downloaded_files），并向会话注入「收到文件+本地路径」，agent 可直接读取。Inbound Feishu file/image/audio messages are downloaded to ileInbox and surfaced to the agent with a local path.
 
