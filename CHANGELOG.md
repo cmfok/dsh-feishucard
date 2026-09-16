@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed（2026-09-16，CM 拍板：审批**默认关闭**）
+
+CM 原话：「正常来说 dsh 就不用我审批，现在为什么还需要点审批呢？连推送个仓库都要我审批。」
+盘点结论：**唯一还会弹审批的就是本插件加的飞书审批拦截器**（审计哨兵已关、DSH 权限已是
+`danger-full-access`），它当时默认开启（`?? '1'`）→ `git push` 等联网命令都会触发。
+
+- **`APPROVAL_ON_FEISHU` 默认由「开」改为「关」**：`String(process.env.DSH_FEISHU_APPROVAL ?? '0') === '1'`
+  —— 默认**不拦截、不审批**；要恢复审批：设 `DSH_FEISHU_APPROVAL=1`。
+- **这是默认行为，不许被改回去**（除非 CM 明确要求）。审批相关的"不变量"与协作规矩见 README/项目档案。
+- 审计哨兵 `sentinelEnabled: false` 保持不变（它另走主程序审批界面 → 只在电脑上，飞书看不到）。
+
+**验证**（重启后实测）：`bridge active` ×1、`长连接 ready` ×2、收到真实消息并跑了工具，
+而 `approval needed (pre-execute)` = **0**、`approval card sent` = **0** → 确认不再弹审批。
+
 ### Fixed（2026-09-16，CM 反馈「卡片隔很久才回 + 中间步骤看不到 + 表格只显示 | 符号」）
 
 **根因①（主凶）：`toolArgSummary()` 每次调用必抛 `ReferenceError: cmd is not defined`**

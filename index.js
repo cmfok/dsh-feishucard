@@ -1960,8 +1960,10 @@ export function apply(ctx) {
   // 所以飞书上根本收不到卡，CM 只能在电脑上点。
   // 修法：在**更前面的** `tools/pre-execute` 自己拦 —— 发飞书卡、等点击、再决定放行/拦截。
   // 这样 `ctx.approval` 根本不会被触发，审批只出现在飞书。
-  // 开关：环境变量 DSH_FEISHU_APPROVAL=0 关闭（关掉即退回原行为）。
-  const APPROVAL_ON_FEISHU = String(process.env.DSH_FEISHU_APPROVAL ?? '1').trim() !== '0'
+  // 开关：**默认关闭**；要启用审批设 DSH_FEISHU_APPROVAL=1（CM 2026-09-16 拍板）
+  // **默认关闭**（CM 2026-09-16 拍板）：他给的是 danger-full-access 完全访问，
+  // 审批不该由插件再加一道。要恢复审批：设环境变量 DSH_FEISHU_APPROVAL=1。
+  const APPROVAL_ON_FEISHU = String(process.env.DSH_FEISHU_APPROVAL ?? '0').trim() === '1'
   // 需要确认的两类（**故意收窄**：只拦"外发数据"和"工作区外写入"，避免把常用操作都拦下来）
   //
   // 2026-09-16 收窄（CM 拍板）：原正则尾部的 `nc ` 是**两个字母加一个空格**，
