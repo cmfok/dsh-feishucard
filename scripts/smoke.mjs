@@ -115,23 +115,42 @@ const fakeGoals = {
 }
 const fakeCommands = { execute: async () => undefined }   // 默认"注册表没接管" → 走 goals 兜底
 
+// 会话切换：假的持久化服务 + 会话创建记录 + 活着的 agent 列表（用例 15 用）
+const createdSessionIds = []
+const liveAgents = []
+let persistedSessions = []
+const persistedFirstText = {}          // sessionId -> 首条用户消息（摘要）
+const fakePersistence = {
+  list: async () => persistedSessions,
+  locate: (meta) => ({ kind: 'jsonl', path: join(tmpdir(), 'no-such-' + meta.id + '.jsonl.zstd') }),
+  readFrom: async (id) => ({
+    meta: (persistedSessions.find((s) => s.id === id)) || { version: 0, id },
+    events: persistedFirstText[id]
+      ? [{ type: 'user/message', seq: 0, data: { content: [{ type: 'text', text: persistedFirstText[id] }], source: { kind: 'user' } } }]
+      : [],
+  }),
+}
+
 const ctx = {
   get(key) {
     if (key === 'agents') {
       return {
         create: async (opts) => {
           createdSessions += 1
+          createdSessionIds.push(opts.sessionId)
           agent.session.header.cwd = opts.meta && opts.meta.cwd
           if (opts.setup) await opts.setup({ get: () => ({ mount: async () => {} }) })
           return { agent }
         },
         resume: async () => { resumedSessions += 1; return { agent } },
+        list: () => liveAgents,
       }
     }
     if (key === 'sandboxPolicy') return { workspaceRoot: WORKSPACE }
     if (key === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'test', model: 'test-model' }) }
     if (key === 'goals') return fakeGoals
     if (key === 'commands') return fakeCommands
+    if (key === 'sessionPersistence') return fakePersistence
     return undefined
   },
   shell: {
@@ -579,6 +598,100 @@ console.log('14) 飞书命令 /goal：目标模式入口（CM 2026-09-16 要求�
   ok(goalCalls.length === usesBefore2, '子命令不会被误当成新目标创建')
   ok(replyText().includes('用法：/goal'), '给出用法提示（不静默失败）')
   fakeCommands.execute = async () => undefined
+}
+
+console.log('15) /switch：列出可切换的会话/工作区（CM 2026-09-16 需求）')
+{
+  const mark = sentCards.length
+  const summaryText = '帮我看看上周的复盘记录'
+  const ownId = createdSessionIds[0]
+  persistedSessions = [
+    { version: 0, id: ownId, createdAt: Date.now() - 7200e3, cwd: WORKSPACE },                    // 已在本聊天 → 不应重复列出
+    { version: 0, id: 'gui-session-aaaa1111', createdAt: Date.now() - 3600e3, cwd: WORKSPACE },
+    { version: 0, id: 'fu-session-bbbb2222', createdAt: Date.now() - 1800e3, cwd: 'P:/fu' },
+    { version: 0, id: 'sub-child-cccc3333', createdAt: Date.now() - 600e3, cwd: WORKSPACE, origin: 'subagent' },
+  ]
+  persistedFirstText['gui-session-aaaa1111'] = summaryText
+
+  feedInbound('om_switch_list', '/switch')
+  await drain()
+
+  const picker = sentCards.slice(mark).filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)).pop()
+  const body = JSON.stringify(picker && picker.payload)
+  ok(Boolean(picker) && body.includes('① 本聊天的会话'), '卡片列了「本聊天的会话」组')
+  ok(body.includes('② 本工作区的其它会话'), '卡片列了「本工作区的其它会话」组')
+  ok(body.includes('③ 其它工作区'), '卡片列了「其它工作区」组')
+  ok(body.includes('gui-sess'), '列出了其它会话（短 id）')
+  ok(body.includes(summaryText), '其它会话带了首条消息摘要（认得出是哪个）')
+  ok(!body.includes('sub-chil'), '子代理子会话不被列为可切换目标')
+
+  // 行号从卡片里读出来（本聊天有几个会话由前面的用例决定，不写死）
+  const rowDivs = (picker.payload.elements || [])
+    .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
+  const indexOfRow = (needle) => {
+    const el = rowDivs.find((e) => String(e.text.content).includes(needle))
+    if (!el) return -1
+    const m = /(\d+)\. /.exec(String(el.text.content))
+    return m ? Number(m[1]) - 1 : -1
+  }
+  const guiIndex = indexOfRow(summaryText)
+  const fuIndex = indexOfRow('P:/fu')
+  ok(rowDivs.length === 4, '共 4 行（2 个本聊天会话 + 本工作区 1 条 + 其它工作区 1 条），既没重复也没多列（' + rowDivs.length + '）')
+  ok(guiIndex >= 0 && fuIndex > guiIndex, '两个候选行的序号可读且顺序正确（gui=' + (guiIndex + 1) + ', fu=' + (fuIndex + 1) + '）')
+  const ownIdShown = rowDivs.filter((e) => String(e.text.content).includes(ownId.slice(0, 8))).length
+  ok(ownIdShown >= 1 && rowDivs.length === 4, '已在本聊天的会话没有被当成"其它会话"重复列一遍')
+
+  // 点「接管」按钮 → 走真实卡片回调路径（helper 事件 → handleCardAction）
+  const buttons = (picker.payload.elements || [])
+    .filter((e) => e.tag === 'action')
+    .flatMap((e) => e.actions || [])
+  const takeover = buttons.find((b) => b.value && b.value.fs_index === guiIndex && b.value.fs_mode === 'takeover')
+  ok(Boolean(takeover), '空闲会话给了「接管」按钮')
+  const tookBefore = resumedSessions
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'card.action.trigger',
+    data: {
+      action: { tag: 'button', value: takeover.value },
+      context: { open_chat_id: CHAT_ID },
+    },
+  }) + '\n'
+  await drain()
+  ok(resumedSessions === tookBefore + 1, '点按钮后真的 resume 了那个会话（接管生效）')
+
+  // 文本兜底：/switch <序号> new → 在该工作区新建（cwd 必须是那个工作区）
+  feedInbound('om_switch_new', '/switch ' + (fuIndex + 1) + ' new')
+  await drain()
+  ok(agent.session.header.cwd === 'P:/fu', 'new 模式把新会话的 cwd 设成了那个工作区（实际 ' + agent.session.header.cwd + '）')
+
+  // 运行中的会话（🟡）不给「接管」：只允许新建
+  // 注意：前面"接管"过的会话已经进了本聊天（切过去只是换序号，不需要 resume），
+  // 所以这里拿**没进本聊天**的 P:/fu 会话来验 🟡 规则。
+  liveAgents.push({ id: 'fu-session-bbbb2222', session: agent.session })
+  const mark2 = sentCards.length
+  feedInbound('om_switch_live', '/switch')
+  await drain()
+  const livePicker = sentCards.slice(mark2).filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)).pop()
+  const liveBody = JSON.stringify(livePicker && livePicker.payload)
+  ok(liveBody.includes('🟡'), '运行中的会话被标成 🟡')
+  ok(liveBody.includes('运行中（只给'), '卡面说明了 🟡 的规则（不让 CM 猜）')
+  const liveRowDivs = (livePicker.payload.elements || [])
+    .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
+  const liveFuRow = liveRowDivs.find((e) => String(e.text.content).includes('fu-sess'))
+  const liveFuIndex = liveFuRow ? Number(/(\d+)\. /.exec(String(liveFuRow.text.content))[1]) - 1 : -1
+  ok(liveFuIndex >= 0, '🟡 那一行还在列表里（序号 ' + (liveFuIndex + 1) + '）')
+  const liveButtons = (livePicker.payload.elements || [])
+    .filter((e) => e.tag === 'action')
+    .flatMap((e) => e.actions || [])
+    .filter((b) => b.value && b.value.fs_index === liveFuIndex)
+  ok(liveButtons.length === 1 && liveButtons[0].value.fs_mode === 'new',
+    '运行中的会话只给了「新建」按钮（' + JSON.stringify(liveButtons.map((b) => b.text.content)) + '）')
+  // 文字路径也必须挡住接管
+  feedInbound('om_switch_live_takeover', '/switch ' + (liveFuIndex + 1))
+  await drain()
+  const warn = sentCards.slice(mark2).filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)).pop()
+  ok(JSON.stringify(warn && warn.payload).includes('正在别处运行'), '文字接管被挡下并说明原因')
+  liveAgents.length = 0
 }
 
 console.log('')
