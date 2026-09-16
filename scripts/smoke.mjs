@@ -694,6 +694,47 @@ console.log('15) /switch：列出可切换的会话/工作区（CM 2026-09-16 �
   liveAgents.length = 0
 }
 
+console.log('16) 目标轮封口必须补扫：收尾汇报不能丢（CM 2026-09-16 实测反馈）')
+{
+  // 背景（真机取证）：FU 机器人目标模式 round 2~6 的卡片全是 notes=0、只有工具记录，
+  // 而会话日志里确实有整段「**进度（第 N 轮）**…」。根因＝封口时**没有补扫**：
+  // 工具调用是轮内陆续到达的（被 300ms watcher 拍到），收尾话语与轮结束几乎同时到，
+  // 落在最后一拍之后 → 直接被丢掉。普通回合路径有 catch-up scan，目标卡漏了。
+  const mark = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 600,
+    data: {
+      content: [{ type: 'text', text: '<goal_round>\nRound: 3/10\n</goal_round>' }],
+      source: { kind: 'goal', goalId: 'g_seal', revision: 1, round: 3 },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  ok(createsSince(mark).length === 1, '第 3 轮建卡')
+
+  agentEvents.push({ type: 'tool/call', seq: 601, data: { callId: 'call_seal_1', name: 'read', arguments: '{"file_path":"a.md"}' } })
+  await drain()
+
+  // 收尾汇报：**紧接**轮结束到达，中间不给 watcher 任何一拍。
+  // 同时塞进"倒数第二段话"和一个工具调用 —— 这两样**只有补扫**才会进卡
+  // （提升逻辑只搬最后一段话；去掉补扫时它们必须消失，否则这测试就是假保险丝）。
+  const midText = '窗口外的中途交代-MID'
+  const closing = '**进度（第 3 轮）** ' + 'A'.repeat(700) + ' 收尾标记-END'
+  agentEvents.push({ type: 'assistant/message', seq: 602, data: { message: { content: [{ type: 'text', text: midText }] } } })
+  agentEvents.push({ type: 'tool/call', seq: 603, data: { callId: 'call_seal_2', name: 'fuse_probe_tool', arguments: '{"x":1}' } })
+  agentEvents.push({ type: 'assistant/message', seq: 604, data: { message: { content: [{ type: 'text', text: closing }] } } })
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('收尾标记-END'), '封口补扫到了收尾汇报')
+  ok(body.includes(midText), '末刻到达的中途话语也在卡上（只有补扫能做到 → 真保险丝）')
+  ok(body.includes('fuse_probe_tool'), '末刻到达的工具调用也在卡上（只有补扫能做到）')
+  ok((body.match(/收尾标记-END/g) || []).length === 1, '收尾汇报只出现一次（不重复）')
+  ok(body.includes('A'.repeat(600)), '收尾汇报按正式消息块写入，未被 500 字过程话语截断（600 个连续 A 仍在）')
+  ok(body.includes('本轮结束'), '仍然写了「本轮结束」')
+}
+
 console.log('')
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
