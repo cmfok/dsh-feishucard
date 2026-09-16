@@ -1,6 +1,6 @@
 {
   "name": "dsh-feishucard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness <-> Feishu (Lark) bridge with a streaming reply card: official-SDK long connection (no public URL), per-chat dedicated agent sessions, /new /switch /list /help commands, collapsible tool-call panels with status symbols, inline agent notes, rate-limit / backoff / circuit-breaker / text fallback. Self-developed (not a fork).",
   "repository": {
     "type": "git",

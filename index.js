@@ -33,6 +33,7 @@ const CARD_RETRY_BASE = 1000         // backoff base (exponential)
 const CARD_MAX_FAILURES = 5          // consecutive failures before breaker
 const CARD_TIMEOUT = 15000           // single card request timeout
 const CARD_POLL_INTERVAL = 300       // agent event poll interval
+const SESSION_GEN = 2                // session-state schema gen; gen<2 sessions predate the standard-preset mount and never saw file/shell tools
 const DRAIN_INTERVAL = 500           // helper stdout drain interval
 const CONFIG_REFRESH_MS = 10000      // config hot-reload cadence
 const STATUS_INTERVAL = 10000        // helper status line cadence
@@ -45,6 +46,24 @@ export function apply(ctx) {
   let lastConfigCheck = 0
   let lastSpawnAt = 0
   const bots = new Map()             // appId -> Bot runtime
+
+  // Agent -> live streaming-card context of its current turn. Lets the
+  // ask_user_question flow freeze the *old* card (the one sitting above the
+  // question card) and hand the agent's post-answer narration to a *new*
+  // card below it — otherwise updates land on the stale card the user can no
+  // longer see (2026-09-08 CM report).
+  const activeTurns = new Map()         // agentId -> { card, bot, chatId, split }
+
+  // 找出某个会话当前正在跑的、还没封口的卡片（用于让 feishu_send 知道"这个对话正在被回复"）。
+  // 2026-09-15：agent 在活跃对话里调 feishu_send 会另发一条消息，与卡片里的回复重复
+  //（CM 反馈"同一段东西分两个卡片发"）——有活跃卡时应当跳过。
+  function findActiveCardForChat(chatId) {
+    if (!chatId) return null
+    for (const entry of activeTurns.values()) {
+      if (entry && entry.chatId === chatId && entry.card && entry.card.status !== 'sealed') return entry
+    }
+    return null
+  }
 
   // ---- config -------------------------------------------------------------
   // Config/state live under ~/.dsh-feishucard by default; FS_CONFIG_DIR
@@ -95,6 +114,7 @@ export function apply(ctx) {
       cleaned.push({
         name: typeof bot.name === 'string' && bot.name.trim() ? bot.name.trim() : appId,
         workspace: typeof bot.workspace === 'string' ? bot.workspace : '',
+        fileInbox: typeof bot.fileInbox === 'string' ? bot.fileInbox.trim() : '',
         appId,
         appSecret: typeof bot.appSecret === 'string' ? bot.appSecret : '',
         reactionEmoji: typeof bot.reactionEmoji === 'string' ? bot.reactionEmoji : undefined,
@@ -270,6 +290,16 @@ export function apply(ctx) {
       circuitOpen: false,
       retryUntil: 0,
       queue: Promise.resolve(),
+      // 2026-09-15 修复：一卡一游标 + 已消费事件去重。
+      // 旧实现的 seal 前补扫用 `{from: seqBefore}`（本轮起点）重放整轮，而 appendNote 无去重
+      // → split 之后新卡会把 split 前的内容再写一遍、split 后的内容写两遍
+      //   （CM 反馈的"同一段东西分两个卡片发、内容大量重复"）。
+      cursor: 0,           // 本卡已消费到的事件下标（== seq）
+      seenSeqs: new Set(), // 已写入卡片的 assistant/message seq（防重放重复）
+      createFailed: false, // 建卡失败过 → 不再重复建卡（防超时导致的孤儿卡与多张卡）
+      // 2026-09-16：诚实状态用。lastEventAt = 上次有新事件的时刻；idleMinutes = 已静默分钟数（0=正常）
+      lastEventAt: Date.now(),
+      idleMinutes: 0,
     }
   }
 
@@ -285,6 +315,13 @@ export function apply(ctx) {
         if (picks.length >= 2) break
       }
     }
+    // 2026-09-16 修复：此处曾被误插入一行 `if (cmd && EGRESS_CMD_RE.test(cmd)) ...`
+    // （从 approvalReasonFor 里抄过来的"联网/外发命令"判断），但本函数作用域内没有 cmd，
+    // 且该插入同时删掉了 `const joined = ...` 一行 → 本函数**每次调用必抛
+    // ReferenceError: cmd is not defined**，导致卡片工具面板构建失败、
+    // 流式更新整条链路崩掉，只能退化成最后一条纯文本回复（CM 反馈"隔很久才回、看不到进度"）。
+    // 现按 git 历史（5c800e5 等提交）还原为已知正确实现；"联网/外发命令"提示由
+    // approvalReasonFor（第 ~1868 行，那里的 cmd 有正确定义）负责，职责不重复。
     const joined = picks.join(' ').replace(/\s+/g, ' ').trim()
     return joined.length > 80 ? joined.slice(0, 80) + '…' : joined
   }
@@ -297,7 +334,7 @@ export function apply(ctx) {
     if (!inner || !Array.isArray(inner)) return ''
     for (const c of inner) {
       if (c && c.type === 'text' && typeof c.text === 'string') {
-        const t = c.text.replace(/\s+/g, ' ').trim()
+        const t = c.text.trim()
         if (t) return t
       }
     }
@@ -320,10 +357,33 @@ export function apply(ctx) {
 
   const MAX_NOTE_CHARS = 500
 
+  // 截断过程话语时**不能把表格切断**（2026-09-16 与 CM 的"表格只显示竖线"排查一并处理）：
+  // markdown 表格必须是「表头行 + 分隔行 + 数据行」连续成块才会被飞书渲染成表格；
+  // 原实现直接 `slice(0, 500) + '…'`，一旦截断点落在表格中间，就可能只剩表头没有分隔行
+  // → 飞书判定不是表格 → 原样显示竖线（CM 看到的现象之一）。
+  // 处理：先退到整行边界；若末尾还停留在表格行上，把这个不完整的表格整块丢掉。
+  function clipNoteText(text, max) {
+    const s = String(text || '')
+    if (s.length <= max) return s
+    let cut = s.slice(0, max)
+    const nl = cut.lastIndexOf('\n')
+    if (nl > 0) cut = cut.slice(0, nl)
+    const lines = cut.split('\n')
+    while (lines.length && /^\s*\|.*\|\s*$/.test(lines[lines.length - 1])) lines.pop()
+    return lines.join('\n').replace(/\s+$/, '') + '…'
+  }
+
   function appendNote(card, text, seq) {
     const trimmed = String(text || '').trim()
     if (!trimmed) return
-    const clipped = trimmed.length > MAX_NOTE_CHARS ? trimmed.slice(0, MAX_NOTE_CHARS) + '…' : trimmed
+    // 同一 seq 只写一次：补扫与 watcher 会扫到重叠区间，旧实现没有去重 → 卡上出现重复段落
+    // （2026-09-15 CM 反馈"内容大量重复"）。
+    if (seq !== undefined && seq !== null) {
+      if (!card.seenSeqs) card.seenSeqs = new Set()
+      if (card.seenSeqs.has(seq)) return
+      card.seenSeqs.add(seq)
+    }
+    const clipped = clipNoteText(trimmed, MAX_NOTE_CHARS)
     card.blocks.push({ type: 'note', text: clipped, seq })
   }
 
@@ -357,6 +417,192 @@ export function apply(ctx) {
   // Card payload: notes as markdown blocks, tool panels collapsed by default,
   // a bottom status line until sealed. Elements capped (Feishu limit 50,
   // keep headroom at 40), overflow folded into one "更多过程" panel.
+  // Card payload: notes as markdown blocks, tool panels collapsed by default,
+  // a bottom status line until sealed. Elements capped (Feishu limit 50,
+  // keep headroom at 40), overflow folded into one "更多过程" panel.
+
+  // 正文 → 元素列表：**长代码块折成默认收起的面板**，短代码块保持原样渲染。
+  // 阈值与 Hermes 侧一致（>8 行 或 >600 字符），行为可预期；未闭合围栏自动补全。
+  const CODE_MAX_LINES = 8
+  const CODE_MAX_CHARS = 600
+  const CODE_FENCE_RE = /```(\w*)\n([\s\S]*?)```/g
+
+  function renderMessageElements(text) {
+    let src = String(text || '')
+    if ((src.match(/```/g) || []).length % 2 === 1) {
+      // 流式片段可能把围栏切开：奇数个 ``` → 补一个，避免飞书渲染错乱
+      src = src.trim().endsWith('```') && !src.trim().startsWith('```')
+        ? '```\n' + src
+        : src + '\n```'
+    }
+    const out = []
+    let pos = 0
+    CODE_FENCE_RE.lastIndex = 0
+    let m
+    while ((m = CODE_FENCE_RE.exec(src)) !== null) {
+      const before = src.slice(pos, m.index)
+      if (before.trim()) out.push({ tag: 'markdown', content: before })
+      const lang = m[1] || 'code'
+      const code = m[2]
+      const lines = code.split('\n').length
+      if (lines > CODE_MAX_LINES || code.length > CODE_MAX_CHARS) {
+        out.push({
+          tag: 'collapsible_panel',
+          expanded: false,
+          background_color: 'grey-50',
+          border: { color: 'grey', corner_radius: '8px' },
+          header: { title: { tag: 'plain_text', content: lang + ' · ' + lines + ' 行 · 点击展开' } },
+          elements: [{ tag: 'markdown', content: '```' + lang + '\n' + code + '```' }],
+        })
+      } else {
+        out.push({ tag: 'markdown', content: m[0] })
+      }
+      pos = m.index + m[0].length
+    }
+    const tail = src.slice(pos)
+    if (tail.trim()) out.push({ tag: 'markdown', content: tail })
+    return out.length ? out : [{ tag: 'markdown', content: src }]
+  }
+
+  // ---- 折叠/容量：两个机制必须自洽（2026-09-16 从 Hermes 侧同步的两个修复）---------
+  // ① 每个「更早过程」面板的正文上限：内容超过它就**多切一块面板**，绝不截断丢弃。
+  const FOLD_CHUNK_CHARS = 3000
+  // ② 单卡 markdown 表格数上限：飞书官方硬上限 5（《表格组件》），超出报
+  //    `ErrCode 11310 / card table number over limit`。Hermes 侧 2026-09-15 实测
+  //    单日 22 次 11310 **全部**来自这一条 —— 而 DSH 此前**完全没有表格防护**。
+  const CARD_MAX_TABLES = 5
+
+  // 把长文本按段落边界切成 ≤ size 的块；单段本身超长则硬切。**不丢任何字符。**
+  function chunkText(text, size) {
+    const out = []
+    let buf = ''
+    for (const para of String(text || '').split('\n\n')) {
+      const piece = buf ? buf + '\n\n' + para : para
+      if (piece.length <= size) { buf = piece; continue }
+      if (buf) { out.push(buf); buf = '' }
+      let rest = para
+      while (rest.length > size) { out.push(rest.slice(0, size)); rest = rest.slice(size) }
+      buf = rest
+    }
+    if (buf) out.push(buf)
+    return out.filter((c) => c.trim())
+  }
+
+  // 一段 markdown 里有几张表（连续 |...| 行算一张）
+  // **必须跳过 ``` 代码块**：代码块里的 `| a | b |` 是普通文本，飞书不算表格组件
+  // （否则"把超限表格降级成代码块"会被自己重新数进去，降级永远不生效 —— 实测踩过）。
+  function countMarkdownTables(text) {
+    let count = 0
+    let prev = false
+    let inFence = false
+    for (const line of String(text || '').split('\n')) {
+      if (/^\s*```/.test(line)) { inFence = !inFence; prev = false; continue }
+      const row = !inFence && /^\s*\|.*\|\s*$/.test(line)
+      if (row && !prev) count += 1
+      prev = row
+    }
+    return count
+  }
+
+  // 把一行 markdown 表格行拆成单元格数组：'| a | b |' → ['a','b']
+  function splitTableRow(line) {
+    let s = String(line || '').trim()
+    if (s.startsWith('|')) s = s.slice(1)
+    if (s.endsWith('|')) s = s.slice(0, -1)
+    return s.split('|').map((c) => c.trim())
+  }
+  // 把 markdown 表格行转成**可读清单**（降级用）：
+  // CM 2026-09-16 反馈"超出限额后表格只剩一堆 | 符号" —— 旧的降级方式是包成 ``` 代码块，
+  // 代码块里就是原始竖线，纯属把问题换个地方展示。
+  // 现在改成 `- **列名**：值 ｜ **列名**：值`，人一眼能读，且一个字符都不丢。
+  function demoteTableToLines(rows) {
+    const cells = rows.map(splitTableRow).filter((c) => c.length > 0)
+    if (cells.length === 0) return rows
+    const header = cells[0]
+    // 第 2 行若是分隔行（全是 --- / :--:）则跳过
+    const isSep = (c) => c.every((x) => /^:?-{1,}:?$/.test(x.replace(/\s/g, '')))
+    const body = cells.slice(1).filter((c, i) => !(i === 0 && isSep(c)))
+    if (body.length === 0) return rows
+    const out = ['*（表格超出飞书单卡上限，已转为清单，内容不变）*']
+    for (const c of body) {
+      const parts = header.map((h, i) => {
+        const v = (c[i] === undefined || c[i] === '') ? '—' : c[i]
+        return (h ? '**' + h + '**：' : '') + v
+      })
+      out.push('- ' + parts.join('　｜　'))
+    }
+    return out
+  }
+
+  // 把文本里"超出配额"的表格降级（保持行序与内容，一个字符都不丢）。
+  // 为什么必须这么做：**折叠降低不了表格数**（折叠只是把同样的文本挪进面板），
+  // 所以超限时只能改渲染方式，不能删内容。
+  function demoteTablesInText(text, shouldDemote) {
+    const out = []
+    let table = []
+    let inFence = false
+    const flush = () => {
+      if (!table.length) return
+      if (shouldDemote()) out.push(...demoteTableToLines(table))
+      else out.push(...table)
+      table = []
+    }
+    for (const line of String(text || '').split('\n')) {
+      if (/^\s*```/.test(line)) inFence = !inFence
+      if (!inFence && /^\s*\|.*\|\s*$/.test(line)) { table.push(line); continue }
+      flush()
+      out.push(line)
+    }
+    flush()
+    return out.join('\n')
+  }
+
+  // 卡片级表格配额：按元素顺序，第 6 张起的表格降级成可读清单（不再用代码块）
+  function demoteOverflowTables(elements, max) {
+    let used = 0
+    for (const el of elements) {
+      const targets = el && el.tag === 'markdown' ? [el]
+        : (el && el.tag === 'collapsible_panel' ? (el.elements || []) : [])
+      for (const t of targets) {
+        if (!t || t.tag !== 'markdown' || !t.content) continue
+        if (countMarkdownTables(t.content) === 0) continue
+        t.content = demoteTablesInText(t.content, () => (++used > max))
+      }
+    }
+    return elements
+  }
+
+  // 本卡**当前累计**的 markdown 表格数 —— 「表格额度换卡」的判定依据（CM 2026-09-16 方案）。
+  // 为什么按 message 块数、而不是数渲染后的 elements：换卡判定发生在扫描新事件**之前**，
+  // 此时还没生成 elements；而 buildCardPayload 里各 message 块是各自独立渲染的，
+  // 表格总数 = 各块表格数之和（代码块内的 `|` 不算，已有 countMarkdownTables 处理）。
+  function cardTableCount(card) {
+    let n = 0
+    for (const block of (card && card.blocks) || []) {
+      // 必须同时数 message 与 note：agent 的过程话语走 appendNote 存成 `type: 'note'`，
+      // 最终回复才会被提升成 `type: 'message'`。只数 message 会让判定永远不触发
+      // （2026-09-16 实测：用例 12 换卡不生效，create 次数停在 1）。
+      if (block.type !== 'message' && block.type !== 'note') continue
+      if (!block.text) continue
+      n += countMarkdownTables(block.text)
+    }
+    return n
+  }
+
+  // ---- 状态行（2026-09-16 与 Hermes 对齐：状态必须真实）---------------------------
+  // 原实现两个毛病：
+  //   ① `completed` 是**死状态** —— 全文件从未赋值 → 「已完成」分支永不执行；
+  //   ② `sealed` 时**直接把状态行删掉** → 回合结束后用户看不出"这轮结束了没有"。
+  // 另加一条诚实提示：长时间无新事件 → 写明"已 N 分钟无新动作"，不用假状态糊弄。
+  const DSH_IDLE_NOTICE_MIN = 3      // 无新事件多少分钟后提示
+  function statusTextFor(card) {
+    if (card.status === 'sealed') return '_✅ 已完成_'
+    if (card.status === 'completed') return '_已完成_'
+    if (card.status === 'error') return '_失败_'
+    if (card.idleMinutes > 0) return '_运行中…（已 ' + card.idleMinutes + ' 分钟无新动作）_'
+    return '_运行中…_'
+  }
+
   function buildCardPayload(card) {
     const elements = []
     console.log('[fs] buildCardPayload: blocks=' + card.blocks.length
@@ -365,7 +611,10 @@ export function apply(ctx) {
     for (const block of card.blocks) {
       if (block.type === 'message' || block.type === 'note') {
         const text = (block.text || '').trim()
-        if (text) elements.push({ tag: 'markdown', content: text })
+        // 2026-09-15：正文里的长代码块也折起来（移植 Hermes 的 message_elements 思路）。
+        // 旧实现平铺 markdown → 回复里的 ``` 代码框、命令全文全部摊在卡片上，
+        // 用户看到的"只有工具面板折叠、其余代码框全展示"就是这个（DSH 侧没有正文折叠）。
+        if (text) elements.push(...renderMessageElements(text))
         continue
       }
       if (block.type === 'tools') {
@@ -393,77 +642,117 @@ export function apply(ctx) {
         })
       }
     }
+    // 表格配额：飞书单卡最多 5 张表，超出的改成代码块（**不删内容**）。
+    // 必须在折叠之前做 —— 折叠把文本挪进面板并不会减少表格数。
+    demoteOverflowTables(elements, CARD_MAX_TABLES)
+
     // Window fold: keep the NEWEST content visible (live progress + conclusion
-    // at the bottom), fold the ALREADY-SEEN history into one panel at the TOP.
+    // at the bottom), fold the ALREADY-SEEN history into panel(s) at the TOP.
     // The last KEEP_TAIL elements are never folded (2026-08-15 CM design).
     if (elements.length > 40) {
       const KEEP_TAIL = 10
       const head = elements.slice(0, elements.length - KEEP_TAIL)
       const tail = elements.slice(elements.length - KEEP_TAIL)
       const extraLines = []
-      let extraPanels = 0
       for (const el of head) {
         if (el.tag === 'markdown') {
           if (el.content) extraLines.push(el.content)
         } else {
-          extraPanels += 1
           const inner = el.elements && el.elements[0]
           if (inner && inner.tag === 'markdown' && inner.content) extraLines.push(inner.content)
         }
       }
       if (extraLines.length > 0) {
-        tail.unshift({
-          tag: 'collapsible_panel',
-          expanded: false,
-          background_color: 'grey-50',
-          border: { color: 'grey', corner_radius: '8px' },
-          padding: '8px 8px 8px 8px',
-          header: {
-            title: { tag: 'plain_text', content: '📎 更早过程 (' + (elements.length - KEEP_TAIL) + ')' },
-            vertical_align: 'center',
+        // **无损折叠（2026-09-16 修复）**：旧实现是
+        //   `extraLines.join('\n\n').slice(0, 3000)` —— 把折叠正文硬砍到 3000 字、
+        //   其余**直接丢弃**。而卡片没有容量上限（DSH 没有 Hermes 那种换卡），会长到远超
+        //   3000 字，于是中间那一大段历史被删掉，用户看到的就是"旧消息被吞"
+        //   （Hermes 侧同款 bug 实测丢 57% 内容、28/50 段消失）。
+        //   现在按 FOLD_CHUNK_CHARS 切成**多块面板**：每块仍 ≤ 单元素保守上限，一个字符都不丢。
+        const chunks = chunkText(extraLines.join('\n\n'), FOLD_CHUNK_CHARS)
+        const count = chunks.length
+        for (let i = count - 1; i >= 0; i--) {
+          tail.unshift({
+            tag: 'collapsible_panel',
+            expanded: false,
+            background_color: 'grey-50',
+            border: { color: 'grey', corner_radius: '8px' },
             padding: '8px 8px 8px 8px',
-            icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', color: 'grey', size: '16px 16px' },
-            icon_position: 'right',
-            icon_expanded_angle: -180,
-          },
-          elements: [{ tag: 'markdown', content: extraLines.join('\n\n').slice(0, 3000) }],
-        })
+            header: {
+              title: {
+                tag: 'plain_text',
+                content: count === 1
+                  ? '📎 更早过程 (' + (elements.length - KEEP_TAIL) + ')'
+                  : '📎 更早过程 (' + (i + 1) + '/' + count + ')',
+              },
+              vertical_align: 'center',
+              padding: '8px 8px 8px 8px',
+              icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', color: 'grey', size: '16px 16px' },
+              icon_position: 'right',
+              icon_expanded_angle: -180,
+            },
+            elements: [{ tag: 'markdown', content: chunks[i] }],
+          })
+        }
       }
       elements.length = 0
       for (const el of tail) elements.push(el)
     }
     if (elements.length === 0) elements.push({ tag: 'markdown', content: ' ' })
-    if (card.status !== 'sealed') {
-      const statusText = card.status === 'completed' ? '_已完成_'
-        : card.status === 'error' ? '_失败_'
-        : '_运行中…_'
-      elements.push({ tag: 'markdown', content: statusText })
-    }
+    elements.push({ tag: 'markdown', content: statusTextFor(card) })
     return { schema: '2.0', config: { wide_screen_mode: true }, body: { elements } }
   }
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
   function syncCard(bot, chatId, card, force) {
-    if (!card || !bot || card.circuitOpen) return card.queue
+    if (!card || !bot || card.circuitOpen) {
+      if (card && card.circuitOpen) console.log('[fs] card sync skipped: circuitOpen (failCount=' + card.failCount + ')')
+      return card.queue
+    }
+    // 建卡失败过就**不再重复建卡**：15s 超时被 abort 时飞书侧可能已经建成功，
+    // 再发一次就会留下一张永远不再更新的孤儿卡（用户看到两张内容相同的卡）。
+    if (!card.token && card.createFailed) {
+      console.log('[fs] card sync skipped: createFailed (no token)')
+      return card.queue
+    }
     const now = Date.now()
     if (now < card.retryUntil) return card.queue
     if (card.token && !force && now - card.lastSyncAt < CARD_MIN_INTERVAL) return card.queue
     card.queue = card.queue.catch(() => {}).then(async () => {
+      // 队列**内部**再检查一次：syncCard 会被多处几乎同时调用（建卡时 force、watcher、
+      // seal），它们在入口检查时 createFailed 还是 false → 都排进队列 → 串行执行时各自 create。
+      // 队列内检查才能保证"建卡只成功/尝试一次"（2026-09-15 smoke 实测：入口检查漏掉 3 次 create）。
+      if (!card.token && card.createFailed) return
       const payload = buildCardPayload(card)
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(new Error('card request timed out')), CARD_TIMEOUT)
+      const wasPatch = Boolean(card.token)
       try {
-        if (card.token) {
+        if (wasPatch) {
           await updateInteractive(bot, card.token, payload, controller.signal)
         } else {
           const messageId = await sendInteractive(bot, chatId, payload, controller.signal)
+          // 必须校验返回值：旧实现把 undefined 也写进 token → token 恒空 → 每次 sync 再建一张卡
+          if (!messageId || typeof messageId !== 'string') {
+            throw new Error('create card returned no message_id')
+          }
           card.token = messageId
         }
         card.lastSyncAt = Date.now()
-        card.failCount = 0
+        // 只有**成功的 PATCH** 才清零失败计数：create 成功不代表这张卡健康，
+        // 否则"建卡成功→PATCH 失败→计数归零"会绕过熔断（与 Hermes 侧同型缺陷）。
+        if (wasPatch) card.failCount = 0
         card.retryUntil = 0
+        // 2026-09-16 修复（CM：卡片看不到中间过程、只等到最后一条）：
+        // createFailed / circuitOpen 原本**只置位、没有任何复位** → 一次瞬时故障就把整张卡
+        // 永久打进"静默跳过"状态：之后 buildCardPayload 照常跑、但一次都不再发出去
+        // （日志特征：card created=0 / card reply delivered=0，且**无任何报错**）。
+        // 现在：任何一次成功（create 或 PATCH）= 链路是通的 → 复位。
+        card.circuitOpen = false
+        if (card.token) card.createFailed = false
       } catch (error) {
         card.failCount += 1
+        if (!wasPatch) card.createFailed = true   // 建卡失败 → 放弃该卡，交给兜底纯文本
         const delay = CARD_RETRY_BASE * 2 ** (card.failCount - 1)
         if (card.failCount >= CARD_MAX_FAILURES) {
           card.circuitOpen = true
@@ -481,14 +770,38 @@ export function apply(ctx) {
     return card.queue
   }
 
-  // Scan the agent session event log from `fromRef.from` and mirror new events
-  // into the card. Returns true if anything changed. Shared by the periodic
-  // watcher and the seal-time catch-up scan so a fast turn still gets its
-  // narration + tool panels on the card.
-  function scanEvents(agent, fromRef, card) {
-    const events = agent.session.events
+  // Session event log accessor — DSH version compatibility.
+  // 0.1.0-rc.5 (公开版，本机在跑的那版) 暴露的是 `session.events`（数组，下标=seq）；
+  // 更晚的 0.1.2-rc.1 把它废弃成 `session.snapshotEvents()`。2026-09-08 那次"为 0.1.2 适配"
+  // 把调用点硬编码成了后者 → 在 0.1.0-rc.5 上入站消息一进 runTurn 就抛
+  // `TypeError: session.snapshotEvents is not a function`，飞书里表现为"发消息没回复"。
+  // 两个版本都读一遍：有 snapshotEvents 就用，没有就退回 events。
+  function sessionEvents(session) {
+    if (!session) return []
+    try {
+      if (typeof session.snapshotEvents === 'function') {
+        const snapshot = session.snapshotEvents()
+        if (Array.isArray(snapshot)) return snapshot
+      }
+    } catch (e) {
+      console.log('[fs] snapshotEvents() failed, falling back to events: ' + String(e && e.message || e))
+    }
+    return Array.isArray(session.events) ? session.events : []
+  }
+
+  // Scan the agent session event log from **this card's own cursor** and mirror
+  // new events into the card. Returns true if anything changed.
+  //
+  // 2026-09-15 修复：游标挂在**卡对象**上（`card.cursor`），不再由调用方传 `{from}`。
+  // 旧实现里 watcher 用局部 `fromRef`、seal 前补扫用 `{from: seqBefore}`（本轮起点），
+  // 两者互不知情 —— 一旦发生 `split()`（答题后开新卡），补扫会把 split **之前**的内容
+  // 重放一遍、split 之后的写两遍（appendNote 无去重），用户就看到"同一段东西分两张卡、
+  // 内容大量重复"。一卡一游标 + appendNote 的 seq 去重彻底消除这个重叠窗口。
+  function scanCard(agent, card) {
+    const events = sessionEvents(agent.session)
+    const from = Number.isFinite(card.cursor) ? card.cursor : 0
     let changed = false
-    for (let i = fromRef.from; i < events.length; i++) {
+    for (let i = from; i < events.length; i++) {
       const event = events[i]
       if (!event || !event.data) continue
       if (event.type === 'assistant/message') {
@@ -524,18 +837,36 @@ export function apply(ctx) {
         }
       }
     }
-    fromRef.from = events.length
+    card.cursor = events.length
     return changed
   }
 
   // Poll the agent session event log and mirror new events into the card.
-  function startCardWatcher(agent, seqFrom, card, bot, chatId) {
-    const fromRef = { from: seqFrom }
+  // `initialCursor` 只在第一次设置（卡自己的游标），不传则沿用 card.cursor。
+  function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
     const timer = setInterval(() => {
       if (card.sealing) return
       try {
-        if (scanEvents(agent, fromRef, card)) {
+        // 表格额度换卡（CM 2026-09-16 方案）：飞书单卡硬上限 5 张表（ErrCode 11310）。
+        // 本卡已用满且**还有新事件待镜像**时，先换一张新卡 —— 旧卡的表格原样留在旧卡，
+        // 新事件由新卡接续（新卡游标 = 旧卡游标，不丢不重）。这样永远不降级表格。
+        if (typeof onTableBudget === 'function' && cardTableCount(card) >= CARD_MAX_TABLES) {
+          const pending = sessionEvents(agent.session)
+          const from = Number.isFinite(card.cursor) ? card.cursor : 0
+          if (pending.length > from) { onTableBudget(); return }
+        }
+        if (scanCard(agent, card)) {
+          card.lastEventAt = Date.now()
+          card.idleMinutes = 0
           void syncCard(bot, chatId, card, false).catch(() => {})
+        } else if (card.status === 'running' && card.lastEventAt) {
+          // 诚实状态：长时间没有新事件就说清楚"多久没动"，**不宣称完成**
+          const mins = Math.floor((Date.now() - card.lastEventAt) / 60000)
+          const next = mins >= DSH_IDLE_NOTICE_MIN ? mins : 0
+          if (next !== card.idleMinutes) {
+            card.idleMinutes = next
+            void syncCard(bot, chatId, card, false).catch(() => {})
+          }
         }
       } catch (error) {
         console.log('[fs] card watcher error: ' + String(error && error.message || error))
@@ -552,6 +883,21 @@ export function apply(ctx) {
     return selected ? { provider: selected.provider, model: selected.model } : undefined
   }
 
+  // Compose the standard agent preset (fs/bash/web/... bundles) onto an agent
+  // context — sessions created/resumed without it only expose plugin-owned
+  // tools (feishu_send): the "飞书新会话没有工具" failure (2026-09-08, dsh
+  // 0.1.2-rc.1). Mirrors the GUI session factory (presets.mount from setup).
+  async function mountStandardPreset(agentCtx) {
+    const presets = agentCtx.get('agentPresets')
+    if (!presets) return
+    try {
+      const preset = await presets.mount(agentCtx)
+      console.log('[fs] standard agent preset mounted: ' + String(preset && preset.id || 'default'))
+    } catch (error) {
+      console.log('[fs] preset mount failed: ' + String(error && error.message || error))
+    }
+  }
+
   async function createDedicated(bot, sessionId) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
@@ -560,15 +906,7 @@ export function apply(ctx) {
       sessionId,
       meta: { cwd: (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined },
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
-      setup: async (agentCtx) => {
-        const presets = agentCtx.get('agentPresets')
-        if (!presets) return
-        try {
-          await presets.mount(agentCtx)
-        } catch (error) {
-          console.log('[fs] preset mount failed: ' + String(error && error.message || error))
-        }
-      },
+      setup: mountStandardPreset,
     })
   }
 
@@ -578,6 +916,7 @@ export function apply(ctx) {
     return agents.resume({
       resumeSessionId: sessionId,
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
+      setup: mountStandardPreset,
     })
   }
 
@@ -586,7 +925,17 @@ export function apply(ctx) {
     const state = readState(bot.cfg.appId)
     const chats = new Map()
     for (const [chatId, record] of Object.entries(state.chats || {})) {
-      const sessions = Array.isArray(record && record.sessions) ? record.sessions : []
+      let sessions = Array.isArray(record && record.sessions) ? record.sessions : []
+      // Sessions persisted before SESSION_GEN 2 were created without the
+      // standard-preset mount and only expose feishu_send — reuse would keep
+      // them tool-less forever, so drop them once; the next inbound message
+      // auto-creates a fully tooled session for the chat.
+      const legacy = sessions.filter((s) => s && s.type === 'dedicated' && s.gen !== SESSION_GEN)
+      if (legacy.length > 0) {
+        console.log('[fs] dropping ' + legacy.length + ' legacy session(s) created without standard tools: '
+          + legacy.map((s) => s.id).join(', '))
+        sessions = sessions.filter((s) => !(s && s.type === 'dedicated' && s.gen !== SESSION_GEN))
+      }
       const activeId = record && record.active
       let activeIndex = 0
       if (activeId) {
@@ -603,7 +952,7 @@ export function apply(ctx) {
     for (const [chatId, chat] of chats) {
       const active = chat.sessions[chat.activeIndex]
       state.chats[chatId] = {
-        sessions: chat.sessions.map((s) => ({ id: s.id, label: s.label, type: s.type })),
+        sessions: chat.sessions.map((s) => ({ id: s.id, label: s.label, type: s.type, gen: s.gen })),
         active: active ? active.id : (chat.sessions[0] ? chat.sessions[0].id : 'main'),
       }
     }
@@ -745,7 +1094,7 @@ export function apply(ctx) {
     if (resolved === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       const handle = await createDedicated(bot, sessionId)
-      chat.sessions.push({ id: sessionId, label: cmd.arg || ('会话 ' + (chat.sessions.length + 1)), type: 'dedicated', handle })
+      chat.sessions.push({ id: sessionId, label: cmd.arg || ('会话 ' + (chat.sessions.length + 1)), type: 'dedicated', gen: SESSION_GEN, handle })
       chat.activeIndex = chat.sessions.length - 1
       persistChats(bot, bot.chats)
       await sendPlainText(bot, chatId, '已新建会话' + (cmd.arg ? '「' + cmd.arg + '」' : '') + '并切换过去。')
@@ -791,28 +1140,114 @@ export function apply(ctx) {
   function extractText(contentJson) {
     try {
       const parsed = JSON.parse(contentJson || '{}')
-      const text = typeof parsed.text === 'string' ? parsed.text : ''
-      const mentions = parsed.mentions
-      if (!mentions || !Array.isArray(mentions)) return text
-      let out = text
-      for (const m of mentions) {
-        if (m && typeof m.key === 'string' && typeof m.denote_text === 'string') {
-          out = out.split(m.key).join(m.denote_text)
+      // Plain text (mobile client): {"text":"...","mentions":[...]}
+      if (typeof parsed.text === 'string') {
+        const mentions = parsed.mentions
+        if (!mentions || !Array.isArray(mentions)) return parsed.text
+        let out = parsed.text
+        for (const m of mentions) {
+          if (m && typeof m.key === 'string' && typeof m.denote_text === 'string') {
+            out = out.split(m.key).join(m.denote_text)
+          }
         }
+        return out
       }
-      return out
+      // Rich-text post (desktop client): {"title":"...","content":[[{tag,text},...],...]}
+      // PC 端发的普通文本是 post 格式，不解析会被静默丢弃（2026-09-01 事故）。
+      if (Array.isArray(parsed.content)) {
+        const parts = []
+        for (const para of parsed.content) {
+          if (!Array.isArray(para)) continue
+          for (const el of para) {
+            if (el && typeof el === 'object' && typeof el.text === 'string') parts.push(el.text)
+          }
+        }
+        return parts.join(' ').trim()
+      }
+      return ''
     } catch {
       return ''
     }
   }
 
+  // ---- inbound file inbox (2026-09-09, CM): Feishu file/media messages carry
+  // no text, so extractText() returns '' and the old code dropped them
+  // silently. Download the resource via the message-resources API and inject a
+  // text note with its local path so the agent session can read the file.
+  // Destination: bot.fileInbox, else <bot.workspace>/downloaded_files (config
+  // driven, never a hardcoded absolute path).
+  async function downloadInboundFile(bot, evt) {
+    try {
+      const msgType = String(evt.msg_type || '')
+      const parsed = JSON.parse(evt.content || '{}')
+      let key = ''
+      let type = ''
+      let fileName = ''
+      if (msgType === 'file') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || '' }
+      else if (msgType === 'image') { type = 'image'; key = parsed.image_key || ''; fileName = 'image' }
+      else if (msgType === 'audio') { type = 'file'; key = parsed.file_key || parsed.audio_key || ''; fileName = parsed.file_name || 'audio' }
+      else if (msgType === 'media') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || 'media' }
+      if (!key || !type) return ''
+      const ws = bot.cfg.workspace && String(bot.cfg.workspace).trim() ? String(bot.cfg.workspace).trim() : ''
+      const base = (bot.cfg.fileInbox && String(bot.cfg.fileInbox).trim())
+        || (ws ? join(ws, 'downloaded_files') : join(homedir(), 'downloaded_files'))
+      mkdirSync(base, { recursive: true })
+      const token = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
+      const url = 'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(evt.message_id)
+        + '/resources/' + encodeURIComponent(key) + '?type=' + type
+      const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+      if (!res.ok) {
+        console.log('[fs] inbound file download failed: HTTP ' + res.status + ' (' + fileName + ')')
+        return ''
+      }
+      const buf = Buffer.from(await res.arrayBuffer())
+      const safe = String(fileName || type + '-' + Date.now()).replace(/[\\/:*?"<>|\r\n]/g, '_').slice(0, 120)
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+      const path = join(base, stamp + '_' + safe)
+      writeFileSync(path, buf)
+      console.log('[fs] inbound file saved: ' + path + ' (' + buf.length + ' bytes)')
+      return '📎 收到文件：' + (fileName || '(无文件名)') + '\n已保存到：' + path + '\n（需要时请用文件工具读取该路径）'
+    } catch (e) {
+      console.log('[fs] inbound file handler error: ' + String(e && e.message || e))
+      return ''
+    }
+  }
+
+  // ---- inbound dedup (2026-09-15) -------------------------------------------
+  // 按 message_id 记住最近处理过的入站消息，防"重连重投 / 双 helper"导致整轮重复。
+  const SEEN_INBOUND_MAX = 200
+  const seenInboundIds = new Set()
+  function isDuplicateInbound(messageId) {
+    const id = String(messageId || '')
+    if (!id) return false
+    if (seenInboundIds.has(id)) return true
+    seenInboundIds.add(id)
+    if (seenInboundIds.size > SEEN_INBOUND_MAX) {
+      // Set 保序：删掉最早的一个，维持 LRU 窗口
+      const oldest = seenInboundIds.values().next().value
+      seenInboundIds.delete(oldest)
+    }
+    return false
+  }
+
   async function handleInbound(bot, evt) {
     const chatId = evt.chat_id
     if (!chatId) return
+    // 入站去重：飞书长连接是 at-least-once，重连后会重投未 ack 的事件；
+    // 进程内也可能有两份 helper 订阅同一 app。没有去重时同一条消息会跑两整轮、
+    // 产出两张内容相同的卡（2026-09-15 CM 反馈"同一段东西分两个卡片发"）。
+    if (isDuplicateInbound(evt.message_id)) {
+      console.log('[fs] duplicate inbound skipped: ' + String(evt.message_id || ''))
+      return
+    }
     bot.lastChatId = chatId
 
     const messageId = evt.message_id
-    const text = extractText(evt.content)
+    let text = extractText(evt.content)
+    if (!text.trim()) {
+      const note = await downloadInboundFile(bot, evt)
+      if (note) text = note
+    }
     if (!text.trim()) return
 
     // Commands are handled without touching an agent session.
@@ -833,6 +1268,16 @@ export function apply(ctx) {
     if (pendingQ) {
       pendingQuestions.delete(chatId)
       if (pendingQ.timer) clearTimeout(pendingQ.timer)
+      // Free-text answers should also continue on a fresh card below the
+      // question card (same stale-card problem as button taps).
+      if (pendingQ.agentId) {
+        const turn = activeTurns.get(pendingQ.agentId)
+        if (turn && typeof turn.split === 'function') {
+          try { turn.split() } catch (error) {
+            console.log('[fs] question split failed (text path): ' + String(error && error.message || error))
+          }
+        }
+      }
       pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
       await sendPlainText(bot, chatId, '✅ 已收到你的回答。')
       return
@@ -841,13 +1286,14 @@ export function apply(ctx) {
     // Ensure a dedicated session exists for this chat.
     let chat = bot.chats.get(chatId)
     let agent
+    let sessionReused = false
     if (!chat || chat.sessions.length === 0) {
       chat = { sessions: [], activeIndex: 0 }
       bot.chats.set(chatId, chat)
       const sessionId = 'fs-main-' + Date.now().toString(36)
       try {
         const handle = await createDedicated(bot, sessionId)
-        chat.sessions = [{ id: sessionId, label: '主会话', type: 'dedicated', handle }]
+        chat.sessions = [{ id: sessionId, label: '主会话', type: 'dedicated', gen: SESSION_GEN, handle }]
         chat.activeIndex = 0
         persistChats(bot, bot.chats)
         agent = handle.agent
@@ -858,6 +1304,7 @@ export function apply(ctx) {
         return
       }
     } else {
+      sessionReused = true
       agent = await resolveAgent(bot, chat)
       if (!agent) {
         // The previous session could not be resumed (DSH refuses to prepare a
@@ -867,9 +1314,10 @@ export function apply(ctx) {
         const sessionId = 'fs-main-' + Date.now().toString(36)
         try {
           const handle = await createDedicated(bot, sessionId)
-          chat.sessions.push({ id: sessionId, label: '会话 ' + (chat.sessions.length + 1), type: 'dedicated', handle })
+          chat.sessions.push({ id: sessionId, label: '会话 ' + (chat.sessions.length + 1), type: 'dedicated', gen: SESSION_GEN, handle })
           chat.activeIndex = chat.sessions.length - 1
           persistChats(bot, bot.chats)
+          sessionReused = false
           agent = handle.agent
           console.log('[fs] old session not resumable (live), created fallback ' + sessionId)
         } catch (error) {
@@ -883,14 +1331,6 @@ export function apply(ctx) {
 
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     const label = openId ? '[飞书 ' + openId + '] ' : '[飞书消息] '
-    const seqBefore = agent.session.events.length
-    const message = {
-      id: 'fs-' + messageId,
-      role: 'user',
-      content: [{ type: 'text', text: label + text }],
-      source: { kind: 'user' },
-    }
-    agent.send(message, 'next-turn', true)
 
     // Typing reaction: added on arrival, removed after the reply is delivered.
     const emoji = (bot.cfg.reactionEmoji && String(bot.cfg.reactionEmoji).trim()) || 'OnIt'
@@ -912,67 +1352,162 @@ export function apply(ctx) {
       })
     }
 
-    // Streaming reply card for this turn.
-    const card = makeCardState()
-    card.blocks.push({ type: 'message', text: '正在工作中…' })
-    void syncCard(bot, chatId, card, true).catch(() => {})
-    const stopCardWatcher = startCardWatcher(agent, seqBefore, card, bot, chatId)
-
-    try {
-      await agent.whenIdle()
-    } catch (error) {
-      console.log('[fs] turn wait failed for ' + messageId + ': ' + String(error && error.message || error))
-      stopCardWatcher()
-      card.status = 'error'
+    // Send -> wait -> scan -> seal. Delivery stays outside so a zombie session
+    // (answers nothing after a dsh web restart interrupted its turn) can be
+    // dropped and retried on a fresh session before an empty card is sent.
+    const runTurn = async (turnAgent) => {
+      const seqBefore = sessionEvents(turnAgent.session).length
+      const message = {
+        id: 'fs-' + messageId,
+        role: 'user',
+        content: [{ type: 'text', text: label + text }],
+        source: { kind: 'user' },
+      }
+      turnAgent.send(message, 'next-turn', true)
+      let card = makeCardState()
+      card.cursor = seqBefore          // 本卡只消费本轮开始之后的事件
+      card.blocks.push({ type: 'message', text: '正在工作中…' })
       void syncCard(bot, chatId, card, true).catch(() => {})
+      // 表格额度换卡（CM 2026-09-16 方案）：飞书单卡最多 5 张表，满额时**不降级表格**，
+      // 而是把旧卡封住（表格留在旧卡），后续内容写到一张新卡上。
+      // 与 split() 的唯一差别：新卡游标 = 旧卡**当前**游标 → 触发换卡的待处理事件落到新卡，
+      // 既不丢也不重（split() 是答题专用，它把游标设到事件末尾，会跳过待处理事件）。
+      const rotateTables = () => {
+        if (!stopCardWatcher) return
+        if (!card || card.status === 'sealed' || card.status === 'error') return
+        const carry = Number.isFinite(card.cursor) ? card.cursor : 0
+        stopCardWatcher()
+        card.status = 'sealed'
+        void syncCard(bot, chatId, card, true).catch(() => {})
+        const fresh = makeCardState()
+        fresh.cursor = carry
+        fresh.blocks.push({ type: 'message', text: '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。' })
+        card = fresh
+        void syncCard(bot, chatId, fresh, true).catch(() => {})
+        stopCardWatcher = startCardWatcher(turnAgent, fresh, bot, chatId, rotateTables)
+        const live = activeTurns.get(turnAgent.id)
+        if (live) live.card = fresh
+      }
+      let stopCardWatcher = startCardWatcher(turnAgent, card, bot, chatId, rotateTables)
+      // Register this turn's live card so ask_user_question can split the
+      // stream: when the user answers, the old card (above the question card)
+      // is frozen and a fresh card takes over for the post-answer narration.
+      const entry = {
+        card, bot, chatId,
+        split: () => {
+          if (card.status === 'sealed' || card.status === 'error') return
+          // 1) Freeze the current card: stop its watcher, seal it in place.
+          stopCardWatcher()
+          card.status = 'sealed'
+          card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+          card.blocks.push({ type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
+          void syncCard(bot, chatId, card, true).catch(() => {})
+          // 2) Open a fresh card below for the rest of this turn. Resume the
+          // watcher from the CURRENT event position so events already shown
+          // on the old card are not replayed onto the fresh one.
+          const fresh = makeCardState()
+          // 新卡游标 = 当前事件位置：split 之前的内容**已经**在旧卡上，绝不能再重放一遍
+          // （旧实现的 seal 前补扫从 seqBefore 重放整轮，造成新卡与旧卡内容大面积重复）。
+          fresh.cursor = sessionEvents(turnAgent.session).length
+          fresh.blocks.push({ type: 'message', text: '继续处理中…' })
+          card = fresh
+          void syncCard(bot, chatId, fresh, true).catch(() => {})
+          stopCardWatcher = startCardWatcher(turnAgent, fresh, bot, chatId, rotateTables)
+          entry.card = fresh
+        },
+      }
+      activeTurns.set(turnAgent.id, entry)
+      let waitError = null
+      try {
+        await turnAgent.whenIdle()
+      } catch (error) {
+        waitError = error
+        console.log('[fs] turn wait failed for ' + messageId + ': ' + String(error && error.message || error))
+      }
+      stopCardWatcher()
+      activeTurns.delete(turnAgent.id)
+      if (waitError) {
+        card.status = 'error'
+        void syncCard(bot, chatId, card, true).catch(() => {})
+        return { card, reply: '（Agent 未产生文字回复）', hadOutput: false, waitError }
+      }
+      // Catch-up scan: if the turn finished faster than the watcher's poll
+      // interval, fold every event into the card now so narration and tool
+      // panels are not lost. 用**本卡自己的游标**（不是本轮起点）→ 已镜像过的不会重放。
+      scanCard(turnAgent, card)
+      // Seal: promote the last note (the final reply) to a message block so
+      // the reply is not duplicated as narration; drop the placeholder; kill
+      // the status line.
+      const events = sessionEvents(turnAgent.session)
+      let reply = '（Agent 未产生文字回复）'
+      let lastSeq
+      for (let i = events.length - 1; i >= seqBefore; i--) {
+        const event = events[i]
+        if (event && event.type === 'assistant/message') {
+          const spoken = extractProcessText(event.data && event.data.message)
+          if (spoken) { reply = spoken; lastSeq = event.seq; break }
+        }
+      }
+      card.status = 'sealed'
+      card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+      let replaced = false
+      if (lastSeq !== undefined) {
+        for (let i = card.blocks.length - 1; i >= 0; i--) {
+          const b = card.blocks[i]
+          if (b.type === 'note' && b.seq === lastSeq) {
+            card.blocks[i] = { type: 'message', text: reply }
+            replaced = true
+            break
+          }
+        }
+      }
+      if (!replaced) card.blocks.push({ type: 'message', text: reply })
+      return {
+        card,
+        reply,
+        hadOutput: lastSeq !== undefined || card.tools.size > 0,
+        waitError: null,
+      }
+    }
+
+    let turn = await runTurn(agent)
+    if (!turn.hadOutput && sessionReused) {
+      // Reused/resumed session produced nothing at all — the signature of a
+      // session whose turn was killed by a dsh web restart (2026-09-08). Drop
+      // it and answer from a brand-new session so the user never gets a blank
+      // reply; keep the old entry's history in DSH storage, just unbind it.
+      const stale = chat.sessions[chat.activeIndex]
+      console.log('[fs] session ' + (stale && stale.id || '?') + ' produced no output; recreating session and retrying once')
+      chat.sessions.splice(chat.activeIndex, 1)
+      if (chat.sessions.length === 0) chat.activeIndex = 0
+      else if (chat.activeIndex >= chat.sessions.length) chat.activeIndex = chat.sessions.length - 1
+      const sessionId = 'fs-main-' + Date.now().toString(36)
+      try {
+        const handle = await createDedicated(bot, sessionId)
+        chat.sessions.push({ id: sessionId, label: '主会话（自愈）', type: 'dedicated', gen: SESSION_GEN, handle })
+        chat.activeIndex = chat.sessions.length - 1
+        persistChats(bot, bot.chats)
+        turn = await runTurn(handle.agent)
+        turn.reply = '⚠️ 检测到上一会话无响应（可能被 dsh 重启打断），已自动重建会话。\n\n' + turn.reply
+        console.log('[fs] heal: recreated session ' + sessionId + ' and retried the message')
+      } catch (error) {
+        console.log('[fs] heal create failed: ' + String(error && error.message || error))
+      }
+    }
+    if (turn.waitError) {
       removeReactionOnce()
       return
     }
-    stopCardWatcher()
-
-    // Catch-up scan: if the turn finished faster than the watcher's poll
-    // interval, fold every event into the card now so narration and tool
-    // panels are not lost.
-    scanEvents(agent, { from: seqBefore }, card)
-
-    // Seal: promote the last note (the final reply) to a message block so the
-    // reply is not duplicated as narration; drop the placeholder; kill the
-    // status line.
-    const events = agent.session.events
-    let reply = '（Agent 未产生文字回复）'
-    let lastSeq
-    for (let i = events.length - 1; i >= seqBefore; i--) {
-      const event = events[i]
-      if (event && event.type === 'assistant/message') {
-        const spoken = extractProcessText(event.data && event.data.message)
-        if (spoken) { reply = spoken; lastSeq = event.seq; break }
-      }
-    }
-    card.status = 'sealed'
-    card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
-    let replaced = false
-    if (lastSeq !== undefined) {
-      for (let i = card.blocks.length - 1; i >= 0; i--) {
-        const b = card.blocks[i]
-        if (b.type === 'note' && b.seq === lastSeq) {
-          card.blocks[i] = { type: 'message', text: reply }
-          replaced = true
-          break
-        }
-      }
-    }
-    if (!replaced) card.blocks.push({ type: 'message', text: reply })
-
     let cardDelivered = false
     try {
-      await syncCard(bot, chatId, card, true)
-      cardDelivered = !!card.token && !card.circuitOpen
+      await syncCard(bot, chatId, turn.card, true)
+      cardDelivered = !!turn.card.token && !turn.card.circuitOpen
     } catch {
       cardDelivered = false
     }
     if (!cardDelivered) {
       try {
-        const res = await sendPlainText(bot, chatId, reply)
+        const res = await sendPlainText(bot, chatId, turn.reply)
         console.log('[fs] fallback text reply to ' + chatId + ' status=' + String(res.status))
       } catch (error) {
         console.log('[fs] send failed for ' + messageId + ': ' + String(error && error.message || error))
@@ -1187,6 +1722,20 @@ export function apply(ctx) {
     return undefined
   }
 
+  // Look up which bot owns a chat id (for replying from card-action callbacks
+  // where we only know open_chat_id, e.g. stale question-card taps).
+  function findBotForChat(chatId) {
+    if (!chatId) return undefined
+    for (const bot of bots.values()) {
+      if (bot.chats && bot.chats.has(chatId)) return bot
+    }
+    // Fall back to the bot that most recently heard from this chat.
+    for (const bot of bots.values()) {
+      if (bot.lastChatId === chatId) return bot
+    }
+    return undefined
+  }
+
   function approvalCardPayload(toolName, reason, token) {
     return {
       config: { wide_screen_mode: true },
@@ -1304,7 +1853,20 @@ export function apply(ctx) {
       const chatId = data && data.context && data.context.open_chat_id
       const record = chatId ? pendingQuestions.get(chatId) : undefined
       if (!record || record.token !== value.fs_question) {
-        console.log('[fs] question button: record not found for chat ' + chatId)
+        // Stale-card click (already answered / superseded) must never be a
+        // silent no-op: tell the user visibly instead of dropping the tap.
+        // (2026-09-08 CM: clicked a stale card button -> nothing happened.)
+        console.log('[fs] question button: record not found for chat ' + chatId + ' token=' + value.fs_question)
+        const stale = chatId ? recentQuestions.get(chatId) : undefined
+        const hint = (stale && stale.token === value.fs_question)
+          ? '该选项已经处理过了（点过即生效）。请看我最新一条消息，或直接回复文字。'
+          : '这张卡片已过期（可能已经回答过）。请看我最新一条卡片，或直接回复文字即可。'
+        if (chatId) {
+          const ownerBot = findBotForChat(chatId)
+          if (ownerBot) {
+            sendPlainText(ownerBot, chatId, '⚠️ ' + hint).catch(() => {})
+          }
+        }
         return
       }
       const q = record.questions[0]
@@ -1312,17 +1874,42 @@ export function apply(ctx) {
       const opt = opts[Number(value.fs_option)]
       if (!opt) {
         console.log('[fs] question button: bad option index ' + value.fs_option)
+        if (chatId) {
+          const ownerBot = findBotForChat(chatId)
+          if (ownerBot) {
+            sendPlainText(ownerBot, chatId, '⚠️ 无法识别该选项，请直接回复文字。').catch(() => {})
+          }
+        }
         return
       }
       pendingQuestions.delete(chatId)
       if (record.timer) clearTimeout(record.timer)
       console.log('[fs] question answered via button: ' + q.id + ' -> ' + opt.label)
+      // Keep the last answered token per chat so a second tap on the same
+      // (now stale) card gets a friendly hint instead of silence.
+      recentQuestions.set(chatId, { token: value.fs_question, answeredAt: Date.now() })
+      // Split the streaming card: the old one sits above this question card,
+      // so the rest of the turn must continue on a NEW card below it
+      // (2026-09-08 CM report). Do this before resolve() so post-answer
+      // narration lands on the fresh card.
+      if (record.agentId) {
+        const turn = activeTurns.get(record.agentId)
+        if (turn && typeof turn.split === 'function') {
+          try { turn.split() } catch (error) {
+            console.log('[fs] question split failed: ' + String(error && error.message || error))
+          }
+        }
+      }
       record.resolve(buildQuestionAnswer(record.questions, opt.label))
       if (record.cardId) {
         updateInteractive(record.bot, record.cardId, questionResultCardPayload(q, opt.label))
           .catch((error) => {
             console.log('[fs] question card update failed: ' + String(error && error.message || error))
+            // Fallback: a visible text confirmation so the tap never looks dead.
+            sendPlainText(record.bot, chatId, '✅ 已收到：' + opt.label).catch(() => {})
           })
+      } else if (chatId) {
+        sendPlainText(record.bot, chatId, '✅ 已收到：' + opt.label).catch(() => {})
       }
       return
     }
@@ -1362,12 +1949,101 @@ export function apply(ctx) {
     return askApprovalCard(owner.bot, owner.chatId, request)
   })
 
+  // ---- 审批前置拦截：把"审计类 ask"搬到飞书（2026-09-16 CM 拍板）--------------------
+  // 为什么要自己拦：审计插件返回 {kind:"ask"} 后，主程序走它自己的 `ctx.approval`
+  // （PC 一次性提示），**绕开**我们已有的 `approval/request` 卡片链路 —— 实机日志已验证：
+  // 5 次 `sentinel: ask`（01:49 / 05:50 / 05:55 / 05:56×2）**没有一次**走到 approval/request，
+  // 所以飞书上根本收不到卡，CM 只能在电脑上点。
+  // 修法：在**更前面的** `tools/pre-execute` 自己拦 —— 发飞书卡、等点击、再决定放行/拦截。
+  // 这样 `ctx.approval` 根本不会被触发，审批只出现在飞书。
+  // 开关：环境变量 DSH_FEISHU_APPROVAL=0 关闭（关掉即退回原行为）。
+  const APPROVAL_ON_FEISHU = String(process.env.DSH_FEISHU_APPROVAL ?? '1').trim() !== '0'
+  // 需要确认的两类（**故意收窄**：只拦"外发数据"和"工作区外写入"，避免把常用操作都拦下来）
+  //
+  // 2026-09-16 收窄（CM 拍板）：原正则尾部的 `nc ` 是**两个字母加一个空格**，
+  // 太短，极易在多行命令拼接后误命中，把纯读操作判成"联网/外发命令"并弹审批卡；
+  // CM 未及时点 → 命令直接被拒（实测白费一轮排查）。
+  // 现处理：
+  //   ① 所有词都加 `\b` 词边界（避免路径/文件名里出现 ssh、ftp 等子串被误判）；
+  //   ② `nc` 要求后接空白 + 短横线（`\bnc\s+-`），即真实的 netcat 调用形式，
+  //      纯文本里出现 "nc " 不再触发；
+  //   ③ 补上常被忽略的真实外发命令：`socat`、`telnet`、`Test-NetConnection`、`tracert`。
+  const EGRESS_CMD_RE = /(\bcurl\b|\bwget\b|\bInvoke-WebRequest\b|\biwr\b|\bncat\b|\bsocat\b|\btelnet\b|\bssh\b|\bscp\b|\bsftp\b|\bftp\b|\bnc\s+-|\bTest-NetConnection\b)/i
+  const SHELL_TOOLS = /^(terminal|pwsh|powershell|shell|exec|bash|cmd)$/i
+  const WRITE_TOOLS = /^(write|write_file|patch|edit|edit_file|apply_patch)$/i
+  let lastChat = null          // { bot, chatId }：最近收到消息的会话，用于兜底定位
+
+  function normPath(v) {
+    return String(v || '').split(String.fromCharCode(92)).join('/').toLowerCase()
+  }
+  function workspaceOf(bot) {
+    return normPath(bot && (bot.workspace || (bot.config && bot.config.workspace) || ''))
+  }
+  // 返回"需要确认的理由"，null = 放行
+  function approvalReasonFor(exec, bot) {
+    const name = String((exec && exec.name) || '')
+    const args = (exec && (exec.arguments || exec.args)) || {}
+    if (SHELL_TOOLS.test(name)) {
+      const cmd = String(args.command || args.cmd || '')
+      // 只测**命令主体**：砍掉 '#' 之后的注释（PowerShell 注释里提到 curl 也拦 = 误报，
+      // 2026-09-16 实测被拦过一条 `Write-Output ... # 旧正则会拦这条`）
+      const body = String(cmd).split('#')[0]
+      if (body && EGRESS_CMD_RE.test(body)) return '联网/外发命令：' + body.split(' ').filter(Boolean).join(' ').slice(0, 140)
+      return null
+    }
+    if (WRITE_TOOLS.test(name)) {
+      const target = String(args.path || args.file_path || args.filename || '')
+      const ws = workspaceOf(bot)
+      if (target && ws && !normPath(target).startsWith(ws)) return '工作区外写入：' + target.slice(0, 160)
+      return null
+    }
+    return null
+  }
+  function ownerForExec(exec) {
+    const agent = exec && exec.agent
+    if (agent) {
+      const hit = findChatForAgent(agent)
+      if (hit) return hit
+    }
+    return lastChat                      // 兜底：最近活跃会话（拿不到 agent 时）
+  }
+
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    const pass = () => (typeof next === 'function' ? next() : undefined)
+    if (!APPROVAL_ON_FEISHU) return pass()
+    try {
+      const owner = ownerForExec(exec)
+      if (!owner) return pass()
+      const reason = approvalReasonFor(exec, owner.bot)
+      if (!reason) return pass()
+      console.log('[fs] approval needed (pre-execute): ' + String(exec && exec.name) + ' — ' + reason)
+      const outcome = await askApprovalCard(owner.bot, owner.chatId,
+        { toolName: String(exec && exec.name || 'tool'), reason })
+      // 注意：askApprovalCard 的返回值是 'allowed-once' / 可能还有 'allowed-always' /
+      // 'rejected' / 'cancelled' —— 旧代码写 `=== 'allowed'` **永远不成立**，
+      // 导致"你在飞书点了允许，agent 收到的却是拒绝"（2026-09-16 实机日志抓到）。
+      // 现在按前缀判定，并把原始值打进日志，便于以后一眼确认。
+      const verdict = String(outcome || '')
+      if (verdict.indexOf('allowed') === 0) {
+        console.log('[fs] approval granted on Feishu (' + verdict + '): ' + String(exec && exec.name))
+        return pass()
+      }
+      console.log('[fs] approval ' + outcome + ' on Feishu — denying: ' + String(exec && exec.name))
+      return { kind: 'deny', reason: '用户在飞书' + (outcome === 'rejected' ? '拒绝' : '未在时限内确认') + '：' + reason }
+    } catch (error) {
+      // 出错一律放行（保持原有行为，绝不因审批自身故障把 agent 卡死）；但记日志
+      console.log('[fs] approval hook error (passing through): ' + String(error && error.message || error))
+      return pass()
+    }
+  })
+
   // ---- user questions (ask_user_question over Feishu, plugin-only) ----------
   // We intercept the ask_user_question tool dispatch on the tools/execute
   // waterfall — no harness source changes needed, so the open-source plugin
   // works on stock DSH builds. The question goes out as a plain message; the
   // next message in the chat is the answer, returned as the tool result.
   const pendingQuestions = new Map()    // chatId -> { resolve, reject, questions, timer }
+  const recentQuestions = new Map()     // chatId -> { token, answeredAt } (last answered question card, for stale-tap hints)
 
   function buildQuestionAnswer(questions, text) {
     return {
@@ -1431,13 +2107,13 @@ export function apply(ctx) {
     }
   }
 
-  function askUserQuestion(bot, chatId, questions, signal) {
+  function askUserQuestion(bot, chatId, questions, signal, agentId) {
     return new Promise((resolve, reject) => {
       const q = questions[0]
       const opts = (q.options || []).slice(0, QUESTION_MAX_BUTTONS)
       const record = {
         resolve, reject, questions, timer: undefined, token: randomUUID(),
-        cardId: undefined, bot, chatId, q,
+        cardId: undefined, bot, chatId, q, agentId,
       }
       pendingQuestions.set(chatId, record)
       record.timer = setTimeout(() => {
@@ -1488,7 +2164,7 @@ export function apply(ctx) {
     const args = exec.arguments || {}
     const questions = Array.isArray(args.questions) ? args.questions : []
     if (questions.length === 0) return next()
-    const answer = await askUserQuestion(owner.bot, owner.chatId, questions, exec.signal)
+    const answer = await askUserQuestion(owner.bot, owner.chatId, questions, exec.signal, exec.agent.id)
     return {
       isError: false,
       value: answer,
@@ -1586,7 +2262,7 @@ export function apply(ctx) {
   // ---- model tool: proactive send -------------------------------------------------
   const tool = defineTool({
     name: 'feishu_send',
-    description: 'Send a text message to a Feishu chat through a configured app bot (~/.dsh-feishucard/feishu.config.json). chatId is optional: it defaults to the most recent chat that messaged the bot. appId is optional: it selects which bot to use (defaults to the bot that last received a message).',
+    description: 'Send a text message to a Feishu chat through a configured app bot (~/.dsh-feishucard/feishu.config.json). chatId is optional: it defaults to the most recent chat that messaged the bot. appId is optional: it selects which bot to use (defaults to the bot that last received a message). NOTE: replying to the user in an ongoing Feishu conversation does NOT need this tool — the reply is delivered as a card automatically; calling it mid-conversation sends a SECOND message and duplicates the answer.',
     parameters: {
       text: { type: 'string', required: true, description: 'Text content to send.' },
       chatId: { type: 'string', description: 'Target chat id (oc_...). Omit to send to the most recent chat that messaged the bot.' },
@@ -1624,6 +2300,24 @@ export function apply(ctx) {
         bot = best
       }
       const chatId = typeof args.chatId === 'string' && args.chatId.length > 0 ? args.chatId : undefined
+      // 2026-09-15 修复：对话进行中不要另发一条消息。
+      // 实测（CM 反馈"同一段东西分两个卡片发"）：agent 在回答时调用了 feishu_send，
+      // 把同一段回复主动发了一遍；紧接着这段内容又作为最终回复进了流式卡
+      // → 用户看到两张卡片、内容重复。飞书对话的回复本来就会自动显示在卡片上，
+      // 所以"目标 chat 正是当前活跃 turn"时应当跳过，并明确告诉 agent 不需要它。
+      const targetChat = chatId || bot.lastChatId
+      if (targetChat) {
+        const active = findActiveCardForChat(targetChat)
+        if (active) {
+          console.log('[fs] feishu_send skipped (active card in this chat): ' + targetChat)
+          return {
+            ok: true,
+            status: 200,
+            detail: '（已跳过）当前对话的回复会自动显示为飞书卡片，无需调用 feishu_send；'
+              + '请直接把要说的内容作为最终回答输出。若确实要发到别的会话，请显式传 chatId。',
+          }
+        }
+      }
       try {
         const res = await sendPlainText(bot, chatId, String(args.text))
         return { ok: res.status >= 200 && res.status < 300, status: res.status, detail: String(res.text || '').slice(0, 1000) }
