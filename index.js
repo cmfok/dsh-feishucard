@@ -996,7 +996,7 @@ export function apply(ctx) {
   }
 
   // ---- commands --------------------------------------------------------------
-  const COMMANDS = ['help', 'new', 'switch', 'list', 'plan', 'stop']
+  const COMMANDS = ['help', 'new', 'switch', 'list', 'plan', 'goal', 'stop']
 
   function splitCommand(text) {
     const trimmed = (text || '').trim()
@@ -1013,12 +1013,23 @@ export function apply(ctx) {
     return prefix
   }
 
+  // `/goal` 的正文由 harness 的 command-goal 实现渲染（英文标签：Goal created /
+  // Status / Objective / Rounds）。这里只在"刚启动一轮目标"时补一句中文说明，
+  // 让 CM 知道接下来飞书上会发生什么 —— 每轮一张进度卡，不需要他催。
+  const GOAL_START_HINT = '（目标模式下我会自动一轮一轮接着干；每一轮的进度都会在这张聊天里开卡更新，'
+    + '轮结束封口写「本轮结束」。随时 /goal 查看状态，/goal pause 暂停。）'
+  function normalizeGoalReply(text) {
+    const body = String(text || '').trim() || 'ok'
+    if (/^Goal (created|resumed)/iu.test(body)) return body + '\n\n' + GOAL_START_HINT
+    return body
+  }
+
   async function handleCommand(bot, chat, chatId, cmd) {
     const resolved = resolveCommandName(cmd.name)
     if (!resolved) return false
     if (resolved === 'help') {
       await sendPlainText(bot, chatId,
-        '/new [名称] 新建会话\n/switch <序号> 切换会话\n/list 列出会话\n/plan [off] 计划模式开关\n/stop 停止当前任务\n/help 帮助')
+        '/new [名称] 新建会话\n/switch <序号> 切换会话\n/list 列出会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause|resume|clear|edit <目标>\n/stop 停止当前任务\n/help 帮助')
       return true
     }
     if (resolved === 'stop') {
@@ -1091,6 +1102,52 @@ export function apply(ctx) {
       await sendPlainText(bot, chatId, off
         ? '已退出计划模式（' + outcome + '）。'
         : '已进入计划模式（' + outcome + '）。提交计划时我会通过评审卡片请你确认。')
+      return true
+    }
+    if (resolved === 'goal') {
+      const active = chat.sessions[chat.activeIndex]
+      const agent = active && active.handle && active.handle.agent
+      if (!agent) {
+        await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /goal <目标>。')
+        return true
+      }
+      // 目标模式（CM 2026-09-16）：走与 /plan 同一条命令通道 —— command-goal 插件
+      // 已在 `commands` 注册表登记 /goal，能正确处理 <目标>|pause|resume|clear|edit。
+      const line = cmd.arg ? '/goal ' + cmd.arg : '/goal'
+      let handled = false
+      try {
+        const commands = ctx.get('commands')
+        if (commands && typeof commands.execute === 'function') {
+          const exec = await commands.execute(agent, line, new AbortController().signal)
+          if (exec !== undefined) {
+            const text = exec.result && exec.result.text ? exec.result.text : 'ok'
+            await sendPlainText(bot, chatId, normalizeGoalReply(text))
+            handled = true
+          } else {
+            console.log('[fs] /goal: commands.execute resolved nothing, falling back')
+          }
+        }
+      } catch (error) {
+        console.log('[fs] /goal via commands failed: ' + String(error && error.message || error))
+      }
+      if (handled) return true
+      // 兜底：命令注册表不可用时直接调 goals 服务（只覆盖创建；其余子命令提示用法）。
+      const goals = ctx.get('goals')
+      if (!goals || typeof goals.create !== 'function') {
+        await sendPlainText(bot, chatId, '目标模式不可用（goal 插件未装载）。')
+        return true
+      }
+      if (!cmd.arg || /^(pause|resume|clear|edit)(\s|$)/iu.test(cmd.arg)) {
+        await sendPlainText(bot, chatId, '用法：/goal <目标> ｜ /goal（查看状态）｜ /goal pause ｜ /goal resume ｜ /goal clear ｜ /goal edit <新目标>')
+        return true
+      }
+      try {
+        const view = goals.create(agent, { objective: cmd.arg })
+        await sendPlainText(bot, chatId, '目标已创建：' + view.objective
+          + '（轮数 ' + view.roundsStarted + '/' + view.maxGoalRounds + '）\n\n' + GOAL_START_HINT)
+      } catch (error) {
+        await sendPlainText(bot, chatId, '创建目标失败：' + String(error && error.message || error))
+      }
       return true
     }
     if (resolved === 'new') {

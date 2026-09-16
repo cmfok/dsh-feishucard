@@ -104,6 +104,17 @@ const fakeProc = {
   kill() { this.status = 'killed' },
 }
 
+// 目标模式：假的 goals 服务 + 假的命令注册表（用例 14 用）
+const goalCalls = []          // goals.create 收到什么
+const commandCalls = []       // commands.execute 收到什么
+const fakeGoals = {
+  create(agent, request) {
+    goalCalls.push({ agentId: agent && agent.id, objective: request && request.objective })
+    return { objective: request && request.objective, roundsStarted: 0, maxGoalRounds: 10, phase: 'active' }
+  },
+}
+const fakeCommands = { execute: async () => undefined }   // 默认"注册表没接管" → 走 goals 兜底
+
 const ctx = {
   get(key) {
     if (key === 'agents') {
@@ -119,6 +130,8 @@ const ctx = {
     }
     if (key === 'sandboxPolicy') return { workspaceRoot: WORKSPACE }
     if (key === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'test', model: 'test-model' }) }
+    if (key === 'goals') return fakeGoals
+    if (key === 'commands') return fakeCommands
     return undefined
   },
   shell: {
@@ -517,6 +530,55 @@ console.log('13b) 目标卡照样享受表格换卡（新功能 × 既有换卡�
     '第 6 张表落在新卡且保持 markdown 原样（未被降级）')
   ok(!JSON.stringify(all.slice(0, hintAt < 0 ? 0 : hintAt)).includes('| 列6 |'),
     '第 6 张表没有跑到旧卡（游标接续不重不漏）')
+}
+
+console.log('14) 飞书命令 /goal：目标模式入口（CM 2026-09-16 要求）')
+{
+  const mark = sentCards.length
+  const sentBefore = agent.sent.length
+  // 取本次命令的纯文本回复（sendPlainText 发的是 1.0 卡片，elements[0].content 即正文）
+  const replyText = () => {
+    const creates = sentCards.slice(mark)
+      .filter((c) => c.op === 'create' && c.payload && !c.payload.schema && Array.isArray(c.payload.elements))
+    const last = creates[creates.length - 1]
+    return last ? String(last.payload.elements[0].content || '') : ''
+  }
+
+  // ① 命令注册表未接管（execute 返回 undefined）→ 走 goals 服务兜底
+  fakeCommands.execute = async () => undefined
+  const usesBefore = goalCalls.length
+  feedInbound('om_goal_cmd_1', '/goal 把 A 项目的总结写完')
+  await drain()
+  ok(goalCalls.length === usesBefore + 1 && goalCalls[goalCalls.length - 1].objective === '把 A 项目的总结写完',
+    '目标原样传给 goals.create（' + JSON.stringify(goalCalls[goalCalls.length - 1] || null) + '）')
+  ok(replyText().includes('目标已创建'), '飞书回复创建结果')
+  ok(replyText().includes('开卡更新'), '回复里说明接下来每轮会发进度卡')
+
+  // ② /goal 属于命令，不该被当成普通消息丢给模型
+  ok(agent.sent.length === sentBefore, '/goal 没有走普通消息路径（模型未收到）')
+
+  // ③ 命令注册表可用时优先走它（子命令 pause/resume/clear/edit 都由它处理）
+  const registry = []
+  fakeCommands.execute = async (_agent, line) => { registry.push(line); return { result: { text: 'Goal paused\nStatus: paused' } } }
+  feedInbound('om_goal_cmd_2', '/goal pause')
+  await drain()
+  ok(registry.includes('/goal pause'), '子命令透传到 harness 命令通道（' + JSON.stringify(registry) + '）')
+  ok(replyText().includes('Goal paused'), '命令通道的返回原样发回飞书')
+  ok(!replyText().includes('开卡更新'), '暂停时不补"会发进度卡"的提示')
+
+  // ④ 无参数 = 查看状态，同样透传
+  feedInbound('om_goal_cmd_3', '/goal')
+  await drain()
+  ok(registry.includes('/goal'), '无参数 /goal 透传为状态查询')
+
+  // ⑤ 注册表也没接管 + 是子命令 → 不静默、给用法（不能把 pause 当成新目标）
+  const usesBefore2 = goalCalls.length
+  fakeCommands.execute = async () => undefined
+  feedInbound('om_goal_cmd_4', '/goal pause')
+  await drain()
+  ok(goalCalls.length === usesBefore2, '子命令不会被误当成新目标创建')
+  ok(replyText().includes('用法：/goal'), '给出用法提示（不静默失败）')
+  fakeCommands.execute = async () => undefined
 }
 
 console.log('')

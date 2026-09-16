@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added（2026-09-16，CM 要求：飞书里直接开目标模式 —— `/goal` 命令）
+
+原来飞书里打 `/goal` 不生效：桥的命令白名单 `COMMANDS = ['help','new','switch','list','plan','stop']`
+不含 `goal`，`resolveCommandName()` 返回 undefined → 整条消息被当普通话转给模型。
+
+- `COMMANDS` 增加 `goal`；新增 `goal` 分支，**走与 `/plan` 同一条命令通道**
+  （`ctx.get('commands').execute(agent, '/goal …', signal)`）→ `command-goal` 插件正确处理
+  ` <目标> ` / 无参数（查看状态）/ `pause` / `resume` / `clear` / `edit <新目标>`。
+- **兜底**：命令注册表不可用（`execute` 返回 undefined 或抛错）时直连 `ctx.get('goals').create(agent, { objective })`
+  创建目标；子命令在这种状态下**不猜测**，只回用法（避免把 `pause` 误建成目标）。
+- 目标刚创建/恢复时补一句中文提示（`normalizeGoalReply` + `GOAL_START_HINT`）：
+  「接下来每轮都会在这张聊天里开卡更新」；命令输出正文仍用 harness 原文（不翻译引擎输出）。
+- `/help` 文案同步补 `/goal`。
+- **测试**（`scripts/smoke.mjs` 用例 14）：mock 增加假 `goals` / `commands` 服务，覆盖
+  ① 注册表未接管 → 走 `goals` 兜底且 objective 原样传递；② `/goal` 不被丢给模型（模型零接收）；
+  ③ 注册表可用时 `/goal pause` 与无参数 `/goal` 都透传、返回原样回飞书、暂停时不补启动提示；
+  ④ 子命令在兜底态**不会**被误建成新目标，且给出用法（不静默失败）。
+
 ### Added（2026-09-16，CM 拍板方案 A：目标模式的**工作过程**也发到飞书）
 
 CM 原话诉求：「你处在目标模式的时候，我在飞书上也能看到你工作的过程。」
