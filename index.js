@@ -1703,7 +1703,11 @@ export function apply(ctx) {
 
   // ---- approval cards (dsh approval/request -> Feishu card with buttons) -----
   const pendingApprovals = new Map()     // token -> record { bot, chatId, request, settle, timer, cardId }
-  const APPROVAL_TIMEOUT_MS = 3 * 60 * 1000
+  // 2026-09-16 CM 反馈：3 分钟太短，人常常不在手机前，卡就自动过期被拒了（实测拦掉一条
+  // 正常的 git push）。改为 10 分钟；卡片文案由本常量推导，别再写死数字（原来文案里
+  // 硬编码了"3 分钟"，改常量不改文案会自相矛盾）。
+  const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
+  const APPROVAL_TIMEOUT_MIN = Math.round(APPROVAL_TIMEOUT_MS / 60000)
 
   // planMode service arrives via dependency injection (cordis scopes make a
   // plain ctx.get miss cross-bundle services; the commands registry is
@@ -1746,7 +1750,7 @@ export function apply(ctx) {
             text: {
               tag: 'lark_md',
               content: '**工具**：`' + toolName + '`\n**说明**：' + (reason || '（无说明）')
-                + '\n\n是否允许执行（仅本次）？\n⏰ 3 分钟内未操作将自动拒绝。',
+                + '\n\n是否允许执行（仅本次）？\n⏰ ' + APPROVAL_TIMEOUT_MIN + ' 分钟内未操作将自动拒绝。',
             },
           },
         {
