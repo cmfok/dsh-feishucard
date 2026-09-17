@@ -2016,11 +2016,31 @@ export function apply(ctx) {
     } catch { return undefined }
   }
 
+  // 读一份会话日志快照（调用方只用 `{ events }`）。跨版本策略：**先试 0.1.6 的 sessionQuery，失败再退回旧调用**。
+  // - 0.1.6+：`ctx.sessionQuery.readSession(id)` → `SessionLogSnapshot`
+  //   `{ session, inheritedEventCount, events: SessionEvent[] }`；events 是"从 seq 0 起的连续原始事件"。
+  //   依据：@deepseek-ai/dsh-session-query@0.1.6-alpha.1 的 lib/types/index.d.ts:readSession、
+  //   lib/types/types.d.ts:SessionLogSnapshot，及 lib/index.js:1074 的实现（返回上述三个字段）。
+  // - 旧宿主：`sessionPersistence.readFrom(id, 0)` → `{ events }`（该 API 在 0.1.6 已不存在，见 READFROM-FIX.md）。
+  async function readSessionLog(sp, sessionId) {
+    const sq = ctx.get('sessionQuery')
+    if (sq && typeof sq.readSession === 'function') {
+      try {
+        const snap = await sq.readSession(sessionId)
+        if (snap && Array.isArray(snap.events)) return snap
+      } catch (error) {
+        console.log('[fs] switch: sessionQuery.readSession failed for ' + sessionId + ': ' + String(error && error.message || error))
+      }
+    }
+    if (sp && typeof sp.readFrom === 'function') return sp.readFrom(sessionId, 0)
+    return undefined
+  }
+
   // 首条用户消息（摘要）：只对**体积可控**的日志读，绝不为列个表去解析几百 MB 的历史。
   async function firstUserText(sp, meta, size) {
     if (Number.isFinite(size) && size > SWITCH_SUMMARY_MAX_BYTES) return ''
     try {
-      const pending = Promise.resolve(sp.readFrom(meta.id, 0))
+      const pending = readSessionLog(sp, meta.id)
       pending.catch(() => {})                       // 超时后仍会 reject：先挂上处理器
       const raced = await Promise.race([
         pending,
