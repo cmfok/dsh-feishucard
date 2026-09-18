@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
+### Not a defect（2026-09-16 已核实，避免重复排查）
+
+**「卡片只有工具、看不到它中途说的话」= 模型本来就不在中途说话，不是卡片吞了内容。**
+
+CM 追问后按**轮**切开会话日志统计（脚本 `output/dsh-install/analyze-narration.mjs`），结论：
+
+- 每个回合都**只有 1 段文字，且发生在最后一个工具之后**（即收尾总结），**"开场说话"次数恒为 0** ——
+  它从不说"我先去查一下 X"再动手，而是闷头调工具、最后交一段报告。
+- 大量"思考"在 `reasoning` 块里（最近 150 条 assistant 消息中 **105 条有 reasoning、仅 25 条有 text**；
+  reasoning 合计 ~15.6 万字 vs text ~3.2 万字）—— **`extractProcessText()` 只取 `text` 块，reasoning 不推送**，
+  这是 2026-08 起的既有设计（源码注释：*"reasoning blocks are NOT pushed"*），**不是缺陷**；
+  CM 2026-09-16 明确表示**不需要**后台思考过程，只要"它说出来的话"，故不做 reasoning 面板。
+- 因此卡片显示"工具 → 结果"是**忠实反映**；真正被丢掉的只有目标轮的**收尾报告**（见上一节 Fixed，已修）。
+- 若将来想让卡片出现"它正在做什么"的自然语言，只能让**模型多说**（给它加执行风格约定）或由卡片
+  从工具调用机械生成旁白；CM 本轮判断"它就是这么工作的，不用改"，故**不做**。
+
 ### Fixed（2026-09-16，CM 实测反馈：目标轮卡片"只有工具记录、一句话都没有"）
 
 **根因：目标卡封口时缺少"补扫"（catch-up scan），每轮的收尾汇报被丢掉。**
@@ -279,10 +297,6 @@ Hermes 侧踩过的坑 DSH 这边也有一份：
   **长代码框折叠**、**建卡幂等**（用 `createReturnsEmptyId` 开关模拟返回体缺 message_id）。
   这些断言在修复过程中直接抓出两处我自己的实现漏洞（入口检查漏掉并发排队的 create；断言把
   兜底纯文本误计为重复建卡）。
-
-## [Unreleased]（早前）
-
-### Added
 
 - **飞书文件消息静默丢弃 → 自动收件（2026-09-09 CM 实测）**：`handleInbound` 对无文本的文件/图片消息直接 return，用户发文件 agent 无感知。修复：新增 `downloadInboundFile`——识别 file/image/audio/media 消息的 file_key，经消息资源 API 下载到 fileInbox（config 可选，缺省 <workspace>/downloaded_files）并注入「收到文件+本地路径」文本；语法 + smoke 全绿（2026-09-09）。
 
