@@ -1605,7 +1605,7 @@ export function apply(ctx) {
     return '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
   }
 
-  function spawnHelper(bot) {
+  async function spawnHelper(bot) {
     const cfg = bot.cfg
     const appId = cfg.appId && String(cfg.appId).trim()
     const appSecret = cfg.appSecret && String(cfg.appSecret).trim()
@@ -1620,7 +1620,13 @@ export function apply(ctx) {
     const spec = ctx.shell.resolve({
       command: 'node ' + quoteArg(HELPER_PATH) + ' ' + quoteArg(appId) + ' ' + quoteArg(appSecret),
     })
-    bot.proc = ctx.shell.start(spec)
+    try {
+      bot.proc = await ctx.shell.start(spec)
+    } catch (error) {
+      console.log('[fs] helper start failed: ' + (error && error.message ? error.message : String(error)))
+      bot.proc = undefined
+      return
+    }
     bot.procKey = key
     console.log('[fs] helper spawned (app ' + appId + ')')
   }
@@ -1679,7 +1685,9 @@ export function apply(ctx) {
       // status 'running', which would otherwise trigger a duplicate spawn on
       // the next 500ms tick (observed: 5x "helper spawned" in a row).
       if (now - bot.spawningAt < 5000) continue
-      spawnHelper(bot)
+      spawnHelper(bot).catch(error => {
+        console.log('[fs] spawnHelper failed: ' + String((error && error.message) || error))
+      })
     }
   }
 
