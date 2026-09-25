@@ -15,8 +15,8 @@
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { dirname, join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'feishu-stream'
@@ -38,10 +38,31 @@ const DRAIN_INTERVAL = 500           // helper stdout drain interval
 const CONFIG_REFRESH_MS = 10000      // config hot-reload cadence
 const STATUS_INTERVAL = 10000        // helper status line cadence
 
+// 构建标记（2026-09-18 落地复验教训）：此前要确认"线上到底跑的是哪一份 index.js"，
+// 只能靠外部 md5 比对源码与 profile 副本 —— 太绕，而且副本是实体拷贝（HMR 碰不到它）。
+// 现在 apply 时直接打印**自身文件**的版本与 md5：`grep 'plugin apply'` 一眼可查。
+// 版本取**部署目录里**的 package.json —— 元数据陈旧（副本曾长期停在 0.2.0）会在这里露出来。
+function buildStamp() {
+  try {
+    const self = fileURLToPath(import.meta.url)
+    let version = '?'
+    try {
+      const pkg = JSON.parse(readFileSync(join(dirname(self), 'package.json'), 'utf8'))
+      version = String(pkg && pkg.version || '?')
+    } catch { /* 缺 package.json 不影响运行，只影响标记里的版本号 */ }
+    const bytes = readFileSync(self)
+    return 'v' + version + ' md5=' + createHash('md5').update(bytes).digest('hex').slice(0, 8)
+      + ' bytes=' + bytes.length
+  } catch (error) {
+    return 'stamp failed: ' + String(error && error.message || error)
+  }
+}
+
 export function apply(ctx) {
   if (globalThis.__dshFeishucardApplyCount === undefined) globalThis.__dshFeishucardApplyCount = 0
   globalThis.__dshFeishucardApplyCount += 1
-  console.log('[fs] plugin apply #' + globalThis.__dshFeishucardApplyCount + ' @ ' + new Date().toISOString())
+  console.log('[fs] plugin apply #' + globalThis.__dshFeishucardApplyCount + ' ' + buildStamp()
+    + ' @ ' + new Date().toISOString())
   let stopping = false
   let lastConfigCheck = 0
   let lastSpawnAt = 0
@@ -121,6 +142,8 @@ export function apply(ctx) {
         ownerOpenId: typeof bot.ownerOpenId === 'string' ? bot.ownerOpenId : '',
         // 2026-09-16：目标模式（goal round）过程卡开关；未设置=开（可用环境变量全局关）
         notifyGoalRounds: typeof bot.notifyGoalRounds === 'boolean' ? bot.notifyGoalRounds : undefined,
+        // 2026-09-21：后台回执轮（子代理／后台 job 完成把模型唤醒）过程卡开关；未设置=开
+        notifyAgentNotices: typeof bot.notifyAgentNotices === 'boolean' ? bot.notifyAgentNotices : undefined,
       })
     }
     return cleaned
@@ -355,6 +378,68 @@ export function apply(ctx) {
       }
     }
     return parts.join('\n').trim()
+  }
+
+  // 本轮失败原因 —— 只认上游**显式标记**，不靠文案去猜（开发标准 §10.2-2）：
+  //   turn/end          → data.reason = { kind:'error', error:{ message, code, status } }
+  //   assistant/attempt → data.stream[].chunk = { type:'finish', reason:{ kind:'error', failure:{...} } }
+  // 背景（2026-09-18 真机事故，会话 fs-main-mu532zzl seq=724-727）：账户余额不足时上游返回
+  // 402 QUOTA「Insufficient Balance」，整轮**一个 assistant/message 都没有**；旧实现只写
+  // 「（Agent 未产生文字回复）」、状态行还显示「✅ 已完成」→ CM：'我都不知道它为什么突然不回我了'。
+  function failureSummary(failure) {
+    const message = String(failure && failure.message || '').trim()
+    const code = String(failure && failure.code || '').trim()
+    const status = failure && failure.status !== undefined && failure.status !== null ? String(failure.status) : ''
+    const tag = [code, status].filter(Boolean).join(' ')
+    const zh = failureZh(failure)
+    const raw = message + (tag ? ' · ' + tag : '')
+    return {
+      message,
+      code,
+      status,
+      zh,
+      // 中文人话在前、上游原文在后（用户 2026-09-21：「它不会提示我欠费」——
+      // 「Insufficient Balance · QUOTA 402」摆在卡面上等于没说）。
+      text: (zh ? zh + '｜' : '') + (raw || '原因未上报（上游没有给出错误内容）'),
+    }
+  }
+
+  // 已知上游错误的**人话**。只做最保守的映射（认不出就不编，原样透传）。
+  function failureZh(failure) {
+    const code = String(failure && failure.code || '').toUpperCase()
+    const status = failure && failure.status !== undefined && failure.status !== null ? String(failure.status) : ''
+    const message = String(failure && failure.message || '')
+    if (code === 'QUOTA' || status === '402' || /insufficient\s*(balance|quota)|balance/i.test(message)) {
+      return '账户欠费／余额不足'
+    }
+    if (status === '401' || code === 'AUTH' || /invalid\s*api\s*key|unauthor/i.test(message)) return 'API 密钥无效或未授权'
+    if (status === '429' || code === 'RATE_LIMIT' || /rate\s*limit|too\s*many\s*requests/i.test(message)) return '被上游限流（请求过快）'
+    if (status === '503' || /overloaded|service\s*unavailable/i.test(message)) return '上游暂时不可用'
+    if (/context\s*window|too\s*long|maximum\s*context/i.test(message)) return '上下文超长'
+    return ''
+  }
+
+  // turn/end 是本轮的**终审**：只要它存在就以它为准（中途某步失败后重试成功的回合，
+  // 不能再被 assistant/attempt 里的旧失败误判成失败）。没有 turn/end 时才回退看 attempt。
+  function turnFailureReason(events, fromSeq) {
+    for (let i = events.length - 1; i >= fromSeq; i--) {
+      const event = events[i]
+      if (!event || event.type !== 'turn/end') continue
+      const reason = event.data && event.data.reason
+      return reason && reason.kind === 'error' && reason.error ? failureSummary(reason.error) : null
+    }
+    for (let i = events.length - 1; i >= fromSeq; i--) {
+      const event = events[i]
+      if (!event || event.type !== 'assistant/attempt') continue
+      const stream = event.data && event.data.stream
+      if (!Array.isArray(stream)) continue
+      for (let j = stream.length - 1; j >= 0; j--) {
+        const chunk = stream[j] && stream[j].chunk
+        const reason = chunk && chunk.type === 'finish' ? chunk.reason : null
+        if (reason && reason.kind === 'error' && reason.failure) return failureSummary(reason.failure)
+      }
+    }
+    return null
   }
 
   const MAX_NOTE_CHARS = 500
@@ -1445,11 +1530,10 @@ export function apply(ctx) {
         content: [{ type: 'text', text: label + text }],
         source: { kind: 'user' },
       }
-      turnAgent.send(message, 'next-turn', true)
       let card = makeCardState()
       card.cursor = seqBefore          // 本卡只消费本轮开始之后的事件
       card.blocks.push({ type: 'message', text: '正在工作中…' })
-      void syncCard(bot, chatId, card, true).catch(() => {})
+      let stopCardWatcher = null       // 在 send() 之前就必须存在（见下方登记顺序注释）
       // 表格额度换卡（CM 2026-09-16 方案）：飞书单卡最多 5 张表，满额时**不降级表格**，
       // 而是把旧卡封住（表格留在旧卡），后续内容写到一张新卡上。
       // 与 split() 的唯一差别：新卡游标 = 旧卡**当前**游标 → 触发换卡的待处理事件落到新卡，
@@ -1470,7 +1554,6 @@ export function apply(ctx) {
         const live = activeTurns.get(turnAgent.id)
         if (live) live.card = fresh
       }
-      let stopCardWatcher = startCardWatcher(turnAgent, card, bot, chatId, rotateTables)
       // Register this turn's live card so ask_user_question can split the
       // stream: when the user answers, the old card (above the question card)
       // is frozen and a fresh card takes over for the post-answer narration.
@@ -1479,7 +1562,7 @@ export function apply(ctx) {
         split: () => {
           if (card.status === 'sealed' || card.status === 'error') return
           // 1) Freeze the current card: stop its watcher, seal it in place.
-          stopCardWatcher()
+          if (stopCardWatcher) stopCardWatcher()
           card.status = 'sealed'
           card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
           card.blocks.push({ type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
@@ -1498,7 +1581,19 @@ export function apply(ctx) {
           entry.card = fresh
         },
       }
+      // ⚠️ 顺序不能改（2026-09-23 修）：必须在 send() **之前**登记 activeTurns。
+      // send() 会把 agent 立刻置为 running，`agent/status` 处理器在**同一拍**里读 activeTurns；
+      // 登记晚一步（旧实现登记在 send 之后）时它读到「没有普通回合」，转而按 kind='notice'
+      // 再开一张卡 —— 同一轮两张卡、都在镜像同一批会话事件（用户看到内容重复的两张卡）。
       activeTurns.set(turnAgent.id, entry)
+      try {
+        turnAgent.send(message, 'next-turn', true)
+      } catch (error) {
+        activeTurns.delete(turnAgent.id)
+        throw error
+      }
+      void syncCard(bot, chatId, card, true).catch(() => {})
+      stopCardWatcher = startCardWatcher(turnAgent, card, bot, chatId, rotateTables)
       let waitError = null
       try {
         await turnAgent.whenIdle()
@@ -1510,8 +1605,15 @@ export function apply(ctx) {
       activeTurns.delete(turnAgent.id)
       if (waitError) {
         card.status = 'error'
+        // 中断同样要把原因说清楚，并且**不能把「正在工作中…」留在卡上**
+        //（旧实现直接 sync 现状 → 卡片永远停在"正在工作中…" + "失败"，用户看不出所以然）。
+        card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+        card.blocks.push({
+          type: 'message',
+          text: '⚠️ 本轮中断：' + String(waitError && waitError.message || waitError),
+        })
         void syncCard(bot, chatId, card, true).catch(() => {})
-        return { card, reply: '（Agent 未产生文字回复）', hadOutput: false, waitError }
+        return { card, reply: '（Agent 未产生文字回复）', hadOutput: false, waitError, failure: null }
       }
       // Catch-up scan: if the turn finished faster than the watcher's poll
       // interval, fold every event into the card now so narration and tool
@@ -1521,6 +1623,7 @@ export function apply(ctx) {
       // the reply is not duplicated as narration; drop the placeholder; kill
       // the status line.
       const events = sessionEvents(turnAgent.session)
+      const failure = turnFailureReason(events, seqBefore)
       let reply = '（Agent 未产生文字回复）'
       let lastSeq
       for (let i = events.length - 1; i >= seqBefore; i--) {
@@ -1530,7 +1633,22 @@ export function apply(ctx) {
           if (spoken) { reply = spoken; lastSeq = event.seq; break }
         }
       }
-      card.status = 'sealed'
+      // 一个字都没说出来时，卡面**必须**说清为什么（2026-09-21 用户原话：「它不会提示我欠费，
+      // 它不会把报错信息报出来，就直接显示说"本轮没有回复"」）：
+      //   ① 有上游失败标记 → 写原因（中文人话 ＋ 上游原文）
+      //   ② 没有失败标记  → 明说"原因未上报"，**不再**留下一句干巴巴的占位符
+      const notSpoken = lastSeq === undefined
+      const silent = notSpoken && card.tools.size === 0
+      if (notSpoken && failure) {
+        reply = '⚠️ 本轮没有产生回复：' + failure.text
+      } else if (silent) {
+        reply = '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI 里这一轮）'
+      }
+      card.status = (notSpoken && (failure || card.tools.size === 0)) ? 'error' : 'sealed'
+      // 留痕：下次"卡片到底写了什么"不用再靠猜（飞书对 2.0 卡片只回占位符，读不回来）。
+      console.log('[fs] turn sealed: status=' + card.status + ' silent=' + silent
+        + ' failure=' + (failure ? failure.text : 'none')
+        + ' reply=' + JSON.stringify(String(reply).slice(0, 160)))
       card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
       let replaced = false
       if (lastSeq !== undefined) {
@@ -1549,17 +1667,29 @@ export function apply(ctx) {
         reply,
         hadOutput: lastSeq !== undefined || card.tools.size > 0,
         waitError: null,
+        failure,
       }
     }
 
     let turn = await runTurn(agent)
-    if (!turn.hadOutput && sessionReused) {
+    if (!turn.hadOutput && turn.failure) {
+      // 上游已经明确报错（402 欠费／401 密钥／429 限流…）⇒ **重建会话修不好它**。
+      // 旧行为：照样重建会话＋重试一次 —— 白跑一轮、二次失败，还把真正的报错
+      // 换成「已自动重建会话重试」（用户 2026-09-21：「它不会提示我欠费…就直接显示
+      // 说本轮没有回复」）。现在：原因留在卡上（runTurn 已写），**不自愈**。
+      console.log('[fs] skip self-heal: upstream failure (' + turn.failure.text + ')')
+    } else if (!turn.hadOutput && sessionReused) {
       // Reused/resumed session produced nothing at all — the signature of a
       // session whose turn was killed by a dsh web restart (2026-09-08). Drop
       // it and answer from a brand-new session so the user never gets a blank
       // reply; keep the old entry's history in DSH storage, just unbind it.
+      const failedTurn = turn
       const stale = chat.sessions[chat.activeIndex]
       console.log('[fs] session ' + (stale && stale.id || '?') + ' produced no output; recreating session and retrying once')
+      // 旧卡不能停在「正在工作中…」：它已经被 runTurn 封口（状态 + 失败原因都在卡对象里），
+      // 但旧的调用路径只在**重试后的**新卡上 sync → 旧卡在飞书里永远转圈（真机 14:35:28 那张）。
+      // 这里把它封口后的状态推上去；建卡本来就失败（createFailed/无 token）时 syncCard 会自行跳过。
+      try { await syncCard(bot, chatId, failedTurn.card, true) } catch { /* 推送失败不影响重试 */ }
       chat.sessions.splice(chat.activeIndex, 1)
       if (chat.sessions.length === 0) chat.activeIndex = 0
       else if (chat.activeIndex >= chat.sessions.length) chat.activeIndex = chat.sessions.length - 1
@@ -1570,7 +1700,13 @@ export function apply(ctx) {
         chat.activeIndex = chat.sessions.length - 1
         persistChats(bot, bot.chats)
         turn = await runTurn(handle.agent)
-        turn.reply = '⚠️ 检测到上一会话无响应（可能被 dsh 重启打断），已自动重建会话。\n\n' + turn.reply
+        // 提示必须**上卡**：旧实现只把它拼进 turn.reply，而卡片送达时用的是卡对象的 blocks
+        // → 走卡片路径的用户根本看不到这句（只有卡片失败退化成纯文本时才带）。
+        // 原因用上游给的真实原因（有的话），不再一律猜「可能被 dsh 重启打断」。
+        const why = failedTurn.failure ? '（' + failedTurn.failure.text + '）' : ''
+        const notice = '⚠️ 上一会话本轮没有产生回复' + why + '，已自动重建会话重试。'
+        turn.reply = notice + '\n\n' + turn.reply
+        turn.card.blocks.unshift({ type: 'message', text: notice })
         console.log('[fs] heal: recreated session ' + sessionId + ' and retried the message')
       } catch (error) {
         console.log('[fs] heal create failed: ' + String(error && error.message || error))
@@ -2778,6 +2914,10 @@ export function apply(ctx) {
   // 开关：环境变量 DSH_FEISHU_GOAL_CARDS=0 全局关；per-bot 配置 notifyGoalRounds:false 单独关。
   // 范围（CM 拍板）：**只报目标轮**（精确匹配 source.kind==='goal'），不报其它自动回合，噪声最低。
   const GOAL_CARDS_ON = String(process.env.DSH_FEISHU_GOAL_CARDS ?? '1').trim() !== '0'
+  // 2026-09-21 新增：**后台回执轮**（子代理／后台 job 完成通知把模型唤醒继续干活）也要上卡。
+  // 这一类轮次没有飞书入站消息 ⇒ 旧实现没有任何卡承接 ⇒ CM 在飞书里看不到"我在继续干活"，
+  // 也收不到这一轮的结论（他只能再发一条消息把我戳醒）。env / per-bot 都可关。
+  const NOTICE_CARDS_ON = String(process.env.DSH_FEISHU_NOTICE_CARDS ?? '1').trim() !== '0'
   const autoCards = new Map()     // agentId -> { card, bot, chatId, agent, openedAt, stop }
 
   // 本轮最后一段"过程话语"（用于封口时提升为正式消息块）。
@@ -2797,20 +2937,42 @@ export function apply(ctx) {
     return { text: '', seq: undefined }
   }
 
-  // 本轮是否由目标轮驱动？看会话事件里**最后一条** user/message 的来源标记。
-  function currentRoundIsGoal(agent) {
+  // 本轮由什么驱动？看会话事件里**最后一条** user/message 的来源标记。
+  //   · source.kind === 'goal' → 目标轮（dsh-goal-round-driver 注入）
+  //   · source.kind === 'plugin' 且正文是**后台回执**（子代理／后台 job 完成通知）
+  //     → "自动回合"：模型被唤醒继续干活，但**没有飞书入站消息** ⇒ 旧实现没有卡承接，
+  //       CM 在飞书里**什么都看不到**（2026-09-21 反馈：「拍了子代理以后…你也不会自动唤醒…
+  //       我要子代理回来，就会发信息激活你，你就继续工作并发信息我」）。
+  //       ⚠️ 注意 source.kind==='plugin' 也包含会话启动时的 system-reminder／技能目录等，
+  //       那些**不能**建卡（会刷屏），所以这里必须按正文形态白名单匹配，不许按 kind 一刀切。
+  const NOTICE_RE = /^\s*(background\s+job\b|background\s+subagent\b|后台任务\b|子代理\b)/i
+  function autoTurnInfo(agent) {
     try {
       const events = sessionEvents(agent.session)
       for (let i = events.length - 1; i >= 0; i--) {
         const e = events[i]
         if (!e || e.type !== 'user/message') continue
         const src = (e.data && e.data.source) || {}
-        return { isGoal: src.kind === 'goal', round: Number(src.round) || 0 }
+        if (src.kind === 'goal') {
+          const round = Number(src.round) || 0
+          return { kind: 'goal', round, title: '🎯 目标模式 · 第 ' + (round || 1) + ' 轮开始，正在工作…' }
+        }
+        // ⚠️ user/message 的正文在 `data.content`（不是 `data.message.content`）——
+        // 两种形态都读一遍（2026-09-21 写用例 22 时踩到：只读 data.message ⇒ 通知正文读成空串、
+        // 于是回执轮永远不建卡）。
+        const content = (e.data && e.data.content) || (e.data && e.data.message && e.data.message.content) || []
+        const text = extractProcessText({ content }) || ''
+        if (NOTICE_RE.test(text)) {
+          const isSub = /subagent|子代理/i.test(text)
+          const label = isSub ? '子代理回执到了' : '后台任务回执到了'
+          return { kind: 'notice', round: 0, title: '🔔 ' + label + ' · 正在继续工作…', label }
+        }
+        return { kind: null, round: 0 }
       }
     } catch (error) {
-      console.log('[fs] goal round probe failed: ' + String(error && error.message || error))
+      console.log('[fs] auto turn probe failed: ' + String(error && error.message || error))
     }
-    return { isGoal: false, round: 0 }
+    return { kind: null, round: 0 }
   }
 
   function openGoalCard(agent, bot, chatId, info) {
@@ -2833,7 +2995,7 @@ export function apply(ctx) {
     }
     const card = makeCardState()
     card.cursor = sessionEvents(agent.session).length      // 只镜像本轮**后续**事件（goal 提示词本身不搬上卡）
-    card.blocks.push({ type: 'message', text: '🎯 目标模式 · 第 ' + (info.round || 1) + ' 轮开始，正在工作…' })
+    card.blocks.push({ type: 'message', text: info.title || ('🎯 目标模式 · 第 ' + (info.round || 1) + ' 轮开始，正在工作…') })
     state.card = card
     void syncCard(bot, chatId, card, true).catch(() => {})
     state.stop = startCardWatcher(agent, card, bot, chatId, rotate)
@@ -2873,34 +3035,55 @@ export function apply(ctx) {
             }
           }
           if (!promoted && closing.text) card.blocks.push({ type: 'message', text: closing.text })
-          card.status = 'sealed'
-          card.blocks.push({ type: 'message', text: '✅ 本轮结束' })
+          // 失败轮不能谎报成功（2026-09-18，与普通回合 runTurn 同源的问题）：
+          // 上游报错（如 402 余额不足）会让整轮**没有任何产出**，旧实现照样写「✅ 本轮结束」+
+          // status='sealed' → 目标模式下同样"看不出为什么不动了"。失败标记只认上游显式 reason。
+          const failure = turnFailureReason(sessionEvents(agent.session), live.openedAt || 0)
+          if (failure && !closing.text) {
+            card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：' + failure.text })
+          } else if (!closing.text && card.tools.size === 0) {
+            // 与普通回合同源（2026-09-21）：没有产出、也没有失败标记时，**不许**写「✅ 本轮结束」装成功。
+            card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI）' })
+          }
+          const silent = !closing.text && card.tools.size === 0
+          card.status = (failure || silent) ? 'error' : 'sealed'
+          card.blocks.push({ type: 'message', text: (failure || silent) ? '❌ 本轮失败' : '✅ 本轮结束' })
+          console.log('[fs] auto card sealed: agent=' + agent.id + ' kind=' + (live.kind || 'goal') + ' failure=' + (failure ? failure.text : 'none') + ' silent=' + silent)
           void syncCard(live.bot, live.chatId, card, true).catch(() => {})
         }
-        console.log('[fs] goal card sealed: agent=' + agent.id)
+        console.log('[fs] auto card sealed: agent=' + agent.id + ' kind=' + (live.kind || 'goal'))
         return
       }
       if (status !== 'running') return
-      if (!GOAL_CARDS_ON) return
       if (autoCards.has(agent.id)) return          // 已在跟踪这一轮
       if (activeTurns.has(agent.id)) return        // 普通飞书回合持有卡，绝不抢
       const where = findChatForAgent(agent)
       if (!where) return                           // 不是飞书会话（GUI/其它通道）
       const cfg = where.bot && where.bot.cfg
-      if (cfg && cfg.notifyGoalRounds === false) return
-      const info = currentRoundIsGoal(agent)
-      if (!info.isGoal) return                     // 只报目标轮（CM 拍板口径）
+      const info = autoTurnInfo(agent)
+      if (info.kind === 'goal') {
+        if (!GOAL_CARDS_ON) return
+        if (cfg && cfg.notifyGoalRounds === false) return
+      } else if (info.kind === 'notice') {
+        // 子代理／后台 job 把模型唤醒的"自动回合"：建卡，让 CM 看得到并且收到这一轮的结论
+        if (!NOTICE_CARDS_ON) return
+        if (cfg && cfg.notifyAgentNotices === false) return
+      } else {
+        return                                     // 其它自动回合（system-reminder 等）不建卡，噪声最低
+      }
       const state = openGoalCard(agent, where.bot, where.chatId, info)
       autoCards.set(agent.id, {
         card: state.card,
         bot: where.bot,
         chatId: where.chatId,
         agent,
+        kind: info.kind,
         // 本卡开始镜像的位置：封口时用它界定"本轮说过的话"，防止把上一轮的文字搬过来
         openedAt: Number.isFinite(state.card.cursor) ? state.card.cursor : 0,
         stop: () => (state.stop ? state.stop() : undefined),
       })
-      console.log('[fs] goal card opened: agent=' + agent.id + ' round=' + (info.round || 1) + ' chat=' + where.chatId)
+      console.log('[fs] auto card opened: agent=' + agent.id + ' kind=' + info.kind
+        + ' round=' + (info.round || 1) + ' chat=' + where.chatId)
     } catch (error) {
       console.log('[fs] agent/status handler error: ' + String(error && error.stack || error))
     }

@@ -735,6 +735,281 @@ console.log('16) 目标轮封口必须补扫：收尾汇报不能丢（CM 2026-0
   ok(body.includes('本轮结束'), '仍然写了「本轮结束」')
 }
 
+console.log('17) 本轮没有回复时必须说明原因（2026-09-18 真机事故：账户余额不足 402 → 卡片空白）')
+{
+  // 背景（真机取证，会话 fs-main-mu532zzl seq=724-727）：
+  //   用户消息 → assistant/attempt(finish.reason=error{message:'Insufficient Balance',code:'QUOTA',status:402})
+  //   → step/end → turn/end(reason.kind='error')，**整轮没有任何 assistant/message**。
+  // 旧行为：卡片只写「（Agent 未产生文字回复）」、状态行还显示「✅ 已完成」；
+  //   自愈重建会话时旧卡停在「正在工作中…」成为孤儿卡，重建提示只走纯文本兜底 → 用户看不到。
+  // 新行为（本用例固化）：① 卡面写明上游原因（**中文人话 ＋ 原文**）；
+  //   ② 失败回合状态行是「失败」不是「已完成」；③ 旧卡补封、不再停在「正在工作中…」；
+  //   ④ 上游已明确报错 ⇒ **不再自愈重建**（2026-09-21 用户反馈：重建修不了欠费，
+  //      还把报错换成「已自动重建会话重试」）—— 自愈只留给「无产出且无失败标记」（用例 20）。
+  const mark = sentCards.length
+  let sendCount = 0
+  // 真实回合不会瞬间结束：给建卡留出落地时间，否则这张卡来不及创建就被封口，
+  // 测不到"旧卡停在正在工作中"这条（真机 14:35:28 建卡 / 14:35:29 重试，中间隔了一拍）。
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+  agent.send = function (message) {
+    this.sent.push(message)
+    sendCount += 1
+    const base = 1000 + sendCount * 10
+    const failure = { message: 'Insufficient Balance', code: 'QUOTA', status: 402 }
+    agentEvents.push(
+      { type: 'user/message', seq: base, data: { content: [{ type: 'text', text: String(message.content[0].text) }], source: { kind: 'user' } } },
+      { type: 'assistant/attempt', seq: base + 1, data: { turn: sendCount, step: 1, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure } } }] } },
+      { type: 'turn/end', seq: base + 2, data: { turn: sendCount, reason: { kind: 'error', error: failure } } },
+    )
+  }
+  feedInbound('om_balance_402', '余额不足测试')
+  await settle(4)
+
+  const ops = cardsSince(mark)
+  const body = JSON.stringify(ops)
+  // 2026-09-21 行为变更（用户：「它不会提示我欠费…就直接显示说本轮没有回复」）：
+  //   ① 原因必须是**中文人话 ＋ 上游原文**（旧断言只查英文原文）；
+  //   ② 上游已明确报错 ⇒ **不再自愈重建**（重建修不了欠费；旧行为每条消息白跑一轮、
+  //      还把报错换成「已自动重建会话重试」）⇒ 本轮**只建 1 张卡**。
+  ok(ops.filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0').length === 1,
+    '上游报错时不再重建会话（只 1 张卡；实际 ' + ops.filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0').length + '）')
+  ok(body.includes('账户欠费'), '卡面用中文写明"账户欠费／余额不足"（不再只甩英文）')
+  ok(body.includes('Insufficient Balance') && body.includes('QUOTA'),
+    '卡面同时保留上游原文（Insufficient Balance / QUOTA 402，便于核对）')
+  ok(!body.includes('已自动重建会话'), '不再把报错换成「已自动重建会话重试」（它修不了欠费）')
+  ok(body.includes('⚠️'), '卡片带警示标记（不是一句干巴巴的占位符）')
+  ok(body.includes('_失败_'), '失败回合的状态行是「失败」')
+  ok(!body.includes('_✅ 已完成_'), '失败回合不再假称「已完成」')
+
+  // 每张卡（create → 其后 update 为一组）的最后形态里都不该再留着「正在工作中…」
+  const perCard = []
+  for (const c of ops) {
+    if (c.op === 'create' && c.payload && c.payload.schema === '2.0') perCard.push(c.payload)
+    else if (perCard.length) perCard[perCard.length - 1] = c.payload
+  }
+  ok(!JSON.stringify(perCard).includes('正在工作中'),
+    '没有卡片停在「正在工作中…」（旧卡被补封，不留孤儿卡）')
+}
+
+console.log('18) 有工具调用但最终失败的回合：工具面板 + 原因 + 失败状态（与自愈路径的组合验证）')
+{
+  // 组合点：hadOutput = lastSeq!==undefined || card.tools.size>0 —— 有工具调用就**不**触发自愈重建，
+  // 所以这条必须自己把原因写在卡上，且**不能**把已有工具面板挤掉（工具面板 × 失败提示 × 状态行）。
+  const mark = sentCards.length
+  let sendCount = 0
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+  agent.send = function (message) {
+    this.sent.push(message)
+    sendCount += 1
+    const base = 2000 + sendCount * 10
+    const failure = { message: 'Insufficient Balance', code: 'QUOTA', status: 402 }
+    agentEvents.push(
+      { type: 'user/message', seq: base, data: { content: [{ type: 'text', text: String(message.content[0].text) }], source: { kind: 'user' } } },
+      { type: 'tool/call', seq: base + 1, data: { callId: 'call_balance_1', name: 'read', arguments: '{"file_path":"a.md"}' } },
+      { type: 'tool/result', seq: base + 2, data: { message: { source: { callId: 'call_balance_1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] } } },
+      { type: 'assistant/attempt', seq: base + 3, data: { turn: sendCount, step: 2, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure } } }] } },
+      { type: 'turn/end', seq: base + 4, data: { turn: sendCount, reason: { kind: 'error', error: failure } } },
+    )
+  }
+  feedInbound('om_balance_tools', '有工具调用但失败的回合')
+  await settle(4)
+
+  const ops = cardsSince(mark)
+  const body = JSON.stringify(ops)
+  ok(ops.filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0').length === 1,
+    '有工具产出 → 不触发自愈重建（只 1 张卡）')
+  ok(body.includes('工具调用'), '工具面板照常进卡（没被失败提示挤掉）')
+  ok(body.includes('call_balance_1') || body.includes('a.md'), '工具参数摘要照常进卡')
+  ok(body.includes('Insufficient Balance'), '卡面写明失败原因')
+  ok(body.includes('_失败_'), '状态行是「失败」')
+  ok(!body.includes('_✅ 已完成_'), '不假称「已完成」')
+}
+
+console.log('19) 目标轮失败也要说原因（不再无条件写「✅ 本轮结束」）')
+{
+  // 与用例 17 同源的问题：目标轮封口**无条件**写「✅ 本轮结束」+ status='sealed'
+  // → 余额不足/上游报错导致整轮没有任何产出时，卡片谎报成功且不写原因。
+  const mark = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 700,
+    data: {
+      content: [{ type: 'text', text: '<goal_round>\nRound: 4/10\n</goal_round>' }],
+      source: { kind: 'goal', goalId: 'g_seal', revision: 1, round: 4 },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  ok(createsSince(mark).length === 1, '第 4 轮建卡')
+
+  const failure = { message: 'Insufficient Balance', code: 'QUOTA', status: 402 }
+  agentEvents.push(
+    { type: 'assistant/attempt', seq: 701, data: { turn: 4, step: 1, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure } } }] } },
+    { type: 'turn/end', seq: 702, data: { turn: 4, reason: { kind: 'error', error: failure } } },
+  )
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('Insufficient Balance'), '目标轮卡写明失败原因')
+  ok(body.includes('本轮失败'), '封口写「本轮失败」')
+  ok(!body.includes('本轮结束'), '失败轮不再写「✅ 本轮结束」')
+  ok(body.includes('_失败_'), '状态行是「失败」')
+}
+
+console.log('20) 无产出且**没有**失败标记：明说「原因未上报」，僵尸会话自愈仍然保留')
+{
+  // 2026-09-21 用户实锤：卡片只说「本轮没有回复」、不给任何原因。
+  // 两种来源都要堵住：①上行有失败标记（用例 17）②上行**没有**标记（本用例）。
+  // 后者正是 2026-09-08「僵尸会话」的形态（重启后当轮被腰斩、事件一个都没落），
+  // 所以**自愈必须保留**；但封口的旧卡不能只留一句占位符。
+  const mark = sentCards.length
+  let sendCount = 0
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+  agent.send = function (message) {
+    this.sent.push(message)
+    sendCount += 1
+    if (sendCount === 1) return // 僵尸轮：一个事件都不产生
+    agentEvents.push(
+      { type: 'user/message', seq: 3000 + sendCount * 10, data: { content: [{ type: 'text', text: String(message.content[0].text) }], source: { kind: 'user' } } },
+      { type: 'assistant/message', seq: 3001 + sendCount * 10, data: { message: { content: [{ type: 'text', text: '自愈后的正常回复-OK' }] } } },
+      { type: 'turn/end', seq: 3002 + sendCount * 10, data: { turn: sendCount, reason: { kind: 'completed' } } },
+    )
+  }
+  feedInbound('om_silent_no_marker', '无产出无标记测试')
+  await settle(4)
+
+  const ops = cardsSince(mark)
+  const body = JSON.stringify(ops)
+  ok(body.includes('原因未上报'), '没有失败标记时，卡片明说「原因未上报」（不再只写占位符）')
+  ok(body.includes('_失败_'), '无产出的回合状态行是「失败」，不假称完成')
+  ok(body.includes('已自动重建会话'), '僵尸会话自愈仍然保留（只在**没有**失败标记时才自愈）')
+  ok(body.includes('自愈后的正常回复-OK'), '自愈重试的回复正常交付给用户')
+}
+
+console.log('21) 其它上游错误也翻成人话（429 限流）')
+{
+  const mark = sentCards.length
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+  agent.send = function (message) {
+    this.sent.push(message)
+    const failure = { message: 'Too Many Requests', code: 'RATE_LIMIT', status: 429 }
+    agentEvents.push(
+      { type: 'user/message', seq: 4000, data: { content: [{ type: 'text', text: String(message.content[0].text) }], source: { kind: 'user' } } },
+      { type: 'assistant/attempt', seq: 4001, data: { turn: 9, step: 1, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure } } }] } },
+      { type: 'turn/end', seq: 4002, data: { turn: 9, reason: { kind: 'error', error: failure } } },
+    )
+  }
+  feedInbound('om_rate_limit', '限流测试')
+  await settle(4)
+
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('被上游限流'), '429 → 卡面写「被上游限流（请求过快）」')
+  ok(body.includes('Too Many Requests'), '仍保留上游原文')
+}
+
+console.log('22) 子代理／后台回执轮也要上卡（2026-09-21 CM：子代理回来了，我在飞书看不到你在继续干活）')
+{
+  // 背景：子代理／后台 job 完成时，DSH 会往同会话注入一条 `source.kind==='plugin'` 的
+  // user/message 把模型唤醒继续干活 —— 这一轮**没有飞书入站消息**，所以旧实现没有卡承接：
+  // CM 看不见「我在继续干活」，也收不到这一轮的结论（只能再发一条消息把我戳醒）。
+  const mark = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 5000,
+    data: {
+      content: [{ type: 'text', text: 'Background subagent f835b8c2 finished and will do no further work unless you send it more.\n\nIts closing message:\n对照台账已落盘。' }],
+      source: { kind: 'plugin' },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  ok(createsSince(mark).length === 1, '回执轮建了卡（实际 ' + createsSince(mark).length + ' 张）')
+
+  agentEvents.push({ type: 'assistant/message', seq: 5001, data: { message: { content: [{ type: 'text', text: '子代理回来了，我接着说：台账已落盘-OK' }] } } })
+  agentEvents.push({ type: 'turn/end', seq: 5002, data: { turn: 20, reason: { kind: 'completed' } } })
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('🔔'), '卡面标了「回执到了」')
+  ok(body.includes('正在继续工作'), '卡面说明模型被唤醒继续干活')
+  ok(body.includes('台账已落盘-OK'), '这一轮的结论进了卡（CM 不用再发消息戳一次）')
+  ok(body.includes('本轮结束'), '正常封口')
+
+  // 控制组：会话启动类 plugin 消息（runtime context／技能目录）**不许**建卡，否则刷屏
+  const mark2 = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 5003,
+    data: {
+      content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }],
+      source: { kind: 'plugin' },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  ok(createsSince(mark2).length === 0, 'system-reminder 类 plugin 消息不建卡（不刷屏）')
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+}
+
+console.log('23) 普通飞书回合**不许**被当成回执轮抢建第二张卡（2026-09-23 CM：每次回复都发两张卡）')
+{
+  // 真机取证链（四环，全部有据）：
+  //   ① dsh-agent-loop `wakeDriver()` 在 `send()` 的**同一个调用栈**里 setPhase({kind:'running'})
+  //      → `dispatch.emit('agent/status')`（lib/index.js L781/L787/L844，同步 emit）。
+  //   ② 旧实现把 `activeTurns.set` 放在 send() **之后** ⇒ 这一刻处理器读到"没有普通回合持有卡"。
+  //   ③ 新用户消息这时还在 inbox 里、**没进会话事件表** ⇒ `autoTurnInfo()` 从末尾读到的
+  //      `user/message` 是**上一条后台回执正文** ⇒ 判成 kind='notice'。
+  //   ④ `openGoalCard()` 另开一张卡；它的游标与普通回合卡的游标同源 ⇒ 两张卡镜像同一批事件
+  //      （CM：「每次回复我都发两张卡片」，内容重复）。
+  // 本用例把 mock 的 send() 改成与真机同序：**先**同步 running，**再**写本轮助手事件。
+  const mark = sentCards.length
+
+  // 本轮之前那一轮正好是"后台回执轮" —— 真机上就是这样，这是本缺陷的触发前提。
+  agentEvents.push({
+    type: 'user/message', seq: 6000,
+    data: {
+      content: [{ type: 'text', text: 'Background subagent 8eebc571 finished and will do no further work unless you send it more.' }],
+      source: { kind: 'plugin' },
+    },
+  })
+
+  agent.send = function (message) {
+    this.sent.push(message)
+    emitCtx('agent/status', { agent, status: 'running' })   // ← 与真机同序：同步、且先于事件落表
+    agentEvents.push(
+      { type: 'assistant/message', seq: 6001, data: { message: { content: [{ type: 'text', text: '两张卡回归测试-正文' }] } } },
+      { type: 'turn/end', seq: 6002, data: { turn: 30, reason: { kind: 'completed' } } },
+    )
+  }
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+
+  feedInbound('om_two_cards_regression', '两张卡回归测试')
+  await settle(4)
+
+  ok(createsSince(mark).length === 1,
+    '普通回合只建一张卡（实际 ' + createsSince(mark).length + ' 张）')
+  const body = JSON.stringify(cardsSince(mark))
+  ok(!body.includes('🔔'), '没有多出来的「回执到了」卡')
+  ok(body.includes('两张卡回归测试-正文'), '正文正常进了唯一那张卡')
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+
+  // 控制组：真正的回执轮（没有飞书入站、直接由 agent/status 进 running）**仍然**建卡 —— 不许误伤。
+  const mark2 = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 6100,
+    data: {
+      content: [{ type: 'text', text: 'Background job pwsh-91 finished.' }],
+      source: { kind: 'plugin' },
+    },
+  })
+  emitCtx('agent/status', { agent, status: 'running' })
+  await drain()
+  ok(createsSince(mark2).length === 1, '真正的回执轮照样建卡（没有误伤）')
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+}
+
 console.log('')
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')

@@ -10,6 +10,10 @@ node_modules/
 *.log
 npm-debug.log*
 
+# local backups written by scripts/sync-to-profile.mjs and hand edits
+*.bak
+*.bak-*
+
 # OS
 .DS_Store
 Thumbs.db

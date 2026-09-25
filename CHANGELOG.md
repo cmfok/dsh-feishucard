@@ -7,6 +7,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed（一次回复发两张卡：普通飞书回合被当成"回执轮"抢建了第二张卡）
+
+**用户原话**：「你现在每次回复我都发两张卡片，你查一下什么原因，修复掉」。
+
+- **现象（真机取证，不是推测）**：拉该会话最近的飞书消息，**最近 29 条可判定的回复里有 10 条**
+  在同一秒出现两张 interactive（`im/v1/messages` 返回两条、`create_time` 相同）。
+- **根因（四环，逐环有据）**：
+  1. dsh-agent-loop 的 `wakeDriver()` 在 `send()` 的**同一个调用栈**里
+     `setPhase({ kind: 'running' })` → 同步 `dispatch.emit('agent/status')`
+     （`@deepseek-ai/dsh-agent-loop/lib/index.js` L781／L787／L844）。
+  2. `runTurn()` 旧实现把 `activeTurns.set(...)` 放在 `turnAgent.send(...)` **之后**，
+     于是 `agent/status` 处理器在同一拍读 `activeTurns` 时读到"没有普通回合持有卡"。
+  3. 这一刻新用户消息还在 agent 的 inbox 里、**尚未进会话事件表**，`autoTurnInfo()`
+     从末尾扫到的 `user/message` 是**上一条后台回执正文** ⇒ 判成 `kind = 'notice'`。
+  4. `openGoalCard()` 于是另开一张卡；它的游标与普通回合卡同源 ⇒ 两张卡镜像同一批事件，
+     用户看到内容重复的两张卡（真机日志特征：用户消息进来后紧跟着
+     `[fs] auto card opened: … kind=notice`，然后才是普通回合卡）。
+- **修法**：`runTurn()` 改成**先登记 `activeTurns`、再 `send()`**（`send` 抛错时回滚登记）；
+  `stopCardWatcher` 提前声明为 `null`；`split()` 加空值保护。`agent/status` 里那道
+  `if (activeTurns.has(agent.id)) return  // 普通飞书回合持有卡，绝不抢` 从此真正生效。
+- **回归用例 23**（`scripts/smoke.mjs`）：mock 的 `send()` 改成与真机同序（先同步 running、
+  再写助手事件），并让会话末尾先是一条回执正文。**对照实验**：把修复前的 `index.js`
+  换回去跑同一套 → 用例 23 报 `❌ 普通回合只建一张卡（实际 2 张）`（exit 1）；
+  换回修复版 → `SMOKE PASS`。
+- **没有误伤**：真正的回执轮（`kind='notice'`）照旧建卡 —— 用例 23 控制组 + 用例 22 全绿。
+
+## [0.3.4] - 2026-09-21
+
+### Added（子代理／后台任务回来时**自动上卡**）
+
+**用户原话**：「经常拍了子代理以后，就算子代理返回的信息，你也不会自动唤醒……**我要子代理回来，
+就会发信息激活你，你就继续工作并发信息我**」。
+
+- **根因（两层）**：
+  1. 子代理／后台 job 结束时，DSH 会往同会话注入一条 `source.kind === 'plugin'` 的 `user/message`
+     **把模型唤醒继续干活** —— 这一轮**没有飞书入站消息**，而本插件的建卡入口 `runTurn` 只从
+     飞书入站调用 ⇒ **没有任何卡承接这一轮**：CM 在飞书里既看不到"我在继续干活"，
+     也收不到这一轮的结论（只能再发一条消息把我戳醒）。这与 2026-09-16 目标轮"看不到过程"
+     是**同一个结构性缺口**（那次只补了 `source.kind === 'goal'`）。
+  2. 探测函数把通知正文读成空串：`user/message` 的正文在 `data.content`，而代码只读
+     `data.message.content`（写用例 22 时当场抓到 —— 所以就算加了白名单也永远不匹配）。
+- **修法（复用目标卡那一整套机制）**：`currentRoundIsGoal()` → `autoTurnInfo()`，返回
+  `kind: 'goal' | 'notice' | null`：
+  - `source.kind === 'goal'` → 目标轮（行为不变）；
+  - 正文命中白名单 `^\s*(background job|background subagent|后台任务|子代理)` → **回执轮**，
+    卡面写「🔔 子代理回执到了 · 正在继续工作…」，走同一套 watcher／补扫／封口／换卡；
+  - 其它 plugin 消息（runtime context／技能目录／系统提醒）→ **不建卡**（不许刷屏）。
+- **开关**：env `DSH_FEISHU_NOTICE_CARDS=0` 全局关；per-bot 配置 `notifyAgentNotices: false` 单独关
+  （`normalizeConfig` 已接受该字段）。
+- 日志：`[fs] auto card opened: … kind=notice|goal`、`[fs] auto card sealed: … kind=…`。
+
+### Tests
+
+- 新增用例 **22**：回执轮建卡（🔔／正在继续工作／本轮结论进卡／正常封口）＋**控制组**
+  （system-reminder 类 plugin 消息**不建卡**）。
+- `npm run check` 通过；`npm run smoke` **SMOKE PASS（sentCards=53）**。
+
+## [0.3.3] - 2026-09-21
+
+### Fixed（用户反馈：「卡片里面欠费了，它不会提示我欠费，不会把报错信息报出来，就直接显示说『本轮没有回复』」）
+
+**三处一起改，都是从真机取证反推出来的：**
+
+1. **上游错误翻成人话**：`failureSummary()` 新增 `failureZh()` ——
+   `QUOTA/402/Insufficient Balance → 「账户欠费／余额不足」`、`401 → 「API 密钥无效或未授权」`、
+   `429 → 「被上游限流（请求过快）」`、`503 → 「上游暂时不可用」`、上下文超长 → `「上下文超长」`。
+   **中文人话在前、上游原文在后**（`账户欠费／余额不足｜Insufficient Balance · QUOTA 402`），
+   认不出就不编（原样透传）。真机现场：卡面只有英文报文时，用户读不出"这是欠费"。
+2. **不再把报错换成「已自动重建会话重试」**：上游**已明确报错**时**跳过自愈**
+   （重建会话修不好欠费／密钥／限流，旧行为每条消息白跑一轮重试＋二次失败）。
+   自愈**只保留给**「无产出**且没有**失败标记」的僵尸会话场景（2026-09-08 那个 bug 的保护未动）。
+3. **"一个原因都不给"这条路彻底堵死**：无产出**且没有**上游失败标记时，卡面写
+   `⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI 里这一轮）`，
+   状态行 `_失败_`（不再退回干巴巴的 `（Agent 未产生文字回复）`，也不再假称「✅ 已完成」）。
+   目标模式封口同源修正（无产出无标记时写 `❌ 本轮失败`，不再写 `✅ 本轮结束`）。
+
+### Added（可观测：卡面文字进日志）
+
+- 封口时打一行 `[fs] turn sealed: status=… silent=… failure=… reply="…"`（含失败原因与卡面正文前 160 字），
+  目标卡同理（`[fs] goal card sealed: … failure=… silent=…`）。
+  **为什么需要**：飞书对 card 2.0 只回降级占位符，**事后读不回卡片正文** ——
+  本次排查就卡在"用户看到的到底是哪一句"无法证实；以后 `grep 'turn sealed'` 即可复盘。
+
+### Tests
+
+- 用例 17 按新行为改写（**只 1 张卡＝不再自愈**；断言中文原因 `账户欠费`＋上游原文＋不再出现「已自动重建会话」）。
+- 新增用例 **20**（无产出且**无**失败标记）：断言卡面写「原因未上报」、状态 `_失败_`、
+  **僵尸自愈仍然生效**（`已自动重建会话` + 重试回复交付）——把"自愈只留给无标记场景"钉住。
+- 新增用例 **21**（429）：断言 `被上游限流` ＋ 上游原文。
+- `npm run check` 通过；`npm run smoke` **SMOKE PASS（sentCards=51）**。
+
+## [0.3.2] - 2026-09-18
+
+### Fixed（目标模式轮次失败也谎报成功）
+
+- 与 0.3.1 同源、但漏在**目标模式**那条路径上：`agent/status === 'idle'` 封口时**无条件**写
+  `✅ 本轮结束` 且 `card.status='sealed'` → 上游报错（如 402 余额不足）导致整轮零产出时，
+  目标卡同样"看不出为什么不动了"，还显示成功。现在：读上游显式失败标记
+  （`turnFailureReason(sessionEvents(agent), live.openedAt)`）→ 无产出时写
+  `⚠️ 本轮没有产生回复：<原因>`、状态行 `_失败_`、封口写 `❌ 本轮失败`；正常轮保持 `✅ 本轮结束`。
+
+### Added（复验与部署的"可观测"补强）
+
+- **构建标记**：`apply` 现在打印 `[fs] plugin apply #N v<版本> md5=<前8位> bytes=<大小> @ <ISO>`
+  （版本读**部署目录**的 `package.json`，md5 为自身文件）→ 复验"线上跑的是哪一版"只需一条
+  `grep 'plugin apply'`，不必再靠外部哈希比对。元数据陈旧（副本曾长期停在 0.2.0）会因此**暴露**。
+- **`scripts/sync-to-profile.mjs` + `npm run sync`**：按 `package.json#files` 体检 → 备份
+  `index.js.bak-<ts>-pre-sync` → 同步整包 payload 到 profile 副本 → **按哈希复验**（不一致退出码非 0）。
+  `--dry-run` 只体检。背景：本包在 profile 里是**实体副本**，手工 `cp index.js` 是元数据漂移
+  （副本 `package.json` 停在 0.2.0、`SECURITY.md`/`CHANGELOG.md` 落后）的根源。
+
+### Docs
+
+- `README.md` 的「Windows 开发陷阱」段更正：明确 **HMR 对本包不生效**（实测保存源码 75 秒零 reload，
+  运行时 import 的是 profile 副本、HMR 只听源码目录），部署姿势改为 `npm run sync` + 重启 + 用
+  `plugin apply` 标记复验；「开发」段补 `npm run sync`。
+- `~/.dsh/AGENTS.md` ① 同步更正（原文"HMR 热重载已启用、改源码即生效"作废），并补：日志文件随启动器
+  变化需按修改时间取最新、想让当前卡片先发出去可先等 10 秒再调重启脚本。
+
+### 影响面清单（§10.1-3）
+
+| 被改对象 | 还有谁在用 | 会不会变样 |
+| --- | --- | --- |
+| `apply` 日志行 | 只有人/脚本看日志 | 格式新增版本与哈希；`plugin apply #N` 前缀不变，旧 grep 仍命中 |
+| `buildStamp()`（模块级新增） | 只有 `apply` | 只读自身文件与同目录 `package.json`；读失败降级为 `stamp failed: …`，不影响启动 |
+| 目标卡封口 `card.status` | `statusTextFor`（→`_失败_`）、`rotate()` 的 `state.card.status !== 'running'` 守卫 | 仅"失败轮"置 `error`；此时 watcher 已 `stop()`，守卫不再触发 |
+| `scripts/sync-to-profile.mjs` | 只有开发者手动跑 | 新增文件，不参与运行时 |
+
+### 验证
+
+- `npm run check` 通过；`npm run smoke` **全绿**（sentCards=47）。
+- 新增用例 **19**（目标轮 402 失败）：断言卡面有原因、封口写「本轮失败」、**不再**出现「本轮结束」、
+  状态行 `_失败_`；用例 16（目标轮成功）仍要求写「✅ 本轮结束」——两条一起构成"该成功成功、该失败失败"。
+- **保险丝验证（§10.2-6）**：改 `index.js` 前先跑用例 19 → **恰好 4 条断言失败**，修复后全绿。
+- `npm run sync -- --dry-run` 在改前正确报出 5 个 stale 文件（index.js / package.json / CHANGELOG.md /
+  SECURITY.md / feishu.config.example.json），改后同步并哈希复验一致。
+
+## [0.3.1] - 2026-09-18
+
+### Fixed（2026-09-18，CM 反馈：bot 突然不回话，卡片只说「没有回复内容」，不知道发生了什么）
+
+**根因（两类，都被同一处"哑巴卡"掩盖）：**
+
+1. **上游报错时卡片不写原因**：模型 API 返回 `402 / code=QUOTA / "Insufficient Balance"` 时，
+   整轮**没有任何 `assistant/message`** → 旧实现只把占位符「（Agent 未产生文字回复）」写进卡，
+   状态行还显示 **`_✅ 已完成_`** —— 用户既看不到原因，还被告知"完成了"。
+   真机取证（会话 `fs-main-mu532zzl`，`output/dsh-install/dump-session-tail.mjs` 解码 zstd 帧）：
+   ```
+   seq=724 user/message  "你看一下新创建这个agent，为什么回复我显示没有回复内容呢？"
+   seq=725 assistant/attempt {"stream":[{"chunk":{"type":"finish","reason":{"kind":"error",
+           "failure":{"message":"Insufficient Balance","code":"QUOTA","status":402}}}}]}
+   seq=727 turn/end  {"reason":{"kind":"error","error":{...402...}}}
+   ```
+2. **自愈提示走不到卡片上**：`!hadOutput && sessionReused` 时插件会重建会话重试，但提示只拼进
+   `turn.reply`，而卡片送达用的是 `turn.card.blocks` → **只有卡片失败退化成纯文本才带这句**；
+   同时被丢弃的旧卡已经在飞书建出来了（14:35:28 那张），**永远停在「正在工作中…」**。
+
+**修法（最小改动，全部围绕"卡面必须说实话"）：**
+
+- 新增 `turnFailureReason(events, fromSeq)` / `failureSummary(failure)`：**只读上游显式标记**
+  （`turn/end.data.reason.kind==='error'` 优先；无 `turn/end` 时才退回 `assistant/attempt` 的
+  `finish.reason`）——`turn/end` 是终审，避免"中途失败后重试成功"的回合被误判（开发标准 §10.2-2）。
+- `runTurn` 封口：本轮一个字都没说出来 **且** 有失败标记 → 卡面写
+  `⚠️ 本轮没有产生回复：<上游原因>`，状态行改 `_失败_`；没有失败标记时维持原占位符（不编造原因）。
+- `runTurn` 的 `waitError` 分支：同样去掉「正在工作中…」并写 `⚠️ 本轮中断：<错误原文>`。
+- 自愈分支：重试前先把**旧卡的封口状态推上去**（不再留孤儿卡）；重建提示 `⚠️ 上一会话本轮没有产生回复
+  （<原因>），已自动重建会话重试。` 同时**写进卡面 blocks** 与 `turn.reply`（纯文本兜底也带）。
+
+**影响面清单（§10.1-3）：**
+
+| 被改对象 | 还有谁在用 | 会不会变样 |
+| --- | --- | --- |
+| `runTurn` 返回值新增 `failure` | 只有 `runTurn` 的两个调用点（普通回合、自愈重试） | 只增字段，既有消费者（`turn.card/reply/hadOutput/waitError`）不变 |
+| `card.status = 'error'`（封口路径） | `statusTextFor`（→`_失败_`）、`rotateTables`/`split` 的守卫 | 仅"本轮失败且无输出"时置位；此时 watcher 已停止，守卫不再触发 |
+| 自愈分支新增一次 `await syncCard(旧卡)` | 无 | 只 PATCH 已存在的旧卡；建卡失败（createFailed）时 `syncCard` 自行跳过 |
+| `turn.card.blocks.unshift(提示)` | 只影响该卡渲染顺序 | 提示置顶；工具面板/正文其余块不动 |
+
+**验证：**
+
+- `node --check index.js` 通过；`npm run smoke` **全绿**（sentCards=45）。
+- 新增用例 **17**（复刻真机 402 事件流：无任何 assistant/message → 自愈重试同样失败）：
+  断言卡面有 `Insufficient Balance · QUOTA 402`、有 `⚠️`、状态行 `_失败_`、不出现 `_✅ 已完成_`、
+  带"已自动重建会话"、且**没有任何卡停在「正在工作中…」**。
+- 新增用例 **18**（功能交互，§10.3）：有工具调用 → `hadOutput=true` 不自愈；断言**工具面板仍在**、
+  参数摘要仍在、原因在、状态 `_失败_`、不假称完成（工具面板 × 失败提示 × 状态行同一条数据流）。
+- **保险丝验证（§10.2-6）**：改动前先跑新用例 → **恰好 6 条断言失败**（基线见本文档与
+  `output/` 留痕），修复后全绿 → 说明每条断言都真的在保护这个行为。
+
+**落地复验（2026-09-18 15:00，重启后实测）：**
+
+- **部署路径**：本包在 profile 里是**实体副本**（`node_modules/dsh-feishucard` 不是软链），
+  而 HMR 只监听源码目录 → 实测**保存源码 75 秒无任何 reload**（`hmr watching` 之后始终没有第二次
+  `plugin apply`）。故本次按「**同步副本 → 重启**」部署：
+  `Copy-Item index.js <profile>/node_modules/dsh-feishucard/`（旧版备份
+  `index.js.bak-20260918-pre-no-reply-notice`）。
+- **落地副本复验**：把**部署副本的** `index.js`（md5 `D6E3BC2A`，与源码逐字节一致）配
+  `scripts/smoke.mjs` 单独跑一遍 → `SMOKE PASS (sentCards=45)`（含用例 17/18）。
+- **重启后状态**：新实例 14:59:12 启动、`plugin apply #1` 14:59:31、三个机器人
+  `long connection ready`、**无任何错误行**；HTTP 3080 = 200。
+- **会话连续性**：`state-cliaaf77f129a78dcc8.json` 仍指向 `fs-main-mu6l3up7`，重启后入站消息
+  **没有触发自愈**（日志无 `produced no output` / `heal`）→ 上下文未丢。
+- **"先发卡再重启"有效**：重启前那条卡片 14:58:42 正常送达
+  （`om_x100b65fa5cd4d8acb28fe532c6bbb0d`）。
+- 遗留（未改，供决策）：① 目标模式轮次封口仍无条件写「✅ 本轮结束」，那一轮失败同样看不出原因；
+  ② 副本里的 `package.json`（0.2.0）/`CHANGELOG.md` 是旧元数据（部署只同步 `index.js`）；
+  ③ 插件没有"版本→日志"的标记行，复验只能靠 md5 比对与行为断言（可加一行 `plugin apply #N (md5)`）。
+
 ## [0.3.0] - 2026-09-18
 
 ### Not a defect（2026-09-16 已核实，避免重复排查）

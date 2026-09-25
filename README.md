@@ -9,7 +9,15 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 > 独立自研，不依赖任何第三方 DSH 飞书插件。配置独立存放于 `~/.dsh-feishucard/`；检测到旧生态路径（`~/.cc-connect/`）有配置时启动自动迁移一次。不要与其他 DSH 飞书插件同时安装（同一飞书 App 的 WS 长连接互踢）。
 > Fully independent. Config lives in `~/.dsh-feishucard/`; a legacy config found at `~/.cc-connect/` is auto-migrated once on boot. Do not install alongside other DSH Feishu plugins (two WS long connections on one app kick each other).
 
-> ⚠️ **Windows 开发陷阱（2026-08-15 实测）**：本包以 `file:` 依赖安装后，DSH profile 的 `node_modules/dsh-feishucard/` 是**实体副本而非软链**——改源文件后 dsh 仍加载旧副本，改动"重启也不生效"。改代码后必须同步副本：`cp index.js helper.cjs <profile>/node_modules/dsh-feishucard/`（或重新 `dsh plugin --profile web add dsh-feishucard`），再重启 dsh。排查"改了没生效"先 `md5sum` 对比源与副本。
+> ⚠️ **Windows 开发陷阱（2026-08-15 实测，2026-09-18 补强）**：本包以 `file:` 依赖安装后，DSH profile 的 `node_modules/dsh-feishucard/` 是**实体副本而非软链**——运行时装的是**这个副本**，而 `cordis-plugin-hmr` 监听的是**源码目录**，两者不相交。
+> **实测结论（2026-09-18）**：保存源码后 75 秒内日志**没有任何 reload**（`hmr watching` 之后始终只有启动那一次 `plugin apply #1`）→ **本包不存在"改源码自动生效"**，别按 HMR 的心智模型操作。
+> 正确部署姿势（一条命令 + 重启）：
+> ```sh
+> npm run sync                  # 校验并同步整包 payload 到 profile 副本（自动备份 index.js.bak-<ts>-pre-sync）
+> # 然后按你本机的脚本/计划任务重启 dsh web —— 副本是启动时 import 的，必须重启
+> ```
+> 复验"线上跑的是哪一版"：`grep 'plugin apply' <dsh日志>` → 现在会打印 `v<版本> md5=<前8位> bytes=<大小>`，与源码哈希比对即可，不必再手工 diff 副本。
+> `npm run sync -- --dry-run` 只体检不写入；退出码非 0 = 副本与源码不一致。排查"改了没生效"先跑它。
 
 > ⚠️ **重启 dsh web 必须走带 key 的启动器（2026-09-08 事故教训）**：部署机上 `DEEPSEEK_API_KEY` 通常放在**用户环境变量**（Windows 注册表 `HKCU\Environment`）——它不在 dsh 凭据文件里、dsh 也没有 .env 层去读它。**裸 `node <dsh包>/lib/bin.js web` 启动 = 进程没有 key = 所有 LLM 调用失败 = 飞书全部空白回复**。需要重启时，请通过你本机的 dsh 启动脚本/计划任务（会先注入用户环境变量再拉起 dsh）；**不要 kill 进程后用裸 node 拉起**。排查"为什么空白回复"先看进程环境里有没有 `DEEPSEEK_API_KEY`。
 
@@ -114,6 +122,7 @@ per-bot 配置项 `notifyGoalRounds`（`false` 关闭该机器人的目标卡）
 npm i                          # 安装依赖 / install deps
 npm run check                  # node --check 语法检查 / syntax check
 npm run smoke                  # 冒烟测试：mock DSH ctx + mock 飞书 API，跑完整回合链路
+npm run sync                   # 同步到 profile 副本（含体检 + 校验，--dry-run 只体检）
 ```
 
 冒烟测试覆盖 / covered by the smoke suite：helper 注册、入站消息管线（会话创建/消息投递）、流式卡片（create/PATCH/schema/工具面板/状态符号/note/seal）、命令处理、链路稳定性。Helper registration, inbound pipeline, streaming card lifecycle, commands, end-to-end stability.
