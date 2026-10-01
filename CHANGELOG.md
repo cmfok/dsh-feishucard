@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.21] - 2026-10-02
+
+### Fixed（🔴 插话会把"正在打的结果"截断 —— CM 报障「导致我看不到」）
+
+**CM 原话**：「我发信息给你，若你刚好在应答的时候，你会**直接截断掉**需要打印结果的那些回复的内容，
+**导致我看不到**」。
+
+**机理（三步，缺一不可）**
+
+1. 插话（steer）会 `split()` **换卡** —— 旧卡就地封口，后续内容写到下面新卡；
+2. 旧卡上镜像的过程话语是 **note**，建卡时限长 `MAX_NOTE_CHARS`（**500 字**）⇒ 长正文被截断；
+3. 新卡游标从**当前位置**起 ⇒ **不重放**旧内容；而 seal 时的结论提取只取"末尾那一段文本"
+   （段与段之间**没有工具调用就停**）⇒ 前半段既不在新卡、也没进结论
+   ⇒ **只剩旧卡上那 500 字，其余彻底看不到**。
+
+**修法**：`split()` 封口旧卡**之前**，把卡上的 note **按 `seq` 从会话事件里还原成完整正文**
+（`extractProcessText`，一个字不丢），再补那行"后续内容见下方新卡"。
+留痕：`[fs] 插话封口：还原 N 段被截断的过程正文`。
+还原失败只记日志、不影响换卡（绝不因为还原把插话弄坏）。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=182, sessions=7)**，`❌` 0 条。
+
 ## [0.4.20] - 2026-10-02
 
 ### Fixed（🔴 同一对话里两张卡并行长 —— CM 报障「又有重复了」）

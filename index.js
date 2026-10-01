@@ -2299,6 +2299,38 @@ export function apply(ctx) {
           if (stopCardWatcher) stopCardWatcher()
           card.status = 'sealed'
           card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+          // 🔴 CM 2026-10-02：「我发信息给你，若你刚好在应答的时候，你会**直接截断掉**
+          // 需要打印结果的那些回复的内容，导致我看不到」。
+          // 机理：插话会 split 换卡 ⇒ 旧卡就此封口；而旧卡上镜像的过程话语是 **note**，
+          // 建卡时限长 `MAX_NOTE_CHARS`(500) 截断；新卡游标从**当前位置**起、不重放旧内容；
+          // seal 时结论又只取"末尾那一段文本"（段与段之间没有工具调用就停）
+          // ⇒ **前半段正文彻底看不到**（只剩旧卡上那 500 字）。
+          // 修法：封口前把这些 note **按 seq 从会话事件里还原成完整正文** —— 一个字都不丢。
+          try {
+            const liveEvents = sessionEvents(turnAgent.session)
+            let expanded = 0
+            for (let i = 0; i < card.blocks.length; i++) {
+              const b = card.blocks[i]
+              if (!b || b.type !== 'note' || b.seq === undefined) continue
+              let full = ''
+              for (let k = liveEvents.length - 1; k >= 0; k--) {
+                const ev = liveEvents[k]
+                if (!ev || ev.seq === undefined) continue
+                if (ev.seq === b.seq) {
+                  if (ev.type === 'assistant/message') full = extractProcessText(ev.data && ev.data.message)
+                  break
+                }
+                if (ev.seq < b.seq) break
+              }
+              if (full && full.length > String(b.text || '').length) {
+                card.blocks[i] = { type: 'note', seq: b.seq, text: full }
+                expanded++
+              }
+            }
+            if (expanded > 0) console.log('[fs] 插话封口：还原 ' + expanded + ' 段被截断的过程正文')
+          } catch (error) {
+            console.log('[fs] 插话封口还原失败（不影响换卡）: ' + String(error && error.message || error))
+          }
           card.blocks.push(notice && notice.old
             ? notice.old
             : { type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
