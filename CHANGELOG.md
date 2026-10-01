@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.22] - 2026-10-02
+
+### Fixed（🔴 热重载后新实例「接管」旧卡，而不是各开一张）
+
+**背景**：接 0.4.20。0.4.20 只做了「停 watcher + 把旧卡封口」，实机发现**副作用**：
+封口把观众丢在「后续内容见新的卡片」，而**下面根本没有新卡** ——
+因为新实例不认领上一代那张卡，于是这一轮的剩余内容**整段不可见**（只能等回合收尾的结论卡）。
+
+**修法（续卡机制）**
+
+1. 新增**跨代登记表** `globalThis.__fsLiveCards`（agentId → `{ agent, card, bot, chatId, stop }`）——
+   `startCardWatcher` 登记、`stop` 注销（只注销"还是我这条"）。
+2. dispose 时**只停 watcher、不再封口**（封口留给真正的回合收尾），
+   并把登记表快照保留下来给新实例。
+3. **apply 时接管**：新实例遍历登记表，把还没封口的卡**接着更新**（同一张卡、同一游标），
+   日志 `[fs] 热重载续卡：接管 agent=… card=… blocks=…`。
+4. 卡片表格额度换卡在续卡通道里也保留（`rotateAdoptedCard`：旧卡留表格、新卡接续游标）。
+
+**另加**：`buildCardPayload` 日志带上**卡片身份**（`card=<token 后 8 位> status=… cursor=…`）——
+此前只有块数，出现"两条流并行"时**分不清是哪两张卡**，只能靠猜（多绕了几轮）。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=182, sessions=7)**，`❌` 0 条。
+
 ## [0.4.21] - 2026-10-02
 
 ### Fixed（🔴 插话会把"正在打的结果"截断 —— CM 报障「导致我看不到」）

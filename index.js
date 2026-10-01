@@ -1050,7 +1050,13 @@ export function apply(ctx) {
 
   function buildCardPayload(card) {
     const elements = []
-    console.log('[fs] buildCardPayload: blocks=' + card.blocks.length
+    // 2026-10-02：日志带上**卡片身份**（token 前 8 位 + 状态）——
+    // 之前只有 blocks/notes/tools，出现"两条流并行长"时**分不清是哪两张卡**
+    // （就是靠猜；CM 报的"重复"因此多绕了几轮）。
+    console.log('[fs] buildCardPayload: card=' + String(card.token || '-').slice(-8)
+      + ' status=' + String(card.status || '?')
+      + ' cursor=' + String(Number.isFinite(card.cursor) ? card.cursor : '-')
+      + ' blocks=' + card.blocks.length
       + ' notes=' + card.blocks.filter((b) => b.type === 'note').length
       + ' tools=' + card.tools.size)
     for (const block of card.blocks) {
@@ -1350,6 +1356,10 @@ export function apply(ctx) {
   // 注意：本防护**只对"带着这段代码的那一代"生效** —— 若重载时正在被销毁的是更早的实例
   // （还没有这张登记表），它的 watcher 仍然会漏一次；从下一代起就干净了。
   const liveCardWatchers = new Set()
+  // 「可接管」登记表（**跨插件代际**，挂 globalThis）：agentId -> { agent, card, bot, chatId, stop }
+  // 热重载后新实例靠它**接管**上一代还没封口的卡，在**同一张卡**上继续更新；
+  // 不接管的话两代各自开卡 ⇒ 就是 CM 报的"两张卡并行长"。
+  const liveCardRegistry = globalThis.__fsLiveCards || (globalThis.__fsLiveCards = new Map())
 
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
     const entry = { agent, card, bot, chatId, stop: null }
@@ -1384,9 +1394,11 @@ export function apply(ctx) {
     const stop = () => {
       clearInterval(timer)
       liveCardWatchers.delete(entry)
+      if (liveCardRegistry.get(String(agent.id)) === entry) liveCardRegistry.delete(String(agent.id))
     }
     entry.stop = stop
     liveCardWatchers.add(entry)
+    liveCardRegistry.set(String(agent.id), entry)
     return stop
   }
 
@@ -1405,20 +1417,55 @@ export function apply(ctx) {
     } catch (error) {
       console.log('[fs] dispose(热重载): activeTurns 移交失败 ' + String(error && error.message || error))
     }
-    // ② 停 watcher + 封口
+    // ② 停 watcher — **但不封口**（2026-10-02 实测副作用：一封口就把观众丢在
+    //    「后续内容见新的卡片」而下面根本没有新卡）。卡片留给新实例"续卡"继续更新：
+    //    先把登记表快照下来，停 watcher 时会被顺手删掉，停完再放回去。
+    const keep = Array.from(liveCardRegistry.entries())
     const n = liveCardWatchers.size
     for (const entry of Array.from(liveCardWatchers)) {
       try { entry.stop() } catch { }
-      const card = entry.card
-      if (!card || card.status !== 'running') continue
-      card.sealing = true
-      card.status = 'sealed'
-      card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
-      card.blocks.push({ type: 'message', text: '♻️ 插件已热重载：本卡停止更新，后续内容见新的卡片。' })
-      try { void syncCard(entry.bot, entry.chatId, card, true).catch(() => { }) } catch { }
     }
-    if (n > 0) console.log('[fs] dispose(热重载): 停掉 ' + n + ' 个卡片 watcher，旧卡已封口')
+    for (const [key, value] of keep) {
+      if (!liveCardRegistry.has(key)) liveCardRegistry.set(key, value)
+    }
+    if (n > 0) console.log('[fs] dispose(热重载): 停掉 ' + n + ' 个 watcher（卡片留给新实例续卡）')
   })
+
+  // 表格额度换卡（续卡通道专用）：旧卡保留表格，新卡接续游标，不丢不重。
+  function rotateAdoptedCard(agent) {
+    const key = String(agent && agent.id)
+    const entry = liveCardRegistry.get(key)
+    if (!entry || !entry.card) return
+    const old = entry.card
+    const fresh = makeCardState(agent)
+    fresh.cursor = old.cursor
+    fresh.footerMode = 'bare'
+    old.sealing = true
+    old.status = 'sealed'
+    old.blocks.push({ type: 'message', text: '📊 表格已达飞书单卡上限，后续内容见下方新卡。' })
+    try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
+    entry.card = fresh
+    if (entry.stop) { try { entry.stop() } catch { } }
+    entry.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, () => rotateAdoptedCard(agent))
+    console.log('[fs] 续卡通道：表格换卡 card=' + String(fresh.token || '-').slice(-8))
+  }
+
+  // 热重载「续卡」：新实例接管上一代还没封口的卡（同一张卡上继续更新）。
+  for (const [key, entry] of Array.from(liveCardRegistry.entries())) {
+    try {
+      const card = entry && entry.card
+      if (!entry || !card || !entry.agent || !entry.bot || !entry.chatId
+        || card.status === 'sealed' || card.status === 'error') {
+        liveCardRegistry.delete(key)
+        continue
+      }
+      console.log('[fs] 热重载续卡：接管 agent=' + key + ' card=' + String(card.token || '-').slice(-8)
+        + ' blocks=' + card.blocks.length)
+      entry.stop = startCardWatcher(entry.agent, card, entry.bot, entry.chatId, () => rotateAdoptedCard(entry.agent))
+    } catch (error) {
+      console.log('[fs] 热重载续卡失败（不影响其它功能）: ' + String(error && error.message || error))
+    }
+  }
 
 
   // ---- dedicated agent sessions --------------------------------------------
