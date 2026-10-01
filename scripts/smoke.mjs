@@ -5,9 +5,19 @@
 //   (create + PATCH updates) -> seal -> final reply on card.
 //
 // Run: node scripts/smoke.mjs   (from the package root)
-import { writeFileSync, mkdirSync } from 'node:fs'
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { EventEmitter } from 'node:events'
+
+// 捕获插件自己的 console.log（2026-10-01 补）：用来断言"观测留痕"类行为
+// （例：sendPlainText 成功后要打 `notice plain text sent` —— 此前只有失败才留痕，无法验证）。
+const consoleLines = []
+const originalLog = console.log
+console.log = (...args) => {
+  consoleLines.push(args.map((a) => String(a)).join(' '))
+  originalLog(...args)
+}
 
 const APP_ID = 'cli_test123456'
 const APP_SECRET = 'secret-test'
@@ -15,12 +25,20 @@ const WORKSPACE = 'C:/smoke/workspace'
 const CHAT_ID = 'oc_smoke_chat_001'
 const MSG_ID = 'om_smoke_msg_001'
 
+// 冷启动变体（2026-10-01 目标轮 7）：`DSH_FEISHU_*` 开关都是 **apply 时读一次**
+// （`GOAL_CARDS_ON` L3466 / `NOTICE_CARDS_ON` L3470）⇒ 必须在 import/apply **之前**设好环境变量。
+// 用法： $env:SMOKE_COLD='notice-off'; node scripts/smoke.mjs     （或 'goal-off'）
+const COLD = process.env.SMOKE_COLD || ''
+if (COLD === 'notice-off') process.env.DSH_FEISHU_NOTICE_CARDS = '0'
+if (COLD === 'goal-off') process.env.DSH_FEISHU_GOAL_CARDS = '0'
+
 // Point the plugin at a throwaway config dir so the test never touches the
 // real ~/.dsh-feishucard (the plugin honours process.env.FS_CONFIG_DIR).
 const FAKE_HOME = join(tmpdir(), 'fs-smoke-' + Date.now())
 mkdirSync(join(FAKE_HOME, '.dsh-feishucard'), { recursive: true })
 writeFileSync(join(FAKE_HOME, '.dsh-feishucard', 'feishu.config.json'),
-  JSON.stringify({ bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET }] }, null, 2))
+  // reactionEmoji 一开始就设成非默认值（默认 'OnIt'）—— 用例 40 用它验证 cfg.reactionEmoji 通道
+  JSON.stringify({ bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE' }] }, null, 2))
 process.env.FS_CONFIG_DIR = join(FAKE_HOME, '.dsh-feishucard')
 
 let failures = 0
@@ -35,8 +53,12 @@ function ok(cond, label) {
 
 // ---- mocked Feishu REST (captures card payloads) -----------------------------
 const sentCards = []      // { op, payload }
+const reactionCalls = []  // { method, url, body } —— 打字提示（reaction）生命周期，用例 40 用
 let tenantTokenCalls = 0
 let createReturnsEmptyId = false   // 建卡幂等测试：模拟返回体缺 message_id
+// 2026-10-01（用例 34）：只让"从此刻起的第 N 次建卡"失败 —— 用来精确打到
+// 「建结论卡那一次」而不误伤过程卡的建卡。0 = 不启用。
+let failCreatesFrom = 0
 const globalFetch = globalThis.fetch
 globalThis.fetch = async (url, init) => {
   const u = String(url)
@@ -45,6 +67,7 @@ globalThis.fetch = async (url, init) => {
     return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, tenant_access_token: 'tok', expire: 7200 })) }
   }
   if (u.includes('/reactions') && (init.method === 'POST' || init.method === 'DELETE')) {
+    reactionCalls.push({ method: init.method, url: u, body: String(init.body || '') })
     return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: { reaction_id: 're_1' } })) }
   }
   if (u.includes('/im/v1/messages')) {
@@ -53,6 +76,14 @@ globalThis.fetch = async (url, init) => {
     sentCards.push({ op: init.method === 'PATCH' ? 'update' : 'create', payload })
     if (init.method === 'PATCH') {
       return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0 })) }
+    }
+    if (failCreatesFrom > 0) {
+      failCreatesFrom -= 1
+      if (failCreatesFrom === 0) {
+        // 建卡失败（返回体没有 message_id → 插件侧 createFailed），且**不抛给调用方**
+        // —— 与真机上"15s 超时被 abort"的表现一致：syncCard 内部吞掉异常。
+        return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: {} })) }
+      }
     }
     if (createReturnsEmptyId) {
       return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: {} })) }
@@ -112,8 +143,40 @@ const fakeGoals = {
     goalCalls.push({ agentId: agent && agent.id, objective: request && request.objective })
     return { objective: request && request.objective, roundsStarted: 0, maxGoalRounds: 10, phase: 'active' }
   },
+  // 改造③（底部目标条）用：state/runtimeState/view 三个读接口。
+  // activation 可被用例改写，用来验「续行已停（disarmed）」那一格。
+  state: () => (fakeGoalEnabled ? {
+    goal: {
+      id: 'goal-smoke-1', revision: 1, phase: fakeGoalPhase,
+      objective: '把飞书卡片这四项改造做完并在真机验收通过', maxGoalRounds: 20,
+      blockedReason: fakeGoalBlockedReason || undefined,
+    },
+    roundsStarted: 3,
+    createdAt: Date.now() - 3600000,
+    updatedAt: Date.now(),
+  } : null),
+  runtimeState: () => ({ activation: fakeGoalActivation }),
+  view: (state, runtime) => state === null || state === undefined ? undefined : ({
+    ...state.goal,
+    roundsStarted: state.roundsStarted,
+    createdAt: state.createdAt,
+    activation: runtime.activation,
+  }),
 }
+let fakeGoalActivation = 'armed'
+let fakeGoalPhase = 'active'
+let fakeGoalBlockedReason = ''      // 只有 phase==='blocked' 时会出现在卡面上
+let fakeGoalEnabled = true
 const fakeCommands = { execute: async () => undefined }   // 默认"注册表没接管" → 走 goals 兜底
+// 2026-10-02：补上假 planMode 服务。此前 `ctx.inject` 对 planMode 直接不触发 ⇒ 插件里
+// `planModeRef` 永远是 null ⇒ 「批准后真的退出计划模式」这条分支**从未被测过**。
+const planModeCalls = []
+const fakePlanMode = {
+  set(agent, active) {
+    planModeCalls.push({ agentId: agent && agent.id, active })
+    return 'queued'
+  },
+}
 
 // 会话切换：假的持久化服务 + 会话创建记录 + 活着的 agent 列表（用例 15 用）
 const createdSessionIds = []
@@ -166,8 +229,12 @@ const ctx = {
   tools: { register: (t) => registeredTools.push(t) },
   inject(keys, callback) {
     // cordis service injection: only invoke when a known service is present.
-    // planMode is not provided by the smoke mock, so the callback is kept for
-    // API-shape compatibility and simply not fired.
+    // 2026-10-02：planMode 现在也提供（见 fakePlanMode）—— exit_plan_mode 工具层接管要断言
+    // 「批准后调用了 set(agent,false)」，不注入的话那条分支永远走不到。
+    if (Array.isArray(keys) && keys.includes('planMode')) {
+      callback({ planMode: fakePlanMode })
+      return () => {}
+    }
     void keys; void callback
     return () => {}
   },
@@ -182,17 +249,69 @@ const ctx = {
 
 // Recorded cordis listeners + a tiny emitter so tests can drive plugin hooks.
 const ctxListeners = new Map()
-function emitCtx(event, payload) {
-  for (const listener of (ctxListeners.get(event) || [])) listener(payload)
+function emitCtx(event, ...args) {
+  // 返回**每个监听器的返回值**（2026-10-01 补：水位线类事件——approval/request、
+  // user-questions/request——监听器返回的是 Promise，用例 42 要 await 它拿答案）。
+  const results = []
+  for (const listener of (ctxListeners.get(event) || [])) results.push(listener(...args))
+  return results
 }
 
 // ---- boot the real plugin -------------------------------------------------------
+// 2026-10-01 补：**启动前**先塞一条"历史回执"进会话 —— 用来验证
+// 「首见某 agent 时只登记游标、绝不回放历史」（否则 dsh 重启后会把很久以前的回执全部重播、刷屏）。
+agentEvents.push({
+  type: 'user/message', seq: 1,
+  data: {
+    content: [{ type: 'text', text: 'Background subagent OLDHISTORY-0001 finished and will do no further work unless you send it more.' }],
+    source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'OLDHISTORY-0001' },
+  },
+})
 const mod = await import('../index.js')
 mod.apply(ctx)
 
 // Fire the interval callback a few times to let ensureHelpers spawn and drain.
 for (let i = 0; i < 3; i++) {
   for (const fn of intervals) fn()
+}
+
+// ---- 冷启动变体分支：只验"启动时读一次"的开关，验完即退出（不跑主用例集）------------
+if (COLD) {
+  console.log('冷启动变体：' + COLD + '（这些开关只有冷启动才能验；主用例集假设开关默认开）')
+  feedInbound('om_cold_' + COLD, '冷启动开关测试')
+  await drain()   // 建立 chat→agent 映射（回执轮询只遍历有飞书映射的 agent）
+
+  if (COLD === 'notice-off') {
+    const before = sentCards.length
+    agentEvents.push({
+      type: 'user/message', seq: 7000,
+      data: {
+        content: [
+          { type: 'text', text: 'Background subagent coldtest-0001 finished and will do no further work unless you send it more.' },
+          { type: 'text', text: 'Its closing message:' },
+          { type: 'text', text: '冷启动开关测试回执。' },
+        ],
+        source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'coldtest-0001' },
+      },
+    })
+    await drain()
+    ok(sentCards.length === before, 'DSH_FEISHU_NOTICE_CARDS=0 ⇒ 回执零播报（不建卡也不发纯文本）')
+    ok(!consoleLines.some((l) => l.includes('notice card opened') || l.includes('notice plain text sent')),
+      '开关关掉时连播报日志都不该有')
+    ok(consoleLines.some((l) => l.includes('plugin apply')), '（前提）插件确实已 apply —— 证明不是"啥都没加载"造成的假绿')
+  } else if (COLD === 'goal-off') {
+    const before = sentCards.length
+    agentEvents.push({
+      type: 'user/message', seq: 7100,
+      data: { content: [{ type: 'text', text: '（目标模式 · 第 1 轮）' }], source: { kind: 'goal', round: 1 } },
+    })
+    emitCtx('agent/status', { agent, status: 'running' })
+    await drain()
+    ok(createsSince(before).length === 0, 'DSH_FEISHU_GOAL_CARDS=0 ⇒ 目标轮不自动建卡（不刷屏）')
+    emitCtx('agent/status', { agent, status: 'idle' })
+  }
+  console.log(failures === 0 ? 'COLD PASS (' + COLD + ')' : 'COLD FAIL (' + COLD + '): ' + failures + ' 条')
+  process.exit(failures === 0 ? 0 : 1)
 }
 
 console.log('1) helper spawned & registered')
@@ -218,6 +337,13 @@ await new Promise((r) => setTimeout(r, 600))
 ok(createdSessions === 1, 'dedicated session created (' + createdSessions + ')')
 ok(agent.sent.length === 1, 'message delivered to agent')
 ok(agent.sent[0] && agent.sent[0].content[0].text.includes('帮我看看'), 'message text intact')
+// 2026-10-01 补（此前无守护）：启动前就存在的历史回执**绝不许回放** ——
+// 首次见到某 agent 时只登记游标；`from === undefined` 那条分支若写错，dsh 重启后会把
+// 很久以前的回执全部重播一遍（刷屏）。判定：全流程里不许出现 OLDHISTORY 这个标记。
+ok(!JSON.stringify(sentCards).includes('OLDHISTORY'),
+  '启动前的历史回执不回放（首见 agent 只登记游标）')
+ok(!consoleLines.some((l) => l.includes('OLDHISTORY')),
+  '历史回执既没进卡片、也没进纯文本播报')
 
 console.log('3) streaming card')
 ok(sentCards.length >= 1, 'card created + updated (' + sentCards.length + ' syncs)')
@@ -288,6 +414,11 @@ async function settle(rounds = 3) {
 // 只统计**流式卡**的 create（schema 2.0）；建卡失败后的兜底纯文本不在此列。
 function createsSince(n) {
   return sentCards.slice(n).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+}
+// 2026-10-01 CM：状态（进行中/已完成/失败）已**并入底部状态栏**，状态词写在栏首、紧跟 "  ｜"。
+// 所以断言不能再找 `_失败_` 这种独立状态行，改判"状态栏里确实是这个词"。
+function statusShows(body, word) {
+  return String(body).includes(word + '  ｜')
 }
 
 console.log('6) inbound dedup (same message_id must not run twice)')
@@ -476,8 +607,11 @@ console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2
   await drain()
 
   const opened = createsSince(mark)
-  ok(opened.length === 1, '目标轮自动建了一张卡（create 次数 ' + opened.length + '）')
-  const openBody = JSON.stringify(opened)
+  // 2026-09-27（CM 实证"一个内容发两次"）：目标轮**允许复用**同一轮刚封口的回合卡 ——
+  // 不再另开一张镜像同一批事件的卡。所以 create 次数 0 或 1 都算对；
+  // 关键断言改为「没有多开卡」＋「🎯 目标模式卡面确实出现（新建或复用那张）」。
+  ok(opened.length <= 1, '目标轮没有多开卡（create 次数 ' + opened.length + '）')
+  const openBody = JSON.stringify(cardsSince(mark))
   ok(openBody.includes('目标模式'), '卡面标明是目标模式')
   ok(openBody.includes('第 1 轮'), '卡面标明轮次')
   ok(!openBody.includes('<goal_round>'), 'goal 提示词本身不搬上卡（只镜像本轮后续事件）')
@@ -778,8 +912,8 @@ console.log('17) 本轮没有回复时必须说明原因（2026-09-18 真机事�
     '卡面同时保留上游原文（Insufficient Balance / QUOTA 402，便于核对）')
   ok(!body.includes('已自动重建会话'), '不再把报错换成「已自动重建会话重试」（它修不了欠费）')
   ok(body.includes('⚠️'), '卡片带警示标记（不是一句干巴巴的占位符）')
-  ok(body.includes('_失败_'), '失败回合的状态行是「失败」')
-  ok(!body.includes('_✅ 已完成_'), '失败回合不再假称「已完成」')
+  ok(statusShows(body, '失败'), '失败回合的状态栏写「失败」')
+  ok(!statusShows(body, '已完成'), '失败回合不再假称「已完成」')
 
   // 每张卡（create → 其后 update 为一组）的最后形态里都不该再留着「正在工作中…」
   const perCard = []
@@ -821,8 +955,8 @@ console.log('18) 有工具调用但最终失败的回合：工具面板 + 原因
   ok(body.includes('工具调用'), '工具面板照常进卡（没被失败提示挤掉）')
   ok(body.includes('call_balance_1') || body.includes('a.md'), '工具参数摘要照常进卡')
   ok(body.includes('Insufficient Balance'), '卡面写明失败原因')
-  ok(body.includes('_失败_'), '状态行是「失败」')
-  ok(!body.includes('_✅ 已完成_'), '不假称「已完成」')
+  ok(statusShows(body, '失败'), '状态栏写「失败」')
+  ok(!statusShows(body, '已完成'), '不假称「已完成」')
 }
 
 console.log('19) 目标轮失败也要说原因（不再无条件写「✅ 本轮结束」）')
@@ -839,7 +973,9 @@ console.log('19) 目标轮失败也要说原因（不再无条件写「✅ 本�
   })
   emitCtx('agent/status', { agent, status: 'running' })
   await drain()
-  ok(createsSince(mark).length === 1, '第 4 轮建卡')
+  // 2026-09-27：允许复用刚封口的回合卡 → 新建 0~1 张都算对；要求「没多开」＋「🎯 卡面出现」
+  ok(createsSince(mark).length <= 1, '第 4 轮没有多开卡（create 次数 ' + createsSince(mark).length + '）')
+  ok(JSON.stringify(cardsSince(mark)).includes('目标模式'), '第 4 轮的 🎯 卡面出现（新建或复用）')
 
   const failure = { message: 'Insufficient Balance', code: 'QUOTA', status: 402 }
   agentEvents.push(
@@ -853,7 +989,7 @@ console.log('19) 目标轮失败也要说原因（不再无条件写「✅ 本�
   ok(body.includes('Insufficient Balance'), '目标轮卡写明失败原因')
   ok(body.includes('本轮失败'), '封口写「本轮失败」')
   ok(!body.includes('本轮结束'), '失败轮不再写「✅ 本轮结束」')
-  ok(body.includes('_失败_'), '状态行是「失败」')
+  ok(statusShows(body, '失败'), '状态栏写「失败」')
 }
 
 console.log('20) 无产出且**没有**失败标记：明说「原因未上报」，僵尸会话自愈仍然保留')
@@ -881,7 +1017,7 @@ console.log('20) 无产出且**没有**失败标记：明说「原因未上报�
   const ops = cardsSince(mark)
   const body = JSON.stringify(ops)
   ok(body.includes('原因未上报'), '没有失败标记时，卡片明说「原因未上报」（不再只写占位符）')
-  ok(body.includes('_失败_'), '无产出的回合状态行是「失败」，不假称完成')
+  ok(statusShows(body, '失败'), '无产出的回合状态栏写「失败」，不假称完成')
   ok(body.includes('已自动重建会话'), '僵尸会话自愈仍然保留（只在**没有**失败标记时才自愈）')
   ok(body.includes('自愈后的正常回复-OK'), '自愈重试的回复正常交付给用户')
 }
@@ -949,6 +1085,12 @@ console.log('22) 子代理／后台回执轮也要上卡（2026-09-21 CM：子�
   ok(createsSince(mark2).length === 0, 'system-reminder 类 plugin 消息不建卡（不刷屏）')
   emitCtx('agent/status', { agent, status: 'idle' })
   await settle()
+
+  // 📌 审计纠正（2026-10-01）：此前把「NOTICE_RE 旧正文正则兜底」记为"0 覆盖"——**那是按标识符 grep
+  //    得出的假结论**。事实上本用例（seq 5000，`source.kind='plugin'`）与用例 23 的控制组
+  //    （`Background job pwsh-91 finished.`）**都只能靠正文正则**才能被判成回执轮：
+  //    `autoTurnInfo()` 只特判 `kind === 'goal'`，其余一律走 NOTICE_RE ⇒ 正则一旦失效，这两条必红。
+  //    故不另加断言（重复覆盖没有价值），在此注明真实的覆盖来源。
 }
 
 console.log('23) 普通飞书回合**不许**被当成回执轮抢建第二张卡（2026-09-23 CM：每次回复都发两张卡）')
@@ -1008,6 +1150,1059 @@ console.log('23) 普通飞书回合**不许**被当成回执轮抢建第二张�
   ok(createsSince(mark2).length === 1, '真正的回执轮照样建卡（没有误伤）')
   emitCtx('agent/status', { agent, status: 'idle' })
   await settle()
+}
+
+console.log('24) 子代理回执「落盘即播报」：不看回合状态（2026-10-01 改造①）')
+{
+  // 真机根因：回执要等 turn/start **之后**才写进会话，而旧实现在"回合启动那一拍"回扫
+  // → 判成普通回合 → 不开卡（CM 实证"没弹"）。本用例**完全不发 agent/status**，
+  // 只把回执事件写进会话 —— 新实现必须照样播报。
+  const mark = sentCards.length
+  const sentBefore = agent.sent.length
+  agentEvents.push({
+    type: 'user/message', seq: 7000,
+    data: {
+      content: [
+        { type: 'text', text: 'Background subagent child-abc12345-0000-0000-0000-000000000000 finished and will do no further work unless you send it more.' },
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'text', text: '交付完成：报告已生成。' },
+      ],
+      source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-abc12345-0000-0000-0000-000000000000' },
+    },
+  })
+  await drain()
+  const created = cardsSince(mark).filter((c) => c.op === 'create')
+  const rawText = JSON.stringify(created.map((c) => c.payload))
+  ok(created.length >= 2, '纯文本 + 详情卡 双层播报都发了（实际 ' + created.length + ' 条）')
+  ok(rawText.includes('已完成'), '播报里写了「子代理已完成」')
+  ok(rawText.includes('child-ab'), '播报带正确的子代理 id 前 8 位（不是张冠李戴）')
+  ok(rawText.includes('不用回这条'), '通知卡定位清楚：不用回这张卡')
+  ok(agent.sent.length === sentBefore, '播报不新开回合（没有往 agent 里塞消息）')
+  // 2026-10-01 补（此前无守护）：v0.4.2 补上的"纯文本成功也留痕"必须真的打出来 ——
+  // 否则"纯文本到底有没有送达"永远证不了（真机并发测试时唯一的观测缺口）。
+  ok(consoleLines.some((l) => l.includes('notice plain text sent')),
+    'sendPlainText 成功后留痕（notice plain text sent）')
+  // 去重：同一批事件再扫一遍，不许重复播报
+  const again = sentCards.length
+  await drain()
+  ok(sentCards.length === again, '同一回执不重复播报')
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+}
+
+console.log('25) 卡片底部「目标条」：目标全文 + 状态 + 上下文占比 + 缓存命中（改造③）')
+{
+  const mark = sentCards.length
+  agentEvents.push(
+    { type: 'request/context', seq: 7100, data: { provider: 'deepseek-official', model: 'deepseek-v4-flash', contextWindow: 1000000 } },
+    {
+      type: 'assistant/message', seq: 7101,
+      data: {
+        usage: { inputTokens: 162, outputTokens: 100, cacheReadTokens: 177152, cacheWriteTokens: 0, totalTokens: 177414 },
+      },
+    },
+  )
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 7110, data: { message: { content: [{ type: 'text', text: '目标条回合正文' }] } } })
+  }
+  agent.whenIdle = async () => {}
+  feedInbound('om_goal_footer', '目标条测试')
+  await settle(3)
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('目标模式'), '底部出现目标条')
+  ok(body.includes('把飞书卡片这四项改造做完'), '折叠面板里带目标全文')
+  ok(body.includes('已激活'), '状态文案＝已激活（armed）')
+  ok(body.includes('第 3/20 轮'), '轮数 N/M 正确')
+  ok(body.includes('缓存命中'), '带缓存命中率')
+  ok(/（\d+\.\d%）/.test(body), '上下文带占比')
+  ok(body.includes('collapsible_panel'), '目标条是可折叠面板')
+  ok(body.includes('"tag":"hr"'), '目标条上面有灰色分隔线 hr（CM 2026-10-01：不然跟正文混到一起）')
+
+  // 续行被解除武装（dsh 重启后的真实状态）必须一眼可见
+  const mark2 = sentCards.length
+  fakeGoalActivation = 'disarmed'
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 7120, data: { message: { content: [{ type: 'text', text: '续行已停的回合一' }] } } })
+  }
+  feedInbound('om_goal_disarmed', '续行已停目标条测试')
+  await settle(3)
+  const body2 = JSON.stringify(cardsSince(mark2))
+  ok(body2.includes('续行已停'), 'disarmed → 卡面写「续行已停」（CM 要抓的"目标停了"）')
+  ok(body2.includes('/goal resume'), '并且给出恢复方式')
+  fakeGoalActivation = 'armed'
+
+  // 未启用形态：CM 2026-10-01「未激活的时候也加一个灰色底」
+  const mark3 = sentCards.length
+  fakeGoalEnabled = false
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 7130, data: { message: { content: [{ type: 'text', text: '无目标回合一' }] } } })
+  }
+  feedInbound('om_goal_disabled', '未启用目标条测试')
+  await settle(3)
+  const body3 = JSON.stringify(cardsSince(mark3))
+  ok(body3.includes('未启用'), '无目标时目标条写「未启用」')
+  ok(body3.includes('grey-50'), '未启用形态也有灰色底（grey-50）')
+  ok(body3.includes('"tag":"hr"'), '未启用形态同样带灰色分隔线')
+  fakeGoalEnabled = true
+}
+
+console.log('26) 选项卡：长选项换行分栏 + 6 个选项不丢（改造④，CM 定 A4）')
+{
+  const mark = sentCards.length
+  const questions = [{
+    id: 'q-smoke-1',
+    question: '阶段 1-4 复盘口径，你要哪一种？',
+    options: [
+      { label: '按决策错误口径：只判用了不合规依据、用了无出处的方法、有据可查却没查这三种情形；流程没走全的一律归到阶段 2。' },
+      { label: '按流程完整性口径：把没走的步骤也算失误，逐项打勾核对。' },
+      { label: '两者都要：先按决策口径判对错，再附一份流程完整性清单。' },
+      { label: '选项四：只看结论对不对。' },
+      { label: '选项五：只看流程走没走全。' },
+      { label: '选项六：以上都不选，我直接回复文字。' },
+    ],
+  }]
+  emitCtx('tools/execute', { name: 'ask_user_question', agent, arguments: { questions }, signal: undefined }, () => {})
+  await drain()
+  const qCard = cardsSince(mark).filter((c) => c.op === 'create')
+    .find((c) => JSON.stringify(c.payload).includes('需要你的回答'))
+  ok(Boolean(qCard), '问句卡已发出')
+  const body = JSON.stringify(qCard ? qCard.payload : {})
+  ok(body.includes('"schema":"2.0"'), '问句卡改用 JSON 2.0 结构')
+  ok(body.includes('column_set'), '选项改成"一行一个分栏"')
+  ok(body.includes('stretch'), '窄屏自动堆叠（A4）')
+  ok(body.includes('选它'), '按钮文案＝选它')
+  ok(body.includes('有据可查却没查这三种情形'), '长选项正文**完整**出现在卡上（不再截断）')
+  ok(body.includes('选项六'), '第 6 个选项没有被静默丢弃（旧实现 slice(0,5)）')
+  // 清掉挂起的提问：否则 30 分钟超时定时器会拖住进程不退出
+  feedInbound('om_answer_pending_question', '选 1')
+  await drain()
+}
+
+console.log('27) 引用回复透传：parent_id → 会话里带被引摘要（改造⑤）')
+{
+  feedInbound('om_quote_source', '这是被引用的那条原消息')
+  await drain()
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: 'om_quote_reply',
+        message_type: 'text',
+        chat_id: CHAT_ID,
+        chat_type: 'p2p',
+        content: JSON.stringify({ text: '我引用的就是上面那条' }),
+        parent_id: 'om_quote_source',
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+  await drain()
+  const last = agent.sent[agent.sent.length - 1]
+  const text = (last && last.content && last.content[0] && last.content[0].text) || ''
+  ok(text.includes('你在引用这条消息'), '引用信息被带进了会话正文')
+  ok(text.includes('这是被引用的那条原消息'), '引用里带的是被引消息的摘要')
+  ok(text.includes('我引用的就是上面那条'), '用户正文本身照旧送达')
+}
+
+console.log('28) 中文目的行：长过程话语被 500 字截断时，🎯 行必须留下（改造②）')
+{
+  const mark = sentCards.length
+  const note = '背景说明。'.repeat(120) + '\n🎯 去查基准库，确认这场比赛的赔率口径。\n结尾一句。'
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 7200, data: { message: { content: [{ type: 'text', text: note }] } } })
+  }
+  feedInbound('om_purpose_line', '目的行测试')
+  await settle(2)
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('🎯 去查基准库'), '目的行没有被 500 字截断切掉（改造②的保护生效）')
+}
+
+console.log('29) 点击选项后后续内容必须写到【新卡】(CM 回归红线：自动轮也要换卡)')
+{
+  // 造一个自动轮：回执落盘 → 播报建卡（这张卡会进 autoCards，成为"活跃卡"）
+  const mark = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 7300,
+    data: {
+      content: [
+        { type: 'text', text: 'Background subagent child-split0001-0000 finished and will do no further work unless you send it more.' },
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'text', text: '这一步做完了。' },
+      ],
+      source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-split0001-0000' },
+    },
+  })
+  await drain()
+  ok(cardsSince(mark).filter((c) => c.op === 'create').length >= 2, '自动轮已建卡（split 的前提）')
+
+  // 在自动轮里提问（真机上就是"我在回执轮里问了 CM 一个问题"）
+  const qmark = sentCards.length
+  const questions = [{ id: 'q-split', question: '选一个', options: [{ label: '选项甲' }, { label: '选项乙' }] }]
+  emitCtx('tools/execute', { name: 'ask_user_question', agent, arguments: { questions }, signal: undefined }, () => {})
+  await drain()
+  const qCard = cardsSince(qmark).filter((c) => c.op === 'create')
+    .find((c) => JSON.stringify(c.payload).includes('需要你的回答'))
+  ok(Boolean(qCard), '问题卡已发出')
+  const token = qCard
+    && qCard.payload.body.elements.find((e) => e.tag === 'column_set')
+    && qCard.payload.body.elements.find((e) => e.tag === 'column_set').columns[1].elements[0].behaviors[0].value.fs_question
+  ok(Boolean(token), '从问题卡里取到了回传 token')
+
+  // 点按钮：**必须走 helper 事件通道**（card.action.trigger 由 handleHelperMessage 分发，
+  // 不是 ctx 事件 —— 用 emitCtx 发它不会有任何反应）。
+  const tapMark = sentCards.length
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'card.action.trigger',
+    data: {
+      action: { tag: 'button', value: { fs_question: token, fs_option: 0 } },
+      context: { open_chat_id: CHAT_ID },
+    },
+  }) + '\n'
+  await drain()
+  ok(createsSince(tapMark).length >= 1,
+    '点击后开了【新卡】（旧卡被冻结，后续内容不再往用户已经划过的那张卡上堆）')
+  const updates = sentCards.slice(tapMark).filter((c) => c.op === 'update')
+  ok(updates.some((c) => JSON.stringify(c.payload).includes('已收到你的选择')),
+    '旧卡被封口并写了「✅ 已收到你的选择，继续处理中…」')
+  ok(updates.some((c) => JSON.stringify(c.payload).includes('继续处理中')),
+    '新卡写了「继续处理中…」')
+}
+
+console.log('30) 有活跃卡时回执【并入卡片】、不发独立消息（CM 2026-10-01：别让它沉在活跃卡下面）')
+{
+  let release = null
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 7400, data: { message: { content: [{ type: 'text', text: '活跃回合正文' }] } } })
+  }
+  agent.whenIdle = () => new Promise((resolve) => { release = resolve })
+  feedInbound('om_merge_notice', '并卡测试')
+  await drain()
+  ok(Boolean(release), '回合确实卡在 whenIdle（活跃卡场景成立）')
+
+  const before = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 7410,
+    data: {
+      content: [
+        { type: 'text', text: 'Background subagent child-merge001-0000 finished and will do no further work unless you send it more.' },
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'text', text: '这一步做完了。' },
+      ],
+      source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-merge001-0000' },
+    },
+  })
+  await drain()
+  const during = sentCards.slice(before)
+  ok(during.length > 0, '回执到达时有动作（至少 PATCH 了活跃卡）')
+  ok(during.every((c) => c.op === 'update'),
+    '有活跃卡时**不发独立消息**（全部是 PATCH，共 ' + during.length + ' 条）')
+  ok(JSON.stringify(during).includes('子代理'), '回执内容并进了那张活跃卡')
+
+  if (release) release()
+  await settle(2)
+  agent.whenIdle = async () => {}
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+}
+
+console.log('31) 结论独立成卡（CM 2026-10-01 B 方案，17:3x 修正：**只按耗时**判定）')
+{
+  // (a) 耗时达标（本用例把阈值压到 0ms —— 冒烟里回合是瞬时完成的，elapsed 可能是 0）
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
+  const mark = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'tool/call', seq: 7500, data: { callId: 'call_split_1', name: 'read', arguments: '{"file_path":"a.md"}' } },
+      { type: 'assistant/message', seq: 7501, data: { message: { content: [{ type: 'text', text: '结论：一切正常。' }] } } },
+    )
+  }
+  feedInbound('om_split_with_tools', '分卡测试（达标）')
+  await settle(3)
+  const events = sentCards.slice(mark)
+  const creates = events.filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  ok(creates.length === 2, '耗时达标 → 过程卡 + 结论卡（实际 ' + creates.length + ' 张）')
+  const conclusionIdx = events.findIndex((c, i) => i > 0 && c.op === 'create' && JSON.stringify(c.payload).includes('一切正常'))
+  ok(conclusionIdx > 0, '结论出现在**新开的**那张卡里')
+  const beforeConclusion = JSON.stringify(events.slice(0, conclusionIdx))
+  ok(!beforeConclusion.includes('一切正常'), '过程卡里**没有**重复结论')
+  ok(beforeConclusion.includes('结论见下方卡片'), '过程卡留一句指路')
+  ok(JSON.stringify(creates[creates.length - 1].payload).includes('已完成'), '结论卡的状态栏写「已完成」')
+  // CM 2026-10-01 A 方案：**过程卡不摆状态栏**（无目标/无上下文/无缓存），只留一行裸状态
+  // 判据用「目标模式」这条状态栏专属文案（`grey-50` 不能当判据 —— 工具折叠面板也是 grey-50）
+  ok(!beforeConclusion.includes('目标模式'),
+    '过程卡**不显示状态栏**（没有目标/上下文/缓存那一条）')
+  ok(beforeConclusion.includes('运行中') || beforeConclusion.includes('已完成'), '过程卡保留一行裸状态')
+  ok(JSON.stringify(creates[creates.length - 1].payload).includes('目标模式'),
+    '结论卡带完整状态栏（灰底那一行在结论卡上）')
+
+  // (b) 未达阈值（恢复默认 30s；本轮的 80ms 远不够）→ 维持单卡
+  //     ★ 这就是 CM 17:3x 的反馈：「短任务都变了两张卡了」—— 短任务**即使调了工具**也必须单卡
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const mark2 = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'tool/call', seq: 7510, data: { callId: 'call_split_2', name: 'read', arguments: '{"file_path":"b.md"}' } },
+      { type: 'assistant/message', seq: 7511, data: { message: { content: [{ type: 'text', text: '简短结论' }] } } },
+    )
+  }
+  feedInbound('om_split_short', '分卡测试（未达标）')
+  await settle(3)
+  ok(createsSince(mark2).length === 1,
+    '**短任务（即使调了工具）也维持单卡**（实际 ' + createsSince(mark2).length + ' 张）')
+}
+
+console.log('32) /compact：压缩上下文必须透传到命令注册表（CM 2026-10-01 要求）')
+{
+  // 旧实现：compact 不在 COMMANDS 白名单 ⇒ `/compact` 被当成**普通消息**丢给模型，压缩根本不会发生。
+  const prev = fakeCommands.execute
+  const calls = []
+  // ★ 记录**全部**参数：execute 的签名是 (agent, line, submittedAttachments, signal)——
+  //   2026-10-01 真机事故：signal 传在第 3 位 ⇒ 注册表里 `signal.aborted` 抛
+  //   `Cannot read properties of undefined (reading 'aborted')`（用户看到「压缩失败：…」）。
+  fakeCommands.execute = async (...args) => {
+    calls.push({ agentId: args[0] && args[0].id, line: args[1], attachments: args[2], signal: args[3] })
+    return { result: { text: 'compacted 12 messages' } }
+  }
+  const mark = sentCards.length
+  feedInbound('om_compact', '/compact')
+  await drain()
+  const body = JSON.stringify(cardsSince(mark))
+  const call = calls.find((c) => c.line === '/compact')
+  ok(Boolean(call), '/compact 被路由到 commands.execute')
+  ok(call && call.signal && typeof call.signal.aborted === 'boolean',
+    'signal 必须传在**第 4 位**（第 3 位是 attachments）—— 传错位会让注册表抛 TypeError')
+  ok(call && call.attachments !== undefined && Array.isArray(call.attachments) && call.attachments.length === 0,
+    '第 3 位必须是**数组**（空附件）—— 传 undefined 会让注册表读 .length 再抛一次')
+  ok(body.includes('压缩上下文'), '把压缩结果回给用户')
+  ok(body.includes('compacted 12 messages'), '上游结果原文可见')
+
+  // /goal 与 /plan 走同一条通道 —— 同一个错位问题也要守住
+  feedInbound('om_goal_signal', '/goal 信号位测试')
+  await drain()
+  const goalCall = calls.find((c) => c.line && c.line.startsWith('/goal'))
+  ok(goalCall && goalCall.signal && typeof goalCall.signal.aborted === 'boolean',
+    '/goal 同样把 signal 传在第 4 位（旧代码在这里静默抛错、退化成兜底分支）')
+
+  // 注册表没有 /compact 时，必须明说"不可用"，而不是静默什么都不做
+  fakeCommands.execute = async () => undefined
+  const mark2 = sentCards.length
+  feedInbound('om_compact_missing', '/compact')
+  await drain()
+  ok(JSON.stringify(cardsSince(mark2)).includes('压缩不可用'), '插件未装载时要明确告知（不静默）')
+
+  // ★ CM 2026-10-01：「报错能不能直接知道、提醒到 agent？」——
+  //   命令抛异常时，除了回给用户，还必须**回注会话并唤醒 agent**（否则它永远不知道出过错）
+  const sentBefore = agent.sent.length
+  const mark3 = sentCards.length
+  fakeCommands.execute = async () => { throw new Error('boom-from-registry') }
+  feedInbound('om_compact_throw', '/compact')
+  await drain()
+  ok(JSON.stringify(cardsSince(mark3)).includes('压缩失败'), '失败照旧回给用户')
+  const injected = agent.sent.slice(sentBefore).map((m) => JSON.stringify(m)).join(' ')
+  ok(injected.includes('[系统回执]') && injected.includes('boom-from-registry'),
+    '失败必须**回注给 agent**（含原因），让它能主动排查')
+
+  // 2026-10-01 审计发现：`/plan`、`/goal` 的 catch 也接了 reportCommandFailure，
+  // 但**从没有人断言过**（上面只注入了 /compact 的异常）。三条通道一起钉住。
+  fakeCommands.execute = async () => { throw new Error('boom-plan') }
+  const sentBeforePlan = agent.sent.length
+  feedInbound('om_plan_throw', '/plan')
+  await drain()
+  ok(agent.sent.slice(sentBeforePlan).map((m) => JSON.stringify(m)).join(' ').includes('boom-plan'),
+    '/plan 失败同样回注 agent（含原因）')
+
+  fakeCommands.execute = async () => { throw new Error('boom-goal') }
+  const sentBeforeGoalFail = agent.sent.length
+  feedInbound('om_goal_throw', '/goal pause')
+  await drain()
+  ok(agent.sent.slice(sentBeforeGoalFail).map((m) => JSON.stringify(m)).join(' ').includes('boom-goal'),
+    '/goal 失败同样回注 agent（含原因）')
+  fakeCommands.execute = prev
+}
+
+console.log('33) 目标状态三分支（paused/blocked/complete）＋ 状态变化刷新活跃卡（2026-10-01 审计补测）')
+{
+  // (a) `goalStateText()` 的三个分支此前**一次都没被执行过**（smoke 只覆盖 armed/disarmed/未启用）。
+  let seqN = 8000
+  const phaseCase = async (label, expect) => {
+    const mark = sentCards.length
+    seqN += 10
+    agent.send = function (message) {
+      this.sent.push(message)
+      agentEvents.push({ type: 'assistant/message', seq: seqN, data: { message: { content: [{ type: 'text', text: label }] } } })
+    }
+    feedInbound('om_goal_phase_' + seqN, label)
+    await settle(3)
+    ok(JSON.stringify(cardsSince(mark)).includes(expect), label + '：卡面出现「' + expect + '」')
+  }
+  fakeGoalPhase = 'paused'
+  await phaseCase('暂停态目标条', '目标模式 · 已暂停')
+  fakeGoalPhase = 'blocked'
+  fakeGoalBlockedReason = '已达轮次上限'
+  await phaseCase('阻塞态目标条（状态栏只写已阻塞）', '目标模式 · 已阻塞')
+  // CM 2026-10-01：**状态栏只写「已阻塞」**，长原因挪到展开面板 ⇒ 上面断"短状态栏"，
+  // 下面断"原因仍完整在卡里（面板内容里）"。
+  await phaseCase('阻塞态目标条（原因在面板里）', '已达轮次上限')
+  // ⚠️ 2026-10-01 真机抓出：驱动服务给的 blockedReason 是**对象** `{code, message}`，
+  //    而这里原来只测字符串形状 ⇒ `String(obj)` 渲染成 `[object Object]` 漏网（CM 在卡上看到了）。
+  //    补对象形状 + "绝不出现 [object Object]" 两条断言。
+  fakeGoalBlockedReason = { code: 'model-reported', message: '对象形状的阻塞原因' }
+  await phaseCase('阻塞态目标条（对象原因在面板里）', '对象形状的阻塞原因')
+  {
+    const mark = sentCards.length
+    seqN += 10
+    agent.send = function (message) {
+      this.sent.push(message)
+      agentEvents.push({ type: 'assistant/message', seq: seqN, data: { message: { content: [{ type: 'text', text: '对象原因渲染测试' }] } } })
+    }
+    feedInbound('om_goal_phase_obj', '对象原因渲染测试')
+    await settle(3)
+    const body = JSON.stringify(cardsSince(mark))
+    ok(!body.includes('[object Object]'), '目标阻塞原因绝不许渲染成 [object Object]')
+  }
+  fakeGoalPhase = 'complete'
+  fakeGoalBlockedReason = ''
+  await phaseCase('完成态目标条', '目标模式 · 已完成 · 共 3 轮')
+  fakeGoalPhase = 'active'
+
+  // (b) `goal/changed` / `goal/activation-changed` → **已经在飞书上的活跃卡**必须跟着刷新。
+  //     审计结论：`index.js` L3595-3618 那段（refreshLiveCards）在 smoke 里 0 触发、真机 0 次 ⇒ 纯代码承诺。
+  //     注意：普通回合的过程卡是 bare（不摆状态栏）⇒ 必须用**自动卡**（回执轮）来验，
+  //     它从出生就是 full（`makeCardState` 默认 footerMode='full'）。
+  const markAuto = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 8100,
+    data: {
+      content: [
+        { type: 'text', text: 'Background subagent child-refresh01-0000 finished and will do no further work unless you send it more.' },
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'text', text: '刷新用例的回执。' },
+      ],
+      source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-refresh01-0000' },
+    },
+  })
+  await drain()
+  // 前提（可失败）：回执必须触发卡片动作 —— 新开自动卡 或 并入活跃卡，两种都算。
+  ok(sentCards.length > markAuto, '前提：回执触发了卡片动作（新开自动卡/并入活跃卡）')
+
+  const markRefresh = sentCards.length
+  fakeGoalPhase = 'paused'
+  emitCtx('goal/changed', {})
+  await drain()
+  // 判据：必须出现一次 **PATCH**，且该 PATCH 的载荷里同时有「目标模式」（＝状态栏，说明刷的是
+  // full 卡）和「已暂停」（＝读到的是**刚刚改过的**状态）。只看 create 不算 —— 那是新建卡，不是刷新。
+  const refreshPatched = sentCards.slice(markRefresh)
+    .filter((c) => c.op === 'update').map((c) => JSON.stringify(c.payload)).join(' ')
+  ok(refreshPatched.includes('目标模式') && refreshPatched.includes('已暂停'),
+    'goal/changed → 已发出的卡被当场 PATCH 成新状态（refreshLiveCards 真的在跑）')
+
+  const markActivation = sentCards.length
+  fakeGoalPhase = 'active'
+  fakeGoalActivation = 'disarmed'
+  emitCtx('goal/activation-changed', { sessionId: agent.session.id || 'agent-smoke-1' })
+  await drain()
+  const activationPatched = sentCards.slice(markActivation)
+    .filter((c) => c.op === 'update').map((c) => JSON.stringify(c.payload)).join(' ')
+  ok(activationPatched.includes('续行已停'),
+    'goal/activation-changed → 同样刷新（「续行已停」当场可见）')
+
+  fakeGoalActivation = 'armed'
+  emitCtx('agent/status', { agent, status: 'idle' })
+  await settle()
+}
+
+console.log('34) 建结论卡失败 → 结论绝不能丢（审计发现：回退分支形同虚设）')
+{
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
+  const mark = sentCards.length
+  // 时间线：本轮第 1 次建卡＝过程卡（必须成功），第 2 次建卡＝结论卡（这次让它失败）。
+  failCreatesFrom = 2
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'tool/call', seq: 8600, data: { callId: 'call_concl_1', name: 'read', arguments: '{"file_path":"c.md"}' } },
+      { type: 'assistant/message', seq: 8601, data: { message: { content: [{ type: 'text', text: '结论：这一句绝不能丢。' }] } } },
+    )
+  }
+  feedInbound('om_conclusion_fail', '结论卡失败测试')
+  await settle(3)
+  failCreatesFrom = 0
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const since = sentCards.slice(mark)
+  ok(JSON.stringify(since).includes('结论见下方卡片'), '前提：本轮确实走了"结论独立成卡"路径')
+  // 判据落在 **PATCH** 上：建卡失败的载荷也会进 sentCards（没有 message_id），
+  // 所以不能靠"载荷里有没有这句话"来判 —— 必须看**已经存在的那张过程卡**有没有被补上结论。
+  const patched = JSON.stringify(since.filter((c) => c.op === 'update'))
+  ok(patched.includes('这一句绝不能丢'),
+    '建结论卡失败 ⇒ 必须把结论补回过程卡（PATCH），否则用户只看到「结论见下方卡片」却永远等不到那张卡')
+}
+
+console.log('35) 引用透传落盘：重启后仍能查出"你引的是哪张卡"（2026-10-01 真机实证补测）')
+{
+  // 真机事故：CM 长按引用一张卡片 → 卡面回「内容未登记，可能是更早的消息」。
+  // 根因＝登记表只在内存，dsh 重启就清空（他引的那张卡恰恰建于本次重启之前）。
+  const idxPath = join(process.env.FS_CONFIG_DIR, 'message-index.json')
+  // 先跑一轮普通回合（封口后有明确结论），用来检查"登记的摘要到底是不是有信息量的那一句"。
+  const labelMarker = '引用摘要测试用的结论'
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 8900, data: { message: { content: [{ type: 'text', text: labelMarker }] } } })
+  }
+  feedInbound('om_label_turn', '摘要登记测试')
+  await settle(3)
+  await drain()   // 等 rememberMessage 的落盘防抖（300ms）跑完
+
+  let saved = null
+  try { saved = JSON.parse(readFileSync(idxPath, 'utf8')) } catch { saved = null }
+  const ids = saved ? Object.keys(saved) : []
+  const labels = ids.map((id) => String((saved[id] && saved[id].label) || ''))
+  // ⚠️ 2026-10-01 真机（CM 引用重启后的卡）：摘要居然是「bot 的回复卡片：正在工作中…」
+  //    —— 建卡那一刻卡片里只有占位符，登记它**等于没登记**（引用时看不出引的是哪张、讲什么）。
+  //    封口时卡片内容才成形 ⇒ 每次成功同步都必须刷新摘要。
+  ok(!labels.some((l) => l.includes('正在工作中')),
+    '登记摘要里不许留着建卡时的占位符「正在工作中…」（实际：' + JSON.stringify(labels.filter((l) => l.includes('正在工作中')).slice(0, 2)) + '）')
+  ok(labels.some((l) => l.includes(labelMarker)),
+    '卡片封口后的结论被登记成摘要（引用时能看出"引的是哪张、说了什么"）')
+  ok(ids.length > 0, '发出去的消息/卡片被登记到落盘索引（' + ids.length + ' 条）')
+  ok(ids.some((id) => String(id).startsWith('om_card_')), '卡片 message_id 在索引里（引用卡片的主场景）')
+  const cardEntry = ids.map((id) => saved[id]).find((v) => v && String(v.label).includes('bot 的回复卡片'))
+  ok(Boolean(cardEntry), '卡片登记的摘要是"bot 的回复卡片：…"（引用时能说出引的是哪张）')
+
+  // 模拟"这张卡是上一次进程登记的"：直接写进磁盘索引（内存里没有它）。
+  const oldId = 'om_from_previous_process'
+  const merged = Object.assign({}, saved, { [oldId]: { label: 'bot 的回复卡片：上一进程发的那张卡', at: Date.now() - 60000 } })
+  writeFileSync(idxPath, JSON.stringify(merged))
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: 'om_quote_old_card',
+        message_type: 'text',
+        chat_id: CHAT_ID,
+        chat_type: 'p2p',
+        content: JSON.stringify({ text: '我引的是上一进程那张卡' }),
+        parent_id: oldId,
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+  await drain()
+  const last = agent.sent[agent.sent.length - 1]
+  const text = (last && last.content && last.content[0] && last.content[0].text) || ''
+  ok(text.includes('上一进程发的那张卡'),
+    '未命中内存时**再读一次落盘索引** ⇒ 重启前发出的卡片也认得出来（不再一律「内容未登记」）')
+
+  // 真·未登记的消息必须照实说，**不许编造**
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: 'om_quote_unknown',
+        message_type: 'text',
+        chat_id: CHAT_ID,
+        chat_type: 'p2p',
+        content: JSON.stringify({ text: '我引的是一条谁也没登记过的消息' }),
+        parent_id: 'om_never_seen_anywhere',
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+  await drain()
+  const last2 = agent.sent[agent.sent.length - 1]
+  const text2 = (last2 && last2.content && last2.content[0] && last2.content[0].text) || ''
+  ok(text2.includes('内容未登记'), '真查不到时照实写「内容未登记」（A24：不许编造出处）')
+}
+
+console.log('36) /help 文案必须列出 /compact（2026-10-01 审计：此前无守护用例）')
+{
+  const mark = sentCards.length
+  agent.send = function (message) { this.sent.push(message) }
+  feedInbound('om_help_cmd', '/help')
+  await drain()
+  const body = JSON.stringify(sentCards.slice(mark))
+  ok(body.includes('/compact'), '/help 里列出了 /compact')
+  ok(body.includes('压缩上下文'), '/help 说明了 /compact 的作用与前置条件')
+  ok(body.includes('/goal') && body.includes('/switch'), '/help 仍保留既有命令（没被改坏）')
+}
+
+console.log('37) 消息索引 300 条上限：不许无界增长，且淘汰最旧的（审计：此前无守护用例）')
+{
+  const idxPath = join(process.env.FS_CONFIG_DIR, 'message-index.json')
+  const many = {}
+  for (let i = 1; i <= 400; i++) {
+    many['om_cap_' + String(i).padStart(3, '0')] = { label: 'cap-entry-' + i, at: Date.now() - (400 - i) * 1000 }
+  }
+  writeFileSync(idxPath, JSON.stringify(many))
+  // 引用其中最后一条（内存里没有 ⇒ 走"未命中再读盘"），既验按需加载、又能触发一次裁剪
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: 'om_cap_quote',
+        message_type: 'text',
+        chat_id: CHAT_ID,
+        chat_type: 'p2p',
+        content: JSON.stringify({ text: '上限测试：引用最后一条' }),
+        parent_id: 'om_cap_400',
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+  await drain()
+  const last = agent.sent[agent.sent.length - 1]
+  const text = (last && last.content && last.content[0] && last.content[0].text) || ''
+  ok(text.includes('cap-entry-400'), '按需读盘：引用能查到落盘索引里的条目')
+  await drain()   // 等 rememberMessage 的 300ms 防抖落盘
+  const after = JSON.parse(readFileSync(idxPath, 'utf8'))
+  const keys = Object.keys(after)
+  ok(keys.length <= 300, '落盘索引被裁到 300 条以内（实际 ' + keys.length + ' 条，防无界增长）')
+  ok(keys.includes('om_cap_400'), '保留较新的条目（最旧的先淘汰）')
+}
+
+console.log('38) bot 配置热读通道：splitConclusionMinMs 优先级 + notifyAgentNotices 开关（审计：两条都没验过）')
+{
+  // 依据：`ensureHelpers()` 每 CONFIG_REFRESH_MS(10s) 重读配置并 `bot.cfg = cfg`（index.js L2288/L2320）
+  // ⇒ 改配置免重启生效。此前 smoke 只测过 env 那条通道（DSH_FEISHU_SPLIT_MIN_MS），
+  //    **bot 配置这条（也是文档里第一优先级）从未验证**；notifyAgentNotices 也是零覆盖。
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'      // env 说：立刻分卡
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{
+      name: 'smoke',
+      workspace: WORKSPACE,
+      appId: APP_ID,
+      appSecret: APP_SECRET,
+      splitConclusionMinMs: 600000,   // bot 配置说：几乎不分卡 ⇒ 应当**压过** env
+      notifyAgentNotices: false,      // 关掉回执播报
+      reactionEmoji: 'GLANCE',        // 别把用例 40 要验的字段洗掉
+    }],
+  }, null, 2))
+  await new Promise((r) => setTimeout(r, 11000))   // 等过热读节拍
+  await drain()                                     // 触发一次 ensureHelpers → 应用新配置
+
+  // A) notifyAgentNotices=false ⇒ 回执**不许**有任何播报动作
+  const markA = sentCards.length
+  agentEvents.push({
+    type: 'user/message', seq: 9200,
+    data: {
+      content: [
+        { type: 'text', text: 'Background subagent cfgswitch-0001 finished and will do no further work unless you send it more.' },
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'text', text: '配置开关测试。' },
+      ],
+      source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'cfgswitch-0001' },
+    },
+  })
+  await drain()
+  const touchedA = sentCards.slice(markA)
+  ok(!JSON.stringify(touchedA).includes('cfgswitch'),
+    'notifyAgentNotices=false：回执被静默跳过（实际 ' + touchedA.length + ' 条卡片动作）')
+
+  // B) bot 配置的阈值优先于 env（env=0 也不许分卡）
+  const markB = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 9210, data: { message: { content: [{ type: 'text', text: '阈值优先级测试正文' }] } } })
+  }
+  feedInbound('om_priority_cfg', '阈值优先级测试')
+  await settle(3)
+  const createsB = createsSince(markB).length
+  ok(createsB === 1,
+    'bot 配置 splitConclusionMinMs=600000 压过 env=0 ⇒ 不分卡（实际 ' + createsB + ' 张）')
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+}
+
+console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 非法方法拒绝（审计：这两条路由零覆盖）')
+{
+  const routeOf = (p) => registeredRoutes.find((r) => r.path === p)
+  const callRoute = async (route, method, body) => {
+    const res = {
+      headersSent: false,
+      status: 0,
+      payload: '',
+      writeHead(status) { this.status = status; this.headersSent = true },
+      end(text) { this.payload = String(text || '') },
+    }
+    const req = new EventEmitter()
+    req.method = method
+    const pending = route.handler(req, res)
+    if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
+    req.emit('end')
+    await pending
+    let json = null
+    try { json = JSON.parse(res.payload) } catch { json = null }
+    return { status: res.status, raw: res.payload, json }
+  }
+
+  const statusRoute = routeOf('/feishu/admin/status')
+  ok(Boolean(statusRoute && statusRoute.handler), '/feishu/admin/status 路由已注册且带 handler')
+  const st = await callRoute(statusRoute, 'GET')
+  ok(st.status === 200 && st.json && st.json.ok === true, '状态路由返回 200 + ok')
+  ok(st.json && st.json.bots && st.json.bots[0] && st.json.bots[0].hasSecret === true,
+    '状态里只给 hasSecret 布尔（证明有密钥），不给密钥本身')
+  ok(!st.raw.includes(APP_SECRET), '状态响应**不含 appSecret 明文**（密钥不泄露）')
+
+  const cfgRoute = routeOf('/feishu/admin/config')
+  ok(Boolean(cfgRoute && cfgRoute.handler), '/feishu/admin/config 路由已注册且带 handler')
+  const g = await callRoute(cfgRoute, 'GET')
+  ok(g.status === 200 && g.json && g.json.ok === true, '配置读取返回 200 + ok')
+  ok(g.json && g.json.bots[0] && g.json.bots[0].appSecret === '***', '配置读取把 appSecret 掩码成 ***')
+  ok(!g.raw.includes(APP_SECRET), '配置读取响应**不含 appSecret 明文**（密钥不泄露）')
+
+  // POST 写入必须走归一化（不认识的字段会被丢弃 —— 这正是本轮抓到 splitConclusionMinMs 那个 bug 的机制）
+  const p = await callRoute(cfgRoute, 'POST', {
+    bots: [{ name: 'smoke-posted', workspace: WORKSPACE, appId: 'cli_posted_1', appSecret: 'posted-secret', unknownField: 'x' }],
+  })
+  ok(p.status === 200 && p.json && p.json.ok === true, '配置写入返回 200 + ok')
+  const onDisk = JSON.parse(readFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), 'utf8'))
+  ok(onDisk.bots.length === 1 && onDisk.bots[0].name === 'smoke-posted', '写入落到 feishu.config.json（归一化后）')
+  ok(!JSON.stringify(onDisk).includes('unknownField'), '归一化丢弃白名单外的字段（这次抓 bug 的机制）')
+
+  const bad = await callRoute(cfgRoute, 'PUT')
+  ok(bad.status === 405, '不支持的方法返回 405（实际 ' + bad.status + '）')
+
+  // 收尾：把配置恢复成 smoke 的标准 bot，避免影响后续（reactionEmoji 要保留，用例 40 还要用）
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE' }],
+  }, null, 2))
+}
+
+console.log('40) 打字提示（reaction）生命周期 + cfg.reactionEmoji 通道（审计：零覆盖）')
+{
+  // 期望：入站时给用户消息挂一个 emoji（"我在打字"），封口时**撤掉**（不留假象）。
+  // cfg.reactionEmoji 在 smoke 配置里显式设成 'GLANCE'（默认是 'OnIt'）⇒ 断言必须看到 GLANCE，
+  // 才能证明是**配置通道**生效、而不是写死的默认值。
+  const mark = reactionCalls.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 9300, data: { message: { content: [{ type: 'text', text: '打字提示测试正文' }] } } })
+  }
+  feedInbound('om_reaction_case', '打字提示测试')
+  await settle(4)
+  const calls = reactionCalls.slice(mark)
+  const posts = calls.filter((c) => c.method === 'POST')
+  const deletes = calls.filter((c) => c.method === 'DELETE')
+  ok(posts.length >= 1, '入站后加了 reaction（打字提示，实际 ' + posts.length + ' 次 POST）')
+  ok(posts.some((c) => c.body.includes('GLANCE') || c.url.includes('GLANCE')),
+    'emoji 用的是**配置里的** GLANCE（证明 cfg.reactionEmoji 通道生效；实际 body=' + (posts[0] ? posts[0].body.slice(0, 80) : '无') + '）')
+  ok(deletes.length >= 1, '封口后撤掉 reaction（不留"正在输入"假象，实际 ' + deletes.length + ' 次 DELETE）')
+}
+
+console.log('41) /list 与 /stop（2026-10-01 审计：两条既有命令零覆盖）')
+{
+  // /list：列出本聊天的会话（▶ 标出当前；无会话时给明确文案）
+  const mark = sentCards.length
+  feedInbound('om_list_cmd', '/list')
+  await drain()
+  const body = JSON.stringify(sentCards.slice(mark))
+  ok(body.includes('▶') || body.includes('无会话'), '/list 列出会话并标出当前（▶）或明确"无会话"')
+  ok(/\d+\.\s/.test(body) || body.includes('无会话'), '/list 的清单带序号')
+
+  // /stop：必须打到"正在跑的**活的** agent"的 cancel()，并给回执（旧实现的坑：缓存句柄可能指向过期实例）
+  const cancels = []
+  agent.cancel = (reason) => { cancels.push(reason) }
+  const mark2 = sentCards.length
+  feedInbound('om_stop_cmd', '/stop')
+  await drain()
+  ok(cancels.length === 1, '/stop 调用了 agent.cancel()（实际 ' + cancels.length + ' 次）')
+  ok(cancels[0] && cancels[0].kind === 'user', 'cancel 的 reason 形如 { kind: "user" }')
+  ok(JSON.stringify(sentCards.slice(mark2)).includes('已发送停止指令'), '回执明确告诉用户已发送停止指令')
+}
+
+console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/request` 水位线必须被接管（CM 2026-10-01 报障）')
+{
+  // 报障原话：「计划模式退出的时候，我收不到你的退出申请」。
+  // 根因：`exit_plan_mode` 调的是 `ctx.userQuestions.ask(...)` **服务**
+  // （`dsh-plan-mode/lib/index.js:261`），**不经过** `ask_user_question` 工具 ⇒
+  // 旧实现只拦 `tools/execute`（用例 26/29 覆盖的那条）⇒ 拦不到它，
+  // 申请只发给了连着长连接的 GUI 客户端。修法＝与 `approval/request` 同构的水位线。
+  const planText = '# 计划：把计划审查搬到飞书\n\n1. 只读排查调用链\n2. 出水印卡 + 中文选项'
+  const questions = [{
+    id: 'plan-review',
+    header: 'Plan review',
+    question: 'Approve this plan and leave plan mode?',
+    detail: planText,
+    options: [
+      { label: 'Approve', description: 'Leave plan mode; the plan is carried out from the next step.' },
+      { label: 'Keep planning', description: 'Stay in plan mode; feedback goes back to the model.' },
+    ],
+    intent: { kind: 'plan-review', approve: 'Approve' },
+  }]
+  let delegated = 0
+  const nextSpy = () => { delegated += 1; return Promise.resolve('next') }
+
+  // (a) 没有 agent / 不是飞书会话的 agent ⇒ 必须 `next()` 交回 harness。
+  //     这条是**红线**：GUI 会话的提问绝不能被本插件吞掉（否则 GUI 里也会变哑巴）。
+  ok(emitCtx('user-questions/request', { questions, signal: undefined }, nextSpy).length === 1,
+    '水位线上只有本插件一个监听器（接管范围可控）')
+  const foreignRuns = emitCtx('user-questions/request', { questions, agent: { id: 'agent-not-feishu' }, signal: undefined }, nextSpy)
+  const foreignResolved = await Promise.all(foreignRuns.map((r) => Promise.resolve(r).catch(() => {})))
+  ok(delegated === 2 && foreignResolved[0] === 'next',
+    '无 agent / 非飞书 agent 一律交回下一个（delegated=' + delegated + '）')
+
+  const cardOf = (since) => cardsSince(since).filter((c) => c.op === 'create')
+    .find((c) => JSON.stringify(c.payload).includes('计划已写好'))
+  const rowsOf = (card) => (card ? card.payload.body.elements.filter((e) => e.tag === 'column_set') : [])
+  const tokenOf = (rows) => rows[0] && rows[0].columns[1].elements[0].behaviors[0].value.fs_question
+  const tap = async (token, index) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event',
+      eventType: 'card.action.trigger',
+      data: { action: { tag: 'button', value: { fs_question: token, fs_option: index } }, context: { open_chat_id: CHAT_ID } },
+    }) + '\n'
+    await drain()
+  }
+
+  // (b) 飞书会话的提问 ⇒ 接管 + 出水印卡（计划正文必须在卡上，不能是空卡）
+  const mark = sentCards.length
+  const r1 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
+  const pending = r1[0]
+  ok(Boolean(pending) && typeof pending.then === 'function', '飞书会话的提问被接管（返回 Promise，而不是 next()）')
+  await drain()
+  const card = cardOf(mark)
+  ok(Boolean(card), '计划审查卡已发到飞书')
+  const body = JSON.stringify(card ? card.payload : {})
+  ok(body.includes('计划已写好'), '卡头是"计划已写好，等你批准"（不是通用的"需要你的回答"）')
+  ok(body.includes('把计划审查搬到飞书') && body.includes('只读排查调用链'),
+    '计划正文**完整**在卡上（含标题与正文，不是只有标题的空卡）')
+  const rows = rowsOf(card)
+  ok(rows.length === 2, '两个选项各占一行分栏（实际 ' + rows.length + ' 行）')
+  ok(body.includes('批准并执行（退出计划模式）') && body.includes('继续修改'), '选项给了中文说明')
+
+  // (c) 点「批准」按钮 ⇒ 回传 harness 的**必须是原 label `Approve`**（plan-mode 按它判批准）
+  await tap(tokenOf(rows), 0)
+  const a1 = await pending
+  ok(a1 && a1.answers && a1.answers.length === 1 && a1.answers[0].id === 'plan-review',
+    '答案按 question.id 原样回传（id=plan-review）')
+  ok(a1.answers[0].selected.length === 1 && a1.answers[0].selected[0] === 'Approve',
+    '选中项是原 label `Approve`（中文只是卡面文案，没污染回传协议）')
+  ok(a1.answers[0].custom === undefined, '没把"按钮选择"冒充成自定义反馈')
+
+  // (d) 点「继续修改」⇒ 回传原 label `Keep planning`（plan-mode 据此留在计划模式）
+  const mark2 = sentCards.length
+  const r2 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
+  await drain()
+  await tap(tokenOf(rowsOf(cardOf(mark2))), 1)
+  const a2 = await r2[0]
+  ok(a2.answers[0].selected[0] === 'Keep planning', '第二个选项回传 `Keep planning`')
+
+  // (e) 文字「批准」＝ 批准（CM 习惯回中文；批准标签是英文硬约定）
+  const mark3 = sentCards.length
+  const r3 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
+  await drain()
+  feedInbound('om_plan_approve_text', '批准')
+  await drain()
+  const a3 = await r3[0]
+  ok(a3.answers[0].selected[0] === 'Approve', '回文字「批准」被认成批准（不再被误当成修改意见）')
+
+  // (f) 带补充说明的文字 ⇒ 仍按"继续修改"的反馈回给模型。
+  //     方向是刻意的：误判成"留在计划模式"可恢复，误判成"已批准"不可恢复（直接开工）。
+  const mark4 = sentCards.length
+  const r4 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
+  await drain()
+  feedInbound('om_plan_feedback_text', '同意，但第 2 步先改成只读排查')
+  await drain()
+  const a4 = await r4[0]
+  ok(a4.answers[0].selected.length === 0 && String(a4.answers[0].custom).includes('第 2 步'),
+    '带补充说明 ⇒ 当成反馈（custom），绝不误批准')
+
+  // (g) 普通提问（走服务时）不受影响：卡头仍是通用文案、回传照旧
+  const mark5 = sentCards.length
+  const r5 = emitCtx('user-questions/request', {
+    questions: [{ id: 'q-plain', question: '选哪个？', options: [{ label: '甲' }, { label: '乙' }] }],
+    agent, signal: undefined,
+  }, nextSpy)
+  await drain()
+  ok(JSON.stringify(cardsSince(mark5)).includes('需要你的回答'),
+    '非计划审查的提问仍走通用问句卡（没有把两类混在一起）')
+  await tap(tokenOf(rowsOf(cardsSince(mark5).filter((c) => c.op === 'create')
+    .find((c) => JSON.stringify(c.payload).includes('需要你的回答')))), 0)
+  const a5 = await r5[0]
+  ok(a5.answers[0].selected[0] === '甲', '普通提问的按钮回传照旧（甲）')
+}
+
+console.log('43) /plan <正文>：命令起了回合也必须建卡（2026-10-01 修复①）')
+{
+  // 背景（CM 报障「我发了这个计划模式的启动给你……飞书上没有看到卡片」）：
+  // harness 把 `/plan <正文>` 解释成「开计划模式 + 把正文当用户消息**起一个真回合**」
+  // （会话 fs-main-mupoeiy4 seq 721→725 实证）；而插件的事件入口把命令交给 handleCommand
+  // 后**直接 return** ⇒ 那一整轮（16 步）没有任何卡片持有它，CM 完全看不到过程。
+  // 修法：命令回报 turnStarted 时落回 handleInbound 走「建卡 → 等回合 → 封口」。
+  const prevExec = fakeCommands.execute
+  const prevIdle43 = agent.whenIdle
+  const mark = sentCards.length
+  agent.whenIdle = async () => {}
+  agent.send = function (message) { this.sent.push(message) }   // 命令轮**不该**再走这条
+  const sentBefore = agent.sent.length
+  const seqBase = 9500
+  fakeCommands.execute = async () => {
+    // 模拟 harness：/plan <正文> 在 execute 内部就把正文投进会话并起了回合、开始产出
+    agentEvents.push({
+      type: 'assistant/message', seq: seqBase + 1,
+      data: { message: { content: [{ type: 'text', text: '命令起回合后的过程' }] } },
+    })
+    return { result: { text: 'Plan mode on. Use /plan off to leave.' } }
+  }
+  feedInbound('om_plan_turn', '/plan 检查计划模式，目标模式，所有卡片是否正常')
+  await settle(3)
+  ok(createsSince(mark).length >= 1,
+    '/plan <正文> 也建了卡（create 次数 ' + createsSince(mark).length + '）')
+  ok(JSON.stringify(cardsSince(mark)).includes('命令起回合后的过程'),
+    '命令起的这一轮过程被镜像进卡（不再「看不见」）')
+  ok(agent.sent.length === sentBefore, '正文没有被重复投递一次（skipSend 生效）')
+  fakeCommands.execute = prevExec
+  agent.whenIdle = prevIdle43
+}
+
+console.log('44) 入站消息不被静默吞掉（2026-10-01 事故守护）')
+{
+  // 事故复盘：steerActiveTurn 第一句就调 isDuplicateInbound() —— 它**有副作用**（把 id 记进
+  // seenInboundIds）。一旦 steer 没走成（没有活跃回合 / agent 无 steer）函数 return false
+  // 落到 handleInbound，那里再查一次 ⇒ 已「见过」⇒ 判重投直接丢掉
+  // ⇒ **所有飞书消息被静默吞掉**（真机日志特征：duplicate inbound skipped 连发）。
+  // 修法：只「窥探」不认领；仅当 steer 真的投出去之后才认领。这条用例把它钉死。
+  const prevIdle44 = agent.whenIdle
+  agent.whenIdle = async () => {}
+  const mark = sentCards.length
+  agent.send = function (message) { this.sent.push(message) }
+  const sentBefore = agent.sent.length
+  delete agent.steer                                   // 没有 steer 能力 ⇒ 必然走 fallback
+  feedInbound('om_never_swallowed', '这条不许被吞')
+  await settle(3)
+  ok(agent.sent.slice(sentBefore).some((m) => JSON.stringify(m).includes('这条不许被吞')),
+    '无 steer 能力时消息照常投递（没被误判成重投）')
+  ok(createsSince(mark).length >= 1, '并且照常建卡')
+  // 真·重投仍必须被去重（去重能力不能被上面的修复削弱）
+  const sentAfter = agent.sent.length
+  feedInbound('om_never_swallowed', '这条不许被吞')
+  await settle(2)
+  ok(agent.sent.length === sentAfter, '同 message_id 重投仍被去重（不会跑两轮）')
+  agent.whenIdle = prevIdle44
+}
+
+console.log('45) exit_plan_mode 经【工具层】接管（2026-10-02 换的通道）')
+{
+  // 背景：`user-questions/request` 水位线即使把监听下沉到 agent.ctx **仍然拿不到**
+  //（真机 2026-10-02 00:4x：只有注册行 bound to agent scope，没有任何接管行；
+  //  harness 侧收到 "The user dismissed the plan review to speak instead"）。
+  // 改用与 ask_user_question 同一条已验证通道：tools/execute。
+  const plan = '# 把计划审查搬到飞书\n\n- 只读排查调用链'
+  const nextSpy = () => Promise.resolve('next')
+  // 2026-10-02：改成**分别收结果与异常** —— 「继续修改」分支现在必须**抛错**
+  //（返回 isError:true 会被 harness 判"不可序列化"而换成报错，见真机实测）。
+  // ⚠️ 必须在 emitCtx **同一拍**就把异常接住并转成值：本用例「继续修改」分支是**抛错**的，
+  // 若等到 await 时才挂 handler，Node 会先看到 unhandled rejection，直接崩掉测试进程
+  //（2026-10-02 实测：`Error: The user chose to keep planning…` 把 smoke 打挂）。
+  const capture = (runs) => runs.map((r) => Promise.resolve(r).then(
+    (value) => ({ value }), (error) => ({ error })))
+  const toolOf = (os) => {
+    const hit = os.find((o) => o.value && typeof o.value === 'object' && 'content' in o.value)
+    return hit && hit.value
+  }
+  const planCardOf = (since) => cardsSince(since).filter((c) => c.op === 'create')
+    .find((c) => JSON.stringify(c.payload).includes('计划已写好'))
+
+  // (a) 红线：非飞书 agent / 空计划 ⇒ 两个监听器都必须 next()
+  const foreign = await Promise.all(capture(emitCtx('tools/execute',
+    { name: 'exit_plan_mode', agent: { id: 'agent-not-feishu' }, arguments: { plan }, signal: undefined }, nextSpy)))
+  ok(foreign.length === 2 && foreign.every((o) => o.value === 'next'), '非飞书 agent ⇒ 一律交回下一个（红线）')
+  const emptyPlan = await Promise.all(capture(emitCtx('tools/execute',
+    { name: 'exit_plan_mode', agent, arguments: { plan: '   ' }, signal: undefined }, nextSpy)))
+  ok(emptyPlan.every((o) => o.value === 'next'), '计划正文为空 ⇒ 交回下一个（不吞）')
+
+  // (b) 飞书会话 ⇒ 接管 + 出计划审查卡（计划正文必须完整在卡上）
+  const mark = sentCards.length
+  const runs = capture(emitCtx('tools/execute',
+    { name: 'exit_plan_mode', agent, arguments: { plan }, signal: undefined }, nextSpy))
+  await drain()
+  const card = planCardOf(mark)
+  ok(Boolean(card), '工具层接管成功：飞书弹出计划审查卡')
+  ok(JSON.stringify(card ? card.payload : {}).includes('把计划审查搬到飞书'), '计划正文完整在卡上')
+
+  // (c) 回文字「批准」⇒ 通过**命令注册表 /plan off** 真的退出计划模式
+  //     （真机实证：ctx.inject(['planMode']) 在本环境从不触发 ⇒ planModeRef 恒为 null，
+  //      只调 planMode.set 那条分支等于"口头说退出"，会话里并未退出）
+  const prevExec = fakeCommands.execute
+  const execLines = []
+  fakeCommands.execute = async (a, line) => {
+    execLines.push(line)
+    return { result: { text: 'Plan mode off.' } }
+  }
+  planModeCalls.length = 0
+  feedInbound('om_plan_approve_tool', '批准')
+  await drain()
+  const tool = toolOf(await Promise.all(runs))
+  ok(Boolean(tool), '返回的是**工具结果**（不是 next()）')
+  ok(tool && tool.isError === false && tool.value && tool.value.approved === true,
+    '批准 ⇒ isError:false + approved:true')
+  ok(execLines.includes('/plan off'),
+    '批准 ⇒ 走命令注册表 /plan off 真正退出计划模式（不只是回一句话）')
+  ok(JSON.stringify(tool ? tool.content : '').includes('Plan approved'), '回给模型的文案与 plan-mode 原文一致')
+  fakeCommands.execute = prevExec
+
+  // (d) 带说明的文字 ⇒ **抛错**把反馈原文回给模型；且不退出计划模式
+  planModeCalls.length = 0
+  const runs2 = capture(emitCtx('tools/execute',
+    { name: 'exit_plan_mode', agent, arguments: { plan: '# 第二版计划' }, signal: undefined }, nextSpy))
+  await drain()
+  feedInbound('om_plan_keep_tool', '同意，但第 2 步先改成只读排查')
+  await drain()
+  const os2 = await Promise.all(runs2)
+  const thrown = os2.find((o) => o.error)
+  ok(Boolean(thrown) && String(thrown.error && thrown.error.message).includes('第 2 步'),
+    '带说明 ⇒ **抛错**把反馈原文回给模型（不是 isError:true —— 那会被 harness 判"不可序列化"）')
+  ok(os2.filter((o) => o.error).length === 1, '恰好一个监听器抛错（另一个交回 next）')
+  ok(planModeCalls.length === 0, '留在计划模式（没有退出）')
+}
+
+console.log('46) 插话必须【新开卡片】+ 醒目彩色块（2026-10-02 CM 追加）')
+{
+  // CM 原话：「我"插话"了以后，你应该新开卡片。不然我说的话全部堆到下面，
+  //           但是你一直在旧卡片上更新」。
+  let release
+  const gate = new Promise((r) => { release = r })
+  const prevIdle = agent.whenIdle
+  agent.whenIdle = () => gate
+  agent.send = function (message) { this.sent.push(message) }
+  agent.steered = []
+  agent.steer = function (message) { this.steered.push(message) }
+
+  const mark = sentCards.length
+  feedInbound('om_steer_start', '起一个会被插话的回合')
+  await drain()
+  const createsBefore = cardsSince(mark).filter((c) => c.op === 'create').length
+  ok(createsBefore >= 1, '活跃回合已建卡（create 次数 ' + createsBefore + '）')
+
+  feedInbound('om_steer_interrupt', '这是我插进去的话')
+  await drain()
+  ok(agent.steered.some((m) => JSON.stringify(m).includes('这是我插进去的话')),
+    '插话以 steer 投递（不排队等整轮跑完）')
+
+  const creates = cardsSince(mark).filter((c) => c.op === 'create')
+  ok(creates.length >= createsBefore + 1,
+    '插话后**新开了一张卡**（create 次数 ' + createsBefore + ' → ' + creates.length + '）')
+  const body = JSON.stringify(cardsSince(mark))
+  ok(body.includes('后续内容见下方新卡'), '旧卡就地封口并指路（不再往下堆）')
+  ok(body.includes('你的消息已插话送达'), '新卡第一块是插话提示')
+  ok(body.includes('**📨 你的消息已插话送达**'), '提示标题加粗（markdown 粗体）')
+  ok(body.includes('orange-50') && body.includes('background_style'),
+    '提示是彩色底块（column_set + background_style，飞书 -50 = 区块背景）')
+  ok(body.includes('这是我插进去的话'), '他这句话本身也在提示块里（看得到自己说了什么）')
+
+  release()
+  agent.whenIdle = prevIdle
+  await drain()
 }
 
 console.log('')

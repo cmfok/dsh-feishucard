@@ -5,7 +5,721 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.17] - 2026-10-02
+
+### Fixed（🔴 0.2 上飞书审批被 GUI 桥接抢答 —— CM 报障后修）
+
+**CM 原话**：「手机上得要能审批才行，**不可以关了**」。
+
+**现象**：把权限改成 `workspace-write` + 审批策略 `ask` 之后，越权请求**只弹在电脑上，
+飞书一张卡都收不到**。
+
+**取证（全部可复现）**
+
+| 证据 | 内容 |
+|:--|:--|
+| 会话日志 | 本会话策略确实是 **`ask`**（`approval/policy` seq=3017，06:00 改的），**不是 `never` 短路** |
+| 实例日志 | 升级 0.2 之后 `[fs] approval/request received` 出现 **0 次**（0.1.x 时代有 **70 次**） |
+| 两次尝试 | 根级挂过、agent scope 也挂过（`bound to agent scope for …` 有日志行）—— **都没轮到** |
+| CM 确认 | 那两次越权请求他都是**在电脑上**看到并拒绝的 |
+
+**根因**：`@deepseek-ai/dsh-api-remotes` 的 forwarded waterfall
+（`lib/index.js:215-232`；事件白名单 `:17-25`）在**根级更早注册**，只要浏览器端连着，
+它就把 `approval/request` 收进队列交给 GUI 客户端，**只有远端不接才 `next()`**
+⇒ 插件监听永远排在它后面。**0.2 新增的这条转发就是本次倒退的来源。**
+
+**修法（不改 harness 一行）**：工具取审批服务是**按对象**取的 ——
+`dsh-tool-pwsh/lib/index.js:341`（`dsh-tool-bash` / `dsh-tool-fs` 同构）都写
+`approver: ctx.get("approval")` ⇒ 把该服务实例的 **`decide`** 包一层即可。
+
+- **只包 `decide`**（政策判定 + 征求答案那一步）；`request()` **原样保留** ——
+  它负责写 `approval/asked` / `approval/decided` **审计对**，绝不能绕过。
+- **重载安全**：包装只装一次（挂在 `globalThis.__fsApprovalBridge`），relay 每次 `apply`
+  重新赋值 ⇒ HMR 重载后不会指向上一代插件的旧状态。
+- **补装点**：`apply` 时 + 每次 `tools/pre-execute`（审批服务可能晚于本插件就绪；幂等）。
+
+**开关默认值改了（按 A20-⑤，旧口径作废）**
+
+- `DSH_FEISHU_APPROVAL`：**默认开启**（原来默认 `'0'`＝关）。
+  显式关闭设 `=0`（或 `false` / `off` / `no`）。
+- 旧口径（2026-09-16「他给的是 danger-full-access 完全访问，审批不该由插件再加一道」）
+  **已作废**，不再出现在代码注释里。
+
+**红线不变**：非飞书会话（GUI / 子代理）一律 `return null` 交回原逻辑，绝不吞别人的审批。
+
+**真机实测（CM 2026-10-02 06:16 在手机端亲测）**
+
+```
+[fs] approval[service] asking on Feishu: tool=pwsh agent=fs-main-muppqw21 reason=escalate sandbox to danger-full-access: …
+[fs] approval card sent: pwsh token=a5d477a1-9086-4333-aac6-f60d6d0d7e51
+[fs] approval allowed (once): pwsh
+[fs] approval card recalled: pwsh
+```
+
+⇒ 卡**到达飞书** → CM **在手机上**点「允许一次」→ 命令**真的执行**
+（探针文件 `%TEMP%\dsh-feishu-approval-probe.txt` 已写出并回读）。
+
+### Fixed（🔴 同一条结论被发送两次 —— CM 2026-10-02 报障「为什么发了给我两次？」）
+
+**实证（`web.log` 69634→69649，全部发生在同一秒内）**
+
+```
+69634 [fs] turn sealed: … card=om_x100b64d9d54ec0a0b1fff6a877c91b3   ← 卡 A 封口
+69635 [fs] conclusion split: elapsed=617236ms tools=83
+69636 [fs] turn sealed: … card=om_x100b64d9fc1a8ca0b4b72a9621c1113   ← 卡 B 封口
+69637 [fs] conclusion split: elapsed=325527ms tools=26
+69642 [fs] card created … payload_md5=4326a255
+69645 [fs] card created … payload_md5=4326a255   ← **同一个 payload**
+69648 [fs] card reply delivered to oc_***（会话 id 已脱敏）
+69649 [fs] card reply delivered to oc_***（会话 id 已脱敏）   ← **发了两次**
+```
+
+**成因**：两条回合链条**各封一次口、各拆一张结论卡**。根因是**插件热重载**
+（那一轮里连续 `apply #8`–`#11`）：重载会重建模块状态，但**上一代实例里仍在
+`await whenIdle()` 的链条不会被注销**，它和新链条在同一秒各自收尾。
+（`steer`／插话只是让两条链各自持有不同的卡，所以看起来像"两张卡"。）
+
+**修法**：结论按「agent + 回复正文哈希」**跨插件代际**去重
+（记在 `globalThis.__fsConclusionSeen`），**先到先得** ⇒ 不丢结论、也不重发新卡；
+窗口 **120 秒**。
+
+- ⚠️ **只在「本来就会开结论卡」的长回合上生效**（未达阈值／纯旁白的短回合完全不受影响），
+  否则同一进程内两轮相同文本的短回复会被误并 —— 冒烟用例大量是短回合。
+- 命中去重的那条链：**不再重复发送结论**，只在它自己的卡上留一行
+  `✅ 本轮已完成，结论见上方卡片。`（正文不重复、也不新开卡）。
+- 留痕：命中时打 `[fs] duplicate conclusion suppressed: agent=… hash=… age_ms=…`。
+
+### Added
+
+- `approval/request` 监听**同时下沉到 agent scope**（新函数 `bindFeishuAgentApproval`，
+  挂载点：`tools/pre-execute` / `agent/status` / `handleInbound` / `/plan` 四处），
+  作为第二道保障（`WeakSet` 幂等，随 agent 回收）。
+
+### Verified
+
+- `node --check index.js` = **0**。
+- `node scripts/smoke.mjs` = **SMOKE PASS (sentCards=182, sessions=7)**（沙箱下需越权重试，走飞书审批放行）。
+- **结论去重改动后重跑**：`node --check` = **0**；`node scripts/smoke.mjs` =
+  **SMOKE PASS (sentCards=182, sessions=7)**，**`❌` 断言 0 条**；
+  `duplicate conclusion suppressed` 命中 **0 次** —— 证实去重**没有误伤任何用例**
+  （冒烟全是短回合，正好验证「只对"本来会开结论卡"的长回合生效」这条收窄是对的）。
+- 线上加载：`[fs] plugin apply #11 v0.4.16 md5=3082fa72 bytes=246590 @ 2026-10-01T22:15:12Z`
+  （该次 apply 的版本行仍是 `v0.4.16` —— 版本号是**之后**才补写的，下次重载会显示 `v0.4.17`）。
+
+## [0.4.16] - 2026-10-02
+
+### Changed（适配 dsh 0.2.0-rc.2：宿主升级后的两处破坏性变更）
+
+**背景**：CM 授权把宿主从 `0.1.6-alpha.1` 升到 `0.2.0-rc.2`。升级前的兼容盘点见
+`UPGRADE-0.2.0-rc.2-compat.md`（含真实判定函数、备份路径、回滚三步）。
+
+**① peer 范围必须放开，否则会被宿主**静默跳过**（不是降级）**
+
+- 0.2 起宿主在**组合阶段**校验 profile bundle 的 peer：只看 `name === '@deepseek-ai/dsh'`
+  或以 `@deepseek-ai/dsh-` 开头的键，判定用
+  **`semver.satisfies(runtimeVersion, range, { includePrerelease: true })`**
+  （已从 `@deepseek-ai/dsh-app-boot@0.2.0-rc.2` 的 `evaluatePluginCompatibility()` 抽出核对）。
+- 旧声明 `^0.1.0-rc.5` → `0.2.0-rc.2` = **false**（`^0.1.x` 的上界是 `<0.2.0-0`）⇒ 会被跳过。
+- **改法**：`"@deepseek-ai/dsh-tools": ">=0.1.0-rc.5 <0.3.0-0"`
+  —— 实测同时满足 `0.1.6-alpha.1` / `0.2.0-rc.1` / `0.2.0-rc.2` / `0.2.1`。
+- ⚠️ **踩过的坑**：用**默认** semver 语义判断会得出"连 0.2.0-rc.2 都不满足"的错误结论
+  （prerelease 默认不被范围接受），**差点把范围改错** —— 必须按宿主的
+  `includePrerelease: true` 语义判。
+
+**② `ctx.shell.start(spec)` 已改名 `execute(spec)`，且新 API 默认会杀掉长驻进程** 🔴
+
+- 真机症状：升级后日志刷屏
+  `[fs] helper start failed: ctx.shell.start is not a function`，
+  **`long connection ready` 0 次、飞书整个收不到消息**（helper 是长连接的实际持有者）。
+- 根因：0.2 新增 `@deepseek-ai/dsh-shell`，`ShellExecutor` 的抽象方法是
+  `resolve(request)` / **`execute(spec)`**（旧 `start` 没了）。
+- **第二处更要命**：0.2 的 `resolve()` 会填 `timeoutMs` 并按 `onExpiry` 处理，
+  **默认 `'kill'` 会把我们这种长驻 helper 直接杀掉** ⇒ 必须显式 **`onExpiry: 'none'`**
+  （官方语义：none 不设截止时间，只能由调用方 signal 或 `kill()` 停止）。
+- 修法：`useExecute = typeof ctx.shell.execute === 'function'`，新版本走 `execute` 并带
+  `onExpiry:'none'`，老版本自动退回 `start` —— **两个版本都能跑**。
+  返回的 `ShellExecution` 与旧句柄形状兼容（`status` / `kill()` / `readOutput().delta` 都在）。
+- **验证**：修完日志立刻 `helper spawned` ×3 → **`long connection ready` ×3**（三个 bot 全恢复）。
+
+**升级后真机验收（四项全绿）**
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 插件未被跳过 | ✅ | `[fs] plugin apply #1 v0.4.14`（启动时）；`--dump-config` 零告警零跳过 |
+| 飞书桥 | ✅ | `helper spawned` ×3 → `long connection ready` ×3 |
+| 模型 | ✅ | 会话 v3/v4 文件均为 `"model":"deepseek-v4-flash"` `"provider":"deepseek-official"`，且实际在用 |
+| 热重载（HMR） | ✅ | `hmr watching [...]` + 保存 index.js 后 `hmr reload plugin` → `plugin apply #2` |
+| 历史会话 | ✅ | 本会话上下文完整续上；日志迁移为 `session.v4.jsonl.zstd`，**旧 v3 文件原样保留** |
+
+**顺带确认**：`settings.yaml` 被 0.2 一次性导入为 `settings.yaml.imported`（符合 release notes）；
+profile 的 `cordis.patch.yml` 被 0.2 规范化重写（保留了本插件所需的那条 HMR `root` 配置）。
+
+- **守护用例**：`node --check` = 0；`npm run smoke` = **SMOKE PASS（182 卡 / 7 会话）**
+  （smoke 的 mock 只提供 `shell.start`，正好覆盖"老版本退回 start"这条分支）。
+
+### Fixed（第三轮：`/new` 名字校验 · 目标卡认不出归属 · `feishu_send` 跳过失效，2026-10-02）
+
+**① `/new` 名字校验（3 个洞，CM 实测一次性暴露）**
+
+| 漏洞 | 修法 |
+|---|---|
+| 名字零校验：`splitCommand` 把**所有空白（含换行）压成单空格**，CM 把整段 `/help` 输出当消息发出去 ⇒ 后面几十行全成了会话名 | `splitCommand` 增 `rawArg`（**保留换行**；`arg` 形态不变 ⇒ `/goal` `/plan` `/switch` 零影响）；`/new` **只取首行** ＋ 折叠空白 |
+| 无长度上限 | **超 60 字直接拒绝**（不静默截断 —— 名字被改了必须让人知道），并提示用短名 |
+| 校验排在「停掉旧会话」**之后** ⇒ 一个被拒的 `/new` 会**先杀掉当前会话** | 校验**前移**到 `cancel()` 之前，**当前会话未受影响** |
+| 回复文案仍用 `cmd.arg`（label 改了、回复没改 ⇒ 割裂） | 回复改用 `nameArg` |
+
+**② 目标卡认不出归属 → 静默跳过（T8 失败）**
+
+- 真机诊断（加日志后一击命中）：`[fs] agent/status skip: no chat owner fs-main-muppqw21`
+- 根因：`findChatForAgent()` **只按活着的 `handle` 匹配**，而 `handle` **不落盘**
+  ⇒ HMR 重载后丢失；目标轮又不走消息路径去 `resolveAgent` 补 ⇒ 认不出归属 ⇒ 目标卡被静默跳过。
+- 修法：改按**会话 id** 匹配（`agent.id === s.id`，落盘、跨重载稳定），`handle` 作兜底。
+- 验证：`auto card opened … kind=goal` ✅；同时给该分支 **5 处静默 `return` 全部加了跳过原因日志**
+  （只加日志不改行为）—— 以后"静默不建卡"类问题一眼定位。
+
+**③ `feishu_send` 跳过失效（T11，间歇）**
+
+- 现象：3 次触发 = **1 次失败（真发出去了）** ＋ 2 次正确跳过；受控复现 2 次**未命中**
+  ⇒ **原故障根因未被日志钉死，不猜**（诊断装晚了）。
+- **但机制从代码确证了一个结构性洞**：`bot.lastChatId` **只在入站消息时写入**，
+  而每次 HMR 重载都会重建 `bots`（日志：每次 `plugin apply` 后紧跟 `bridge active` +
+  `helper spawned`×3）⇒ `lastChatId` 归零 ⇒「重载后～下一条入站消息前」`targetChat` 为空
+  ⇒ **整个 `if (targetChat)` 被绕过、跳过逻辑完全失效**。与"第 1 次失败发生在 `apply #5` 之后"吻合。
+- 修法：`targetChat` 为空时**回退到「当前有活跃卡的会话」**（此时也无处指定收件人，
+  而"对话正在被回答"本身就是不该另发一条的充分理由）；显式传 `chatId` 不受影响。
+- 诊断保留：失败时打印 `target=<chatId> activeTurns=<n> [<chatId>/<status> | …]`，一击定位。
+
+**状态**：`plugin apply #7 md5=e993b8d3` ／ `node --check`=0 ／ **smoke PASS（182 卡 / 7 会话）**
+
+**卡片测试矩阵（本轮）**：T1–T10 ✅（T9 的 `/help`·`/switch`·`/stop` 由 CM 实测）、T12–T13 ✅；
+**T11 = 结构性洞已修 ✅，但原故障未复现 ⇒ 回归待自然触发**（诊断已武装）。
+
+## [0.4.15] - 2026-10-02
+
+### Fixed（CM 四条报障：计划模式启动没卡 / 计划审批只到电脑端 / 消息排队 / 结论卡被截断）
+
+一次成批修复。完整证据链（会话 seq、日志行号、源码行号）见
+`DIAGNOSIS-2026-10-01-plan-mode-card.md`。
+
+1. **`/plan <正文>` 起了回合却没有卡**（CM：「我发了这个计划模式的启动给你……飞书上没有看到卡片」）
+   - 根因：harness 把 `/plan <正文>` 解释成「开计划模式 + 把正文当用户消息**起一个真回合**」
+     （会话 `fs-main-mupoeiy4` seq 721→725 实证：`command/run` → `plan/mode` →
+     `agent/inbox/spliced` → `turn/start`）；而插件的事件入口把命令交给 `handleCommand`
+     后**直接 `return`** ⇒ 那一整轮（16 步）**没有任何卡片持有它**。等 CM 再发一条消息才建卡，
+     而新卡游标从"当下"开始 ⇒ 之前的步骤**永久不可见**。
+   - 修法：`/plan` 分支在 `commands.execute()` **之前**取事件游标，回报 `{ turnStarted }`；
+     事件入口据此落回 `handleInbound`，走与普通消息同构的「建卡 → 等回合 → 封口」，
+     并以 `skipSend` 避免把正文**重复投递**一次（否则模型看到两条一样的用户消息）。
+2. **计划审批只到电脑端**（CM：「电脑端上看到你的计划是发了，但是飞书上没有收到」）
+   - 根因：`user-questions/request` **同时被 GUI 桥接**（`dsh-api-remotes` 的 forwarded
+     waterfall：白名单 `lib/index.js:17-25`，`forwardWaterfall` L187-204）——桥接把请求转给
+     浏览器客户端，**只有远端不接时才 `next()`** ⇒ 只要 GUI 连着，**根级**监听永远轮不到
+     （实测：本实例日志里 `[fs] user-questions/request` 出现 **0 次**）。
+   - 修法：监听**同时**挂到 agent 自己的 scope（`agent.ctx.on`；Agent 接口里
+     `readonly ctx: Context` 就是 Cordis Context，`dsh-api-remotes` 也用 `agent.ctx` 做
+     scope 载体）—— 同一条水位线上里层 scope 先于根级执行；非飞书 agent 依旧 `next()`。
+     日志留痕带 `[agent-scope]` / `[root]` 前缀，便于现场判定是谁接到的。
+3. **回合进行中的消息排队**（CM：「发给你这段话，他在排队……你在做事情的时候没有收到我这条信息」）
+   - 根因：入站消息统一排在 `bot.chain` 后面（事件入口），而上一条 `handleInbound` 正卡在
+     `await whenIdle()` 上；投递目标又写死 `next-turn` ⇒ 必须等整轮跑完才进会话。
+   - 修法：回合进行中、且这条是**普通消息**（不是命令、不是某个提问的答案）时改走
+     `agent.steer()` 插到下一步，并在活跃卡上留一行「💬 你的消息已插话送达」。
+4. **结论卡只有最后一句**（CM：「你的正式回复又被截断了，结论卡片只有这一句话，其他都进了你的过程卡片」）
+   - 根因：旧实现把「最后一条 assistant 文本」当结论；而 agent 常把正文写在**最后一次工具调用
+     之前**（本次实录：正文 → `present` → 一句收尾）⇒ 收尾顶替整段答复，真正的正文只剩过程卡上
+     被 `MAX_NOTE_CHARS(500)` 截断的 note。
+   - 修法（结构性判据，**不用长度阈值**）：从末尾往前收集 assistant 文本 ——
+     遇到**纯目的行旁白即停**（旁白是段落边界）；**连续两段文本之间没有工具调用 ⇒ 只取最后那段**
+     （那是同一段叙述的多次快照，绝不拼起来）；**中间隔着工具调用 ⇒ 允许再取上一段**
+     （正是「正文 → present → 收尾」的真实形态）；同一 seq 只收一次。
+     整轮只有旁白时**不拆结论卡**（消灭「只含一行 🎯 的无信息结论卡」）。
+
+### Fixed（第三轮：真机验收通过的收尾 —— 退出通道 ＋ 问题卡收尾态，2026-10-02）
+
+**先记真机验收结果（本轮实测全部通过）**
+
+- ✅ **计划审查卡到飞书**：`exit_plan_mode intercepted for fs-main-muppqw21 plan_len=1988`
+  → `question card sent: plan-review`（CM 回「看到卡片了」）。
+- ✅ **插话换新卡**：两次 `card created … elements=5`（5 元素 ＝ hr ＋ 彩色块 ＋ hr ＋ …），
+  旧卡留「📨 你的消息已插话送达 —— 后续内容见下方新卡。」。
+- ✅ **消息未被吞**：全窗口零 `duplicate inbound skipped`。
+
+**D1a｜「批准」其实**没有**真的退出计划模式**
+
+- 真机日志：`plan approved on Feishu … exit=unavailable(planMode 服务未注入)`。
+- 根因：`ctx.inject(['planMode'])` 在本环境**从不触发**（profile bundle 跨 scope，
+  与插件里既有的 2026-08-15 那条注释同源）⇒ `planModeRef` 恒为 `null`；
+  所谓"退出"只是**我口头告诉模型**，会话里并没有 append `plan/mode` 事件
+  ⇒ 下一轮系统提示仍会写「You are in plan mode」，等于把模型骗了。
+- 修法：改走**命令注册表**的 `/plan off`（`ctx.get('commands').execute(...)`）——
+  与 `/plan` 命令同一条**已验证可用**的通道，由 `dsh-plan-mode` 自己执行 `set(agent,false)`。
+  日志特征：`exit via /plan off: Plan mode off.`。
+
+**D1b｜「继续修改」分支让 harness 抛异常（我收到的是报错，不是用户的反馈）**
+
+- 真机实测：我拿到的是 `Error: tool result must be losslessly JSON-serializable`。
+- 根因（源码级）：`dsh-tools` 的 `materializeFinalResult()` 在 `isError === true` 时
+  **无条件**写入 `error: result.error`；我们没给 `error` ⇒ 值为 `undefined`；
+  而 `dsh-util-values` 的 `walkJsonValue()` 对 `typeof current !== 'object'` 直接判
+  「不可序列化」⇒ 抛错。
+- 修法：改成 **`throw new Error(文案)`** —— 与 `dsh-plan-mode` 自己的 `execute`
+  **完全同路**，由 harness 统一转成合法的错误工具结果。
+- **测试基建坑**：改成抛错后，`emitCtx` 返回的 promise 若等到 `await` 才挂 handler，
+  Node 会先触发 unhandled rejection **把 smoke 打挂**（实测）⇒ 必须**同一拍**接住
+  （smoke 45 里新增 `capture()` 辅助函数）。
+
+**D2｜文字回答后问题卡不更新 ⇒ 按钮仍可点、点了报 `record not found`**
+
+- 真机场景（CM 亲述）：「弹卡片的时候我刚好发信息了」⇒ 那条被当成回答
+  （`question answered via chat`）；随后再点卡上按钮 ⇒
+  `question button: record not found for chat oc_ebe4…`。
+- 根因：只有**按钮**路径会更新卡片，**文字**回答路径没有。
+- 修法：新增 `finalizeQuestionCard(record, text)`，**两条文字回答路径都调用** ——
+  就地改成「✅ 已收到：<你的选择 / 原文>」态（复用已有的 `questionResultCardPayload`），
+  并登记 `recentQuestions`（再点旧卡给**友好提示**而不是静默失败）。
+
+**D3｜（取证后决定**不改**）`/plan <正文>` 在活跃回合中是否多出空卡**
+
+- 取证结论：本实例窗口内 3 张「（Agent 未产生文字回复）」空卡
+  **全部紧跟 HMR 热重载、且属于另一个 chat**，与 `/plan` 无关
+  ⇒ 按「没有证据就不动代码」**不加守卫**，继续观察。
+
+- **守护用例**：smoke **45** 重写（批准走 `/plan off`；「继续修改」**必须抛错**；
+  非飞书 agent / 空计划仍必须 `next()`）、smoke **46** 不变（插话换新卡 + 彩色块）。
+
+### Fixed（第二轮：计划审查换通道 ＋ 插话换新卡 ＋ 醒目提示，2026-10-02）
+
+**① 计划审查卡**仍然**到不了飞书 ⇒ 换通道到【工具层】**
+
+- 真机复现：把 `user-questions/request` 监听**下沉到 `agent.ctx`** 之后，日志里只有注册行
+  `user-questions/request: bound to agent scope for fs-main-muppqw21`，
+  **没有任何** `[agent-scope]` / `[root]` 的**接管**行；harness 侧收到的是
+  `The user dismissed the plan review to speak instead`
+  ⇒ 该水位线被 GUI 侧**整条吃掉**（`dsh-api-remotes` 的 forwarded waterfall 先答，
+  只有远端不接才 `next()`），**与监听挂在哪一层无关**。
+- 修法：改在 **`tools/execute`** 上拦 `exit_plan_mode` —— 它是**工具**
+  （`dsh-plan-mode/lib/index.js:231` 的 `ctx.tools.register`），与 `ask_user_question`
+  **同一个 dispatch**，而拦 `ask_user_question` 是本插件**线上验证过可用**的通道。
+  - **批准** ⇒ 调 `planMode.set(agent, false)`（与 `/plan off` 同一条官方通道，
+    **真的退出计划模式**，不是只回一句话）＋ 回给模型的文案与 plan-mode 原文**逐字一致**；
+  - **继续修改** ⇒ `isError: true` ＋ 反馈原文，绝不误批准；
+  - **非飞书 agent / 空计划正文** ⇒ `next()`（红线：绝不吞别人的提问）。
+  - 原 `user-questions/request` 监听**保留作兜底**（不冲突：工具层先返回就不再派发水位线）。
+
+**② CM 追加：「我插话了以后，你应该新开卡片。不然我说的话全部堆到下面，你一直在旧卡片上更新」**
+
+- 修法：插话复用答题后那套 `split()` —— 旧卡就地封口并留一行
+  「📨 你的消息已插话送达 —— 后续内容见下方新卡。」，**新卡第一块**就是醒目提示
+  （`split(notice)` 新增 `{ old, fresh }` 参数；不传时行为与原来完全一致）。
+
+**③ CM 追加：「这一句不够明显，加个框、加粗、或者换个颜色」**
+
+- 新增块类型 `notice`，渲染为 `hr` ＋ `column_set(background_style: 'orange-50')` ＋ `hr`，
+  正文 `**📨 你的消息已插话送达**` 加粗。
+- 颜色取自飞书官方枚举（14 色系 + 深浅后缀，**`-50` 的语义就是「区块背景」**）；
+  `column_set` **不支持** `border`（会被 API 拒 `ErrCode 200621`），底块只能靠 `background_style`。
+  **换色只改一个常量** `STEER_NOTICE_BG`（候选：`blue-50` / `wathet-50` / `yellow-50`）。
+- **隔离**：`notice` **不参与** `cardTableCount`（只数 message/note）、
+  **不参与**「本轮结论」摘要提取 —— 不会污染表格额度与结论判定。
+
+**④ 顺带修的稳健性问题**：`activeTurns` 以 **agent id** 为键，而插话查找原先用 **session id**
+（生产上二者恰好相同，但不是同一件事）⇒ 改为按「该会话绑定的 agent」查、session id 兜底。
+
+- **守护用例**：smoke **45**（工具层接管／批准调 `set(agent,false)`／带说明当反馈／
+  非飞书 agent 与空计划必须 `next()`）、smoke **46**（插话换新卡／旧卡封口指路／
+  彩色底块 + 加粗标题）。
+- **测试基建**：smoke mock 补上 `planMode` 服务注入 —— 此前 `ctx.inject` 对 planMode
+  不触发，`planModeRef` 永远是 null，「批准后真的退出计划模式」这条分支**从未被测过**。
+
+### Fixed（事故：本次改动一度让**所有飞书消息被静默吞掉**）
+
+- **现象**：真机日志 `duplicate inbound skipped` 连发，CM 报「所有飞书信息你收不到」（4 条被吞）。
+- **根因**：新加的 `steerActiveTurn` 第一句就调 `isDuplicateInbound()` —— 它**有副作用**
+  （把 id 记进 `seenInboundIds`）。一旦 steer 没走成（没有活跃回合／agent 没有 `steer`）
+  函数 `return false` 落到 `handleInbound`，那里再查一次 ⇒ 已「见过」⇒ 判重投丢掉。
+- **修法**：新增只读的 `inboundAlreadySeen()`；`steerActiveTurn` 只**窥探**，
+  **仅当 steer 真的投出去之后**才 `isDuplicateInbound()` 认领。
+- **守护用例**：smoke **43**（`/plan <正文>` 建卡／过程进卡／正文不重复投递）、
+  smoke **44**（无 steer 能力时消息照常投递、照常建卡；同 `message_id` 重投仍去重）。
+
+## [0.4.14] - 2026-10-01
+
+### Fixed（计划模式退出申请在飞书上**完全收不到** —— CM 报障「计划模式退出的时候，我收不到你的退出申请」）
+
+**根因（同一种提问，插件只拦了一条链路）**：`exit_plan_mode` 调的是 **`ctx.userQuestions.ask(...)` 服务**
+（`@deepseek-ai/dsh-plan-mode/lib/index.js:261`），**不经过** `ask_user_question` 工具；
+而本插件此前只拦 `tools/execute` 上的 `ask_user_question`（`index.js` 里那条 `tools/execute` 拦截）
+⇒ 计划审查请求只发给了**连着长连接的 GUI 客户端**，飞书侧一个字节都收不到，
+模型那一轮就停在"等审批"上（用户侧表现＝没有任何动静）。
+
+- **修法**：补一条与 `approval/request` **同构**的水位线 `user-questions/request`。
+  依据：`userQuestions.ask` 的派发＝`ctx.waterfall(scopeTarget(agent, agent), 'user-questions/request', …)`
+  （`@deepseek-ai/dsh-user-questions/lib/index.js:69`），而 `approval/request` 是同款派发
+  （`@deepseek-ai/dsh-user-approval/lib/index.js:179`）＋本插件根级 `ctx.on('approval/request')` 线上已验证可用。
+  - **只接管飞书自己的会话**：`findChatForAgent(agent)` 取不到 owner（GUI 会话／子代理）一律 `next()` 交回 harness ——
+    **绝不吞掉别人的提问**。
+  - **卡面**：header「📋 计划已写好，等你批准」，正文＝**完整计划 markdown**，
+    选项行给中文说明「批准并执行（退出计划模式）」「继续修改（留在计划模式，回我文字即可）」。
+  - **回传协议保持原 label**（`Approve` / `Keep planning`）：中文只是卡面文案 ——
+    plan-mode 判批批准判的是 `selected[0] === 'Approve'`，污染了就会静默失效。
+  - **文字回复**：整条消息**精确命中** `approve / 批准 / 同意 / 确认` 才算批准；
+    带补充说明（例「同意，但第 2 步先改成只读排查」）按"继续修改"的反馈回给模型。
+    方向是刻意选的：误判成"留在计划模式"可恢复，误判成"已批准"不可恢复（会立刻开工）。
+- **守护用例**：smoke **42**（水位线接管／非飞书 agent 必须 `next()`／计划正文必须在卡上／
+  按钮回传原 label／文字别名＝批准／带补充说明＝反馈／普通问句卡不受影响）。
+- **部署**：junction＋HMR，保存即热重载 ⇒ 日志 `[fs] plugin apply #12 v0.4.13 md5=9a7fc238 bytes=204168`。
+  ⚠️ 版本标记在 **apply 时**读 `package.json`，所以落地那一刻日志仍写 v0.4.13；
+  **代码身份以 `md5=9a7fc238` 为准**，下次重载即显示 v0.4.14。
+
+## [0.4.13] - 2026-10-01
+
+### Fixed（per-bot `splitConclusionMinMs` 配置通道从未生效 —— 由"表面 × 覆盖"扫描抓出）
+
+**发现方式**：目标轮 3 改用**系统性扫描**（把 `index.js` 里真实注册的命令／环境变量／`bot.cfg` 字段／路由／
+工具名逐个丢进 `smoke.mjs` 里查），25 个表面中 16 个零覆盖 → 给其中两条补断言时，**用例 38 当场把这条逼了出来**。
+
+- **根因**：`normalizeConfig()` 用**显式字段白名单**清洗配置，
+  `reactionEmoji / ownerOpenId / notifyGoalRounds / notifyAgentNotices` 都在名单里，
+  **唯独漏了 `splitConclusionMinMs`** ⇒ 写进 `feishu.config.json` 会被丢掉
+  ⇒ `conclusionSplitMinMs(bot)` 永远读到 `undefined` ⇒ **0.4.4 起承诺的"bot 配置优先、10s 热读免重启"只有 env／默认值成立**。
+- **证据（两条独立）**：① 同一份配置里 `notifyAgentNotices=false` 生效（回执 0 动作，证明配置确实被重读），
+  而 `splitConclusionMinMs=600000`（env 同时设 0）仍分卡；② 代码白名单里就是没有这个字段。
+- **修法**：白名单补上该字段（含 `Number.isFinite && >= 0` 校验）。
+- **守护用例**：smoke **38** —— **由红转绿**（`bot 配置 600000 压过 env=0 ⇒ 不分卡`）；
+  同时把 `notifyAgentNotices=false` 从零覆盖变为有断言。
+- **部署**：junction＋HMR ⇒ 保存即热重载，**无需重启、无需 sync**（日志 `plugin apply #3 … md5=f36e3ae1 bytes=198141`）。
+
+### Added（admin 路由首次有守护 —— 用例 39）
+
+- `/feishu/admin/status`：响应**不含 appSecret 明文**（只给 `hasSecret` 布尔）。
+- `/feishu/admin/config`：GET 把 appSecret 掩码成 `***` 且响应不含明文；POST 写入**必须走归一化**
+  （白名单外字段被丢弃 —— 正是本轮 bug 的机制）；不支持的方法返回 405。
+
+## [0.4.12] - 2026-10-01
+
+### Fixed（引用的卡片"认得出来，但摘要没信息量"）
+
+**真机现象（CM 引用重启后发出的卡）**：`（你在引用这条消息：bot 的回复卡片：正在工作中…）`
+—— 落盘生效了（不再"未登记"），但摘要是**建卡那一刻的占位符**。
+
+- **根因**：`rememberMessage` 只在 `syncCard` 的 **create 分支**登记一次，而那一刻卡片里只有
+  `正在工作中…`（真正的内容要等封口才成形）⇒ 登记的等于没登记。
+- **修法**：
+  1. 新增 `cardLabel(card)`：跳过占位符/指路语（`正在工作中…`／`继续处理中…`／`✅ 本轮完成，结论见下方卡片。`…），
+     **取最后一段正文**（封口后的结论最有信息量）；还在跑的卡退到**最后一条过程话语**（如 `🎯 目的行`）；
+     都没有则给中性文案 —— **绝不留占位符**。
+  2. `syncCard` **每次成功同步（create 或 PATCH）都刷新一次摘要**。
+- **守护用例**：smoke **35** 扩充两条断言 —— ① 索引里**不许**出现含「正在工作中」的摘要（**先跑出红色基线**：
+  `❌ …实际：["bot 的回复卡片：正在工作中…"]`）② 封口后的结论必须被登记。
+- **部署**：**本次只 `npm run sync`，不重启**（CM 2026-10-01 明令「不要动不动就重启」）
+  ⇒ 改动会在**下一次**重启时生效，当前进程仍跑 v0.4.11。
+
+### 教训（自己的，记进本地档案）
+
+- **禁止用 PowerShell 重写文本文件**：`(Get-Content -Raw) -replace … | Set-Content -Encoding UTF8`
+  在 Windows PowerShell 5.1 下会写入 **UTF-8 BOM**（`EF BB BF`）⇒ Node 的 `JSON.parse` 当场抛错，
+  `npm run sync` 直接失败。**改文本一律用文件工具**（本次已用 `write` 工具重写为无 BOM）。
+  这与 `~/.dsh/AGENTS.md` A22-⑦（PS `>` 写 UTF-16）是同一类量具/工具陷阱。
+
+## [0.4.11] - 2026-10-01
+
+### Fixed（引用透传真机验收暴露：重启后"引的是哪张卡"查不出来）
+
+**真机现象（CM 第一次真机验引用透传）**：长按引用一张卡片 → 注入会话的正文里出现
+`（你在引用这条消息（内容未登记，可能是更早的消息））` —— **透传通了，但摘要查不到**。
+
+- **取证**：CM 引的卡 `om_x100b64d11132f0a0b0484fbba40a0ca` 建卡于 `web.log` **65263 行**，
+  而本次重启是 **65275 行** ⇒ 那张卡是**上一次进程**发出去的。
+- **根因**：`recentMessages`（message_id → 摘要）**只在内存**，dsh 重启（改插件代码/框架升级）即清空
+  ⇒ 重启前发出的一切卡片/消息都成了"未登记" —— 而参考/引用的卡片恰恰多半是上一轮的，命中率极低。
+- **修法**（零新增飞书权限，沿用已有 state 目录）：
+  1. 索引落盘到 `~/.dsh-feishucard/message-index.json`（`rememberMessage` 后 300ms 防抖写、`unref` 不拖进程）；
+  2. 启动时加载（日志 `[fs] message index loaded: N entries`）；
+  3. `quoteHintFor()` **未命中时再读一次盘** ⇒ 覆盖"本进程启动前登记的消息"。
+- **不做**：仍然**不猜内容** —— 真查不到就照实写「内容未登记」（`~/.dsh/AGENTS.md` A24）；
+  调用 `GET /im/v1/messages/{id}` 需要新增读消息 scope，**待 CM 决定**。
+- **守护用例**：smoke **35** —— ① 索引文件里必须有卡片 message_id 与「bot 的回复卡片：…」摘要；
+  ② **直接往磁盘索引写一条内存里没有的记录**（＝模拟"上一次进程登记的卡"），再喂一条引用它的入站消息，
+  断言摘要能读出来（此断言只有"未命中时重读盘"才可能通过）；③ 真未登记的消息仍写「内容未登记」。
+
+## [0.4.10] - 2026-10-01
+
+### Fixed（结论卡的"单卡回退"形同虚设 ⇒ 结论会丢）
+
+**发现方式**：CM 问「卡片还有哪些是改动过、但没有测试的？」→ 逐条审计改动 × smoke 断言 × 真机记录，
+**补写守护用例时当场把这条逼了出来**（用例先红、修完才绿）。
+
+- **根因**：`syncCard()` **内部吞异常** —— 建卡/改卡失败只在 catch 里置 `createFailed`／`circuitOpen`，
+  **不往调用方抛**。而结论分卡那条路径写的是 `try { await syncCard(…conclusion…); … } catch { 退回单卡 }`
+  ⇒ `catch` 只可能被第二行之后的代码触发，**建卡失败根本进不去回退分支**；
+  结果是：过程卡封口写着「✅ 本轮完成，结论见下方卡片」，而**下面那张卡不存在**
+  （真机日志特征：`conclusion card opened … card=-`），结论只能靠纯文本兜底、卡片链条断掉。
+- **修法**：`await syncCard(…conclusion…)` 之后**自己检查 `conclusion.token`**，拿不到就抛进 catch；
+  catch 里补回结论后**必须把过程卡 PATCH 上去**（`footerMode` 同时升级为 `full` —— 它此刻就是结论卡）。
+- **守护用例**：smoke **34**（mock 新增 `failCreatesFrom`：只让"结论卡那一次"建卡失败，
+  断言判据落在 **PATCH 载荷**上 —— 因为失败的 create 载荷也会进 `sentCards`，靠"载荷里有没有这句话"会假绿）。
+
+### Added（补测审计发现的空白 —— 全是"改过但没人验"的分支）
+
+- **smoke 33**：① `goalStateText()` 的 **paused / blocked / complete** 三个分支（此前一次都没被执行过）；
+  ② **`goal/changed` / `goal/activation-changed` → 刷新已在飞书上的活跃卡**（`refreshLiveCards`，
+  此前 smoke 0 触发、真机 0 次）。判据要求出现 **PATCH** 且载荷同时含「目标模式」与**刚改过的状态**。
+- **smoke 32 扩充**：`/plan`、`/goal` 的命令失败**回注 agent** 也断言（此前只有 `/compact` 那条被验过）。
+- **反向验证（防假保险丝）**：把 `ctx.on('goal/changed')` 临时改名 → smoke 33 当场变红，"去掉修复就失败"成立。
+
+## [0.4.9] - 2026-10-01
+
+### Fixed（`/compact` 第二次报错：`Cannot read properties of undefined (reading 'length')`）
+
+**发现方式**：**由 0.4.8 新加的"命令失败回注 agent"自动叫醒 agent** —— CM 没贴报错，agent 自己知道并开查
+（这条通道上线后第一次实战就抓到了自己的下一个 bug）。
+
+- **根因（我 0.4.7 只修了一半）**：0.4.7 把 `signal` 挪到第 4 位后，第 3 位我填了 `undefined`；
+  但注册表里是 `let attachments = NO_ATTACHMENTS; if (submittedAttachments.length > 0) {...}`
+  —— **第 3 位必须是数组**（`NO_ATTACHMENTS = Object.freeze([])`），传 `undefined` 就在 `.length` 再抛一次。
+- **修法**：三处统一 `commands.execute(agent, line, [], new AbortController().signal)`。
+- **守护用例**：smoke 32 的断言从「第 3 位保持 undefined」**改成**「第 3 位必须是长度 0 的数组」
+  —— 原来那条断言本身就在**保护错误行为**（断言写错＝把 bug 钉住），一并纠正。
+
+## [0.4.8] - 2026-10-01
+
+### Added（命令失败自动回注 agent —— 报错不再只有用户知道）
+
+**CM 原话**：「能不能报错能直接知道，提醒到 agent 啊？」
+
+- **痛点**：斜杠命令（`/compact` `/goal` `/plan`）在**会话链之外**执行 —— 命令炸了，
+  用户看到一句报错，而 **agent 完全不知道**（它那一轮早就结束了）。
+  真机事故就是：`/compact` 抛 TypeError，agent 直到 CM 把报错贴过来才知道 = **能自愈却等用户救**。
+- **改法**：新增 `reportCommandFailure(agent, bot, chatId, what, error)`：
+  1. 先建一张卡承接 agent 被唤醒后的这一轮（复用自动卡机制，标题写「⚠️ <命令> 执行失败 · 正在排查…」）；
+  2. 再把失败**注入会话并唤醒 agent**（`agent.send(..., 'next-turn', true)`，正文含 `[系统回执]` 前缀＋原始错误），
+     提示它"排查原因、用人话告诉用户现在什么情况"。
+  - 接入点：`/plan`、`/goal`、`/compact` 三处 `catch`（原来只 `console.log` ＋（compact）回用户一句）。
+- **守护用例**：smoke 32 增加断言 —— 命令抛异常时**既回用户、也必须回注 agent**（注入正文含原因）。
+
+## [0.4.7] - 2026-10-01
+
+### Fixed（`/compact` 报 `Cannot read properties of undefined (reading 'aborted')`）
+
+**CM 真机反馈**：发 `/compact` 收到「压缩失败：Cannot read properties of undefined (reading 'aborted')」。
+
+- **根因（传参错位，我的锅）**：harness 的签名是
+  `commands.execute(agent, line, submittedAttachments, signal)` —— **signal 在第 4 位**，第 3 位是附件。
+  旧代码三处调用都写成 `execute(agent, line, signal)` ⇒ 真正传进注册表的 `signal === undefined`
+  ⇒ 注册表第一行 `if (signal.aborted)` 当场抛 TypeError。
+- **连带发现（同型，长期潜伏）**：`/plan` 与 `/goal` 也是错位传参 ——
+  异常被各自的 `catch` 吞掉后**静默走了兜底分支**（所以 `/goal` "看起来能用"，
+  实际从未走通 command-goal 的注册表实现，pause/resume/clear/edit 的完整语义一直没生效）。
+- **修法**：三处统一改成 `execute(agent, line, undefined, new AbortController().signal)`。
+- **守护用例**：smoke 32 记录**全部实参**并断言
+  「signal 必须在第 4 位（`typeof signal.aborted === 'boolean'`）／第 3 位保持 undefined」，
+  `/compact` 与 `/goal` 两条通道都断言 —— 这类"位置传错被 catch 吞掉"的坑，靠断言钉死。
+
+## [0.4.6] - 2026-10-01
+
+### Changed（A 方案：过程卡不摆状态栏，状态栏只归结论卡 / 自动卡）
+
+**CM 原话**：「过程卡片不显示状态栏，只有结论卡片才显示，可以吗？」（追问后选定 **A**）
+
+- 新增卡片字段 `footerMode`：
+  - `'full'` = 灰底状态栏（状态 ｜ 目标 ｜ 上下文占比 ｜ 缓存命中）——**结论卡**与**自动卡**（目标轮/回执轮）用；
+  - `'bare'` = 一条 `hr` ＋ 一行裸状态（`运行中…` / `✅ 已完成` / `失败`）——**普通回合的过程卡**用。
+- 判定时机：分卡只有到**封口**才知道 ⇒ 过程卡先设 `bare`；若**不满足分卡条件**（短任务），
+  封口时**升级为 `full`**（那张卡本身就是结论卡，状态栏该在它身上）。
+- 自动卡（目标轮/回执轮）**保留完整状态栏** —— CM 之前专门要的「目标有没有停/丢」就在那里看，不能误伤。
+- **守护用例**：smoke 31 增加三条断言（过程卡无状态栏 / 过程卡留裸状态 / 结论卡带完整状态栏）。
+  判据用「目标模式」这条状态栏专属文案 —— **`grey-50` 不能当判据**（工具折叠面板也是 grey-50，踩过一次）。
+
+## [0.4.5] - 2026-10-01
+
+### Added（飞书端 `/compact`：压缩上下文）
+
+**CM 原话**：「压缩上下文在飞书卡片里面应该发什么指令啊？现在是支持的吗？不支持的话得加上」。
+
+- **查证**：harness 侧**有** `@deepseek-ai/dsh-command-compact`（模块名 `command-compact`，
+  注册 `/compact`，无参数，内部调 `compaction.compactNow(agent, signal, commandId)`）；
+  但插件命令白名单是 `['help','new','switch','list','plan','goal','stop']` —— **没有 compact**
+  ⇒ `/compact` 落到"非命令"分支，被当成**普通消息**发给模型，**压缩根本不会发生**（用户以为按了、其实什么都没做）。
+- **改法**：`COMMANDS` 加 `compact`；新增 `/compact` 分支 —— 走与 `/goal` 同一条注册表通道
+  `commands.execute(agent, '/compact', signal)`，把上游返回文本回给用户；
+  注册表里没有该命令（插件未装载）时**明确回「压缩不可用」**，不静默。
+- **已知前置条件（上游语义）**：**agent 必须空闲**，否则返回 busy
+  （"this process has an active compaction, or the agent is not idle"）；无历史时返回 "No compactable history yet."
+- **守护用例**：smoke **32**（路由到 `commands.execute` ＋ 结果可见 ＋ 未装载时明确告知）。
+- `/help` 文本与 README 命令列表同步补齐。
+
+## [0.4.4] - 2026-10-01
+
+### Fixed（结论分卡阈值太低：短任务也被拆成两张卡）
+
+**CM 反馈（v0.4.3 上线后当场）**：「短任务都变了两张卡了」。
+
+- **真机取证**：两次分卡的 `elapsed=12136ms / 13753ms`、`tools=1` ——
+  即 12~14 秒的短任务也被分卡；而"有工具调用"这条触发条件**对几乎每一轮都成立**（实测每轮至少 1 个工具），
+  **形同虚设**，等于把 10 秒阈值也架空了。
+- **改法**：**删掉"有工具调用"这条触发条件**，**只按耗时**判定；
+  阈值 `CONCLUSION_SPLIT_MIN_MS` 默认 **10s → 30s**，并且改成**可热更新**：
+  1. bot 配置 `splitConclusionMinMs`（`feishu.config.json`，**10 秒热生效、不用重启**）优先级最高；
+  2. 其次环境变量 `DSH_FEISHU_SPLIT_MIN_MS`（进程级）；
+  3. 都没有 → 默认 30000ms。
+  取值在**每次封口时判读**（不是启动读一次）⇒ 可热调、测试也能逐用例设定阈值。
+- **守护用例**：smoke 31 改成"达标（阈值压到 0ms）→ 2 张卡"／"未达标（默认 30s，即使调了工具）→ **1 张卡**"；
+  `conclusion split` 日志新增 `threshold=` 字段，便于事后核对判据。
+
+## [0.4.3] - 2026-10-01
+
+### Added（结论独立成卡 + 状态并入状态栏 —— CM 定 B 方案）
+
+**CM 原话**：「每一个卡片最后都有一个『进行中』和『已完成』的状态……它在运行，但运行完了以后却没有提示……
+把『进行中』和『已完成』的状态并到那个状态栏里面；当它变成『已完成』的情况下，单发一条很简单的信息过来提醒……
+为什么不做成结论那一块单独发一张卡片呢？大模型要输出结论了，肯定有信号的。」
+
+- **信号（协议级，不靠猜文案）**：DSH 的回合靠"这一步还有没有工具调用"决定是否继续 ⇒
+  **assistant/message 里只有文字、没有工具调用 = 这就是结论**。
+- **分卡规则（CM 选 B）**：本轮 **有工具调用** 或 **耗时 ≥ `CONCLUSION_SPLIT_MIN_MS`（10s）**
+  ⇒ 封住**过程卡**（它退化成"工作日志"，结论从它身上摘掉，只留一行「✅ 本轮完成，结论见下方卡片。」）
+  ＋ **新开一张结论卡**（新消息 ⇒ 飞书会**提醒**）。短问答（无工具、<10s）维持单卡，不制造噪声。
+  - 结论卡建卡失败 ⇒ 自动退回单卡（结论补回过程卡），**回复绝不因此丢失**。
+  - `recentTurnCards` 改登记**结论卡**（它是本轮最后一张，自动轮接续时不会跑到它上面）。
+- **状态并入状态栏**：`goalFooterElements()` 把 `statusTextFor()`（运行中／已完成／失败）写在**状态栏栏首**
+  （`运行中… ｜ 🎯 目标模式 … ｜ 🧠 上下文占比 ｜ 💾 缓存命中`）；`buildCardPayload` 不再单独输出状态行，
+  仅在卡片没有 agent（读不到会话）时兜底保留独立一行。
+- **守护用例**：smoke **31**（有工具→2 张卡且结论不重复；短回合→1 张卡）；
+  smoke 2/18-21 的状态断言从 `_失败_` 改为「状态栏里确实是这个词」（`statusShows()`）。
+
+### Tests（v0.4.3）
+
+- `npm run check` ✅ ＋ `SMOKE PASS（95 cards / 31 cases）`，既有用例全绿。
+
+## [0.4.2] - 2026-10-01
+
+### Changed（子代理回执：有活跃卡时**并入卡片**，不再发独立消息）
+
+**CM 原话**：「它弹出来的时候，如果主会话还在更新的话，它会一直留到最后……不要去把它当做一个标签一样，
+它现在就弹出来了以后就一直沉在活跃卡片的下面，那这样其实不好看的呀。」
+
+- **机制原因**：飞书消息按**创建时刻**排位；独立通知发出后位置就固定了，而上面那张流式卡还在原地 PATCH
+  ⇒ 通知被"钉"在活跃卡下面，像一块贴纸。
+- **改法**：`announceSubagentNotice()` 顺序改为 ——
+  1. 有 **活跃飞书回合卡** ⇒ 只把「🔔 子代理 … 已完成」**并进那张卡**（`appendNote` + PATCH），**不发任何独立消息**；
+  2. 有 **活跃自动轮卡** ⇒ 同上；
+  3. **会话不活跃**（没有卡在跑） ⇒ 才走双层播报（纯文本 + 详情卡）——这种情况通知就是最新的那条消息，位置正确。
+- 卡处于熔断/建卡失败状态时自动退回纯文本（不会把通知吞掉）。
+- **顺带补上观测缺口**：`sendPlainText` 成功后会打 `[fs] notice plain text sent: …`（此前只有失败才留痕，
+  导致"纯文本是否送达"无法从日志核对）。
+- **守护用例**：smoke **30**（whenIdle 挂起制造活跃卡 → 断言"回执到达时只 PATCH、不发新消息，且内容进了那张卡"）。
+
+## [0.4.1] - 2026-10-01
+
+### Fixed（回归红线 R1：点击卡片后，后续内容必须写到【新卡】上）
+
+**CM 原话**：「弹卡片以后，我点击卡片了之后，**所有的内容都要在新卡片上去新增**。不然我看到的就是
+——你弹了卡片给我，我点击了，但是你不动了，因为你在旧卡片上面持续的去新增……
+我看到的最后一条消息就是你给我选择的东西。」
+
+- **失效场景（真机实测，0.4.0 期间发生）**：问答发生在**自动轮**（回执轮/目标轮）里时，
+  答题后的 `split` 只查 `activeTurns`（飞书**入站**轮）——自动轮不在那张表里 ⇒ **静默跳过** ⇒
+  内容继续写进用户已经划过去的那张旧卡 ⇒ 用户观感「我点了，它却没动」。
+- **修法**：
+  1. 新增 `splitLiveCardAfterAnswer(agentId)` 统一入口：**入站轮 → 自动轮兜底**；
+     两条路都没有时**必须打日志留痕**（静默跳过正是这次回归的根因）；
+  2. 新增 `makeAutoCardEntry(...)`：自动轮卡片也带 `split()` —— 冻结旧卡
+     （去掉「正在工作中…」、写「✅ 已收到你的选择，继续处理中…」）＋ 开新卡（游标＝当前事件位置，不重放）；
+  3. **新卡必须立刻 `syncCard(...)` 建出来** —— 只登记不建卡的话，用户点完按钮什么都看不到。
+- **守护用例**：smoke **29**（自动轮里提问 → 点按钮 → 断言"旧卡封口 + 新卡已建"）。
+
+### Changed
+
+- 版本 0.4.0 → 0.4.1；新增本地档案 `DEV-PURPOSE.local.md`（记录开发目的与回归红线，命中 `*.local` 不进 Git）。
+- **目的行格式改口径**（CM 2026-10-01 当场要求）：`🎯 目的：<正文>` → **`🎯 <正文>`**（去掉"目的："三个字）。
+  插件侧判据本来就是"以 🎯 开头"（`PURPOSE_LINE_RE`），**无需改代码**；只同步约定（`~/.dsh/AGENTS.md`）与注释/用例文案。
+
+## [0.4.0] - 2026-10-01
+
+飞书端四项体验改造 + 引用透传（CM 计划模式逐条拍板；全部改动集中在 `index.js`）。
+
+### Fixed（子代理回执不自动弹卡 — 判定时点竞态）
+
+- **根因（真机实证）**：旧实现只在 `agent/status === 'running'` 那一拍回扫"最后一条 `user/message`"，
+  而回执消息要等 `turn/start` **之后**才写进会话 ⇒ 判成普通回合 ⇒ 直接 return，**一张卡都不开**。
+  实证（会话 `fs-main-mup1y7yi`）：`turn/start(seq1023) → agent-message relay(seq1026) → subagent-settled(seq1035)`。
+- **反向样本**：DSH-BA 会话（`fs-main-mumyza49`）里 136 轮中有 26 轮"回合启动时最近一条 user/message 是回执"
+  ⇒ 该 agent 打出 19 张 `kind=notice` 卡 —— **是同一 bug 的另一面（误判撞对）**，卡片不带 id、归因不可靠。
+- **修法**：新增**独立于回合状态**的回执轮询（1s）＋ 判据换成正式字段 `source.kind === 'subagent-settled'`
+  （正文正则降级为兜底）；命中即**双层播报**：①`sendPlainText` 纯文本（载荷最简、必达）
+  ②详情卡（含正确子代理 id，卡面写明"这是通知，不用回这张卡"）。
+  普通飞书回合正在跑时**只发文本不建卡**（避免两张卡同内容）；`childId#seq` 去重；首次见到 agent 只登记游标不回放历史。
+
+### Added（卡片底部「目标条」）
+
+- `buildCardPayload` 末尾（状态行之前）新增折叠面板：**折叠＝一行**「目标模式状态 ｜ 🧠 上下文/窗口（占比） ｜ 💾 缓存命中率」，
+  **点开＝状态/续行/创建时间 ＋ 目标全文**。
+- 状态文案覆盖 `active+armed / active+disarmed（⚠️续行已停）/ paused / blocked / complete`；
+  `disarmed` 那一格专门解决"dsh 重启后目标还在但续行停了"看不见的问题。
+- 数据源：`goals.state()/runtimeState()/view()`、`assistant/message` 的 `data.usage`
+  （口径实测：`total = input + cacheRead + output`；上下文＝`input+cacheRead`）、`request/context.contextWindow`。
+  **读不到就整块不显示**（try/catch 静默降级，绝不让卡片因此炸掉）。
+- `goal/changed`、`goal/activation-changed` → 刷新活跃卡。
+
+### Changed（选项卡：分栏换行 + 去掉 5 个上限）
+
+- 旧实现用 1.0 `action` + 按钮（`plain_text`、单行、≤100 字符）⇒ 长选项必被截断成 `…`（CM 实测"按钮上面全是三个点"）。
+- 改为 **JSON 2.0**：每个选项一行 `column_set`（`flex_mode:'stretch'` ⇒ 宽屏并排、窄屏自动上下堆叠），
+  正文列 markdown（自动换行、显示全文）＋ 按钮列「选它」。
+- **去掉 `QUESTION_MAX_BUTTONS = 5`**：选项 >5 不再被静默丢弃；回传值 `{fs_question, fs_option}` 不变，点击逻辑零改动。
+
+### Added（引用回复透传）
+
+- 入站读 `message.parent_id/root_id/thread_id`；本地登记 `message_id → 摘要`（机器人发出去的卡片/消息 +
+  CM 发来的消息，最近 300 条），命中引用时把「（你在引用这条消息：…）」随正文注入会话。
+- 只用本地登记表 —— **不新增任何飞书权限**。
+
+### Fixed（中文目的行不被截断切掉）
+
+- `clipNoteText`：500 字截断后若 `🎯` 目的行丢失，把它补回（目的行是过程里信息密度最高的一行）。
+
+### Tests
+
+- smoke 新增 5 组用例（24-28）：回执落盘即播报＋不重复、目标条五态与上下文/缓存、选项卡 2.0 分栏＋6 选项不丢、
+  `parent_id` 透传、目的行抗截断。`npm run check` + `npm run smoke` 全绿（72 cards / 28 cases）。
+
 ## [Unreleased]
+
+### Fixed（同一个群同时挂着两个会话 / 目标轮另开一张卡 → 用户"一个内容发两次"）
+
+**用户原话**：「为什么你一个内容还是发两次呢？这个问题不是已经修复了吗？你查一下这个什么问题？什么原因？」
+
+- **先排除（真机取证，不是推测）**：
+  1. 拉该群最近 **200 条**消息 → 机器人**只发卡片**（app 发的非卡片消息 **0 条**）、
+     **没有任何两张卡在 5 秒内成对出现**（129 张卡 / 71 条用户消息）⇒ **不是"飞书消息发了两条"**。
+  2. 源码与 profile 运行副本 **MD5 一致**（`F1BC8472`，151615 字节）；运行进程 09-23 **04:15** 启动，
+     晚于 09-23 那次修复（03:49）⇒ **那次修复仍生效**；它的日志指纹（用户消息进来后紧跟
+     `auto card opened … kind=notice`）在最近 1500 行日志里 **0 次命中**。
+- **根因两条（均有 web.log 实证）**：
+  1. **目标轮另开一张卡**：`turn sealed` → `card reply delivered` 之后**紧接着**
+     `auto card opened: agent=… kind=goal round=1`。目标卡与普通回合卡**同源镜像同一批会话事件**
+     → 用户看到同一段内容出现在两张卡上（与 2026-09-23 那条 CHANGELOG 描述的机制同型）。
+     09-23 的 `activeTurns` 守卫只覆盖了 `notice`（回执轮），**`goal` 这条路没覆盖**。
+  2. **`/new` 没停旧会话**：`/new` 只把 `active` 切到新会话，旧会话继续被后台 job 唤醒、
+     继续往**同一个群**发卡（web.log 里两个 agent 的 `auto card opened` 交替出现；该段
+     **卡片/用户消息 = 1.82:1**；旧会话的会话文件最后写入停在 19:40:15）。
+- **修法（三处）**：
+  1. `openGoalCard()` 增加第 5 参 `existing`：**目标轮开卡前先查 `recentTurnCards`**
+     （普通回合卡封口时登记；条件＝同一个群 ＋ `AUTO_CARD_REUSE_MS = 3 分钟` 以内 ＋ 该卡有 token 且未熔断）
+     → **复用那张卡**（沿用它的游标继续镜像、只补一行 🎯 目标模式头），不再另开。
+     日志打 `[fs] auto card reused chat=… msg=… kind=goal`。
+     **回执轮（notice）保持原行为** —— 它是子代理／后台 job 唤起的独立一轮，单独一张卡更好认
+     （smoke 22/23 覆盖该行为）。
+  2. `/new`：切新会话**之前**先 `cancel({ kind: 'user' })` 停掉旧会话的 live agent（同一套 live lookup，
+     缓存句柄可能指向 hmr 后的陈旧实例）；回执文案追加「（旧会话 X 已停 —— 避免两个会话同时往这个群发卡）」，
+     并打 `[fs] /new: cancelled previous live session <id>`。
+  3. **留痕（可取证）**：飞书对 2.0 卡片只回占位符 `{"title":null,"elements":[[img,"请升级至最新版本客户端，以查看内容",""]]}`，
+     **正文读不回来** → 建卡时打 `[fs] card created chat=… msg=<message_id> elements=N payload_md5=<8位>`；
+     封口时把 `turn sealed` / `auto card sealed` 补上 `reply_md5` / `reply_len` / `card=` / `blocks=`
+     （目标轮为 `closing_md5` / `closing_len`）。以后「同一段内容两张卡」可直接按指纹在日志里对上。
+- **回归用例**：23 条全绿（`SMOKE PASS (sentCards=57, sessions=4)`）。用例 13／19 的断言按新契约改成
+  「目标轮**没有多开卡**（create ≤ 1）」＋「🎯 卡面确实出现（新建或复用）」——
+  旧断言写死 `create === 1`，会把"复用"判成失败。
 
 ### Fixed（一次回复发两张卡：普通飞书回合被当成"回执轮"抢建了第二张卡）
 

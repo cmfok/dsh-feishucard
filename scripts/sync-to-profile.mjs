@@ -14,8 +14,13 @@
 //   node scripts/sync-to-profile.mjs --profile <dir>  # explicit profile directory
 //
 // Exit code 0 = copy is byte-identical to source for every shipped file.
+// Exit code 3 = REFUSED: the target is already a link to the source (see below).
+//
+// ⚠️ 2026-10-01 守卫：若 profile 里的这个目录已被换成**指向源码的链接**
+// （junction / symlink ＝ 免重启部署方案 A），那么 target 就是源码目录本身：
+// 再跑本脚本会把 `.bak` 备份写进源码目录、并对自己做无意义拷贝 ⇒ 直接拒绝执行。
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -45,6 +50,20 @@ if (!existsSync(target)) {
   console.error('[sync] FAIL: target directory not found.')
   console.error('[sync]   install the package first: dsh plugin --profile web add ' + PKG_ROOT)
   process.exit(2)
+}
+
+// 守卫（见文件头）：target 已经是链接 ⇒ 它就是源码目录，绝不能往里面写备份/拷贝。
+const isLink = (() => { try { return lstatSync(target).isSymbolicLink() } catch { return false } })()
+const sameReal = (() => {
+  try { return realpathSync(target).toLowerCase() === realpathSync(PKG_ROOT).toLowerCase() } catch { return false }
+})()
+if (isLink || sameReal) {
+  console.error('[sync] REFUSED: target is a link to the source, not a real copy.')
+  console.error('[sync]   target = ' + target)
+  console.error('[sync]   real   = ' + (sameReal ? realpathSync(target) : '(link)'))
+  console.error('[sync]   这种形态下运行时**直接加载源码**，改完即由 HMR 自动重载 —— 既不需要、也不要再跑 sync。')
+  console.error('[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 CM 授权后重启 dsh web。')
+  process.exit(3)
 }
 
 const md5 = (file) => createHash('md5').update(readFileSync(file)).digest('hex')
@@ -100,5 +119,7 @@ for (const r of rows) {
   if (!same) { bad += 1; console.error('[sync] MISMATCH after copy: ' + r.rel) }
 }
 console.log(bad === 0 ? '[sync] OK: deployed copy is byte-identical to source' : '[sync] FAIL: ' + bad + ' file(s) mismatch')
-console.log('[sync] restart dsh web to load the new code (HMR does NOT cover the copy).')
+// 🔴 2026-10-01 CM 明令「禁止随意重启」：sync 之后改动是**待生效**，
+// 只有 CM 明确授权才重启（见 ~/.dsh/AGENTS.md ①-补）。
+console.log('[sync] 改动已进入「待生效」队列：需 CM 授权重启后才会生效（不许自行重启）。')
 process.exit(bad === 0 ? 0 : 1)
