@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.18] - 2026-10-02
+
+### Fixed（🔴 用户已授全权时，插件不该再加一道审批 —— CM 质问后修）
+
+**CM 原话**：「为什么推送到仓库要我审批呢？**我已经给了全部权限给你了呀**」。
+
+**实证（`web.log`，`git push` 那一步）**
+
+```
+[fs] approval needed (pre-execute): pwsh — 联网/外发命令：Set-Location '…dsh-feishucard'
+[fs] approval card sent: pwsh token=4438db21-aec2-415e-901e-b7f335ff1d9f
+[fs] approval allowed (once): pwsh
+[fs] approval needed (pre-execute): pwsh — 联网/外发命令：…
+[fs] approval card sent: pwsh token=92b5e4b3-ed3b-41f3-a0fa-c96eb441a0f7
+```
+
+**根因**：插件自己那道闸（`approvalReasonFor`：外发命令 / 工作区外写入）**不看会话档位** ——
+推送命令里有 `$env:GIT_SSH_COMMAND = 'ssh …'`，命中 `EGRESS_CMD_RE` 的 `\bssh\b` 就弹卡。
+**与 harness 权限无关**：CM 给的是 `danger-full-access`，harness 从未拦过。
+这道闸之所以开着，是 **0.4.17 把它默认打开的副产物**（而它原本的口径就是
+2026-09-16「**他给的是完全访问，审批不该由插件再加一道**」）。
+
+**修法**：`tools/pre-execute` 里先读**本会话当前**的沙箱档位 ——
+`ctx.get('sandboxPolicy').resolve({ session })` → `{ mode, workspaceRoot }`
+（与 `dsh-tool-pwsh/lib/index.js:319` 同源），**`mode === 'danger-full-access'` 直接放行**。
+
+- 恢复 2026-09-16 的本意：**用户已授全权 ⇒ 插件不再加一道**。
+- ⚠️ **真正的"越权升级"审批不受影响**：那种请求只在会话**受限**时才产生
+  （`sandbox_permissions` ⇒ 请求升级 ⇒ 走审批服务 `decide()` 直连 ⇒ 飞书卡）。
+- ⇒ 行为收敛为：**全权模式 = 零审批卡；受限模式 = 只有越权才弹卡**（正是 CM 要的）。
+
 ## [0.4.17] - 2026-10-02
 
 ### Fixed（🔴 0.2 上飞书审批被 GUI 桥接抢答 —— CM 报障后修）

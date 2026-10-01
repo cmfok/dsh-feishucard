@@ -3604,6 +3604,17 @@ export function apply(ctx) {
     }
     return lastChat                      // 兜底：最近活跃会话（拿不到 agent 时）
   }
+  // 读取该 agent **本会话当前**的沙箱档位（dsh-sandbox-policy 的服务 API）。
+  // 用途：判断"用户是不是已经授了全权" —— 是的话插件就不该再加一道审批。
+  function currentSandboxMode(agent) {
+    try {
+      const sp = ctx.get('sandboxPolicy')
+      if (!sp || typeof sp.resolve !== 'function') return undefined
+      const session = agent && agent.session
+      const policy = sp.resolve(session === undefined ? {} : { session })
+      return policy && policy.mode
+    } catch { return undefined }
+  }
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     const pass = () => (typeof next === 'function' ? next() : undefined)
@@ -3615,6 +3626,16 @@ export function apply(ctx) {
     // 那一次 escalation 就一定落在我们手上（WeakSet 幂等，不会重复挂）。
     bindFeishuAgentApproval(exec && exec.agent)
     if (!APPROVAL_ON_FEISHU) return pass()
+    // 🔴 2026-10-02 CM 质问「为什么推送到仓库要我审批呢？我已经给了全部权限给你了呀」：
+    // 这道闸（外发命令 / 工作区外写入）过去**不看会话档位**，于是在 `danger-full-access`
+    // （用户已授全权）下也照弹。实证：那次 `git push` 里
+    // `$env:GIT_SSH_COMMAND = 'ssh …'` 命中 `\bssh\b` ⇒ 连发两张卡
+    // （token `4438db21` / `92b5e4b3`），而 CM 根本没授权过任何限制。
+    // ⇒ **用户已授全权时，插件不再加一道**（恢复 2026-09-16「他给的是完全访问，
+    //   审批不该由插件再加一道」的本意）。
+    // ⚠️ 真正的"越权升级"审批**不受影响**：那种请求只在会话来**受限**时才产生，
+    //    走的是上面的审批服务 `decide()` 直连（`sandbox_permissions` ⇒ 请求升级 ⇒ 弹卡）。
+    if (currentSandboxMode(exec && exec.agent) === 'danger-full-access') return pass()
     try {
       const owner = ownerForExec(exec)
       if (!owner) return pass()

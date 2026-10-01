@@ -56,6 +56,12 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   （`sandbox_permissions` + `justification`）这类此前拦不到的请求。
   Since 0.2 the GUI bridge pre-empts `approval/request` at the root scope; the plugin now wraps the
   approval **service's `decide()`** instead, so escalations reach Feishu (GUI/subagent approvals still delegate).
+- **已授全权时不弹卡（2026-10-02，0.4.18）**：插件的这道闸过去**不看会话档位**，在
+  `danger-full-access`（用户已给全部权限）下也会因为命令里出现 `ssh`／`curl` 等关键词而弹卡
+  —— 实测 `git push` 的 `$env:GIT_SSH_COMMAND = 'ssh …'` 就连发了两张。
+  现在 `tools/pre-execute` 先读 `ctx.get('sandboxPolicy').resolve({ session })`，
+  **`mode === 'danger-full-access'` 直接放行**：**全权模式 = 零审批卡；受限模式 = 只有越权才弹卡**。
+  When the session already runs at `danger-full-access`, the plugin adds no gate of its own.
 - **保活 / Keep-alive**：helper 崩溃自动重启（5s 冷却防重复）+ 凭据变更自动重连 + SDK 自带重连 + 状态可观测。Crash-restart with spawn cooldown, auto-reconnect, observable connection status.
 - **多机器人 / Multi-bot**：一个实例多个机器人，各自绑定工作区。One instance, many bots, one workspace each.
 - **目标模式进度卡 / Goal-round progress cards（2026-09-16，CM 拍板方案 A）**：目标模式（goal 模式）的续轮**不经过飞书入站**，过去在飞书完全看不到它在干什么。现在插件订阅 `agent/status`：某轮由目标轮驱动 → 自动建卡「🎯 目标模式 · 第 N 轮开始，正在工作…」，**复用与普通回合同一套**流式卡（过程话语 / 工具面板 / 表格换卡全部生效），轮结束封口写「✅ 本轮结束」。只报目标轮，其它自动回合不建卡（不刷屏）。Goal-round continuations never pass through Feishu inbound, so they used to be invisible; an `agent/status` hook now opens the same streaming card per goal round.
@@ -123,7 +129,7 @@ dsh web   # 重启 / restart
 | 变量 / Variable | 缺省 / Default | 作用 / Effect |
 | --- | --- | --- |
 | `DSH_FEISHU_GOAL_CARDS` | `1`（开） | 设 `0` 全局关闭「目标模式进度卡」。Set `0` to disable goal-round progress cards. |
-| `DSH_FEISHU_APPROVAL` | `1`（开） | **默认开启**。CM 2026-10-02 改口径：「手机上得要能审批才行，**不可以关了**」（2026-09-16 的"默认关闭、不许改回"按 A20-⑤ 作废）。设 `0`／`false`／`off`／`no` 关闭。覆盖**沙箱越权升级**（`sandbox_permissions: danger-full-access`）的审批。 |
+| `DSH_FEISHU_APPROVAL` | `1`（开） | **默认开启**。CM 2026-10-02 改口径：「手机上得要能审批才行，**不可以关了**」（2026-09-16 的"默认关闭、不许改回"按 A20-⑤ 作废）。设 `0`／`false`／`off`／`no` 关闭。覆盖**沙箱越权升级**（`sandbox_permissions`）的审批。**会话已是 `danger-full-access`（用户已授全权）时一律不弹卡** —— 插件不再加一道（2026-10-02 修，见 CHANGELOG 0.4.18）。 |
 | `FS_CONFIG_DIR` | `~/.dsh-feishucard` | 配置文件目录（测试用）。 |
 
 per-bot 配置项 `notifyGoalRounds`（`false` 关闭该机器人的目标卡）写在 `feishu.config.json` 的对应 bot 里。Per-bot `notifyGoalRounds: false` disables goal cards for that bot only.
