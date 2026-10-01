@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.20] - 2026-10-02
+
+### Fixed（🔴 同一对话里两张卡并行长 —— CM 报障「又有重复了」）
+
+**实证（`web.log`）**
+
+| 证据 | 内容 |
+|:--|:--|
+| 两张卡并行长 | `buildCardPayload` **成对交错、两边块数不同**（例 69950 `blocks=38 tools=62` / 69951 `blocks=29 tools=51`），并排一路涨到 69967 / 69969 |
+| 触发链 | `69810 plugin apply #14`（热重载）→ `69828 im.message.receive_v1`（CM 发消息）→ `69829 reused live session` → **`69833 card created`** |
+
+⇒ **重载之后 CM 的新消息没有插话，而是另起一轮、另开一张卡**；同时上一代那条仍在跑的回合
+继续更新它自己的卡 ⇒ 同一个对话里两张卡同时长。
+
+**根因（两条，都属"热重载没做卫生"）**
+
+1. **上一代的卡片 watcher 不会被停**：旧实现只在回合正常收尾时 `clearInterval`，
+   **完全没有 dispose 清理** ⇒ 旧代的 `setInterval` 继续 PATCH 它自己那张卡。
+2. **`activeTurns` 随重载清空**：新实例查不到"这个 agent 有活跃回合" ⇒
+   `steerActiveTurn()` 落空、下一条消息走 `handleInbound` 另起一轮 ⇒ 又多一张卡。
+
+**修法**
+
+1. 所有 watcher 登记进本代 `liveCardWatchers`；`ctx.effect` 的 dispose 里停掉它们，
+   并把旧卡**就地封口**（留一行 `♻️ 插件已热重载：本卡停止更新，后续内容见新的卡片。`），
+   免得它在飞书里永远停在「正在工作中…」。
+2. `activeTurns` 挂到 **`globalThis.__fsActiveTurns`** ⇒ **跨插件代际共享**，
+   新实例能看见上一代仍在跑的回合，照旧走插话那条路（不再新开卡）；
+   两处 `delete` 同时改成「**只有表里还是我这条才删**」，避免新实例摘掉别人的 entry。
+3. dispose 时把还没结束的活跃回合**移交**给全局表（过渡期也不丢）。
+   注意：本防护**只对"带着这段代码的那一代"生效** —— 销毁更早的实例时它仍会漏一次，
+   从下一代起干净。
+
+**真机验证**
+
+```
+[fs] dispose(热重载): 停掉 1 个卡片 watcher，旧卡已封口
+```
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=182, sessions=7)**，`❌` 0 条。
+
 ## [0.4.19] - 2026-10-02
 
 ### Changed（🔴 清掉仓库里的**硬编码绝对路径** —— CM 提问后按 A17 执行）

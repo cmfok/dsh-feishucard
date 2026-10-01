@@ -90,7 +90,14 @@ export function apply(ctx) {
   // question card) and hand the agent's post-answer narration to a *new*
   // card below it — otherwise updates land on the stale card the user can no
   // longer see (2026-09-08 CM report).
-  const activeTurns = new Map()         // agentId -> { card, bot, chatId, split }
+  // ⚠️ 2026-10-02（CM 报障「卡片又有重复」）：这张表**必须跨插件代际存活**。
+  // 实证（web.log 69810→69833）：热重载后 `activeTurns` 被清空 ⇒ CM 紧接着发的那条消息
+  // 查不到活跃回合 ⇒ **没有插话，而是另起一轮、另开一张卡**；与此同时上一代那条仍在跑的
+  // 回合继续更新它自己的卡 ⇒ 同一对话里两张卡并行长（＝"重复"）。
+  // 处置：挂到 globalThis —— 新实例能直接看见上一代正在跑的回合（entry 里的
+  // agent / card / bot / chatId / split 都跨代可用），于是照旧走插话那条路。
+  const activeTurns = globalThis.__fsActiveTurns
+    || (globalThis.__fsActiveTurns = new Map())   // agentId -> { card, bot, chatId, split }
 
   // 刚封口的普通回合卡：agentId -> { card, bot, chatId, sealedAt }
   // 2026-09-27（CM 实证："每次发东西，大部分都会一个内容发两次"）：
@@ -1330,7 +1337,22 @@ export function apply(ctx) {
 
   // Poll the agent session event log and mirror new events into the card.
   // `initialCursor` 只在第一次设置（卡自己的游标），不传则沿用 card.cursor。
+  // ---- 热重载卫生：上一代的卡片 watcher 必须停掉（2026-10-02，CM 报障后修）------------
+  // CM 报障「最近发给我的几张卡片，**又有重复了**」。取证（web.log）：
+  //   `buildCardPayload` 成对交错、且两边块数不同 —— 例 69950 `blocks=38 tools=62` /
+  //   69951 `blocks=29 tools=51`，一路并排涨到 69967/69969 ⇒ **同一回合有两张卡在并行长**。
+  //   成因：插件热重载（那一轮 apply #12 / #13 / #14）重建了模块状态，但**上一代实例的
+  //   `setInterval` 仍持有它自己的 card/bot/chatId 继续 PATCH** —— 旧实现只在回合正常
+  //   收尾时 `clearInterval`，**没有任何 dispose 清理** ⇒ watcher 泄漏、卡片成对。
+  // 修法：每个 watcher 登记进本代 `liveCardWatchers`；插件卸载（＝热重载）时全部停掉，
+  //   并给旧卡留一行"已热重载、停止更新"，免得它在飞书里永远停在「正在工作中…」。
+  // （结论卡的重复另有一道防护：见下方 `duplicate conclusion suppressed`。）
+  // 注意：本防护**只对"带着这段代码的那一代"生效** —— 若重载时正在被销毁的是更早的实例
+  // （还没有这张登记表），它的 watcher 仍然会漏一次；从下一代起就干净了。
+  const liveCardWatchers = new Set()
+
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
+    const entry = { agent, card, bot, chatId, stop: null }
     const timer = setInterval(() => {
       if (card.sealing) return
       try {
@@ -1359,8 +1381,45 @@ export function apply(ctx) {
         console.log('[fs] card watcher error: ' + String(error && error.message || error))
       }
     }, CARD_POLL_INTERVAL)
-    return () => clearInterval(timer)
+    const stop = () => {
+      clearInterval(timer)
+      liveCardWatchers.delete(entry)
+    }
+    entry.stop = stop
+    liveCardWatchers.add(entry)
+    return stop
   }
+
+  // 卸载（含 HMR 热重载）时：停掉全部在跑的 watcher，把它们那张卡就地封口，
+  // 并把**还没结束的活跃回合移交**给全局表（见 activeTurns 上方的说明）。
+  ctx.effect(() => () => {
+    // ① 移交活跃回合：新实例靠这张表才知道"上一代那一轮还在跑"，
+    //    否则 CM 的下一条消息会另起一轮、另开一张卡。
+    try {
+      const shared = globalThis.__fsActiveTurns || (globalThis.__fsActiveTurns = new Map())
+      let moved = 0
+      for (const [key, value] of activeTurns) {
+        if (!shared.has(key)) { shared.set(key, value); moved++ }
+      }
+      if (moved > 0) console.log('[fs] dispose(热重载): 移交 ' + moved + ' 个活跃回合给新实例')
+    } catch (error) {
+      console.log('[fs] dispose(热重载): activeTurns 移交失败 ' + String(error && error.message || error))
+    }
+    // ② 停 watcher + 封口
+    const n = liveCardWatchers.size
+    for (const entry of Array.from(liveCardWatchers)) {
+      try { entry.stop() } catch { }
+      const card = entry.card
+      if (!card || card.status !== 'running') continue
+      card.sealing = true
+      card.status = 'sealed'
+      card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
+      card.blocks.push({ type: 'message', text: '♻️ 插件已热重载：本卡停止更新，后续内容见新的卡片。' })
+      try { void syncCard(entry.bot, entry.chatId, card, true).catch(() => { }) } catch { }
+    }
+    if (n > 0) console.log('[fs] dispose(热重载): 停掉 ' + n + ' 个卡片 watcher，旧卡已封口')
+  })
+
 
   // ---- dedicated agent sessions --------------------------------------------
   const defaultAgentOptions = () => {
@@ -2272,7 +2331,7 @@ export function apply(ctx) {
         // （否则正文会被喂两遍，模型会看到两条一模一样的用户消息）。
         if (!(opts && opts.skipSend)) turnAgent.send(message, 'next-turn', true)
       } catch (error) {
-        activeTurns.delete(turnAgent.id)
+        if (activeTurns.get(turnAgent.id) === entry) activeTurns.delete(turnAgent.id)
         throw error
       }
       void syncCard(bot, chatId, card, true).catch(() => {})
@@ -2285,7 +2344,9 @@ export function apply(ctx) {
         console.log('[fs] turn wait failed for ' + messageId + ': ' + String(error && error.message || error))
       }
       stopCardWatcher()
-      activeTurns.delete(turnAgent.id)
+      // 只有"表里还是我这条"才删 —— 跨代共享后，新实例可能已经登记了它自己的 entry，
+      // 无条件 delete 会把**别人正在跑的回合**从表里摘掉（又一次"两张卡"）。
+      if (activeTurns.get(turnAgent.id) === entry) activeTurns.delete(turnAgent.id)
       if (waitError) {
         card.status = 'error'
         // 中断同样要把原因说清楚，并且**不能把「正在工作中…」留在卡上**
