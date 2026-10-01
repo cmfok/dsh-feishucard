@@ -113,7 +113,7 @@ dsh web   # 重启 / restart
   "bots": [
     {
       "name": "我的机器人",
-      "workspace": "C:\\path\\to\\workspace",
+      "workspace": "<你的工作区绝对路径>",
       "appId": "cli_xxxxxxxxxxxxxxxx",
       "appSecret": "your_app_secret",
       "reactionEmoji": "OnIt"

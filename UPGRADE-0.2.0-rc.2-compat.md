@@ -1,5 +1,10 @@
 # DSH 0.2.0-rc.2 升级前兼容盘点（2026-10-02）
 
+> **路径约定（本文不写死任何机器绝对路径，A17）**：`%WORK%` = 本机 dsh 工作区根；
+> `%DSH%` = `%USERPROFILE%\.dsh`；`%REPO%` = 本插件仓库目录。
+> Path placeholders: `%WORK%` = the dsh working root, `%DSH%` = `%USERPROFILE%\.dsh`,
+> `%REPO%` = this plugin's repository directory.
+
 ## ⚠️ 事故：升级后「全部任务都超时、没反应」（2026-10-02 03:2x–04:0x，已恢复）
 
 **现象（CM 原话）**：dsh 全部卡住，直接全部任务都超时，没反应；期间两次重启（03:47:59、04:01:16）。
@@ -10,13 +15,16 @@
 |---|---|---|
 | 0.2 的 DeepSeek 模型目录**只有两个 id** | `dsh-llm-deepseek/lib/index.js` 的 `DEFAULT_MODELS` ＝ **`deepseek-flash`**（DeepSeek-V41-Flash）＋ **`deepseek-v4-pro`**（DeepSeek-V4-Pro） | **旧 id `deepseek-v4-flash` 已被移出目录**（＝ 0.1.7 release notes「移除 V4 Flash」＋「部分旧模型 ID 被移除」那两条） |
 | 我们会话存的还是旧 id | 会话 request/header 里出现 `"model":"deepseek-v4-flash"` | 已保存的选择指向一个 **0.2 目录里没有的 id** |
-| 恢复方式是"换模型" | 最近 request/header 出现 `deepseek-v4-pro` ＋ `deepseek-flash`；系统提示连续两次「model changed: … → flash → v4-pro」 | **换到目录内的 id 就通了** ⇒ 强指向"旧 id 请求挂起 → 超时" |
+| 恢复方式是"换模型" | 最近 request/header 出现 `deepseek-v4-pro` ＋ `deepseek-flash`；系统提示连续两次「model changed: … → flash → v4-pro」 | 换模型后**确实恢复了**；但「旧 id 请求挂起」这个因果**已被证伪**（见文末更正）⇒ 恢复可能另有原因 |
 | 不是我的回填改动 | 冻结窗口（03:26:14 回填上线 → 03:47:59 重启）内 `web.log` **零 `[fs]` 行、零报错**；回填只读、512KB 上限、全 try/catch | ✅ 排除 |
 
-**结论**：`deepseek-v4-flash` 是 **0.1.x 的模型 id**，0.2 目录里没有 ⇒ 还选着它的会话请求会挂起直到超时。
+**结论（2026-10-02 晚已更正）**：上面那条「旧 id ⇒ 请求挂起」的推断 **已被实测证伪** ——
+旧 id 直连 API 返回 **HTTP 200**（`model=deepseek-v4-flash`），且
+`dsh-llm-deepseek/lib/index.js:503-512` 未命中目录**不抛错**、原样照传（详见 **第七节**）。
+⇒ **本次卡死的根因仍未定位**，**不要再引用这条推断**。
 **这不是插件问题，是模型 id 迁移。**
 
-**残留风险**：其它会话、以及另外两个 bot（`P:\FU` 足球 / `P:\BA` 篮球）若也保存了 `deepseek-v4-flash`，
+**残留风险**：其它会话、以及另外两个 bot（`<足球工作区>` 足球 / `<篮球工作区>` 篮球）若也保存了 `deepseek-v4-flash`，
 用到它们时会复现同样超时 ⇒ 统一改成 `deepseek-flash`（快、省）或 `deepseek-v4-pro`（强、贵）。
 
 **排查手法（下次直接照做）**：`web.log` 里**没有**模型层报错（模型 HTTP 层不写这个日志），判据是
@@ -61,7 +69,7 @@
 
 **做了什么（顺序）**
 
-1. **备份**（`P:\Qoder\work\output\_dsh-upgrade-backup-20261002-025121\`）
+1. **备份**（`%WORK%\output\_dsh-upgrade-backup-20261002-025121\`）
    - `sessions\`（**1836 文件 / 1112 MB**，V3 会话日志 —— **不可逆项**）
    - `storages\`、`profile-web\`（package.json / pnpm-lock.yaml / pnpm-workspace.yaml /
      cordis.yml / cordis.patch.yml）、`settings.yaml`、`.credentials.yaml`、`AGENTS.md`、
@@ -105,18 +113,18 @@
 
 ```powershell
 # 1) dsh 本体回退
-cd P:\Qoder\work\output\dsh-npm
+cd %WORK%\output\dsh-npm
 Copy-Item "<备份>\package.json","<备份>\package-lock.json" . -Force
 npm install
 
 # 2) profile 配置回退（摘掉的 dsh-outline 加回、patch 名改回、vision-router 降级）
-Copy-Item "<备份>\profile-web\*" C:\Users\CMFOK\.dsh\profiles\web\ -Force
+Copy-Item "<备份>\profile-web\*" %DSH%\profiles\web\ -Force
 
 # 3) 会话日志回退（**只在 0.2 把 V3 迁移成 V4 且 0.1.6 读不了时**才需要）
-robocopy "<备份>\sessions" C:\Users\CMFOK\.dsh\sessions /E
+robocopy "<备份>\sessions" %DSH%\sessions /E
 ```
-`<备份>` = `P:\Qoder\work\output\_dsh-upgrade-backup-20261002-025121`
-（路径也记在 `P:\Qoder\work\output\_dsh-upgrade-backup-LATEST.txt`）
+`<备份>` = `%WORK%\output\_dsh-upgrade-backup-20261002-025121`
+（路径也记在 `%WORK%\output\_dsh-upgrade-backup-LATEST.txt`）
 
 ---
 
@@ -128,10 +136,10 @@ robocopy "<备份>\sessions" C:\Users\CMFOK\.dsh\sessions /E
 
 | 项 | 值 |
 |---|---|
-| 已装 `@deepseek-ai/dsh` | **0.1.6-alpha.1**（`P:\Qoder\work\output\dsh-npm`） |
+| 已装 `@deepseek-ai/dsh` | **0.1.6-alpha.1**（`%WORK%\output\dsh-npm`） |
 | registry 最新 | **0.2.0-rc.2**（prerelease，2026-09-29 发布） |
 | 线上进程 | PID 28300 `node node_modules\@deepseek-ai\dsh\lib\bin.js web --no-open`（cwd = dsh-npm） |
-| profile | `C:\Users\CMFOK\.dsh\profiles\web` |
+| profile | `%DSH%\profiles\web` |
 | 子包变化 | 全线 0.1.6-alpha.1 → 0.2.0-rc.2；新增 10 包；移除 `cordis-plugin-hmr`（改 `dsh-hmr`） |
 | `npm install --dry-run` | 113 新增 / 16 移除 / 285 变更，**零冲突** |
 
@@ -148,7 +156,7 @@ robocopy "<备份>\sessions" C:\Users\CMFOK\.dsh\sessions /E
 ### 我们的插件踩的正是这一条
 
 ```json
-// P:\Qoder\work\Ai100\projects\dsh-feishucard\package.json
+// %REPO%\package.json
 "peerDependencies": { "@deepseek-ai/dsh-tools": "^0.1.0-rc.5" }
 ```
 `^0.1.0-rc.5` ＝ `>=0.1.0-rc.5 <0.2.0` ⇒ **不含 0.2.0-rc.2** ⇒ 被拦。
@@ -217,8 +225,8 @@ robocopy "<备份>\sessions" C:\Users\CMFOK\.dsh\sessions /E
    依据：① 已逐条核对 0.2.0-rc.2 的 API 面（见第四节）；② 新范围仍含当前 0.1.6-alpha.1 ⇒ 不影响现网。
 2. **升 `dsh-vision-router` 2.1.7 → 2.3.0**（否则它也会被拦）。
 3. **决定 `dsh-outline`**：没有 0.2 适配版 ⇒ 接受被跳过，或临时隔离。
-4. `cd P:\Qoder\work\output\dsh-npm; npm install @deepseek-ai/dsh@0.2.0-rc.2`
-5. 重启（**唯一授权方式**）：`cmd /c "P:\Qoder\work\output\dsh-install\restart-dsh-web.cmd"`
+4. `cd %WORK%\output\dsh-npm; npm install @deepseek-ai/dsh@0.2.0-rc.2`
+5. 重启（**唯一授权方式**）：`cmd /c "%WORK%\output\dsh-install\restart-dsh-web.cmd"`
 6. 重启后立刻验：飞书收发 → 插件 apply 行 → **HMR 是否还灵** → 历史会话能否打开 → 计划审查卡。
 
 **回滚**：`npm install @deepseek-ai/dsh@0.1.6-alpha.1` + 恢复 `package.json.bak-pre020` /

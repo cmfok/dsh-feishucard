@@ -2,14 +2,15 @@
   "bots": [
     {
       "name": "我的飞书机器人",
-      "workspace": "C:\\path\\to\\your\\workspace",
+      "workspace": "<你的工作区绝对路径>",
       "appId": "cli_xxxxxxxxxxxxxxxx",
       "appSecret": "your_app_secret",
       "reactionEmoji": "OnIt",
-      "fileInbox": "C:\\path\\to\\inbox"
+      "fileInbox": "<可选：收件目录绝对路径>"
     }
   ],
   "_notes": {
+    "workspace": "required: the absolute path of the workspace this bot serves — fill in your own machine's path; never commit a real one",
     "fileInbox": "optional: directory where inbound Feishu file/media messages are saved; defaults to <workspace>/downloaded_files"
   }
 }

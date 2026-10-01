@@ -21,7 +21,12 @@ console.log = (...args) => {
 
 const APP_ID = 'cli_test123456'
 const APP_SECRET = 'secret-test'
-const WORKSPACE = 'C:/smoke/workspace'
+// ⚠️ 工作区路径**不写死绝对路径**（A17 禁硬编码地址）：从系统临时目录派生，
+// 形状仍是 Windows 绝对路径（正斜杠，与插件内部 normPath 的写法一致）——
+// 写死盘符会把测试绑死在某一台机器上。
+const SMOKE_WS_ROOT = tmpdir().split('\\').join('/')
+const WORKSPACE = SMOKE_WS_ROOT + '/fs-smoke-workspace'
+const OTHER_WORKSPACE = SMOKE_WS_ROOT + '/fs-smoke-other'   // "其它工作区"用例专用
 const CHAT_ID = 'oc_smoke_chat_001'
 const MSG_ID = 'om_smoke_msg_001'
 
@@ -742,7 +747,7 @@ console.log('15) /switch：列出可切换的会话/工作区（CM 2026-09-16 �
   persistedSessions = [
     { version: 0, id: ownId, createdAt: Date.now() - 7200e3, cwd: WORKSPACE },                    // 已在本聊天 → 不应重复列出
     { version: 0, id: 'gui-session-aaaa1111', createdAt: Date.now() - 3600e3, cwd: WORKSPACE },
-    { version: 0, id: 'fu-session-bbbb2222', createdAt: Date.now() - 1800e3, cwd: 'P:/fu' },
+    { version: 0, id: 'fu-session-bbbb2222', createdAt: Date.now() - 1800e3, cwd: OTHER_WORKSPACE },
     { version: 0, id: 'sub-child-cccc3333', createdAt: Date.now() - 600e3, cwd: WORKSPACE, origin: 'subagent' },
   ]
   persistedFirstText['gui-session-aaaa1111'] = summaryText
@@ -769,7 +774,7 @@ console.log('15) /switch：列出可切换的会话/工作区（CM 2026-09-16 �
     return m ? Number(m[1]) - 1 : -1
   }
   const guiIndex = indexOfRow(summaryText)
-  const fuIndex = indexOfRow('P:/fu')
+  const fuIndex = indexOfRow(OTHER_WORKSPACE)
   ok(rowDivs.length === 4, '共 4 行（2 个本聊天会话 + 本工作区 1 条 + 其它工作区 1 条），既没重复也没多列（' + rowDivs.length + '）')
   ok(guiIndex >= 0 && fuIndex > guiIndex, '两个候选行的序号可读且顺序正确（gui=' + (guiIndex + 1) + ', fu=' + (fuIndex + 1) + '）')
   const ownIdShown = rowDivs.filter((e) => String(e.text.content).includes(ownId.slice(0, 8))).length
@@ -796,11 +801,11 @@ console.log('15) /switch：列出可切换的会话/工作区（CM 2026-09-16 �
   // 文本兜底：/switch <序号> new → 在该工作区新建（cwd 必须是那个工作区）
   feedInbound('om_switch_new', '/switch ' + (fuIndex + 1) + ' new')
   await drain()
-  ok(agent.session.header.cwd === 'P:/fu', 'new 模式把新会话的 cwd 设成了那个工作区（实际 ' + agent.session.header.cwd + '）')
+  ok(agent.session.header.cwd === OTHER_WORKSPACE, 'new 模式把新会话的 cwd 设成了那个工作区（实际 ' + agent.session.header.cwd + '）')
 
   // 运行中的会话（🟡）不给「接管」：只允许新建
   // 注意：前面"接管"过的会话已经进了本聊天（切过去只是换序号，不需要 resume），
-  // 所以这里拿**没进本聊天**的 P:/fu 会话来验 🟡 规则。
+  // 所以这里拿**没进本聊天**的「其它工作区」会话来验 🟡 规则。
   liveAgents.push({ id: 'fu-session-bbbb2222', session: agent.session })
   const mark2 = sentCards.length
   feedInbound('om_switch_live', '/switch')

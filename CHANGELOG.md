@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.19] - 2026-10-02
+
+### Changed（🔴 清掉仓库里的**硬编码绝对路径** —— CM 提问后按 A17 执行）
+
+**CM 原话**：「而且不能用绝对路径吧？**绝对路径是不是得全部改掉？**」
+
+**审计（全仓扫 `[A-Za-z]:[\\/]`）** —— 代码侧基本干净，问题集中在测试夹具与文档：
+
+| 位置 | 原状 | 处理 |
+|:--|:--|:--|
+| `scripts/smoke.mjs` | `WORKSPACE` 与「其它工作区」两处**写死了盘符绝对路径**（4 处，含断言与注释） | **改由系统临时目录派生**：`SMOKE_WS_ROOT = tmpdir()` 归一成正斜杠 → `WORKSPACE` / `OTHER_WORKSPACE`（形状仍是 Windows 绝对路径，与插件 `normPath` 写法一致） |
+| `README.md` / `feishu.config.example.json` | 示例配置里写死盘符绝对路径 | 换成 `<你的工作区绝对路径>` 占位符，并在 `_notes` 里写明"填自己机器、别提交真路径" |
+| `UPGRADE-0.2.0-rc.2-compat.md` | 13 处实机路径 | 全量替换为占位符，并在文首加**路径约定**（`%WORK%` / `%DSH%` / `%REPO%`） |
+| `CHANGELOG.md` | 1 处旧工作区绝对路径 | 改为 `<其它工作区>` |
+
+**顺手更正一处作废推断（A22：不留负向锚定）**：`UPGRADE-*.md` 开头的「旧模型 id ⇒ 请求挂起」
+**已实测证伪**（旧 id 直连 API = HTTP 200；未命中目录不抛错、原样照传），
+与同文第七节**互相矛盾** ⇒ 已把该处结论与判断改成"**已作废、根因仍未定位**"，不再两条并存。
+
+**审计结论**：`index.js` / `helper.cjs` / `scripts/sync-to-profile.mjs` **本来就没有**硬编码绝对路径
+（`sync` 脚本走 `homedir()` + `DSH_HOME` + `--profile` 参数 + `import.meta.url`）—— 这点符合 A17。
+
 ## [0.4.18] - 2026-10-02
 
 ### Fixed（🔴 用户已授全权时，插件不该再加一道审批 —— CM 质问后修）
@@ -1004,7 +1026,7 @@ CM 原话：「能不能在飞书里面做一个"切换会话"的命令？① �
 
 - **无参数 `/switch`** → 一张卡片，分三组列出候选，**每行两个按钮**：
   ① 本聊天的会话（现有 `chat.sessions`，当前项标 ▶）② 本工作区的其它会话（含 GUI 里开的）
-  ③ 其它工作区（`P:\fu`、`Ai100` …）。卡面顶部常驻「当前会话 + 工作目录」，并写明图例
+  ③ 其它工作区（`<其它工作区>`、`Ai100` …）。卡面顶部常驻「当前会话 + 工作目录」，并写明图例
   「🟢 空闲（可接管）｜🟡 运行中（只给"新建"）」。
 - **序号连续编号，从本聊天会话开始** → 老语义 `/switch 1`（主会话）不变；
   文本兜底 `/switch <序号>`（接管）、`/switch <序号> new`（在该工作区新建）。
