@@ -86,11 +86,13 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   被引内容的摘要会随正文一起进会话（「（你在引用这条消息：…）」）；只用本地登记表，不新增飞书权限。
   Quoted-message摘要 is injected into the session so the agent knows what the reply refers to; no extra Feishu scope needed.
 - **计划审查卡 / Plan-review card（2026-10-01 起；2026-10-02 改版）**：计划模式里 `exit_plan_mode` 提交的**退出申请**现在会发到飞书 ——
-  卡头「📋 计划已写好，等你批准」，正文是**完整计划**，底下一排**两个按钮**：
-  **`批准`（绿底块）** / **`拒绝`（红底白字）** —— 文字写在按钮上，不再"文字 + 选它"各占一行。
+  卡头「📋 计划已写好，等你批准」，正文是**完整计划**，底下一排**两个控件**：
+  **`批准`＝整块可点击的深绿色块（`interactive_container` + `green-600`，白字居中）** / **`拒绝`＝红底白字按钮**（`danger_filled`）。
   也可以直接回文字（精确回「批准」/「同意」＝批准；带补充说明＝修改意见回给模型）。
-  两条实现约束：飞书 2.0 按钮的**颜色枚举里没有绿色**（default/primary/danger/…_filled/laser）⇒「绿」落在
-  `column.background_style='green-50'` 这个**绿底块**上；窄列按钮**文案 ≤2 字**（超过会被截成省略号），所以是「批准」/「拒绝」。
+  三条实现约束（都是真机踩出来的）：① 飞书 2.0 **按钮颜色枚举里没有绿色**；② 绿**不能**挂在
+  `column.background_style` 上 —— 官方注明该字段**需客户端 v7.9+**（CM 手机上根本没渲染），且会被
+  `width:'fill'` 的按钮整列盖住 ⇒ 绿必须用**整块可点击容器**做；③ markdown 文字要 `text_align:'center'` 居中，
+  且加粗**不能**跨在 `<font>` 标签里外（`<font color='white'>**批准</font>**` 会把标签原文当文字漏出来）。
   **为什么以前收不到**：`exit_plan_mode` 走的是 `userQuestions` **服务**（不是 `ask_user_question` 工具），
   旧实现只拦了工具那一层 ⇒ 申请只发给了连着的 GUI 客户端。现在补了服务层 `user-questions/request` 接管
   （与 `approval/request` 同构，仅接管飞书自己的会话；GUI/子代理的提问一律交回 harness）。

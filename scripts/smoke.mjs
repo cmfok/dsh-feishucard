@@ -2426,23 +2426,31 @@ console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/
   const row = rows[0]
   ok(Boolean(row) && row.flex_mode === 'bisect', '两个按钮**同一排**等分（flex_mode=bisect）')
   const btns = ((row && row.columns) || []).map((c) => (c.elements || [])[0])
-  const approveBtn = btns[0]
+  const approveBlock = btns[0]
   const rejectBtn = btns[1]
-  ok(btns.length === 2, '正好两个按钮（实际 ' + btns.length + ' 个）')
-  ok(Boolean(approveBtn) && Boolean(rejectBtn)
-    && approveBtn.text.content === '批准' && rejectBtn.text.content === '拒绝',
-    '文字写在按钮上：批准 / 拒绝（实际 ' + (approveBtn && approveBtn.text.content) + ' / '
-      + (rejectBtn && rejectBtn.text.content) + '）')
-  ok(Boolean(row) && row.columns[0].background_style === 'green-50',
-    '「批准」＝绿底块（飞书 2.0 按钮没有绿色，绿只能落在底块上）')
+  ok(btns.length === 2, '正好两个控件（实际 ' + btns.length + ' 个）')
+  // 2026-10-02 真机两版：第一版把绿放在 `column.background_style` 上 ⇒ CM 手机上**没渲染**
+  //（官方注明该字段需客户端 v7.9+），且被 width:fill 按钮整列盖住。定稿＝可点击的整块容器。
+  ok(Boolean(approveBlock) && approveBlock.tag === 'interactive_container',
+    '「批准」＝整块可点击的容器（不是按钮 + 绿底列）')
+  ok(Boolean(approveBlock) && approveBlock.background_style === 'green-600',
+    '「批准」＝深绿底 green-600（实际 ' + (approveBlock && approveBlock.background_style) + '）')
+  const approveMd = (approveBlock && approveBlock.elements || [])[0]
+  ok(Boolean(approveMd) && approveMd.tag === 'markdown' && approveMd.text_align === 'center',
+    '批准文字居中（text_align=center —— 第一版左对齐，CM 指出）')
+  ok(Boolean(approveMd) && approveMd.content === "**<font color='white'>批准</font>**",
+    '白字标签**不跨加粗嵌套**（写成 <font…>**批准</font>** 会把标签原文当文字漏出来）')
+  ok(Boolean(approveMd) && !/<\s*font/i.test(String(approveMd.content).replace("<font color='white'>", '').replace('</font>', '')),
+    '除那一处白字标签外没有别的裸标签（防再次漏出英文）')
+  ok(Boolean(rejectBtn) && rejectBtn.text.content === '拒绝', '「拒绝」文字在按钮上')
   ok(Boolean(rejectBtn) && rejectBtn.type === 'danger_filled', '「拒绝」＝红底白字（danger_filled）')
-  ok(Boolean(approveBtn) && Boolean(rejectBtn)
-    && approveBtn.behaviors[0].value.fs_option === 0 && rejectBtn.behaviors[0].value.fs_option === 1,
-    '按钮序号仍指向原选项（0=Approve / 1=Keep planning）—— 协议没动')
+  ok(Boolean(approveBlock) && Boolean(rejectBtn)
+    && approveBlock.behaviors[0].value.fs_option === 0 && rejectBtn.behaviors[0].value.fs_option === 1,
+    '序号仍指向原选项（0=Approve / 1=Keep planning）—— 协议没动')
   ok(body.includes('点「批准」') && !body.includes('选它'), '提示文案跟着改（不再是"点右侧选它"）')
 
-  // (c) 点「批准」按钮 ⇒ 回传 harness 的**必须是原 label `Approve`**（plan-mode 按它判批准）
-  await tapValue(approveBtn.behaviors[0].value)
+  // (c) 点「批准」⇒ 回传 harness 的**必须是原 label `Approve`**（plan-mode 按它判批准）
+  await tapValue(approveBlock.behaviors[0].value)
   const a1 = await pending
   ok(a1 && a1.answers && a1.answers.length === 1 && a1.answers[0].id === 'plan-review',
     '答案按 question.id 原样回传（id=plan-review）')

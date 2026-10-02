@@ -4782,6 +4782,11 @@ export function apply(ctx) {
   //   · 回调**协议不动**：仍是 { fs_question, fs_option }，回传 harness 的仍是原 label
   //     （Approve / Keep planning，由 buildQuestionAnswer 负责中文别名映射）。
   // 找不到 approve 标签、或凑不出第二项时返回 null ⇒ 调用方回退旧布局（绝不把审批卡搞成没按钮）。
+  // 审批按钮文案（2026-10-02 真机定稿：绿块 + 白字，居中）。
+  // ⚠️ 加粗必须在 `<font>` 外面 —— 写成 `<font color='white'>**批准</font>**` 会在真机上
+  // 把标签原文当普通文字漏出来（CM 看到的"一串英文"）。
+  const PLAN_APPROVE_TEXT = "**<font color='white'>批准</font>**"
+
   function planReviewButtonsRow(q, token) {
     const opts = Array.isArray(q.options) ? q.options : []
     if (opts.length < 2) return null
@@ -4790,32 +4795,36 @@ export function apply(ctx) {
     if (approveIndex < 0) return null
     const rejectIndex = opts.findIndex((_, i) => i !== approveIndex)
     if (rejectIndex < 0) return null
-    const mk = (label, index, type) => ({
-      tag: 'button',
-      type,
+    // 「批准」= **整个色块可点击**（interactive_container）+ 深绿底 —— 两处实测教训（CM 真机）：
+    //   ① `column.background_style` 官方注明"**需客户端 v7.9+**"，CM 手机上根本没渲染；
+    //   ② 就算渲染了也被 `width:'fill'` 的按钮整列铺满盖住 ⇒ 一样看不到绿。
+    //   ⇒ 绿只能靠"整块可点击的容器"来做（容器内部没有按钮，绿底不会被盖）。
+    // 文字两个坑（第一版真机都踩了，CM 逐条指出）：
+    //   · 必须 `text_align:'center'`，否则左对齐；
+    //   · 加粗必须写在 `<font>` **外面**：`<font color='white'>**批准</font>**` 这种跨标签嵌套
+    //     不合法，飞书会把标签原文当普通文字显示出来（CM 看到的"一串英文"）。
+    const approveBlock = {
+      tag: 'interactive_container',
       width: 'fill',
-      text: { tag: 'plain_text', content: label },
-      behaviors: [{ type: 'callback', value: { fs_question: token, fs_option: index } }],
-    })
+      background_style: 'green-600',
+      corner_radius: '6px',
+      padding: '8px 12px 8px 12px',
+      horizontal_align: 'center',
+      vertical_align: 'center',
+      behaviors: [{ type: 'callback', value: { fs_question: token, fs_option: approveIndex } }],
+      elements: [{ tag: 'markdown', content: PLAN_APPROVE_TEXT, text_align: 'center' }],
+    }
+    const rejectBtn = {
+      tag: 'button', type: 'danger_filled', width: 'fill',
+      text: { tag: 'plain_text', content: '拒绝' },
+      behaviors: [{ type: 'callback', value: { fs_question: token, fs_option: rejectIndex } }],
+    }
     return {
       tag: 'column_set',
       flex_mode: 'bisect',
       columns: [
-        {
-          tag: 'column',
-          width: 'weighted',
-          weight: 1,
-          vertical_align: 'center',
-          background_style: 'green-50',        // 「审批绿」＝ 绿底块（按钮本色没有绿）
-          elements: [mk('批准', approveIndex, 'default')],
-        },
-        {
-          tag: 'column',
-          width: 'weighted',
-          weight: 1,
-          vertical_align: 'center',
-          elements: [mk('拒绝', rejectIndex, 'danger_filled')],   // 「拒绝红」＝ 红底白字
-        },
+        { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [approveBlock] },
+        { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [rejectBtn] },   // 「拒绝红」＝ 红底白字
       ],
     }
   }

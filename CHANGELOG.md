@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-10-02
+
+### Fixed（真机两处格式问题：「批准」看不到绿 / 文字后面漏出一串英文 + 不居中）
+
+**CM 反馈（2026-10-02，附截图）**：「我看到的卡片按钮不是绿色的」→ 选定甲版后：「甲的批准那个文字后面有一串英文，应该是你输入的时候搞多了东西，然后它不是居中的。这是格式上的问题而已」。
+
+| # | 现象 | 根因（官方文档 + 真机实测） | 处置 |
+|:--|:--|:--|:--|
+| 1 | 「批准」是**白底黑字**，看不到绿 | ① 0.5.5 把绿挂在 `column.background_style` 上，而官方颜色枚举文档注明**该字段需客户端 v7.9+** ⇒ CM 手机上**没渲染**；② 即便渲染，`width:'fill'` 的按钮会把整列铺满、绿底被压在按钮底下 | 改用 **`interactive_container`**（Card 2.0 整块可点击容器，支持 `background_style` + `behaviors`）：**深绿底 `green-600` + 6px 圆角 + 白字**；点击回传仍是 `{ fs_question, fs_option }`（插件按 `action.value` 读、不认 `tag` ⇒ **协议零改动**） |
+| 2 | 批准文字**后面多出一串英文** | 写成了 `<font color='white'>**批准</font>**` —— **加粗跨在 `<font>` 标签里外**，嵌套不合法，飞书把标签原文当普通文字显示出来 | 改成 `**<font color='white'>批准</font>**`（加粗在外、色标在内） |
+| 3 | 批准文字**没有居中** | markdown 少了 `text_align` | 补 `text_align: 'center'`（并保留容器的 `horizontal_align` / `vertical_align: center`） |
+
+**防回归（都会变红，写在冒烟里）**
+
+- 用例 45 改为验新版式：批准＝`interactive_container` + `background_style='green-600'`；文字 markdown **必须** `text_align='center'`；
+  文案**必须**逐字等于 `**<font color='white'>批准</font>**`（加粗在外），且**除该标签对外不许再出现裸标签**（防再次漏出英文）；
+  序号仍指向原选项（0=Approve / 1=Keep planning）；点批准回传的仍是 `Approve`。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=212, sessions=10)**，`❌` 0 条。
+
 ## [0.5.5] - 2026-10-02
 
 ### Fixed（四件事：结果卡收口 / 热重载打断提示（复原）/ 审批卡按钮化 / 入站文件自动收）
@@ -15,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 |:--|:--|:--|:--|
 | 1 | `/switch` 结果卡显示「⚠️ 没能切换」+ 正文只有 `ok`/`warn` | 上一轮把 `buildSwitchResultCard` 签名从 4 参改成 2 参，**漏改调用点**（仍传 `(record, kind, text, i)`）⇒ 参数串位 | 调用点改为 `(kind, text)`；并清掉 **4 处**指向**已删除按钮**的「点下面「← 回到工作区列表」重新选」⇒ 改成「重新发 `/switch`」（那个按钮 0.5.4 已按 CM 原话删掉，留着就是让人去点空气） |
 | 2 | 热重载打断会话**完全没提示** | 0.4.20 曾在 dispose 时把旧卡封口并留一行 `♻️ 插件已热重载：本卡停止更新…`；**0.4.22 改"续卡"时把这行删了** ⇒ 之后 abort 被当正常收尾（`status=sealed`），一个字都不解释 | **复原并加固**：旧实例在 dispose 时登记"这一刻有哪些回合在跑"（`globalThis.__fsReloadHint`）→ 新实例有 bot 之后向**该会话**发纯文本说明；每会话只提示一次（`__fsReloadNotified` 幂等）；线索为空则**不发**（无噪声）；`apply` 期 bot 未就绪时**留住线索重试**，绝不因为"来得太早"把提示吞掉 |
-| 3 | 计划审批卡是"审批文字+按钮 / 拒绝文字+按钮" | plan-review 与通用提问**共用** `questionOptionRow`（左 markdown 文字 + 右「选它」按钮） | 审批卡改用**一排两个按钮**：`批准`（**绿底块** `green-50` —— 飞书 2.0 按钮枚举**没有绿色**）+ `拒绝`（`danger_filled` 红底白字）；`flex_mode:'bisect'` 同一排；回调**协议不变**（仍回 `Approve` / `Keep planning`）；文案 2 字（窄列 >2 字会被截断）；找不到 approve 标签时**回退旧布局**（绝不把审批卡搞成没按钮） |
+| 3 | 计划审批卡是"审批文字+按钮 / 拒绝文字+按钮" | plan-review 与通用提问**共用** `questionOptionRow`（左 markdown 文字 + 右「选它」按钮） | 审批卡改用**一排两个按钮**：`批准`（**绿底块** `green-50` —— 飞书 2.0 按钮枚举**没有绿色**）+ `拒绝`（`danger_filled` 红底白字）；`flex_mode:'bisect'` 同一排；回调**协议不变**（仍回 `Approve` / `Keep planning`）；文案 2 字（窄列 >2 字会被截断）；找不到 approve 标签时**回退旧布局**（绝不把审批卡搞成没按钮）**⚠️ 其中「绿底块挂在 `column` 上」这一版真机没渲染，已由 0.5.6 改为 `interactive_container`** |
 | 4 | 往飞书发文件，插件**不知道** | `downloadInboundFile`（2026-09-09 就有）读 `evt.msg_type`，而 `normalizeEvent` 只产出 `message_type` ⇒ 恒 `undefined` ⇒ 静默 `return ''`（`web.log` 里连一条 `inbound file saved` / `download failed` 都没有） | `normalizeEvent` 补 `msg_type`（两个键都给）；**失败与不支持的类型都必须可见**（失败回一条带 HTTP 码的说明、不支持的类型留日志），不再无声吞掉；注入文案改为"先回一句确认，等指示再动" |
 
 **防回归（都会变红，写在冒烟里）**
