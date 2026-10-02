@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.23] - 2026-10-02
+
+### Added（`/model` —— 飞书侧切换模型，CM 2026-10-02 提）
+
+**CM 原话**：「有一个问题：**飞书上切换不了模型**，你现在能发个卡片给我选择，先把模型切换了吗？」
+
+**语义与 GUI 同源（不自己发明）**
+
+| 动作 | 依据（读自 0.2 源码） |
+|:--|:--|
+| 取当前模型 | `sessionController.selectionFor(agent)`（退回 `agentDefaultModel.currentSelection()`） |
+| 列可选模型 | `ctx.llm.listProviders()` → `ctx.llm.listModels(provider.id)` |
+| **执行切换** | `sessionController.selectForNextRequest(agent, { provider, model })` —— 内部就是 `agent.session.append('model/selection', …)`（`dsh-api-session-controller/lib/index.js:319-322`），**按会话**生效、从下一次请求开始用；服务拿不到时退回直接 append 同一条事件 |
+
+**用法**：`/model` 发选择卡（当前项带 `▶` 且是主按钮，**点一下即切**）；
+`/model <provider>/<model>` 文字直切。
+
+**为什么以前切不了**：模型选择是**会话级**的（session 日志里的 `model/selection` 事件），
+飞书侧从来没有那条写入通道 —— 只有 GUI 那个面板有。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=182, sessions=7)**，`❌` 0 条。
+
 ## [0.4.22] - 2026-10-02
 
 ### Fixed（🔴 热重载后新实例「接管」旧卡，而不是各开一张）

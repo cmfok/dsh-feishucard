@@ -1592,7 +1592,7 @@ export function apply(ctx) {
   }
 
   // ---- commands --------------------------------------------------------------
-  const COMMANDS = ['help', 'new', 'switch', 'list', 'plan', 'goal', 'compact', 'stop']
+  const COMMANDS = ['help', 'new', 'switch', 'list', 'plan', 'goal', 'compact', 'stop', 'model']
 
   // 会话名上限：与 /list 单行、/switch 卡片行的渲染宽度匹配（超了就换行糊成一坨）。
   const NEW_NAME_MAX = 60
@@ -1665,7 +1665,29 @@ export function apply(ctx) {
     if (!resolved) return false
     if (resolved === 'help') {
       await sendPlainText(bot, chatId,
-        '/new [名称] 新建会话\n/switch 切换会话/工作区（列出清单，可点按钮）\n/switch <序号> [new] 按序号切换 / 在该工作区新建\n/list 列出本聊天会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause|resume|clear|edit <目标>\n/compact 压缩上下文（agent 空闲时才可用）\n/stop 停止当前任务\n/help 帮助')
+        '/new [名称] 新建会话\n/switch 切换会话/工作区（列出清单，可点按钮）\n/switch <序号> [new] 按序号切换 / 在该工作区新建\n/list 列出本聊天会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause|resume|clear|edit <目标>\n/compact 压缩上下文（agent 空闲时才可用）\n/model 切换模型（发一张卡，点一下即切）\n/stop 停止当前任务\n/help 帮助')
+      return true
+    }
+    if (resolved === 'model') {
+      // CM 2026-10-02：「飞书上切换不了模型，你现在能发个卡片给我选择吗」
+      const agent = liveAgentForChat(chat)
+      if (!agent) {
+        await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /model。')
+        return true
+      }
+      const arg = String(cmd.arg || '').trim()
+      const direct = /^([\w.-]+)\/([\w.:-]+)$/.exec(arg)
+      if (direct) {
+        try {
+          const how = switchModelForAgent(agent, direct[1], direct[2])
+          await sendPlainText(bot, chatId, '✅ 模型已切换为 `' + direct[1] + '/' + direct[2]
+            + '`（下一次请求生效，via ' + how + '）')
+        } catch (error) {
+          await sendPlainText(bot, chatId, '切换失败：' + String(error && error.message || error))
+        }
+        return true
+      }
+      await sendModelPicker(bot, chatId, agent)
       return true
     }
     if (resolved === 'stop') {
@@ -3482,10 +3504,143 @@ export function apply(ctx) {
     await applySwitch(bot, chat, chatId, row, mode)
   }
 
+  // ---- /model：飞书侧切换模型（CM 2026-10-02）---------------------------------
+  // 飞书原本切不了模型（只有 GUI 有那个面板）。语义与 GUI **同源**，不自己发明：
+  //   · 取当前：`sessionController.selectionFor(agent)`（退回 `agentDefaultModel`）；
+  //   · 列可选：`ctx.llm.listProviders()` → `listModels(provider.id)`；
+  //   · 切换　：`sessionController.selectForNextRequest(agent, {provider, model})`
+  //             —— 它内部就是 `agent.session.append('model/selection', …)`，**按会话**生效、
+  //             从下一次请求开始用；拿不到服务时退回直接 append 同一条事件。
+  // 全部 try 包住：服务不在就明说"拿不到清单"，绝不炸掉整条命令通道。
+  function liveAgentForChat(chat) {
+    const active = chat && chat.sessions && chat.sessions[chat.activeIndex]
+    if (!active) return null
+    try {
+      const agents = ctx.get('agents')
+      const list = agents && typeof agents.list === 'function' ? agents.list() : []
+      const hit = list.find((a) => a && a.id === active.id)
+      if (hit) return hit
+    } catch { }
+    return active.handle ? active.handle.agent : null
+  }
+
+  function currentModelOf(agent) {
+    try {
+      const sc = ctx.get('sessionController')
+      if (sc && typeof sc.selectionFor === 'function') {
+        const sel = sc.selectionFor(agent)
+        const cur = sel && (sel.current || sel.picked || sel.assembled)
+        if (cur && cur.provider) return { provider: cur.provider, model: cur.model }
+      }
+    } catch { }
+    try {
+      const dm = ctx.get('agentDefaultModel')
+      const sel = dm && typeof dm.currentSelection === 'function' ? dm.currentSelection() : undefined
+      if (sel && sel.provider) return { provider: sel.provider, model: sel.model }
+    } catch { }
+    return null
+  }
+
+  async function listModelChoices() {
+    const out = []
+    try {
+      const llm = ctx.get('llm')
+      if (!llm || typeof llm.listProviders !== 'function') return out
+      const providers = llm.listProviders() || []
+      for (const p of providers) {
+        const pid = p && (p.id || p.name)
+        if (!pid) continue
+        let models = []
+        try { models = (await llm.listModels(pid)) || [] } catch { models = [] }
+        for (const m of models) {
+          const mid = m && (m.id || m.name)
+          if (mid) out.push({ provider: pid, model: mid, label: (m && m.name) || mid })
+        }
+      }
+    } catch (error) {
+      console.log('[fs] /model 列表失败: ' + String(error && error.message || error))
+    }
+    return out
+  }
+
+  function modelCardPayload(choices, current) {
+    const cur = current ? current.provider + '/' + current.model : '未知'
+    const elements = [{
+      tag: 'div',
+      text: { tag: 'lark_md', content: '🧠 **切换模型**（按会话生效，从下一次请求开始用）\n当前：`' + cur + '`' },
+    }]
+    if (choices.length === 0) {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: '拿不到模型清单（宿主没暴露 `llm` 服务）。可以直接发：`/model <provider>/<model>`' } })
+      return { config: { wide_screen_mode: true }, elements }
+    }
+    const actions = choices.map((c) => {
+      const isCur = current && current.provider === c.provider && current.model === c.model
+      return {
+        tag: 'button',
+        text: { tag: 'plain_text', content: (isCur ? '▶ ' : '') + c.model },
+        type: isCur ? 'primary' : 'default',
+        value: { fs_model: c.provider + '|' + c.model },
+      }
+    })
+    for (let i = 0; i < actions.length; i += 2) elements.push({ tag: 'action', actions: actions.slice(i, i + 2) })
+    elements.push({ tag: 'hr' })
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: '点一下即切换；也可发文字：`/model <provider>/<model>`' } })
+    return { config: { wide_screen_mode: true }, elements }
+  }
+
+  async function sendModelPicker(bot, chatId, agent) {
+    const current = currentModelOf(agent)
+    const choices = await listModelChoices()
+    console.log('[fs] /model: choices=' + choices.length + ' current=' + JSON.stringify(current))
+    await sendInteractive(bot, chatId, modelCardPayload(choices, current))
+    if (choices.length === 0) {
+      await sendPlainText(bot, chatId, '（模型清单为空 —— 见上一条卡的说明；仍可用 /model <provider>/<model> 直切）')
+    }
+    return choices
+  }
+
+  function switchModelForAgent(agent, provider, model) {
+    const sc = ctx.get('sessionController')
+    if (sc && typeof sc.selectForNextRequest === 'function') {
+      sc.selectForNextRequest(agent, { provider, model })
+      console.log('[fs] /model: selectForNextRequest ' + provider + '/' + model + ' agent=' + agent.id)
+      return 'sessionController'
+    }
+    agent.session.append('model/selection', { provider, model })
+    console.log('[fs] /model: append(model/selection) ' + provider + '/' + model + ' agent=' + agent.id)
+    return 'append'
+  }
+
   function handleCardAction(data) {
     console.log('[fs] card action event received: tag=' + (data && data.action && data.action.tag || '?'))
     const action = data && data.action ? data.action : {}
     const value = action.value || {}
+    // Model-switch buttons (the /model card) — CM 2026-10-02.
+    if (value.fs_model !== undefined) {
+      const chatId = data && data.context && data.context.open_chat_id
+      const ownerBot = chatId ? findBotForChat(chatId) : undefined
+      const chat = ownerBot && chatId ? ownerBot.chats.get(chatId) : undefined
+      const agent = liveAgentForChat(chat)
+      const parts = String(value.fs_model).split('|')
+      const provider = parts[0]
+      const model = parts[1]
+      console.log('[fs] /model click: ' + String(value.fs_model) + ' chat=' + String(chatId || '')
+        + ' agent=' + String(agent && agent.id || 'none'))
+      if (!chatId || !ownerBot) return
+      if (!agent || !provider || !model) {
+        void sendPlainText(ownerBot, chatId, '切换失败：当前没有可用会话（先发一条普通消息建立会话，再 /model）。').catch(() => { })
+        return
+      }
+      try {
+        const how = switchModelForAgent(agent, provider, model)
+        void sendPlainText(ownerBot, chatId, '✅ 模型已切换为 `' + provider + '/' + model
+          + '`（按会话生效，下一次请求开始用；via ' + how + '）').catch(() => { })
+      } catch (error) {
+        console.log('[fs] /model 切换失败: ' + String(error && error.stack || error))
+        void sendPlainText(ownerBot, chatId, '切换失败：' + String(error && error.message || error)).catch(() => { })
+      }
+      return
+    }
     // Session/workspace switch buttons (the /switch picker card).
     if (value.fs_switch !== undefined) {
       const chatId = data && data.context && data.context.open_chat_id
