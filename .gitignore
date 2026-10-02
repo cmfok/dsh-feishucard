@@ -14,6 +14,14 @@ npm-debug.log*
 *.bak
 *.bak-*
 
+# Syncthing 同步临时文件（2026-10-02：这个目录被 Syncthing 同步，
+# 它的中间文件会被 `git add -A` 误收 —— 也是本目录反复出现
+# `ReplaceFileW Win32 1175 文件被占用` 的原因）
+~syncthing~*
+.sync-conflict-*
+*.sync-conflict-*
+~*.tmp
+
 # OS
 .DS_Store
 Thumbs.db
