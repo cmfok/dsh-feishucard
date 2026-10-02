@@ -27,6 +27,7 @@ const APP_SECRET = 'secret-test'
 const SMOKE_WS_ROOT = tmpdir().split('\\').join('/')
 const WORKSPACE = SMOKE_WS_ROOT + '/fs-smoke-workspace'
 const OTHER_WORKSPACE = SMOKE_WS_ROOT + '/fs-smoke-other'   // "其它工作区"用例专用
+const THIRD_WORKSPACE = SMOKE_WS_ROOT + '/fs-smoke-third'   // 只从会话 cwd 兜底出现的"未注册工作区"
 const CHAT_ID = 'oc_smoke_chat_001'
 const MSG_ID = 'om_smoke_msg_001'
 
@@ -41,6 +42,12 @@ if (COLD === 'goal-off') process.env.DSH_FEISHU_GOAL_CARDS = '0'
 // real ~/.dsh-feishucard (the plugin honours process.env.FS_CONFIG_DIR).
 const FAKE_HOME = join(tmpdir(), 'fs-smoke-' + Date.now())
 mkdirSync(join(FAKE_HOME, '.dsh-feishucard'), { recursive: true })
+// 2026-10-02：三个"工作区"目录**真的建出来**。插件现在的 ⚠️/🟢 判定以**本地目录是否存在**为准
+//（门槛第二轮 medium#6：只认注册表返回的那个 token 太松），夹具要是空路径，卡面会全变 ⚠️ ——
+// 那样测的就不是插件逻辑，而是夹具不像真的（A25：验证环境要与生产一致）。
+mkdirSync(WORKSPACE, { recursive: true })
+mkdirSync(OTHER_WORKSPACE, { recursive: true })
+mkdirSync(THIRD_WORKSPACE, { recursive: true })
 writeFileSync(join(FAKE_HOME, '.dsh-feishucard', 'feishu.config.json'),
   // reactionEmoji 一开始就设成非默认值（默认 'OnIt'）—— 用例 40 用它验证 cfg.reactionEmoji 通道
   JSON.stringify({ bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE' }] }, null, 2))
@@ -248,6 +255,37 @@ const fakePersistence = {
   }),
 }
 
+// 工作区注册表 mock（2026-10-02 A 方案）：DSH 原生结构 —— 实体 = { id, path, title, sessionIds[], status(), attachSession() }。
+// 插件现在**先读它**（与 GUI 侧边栏同源），所以要能验证：① 工作区列表来自它 ② 切换后把会话挂回去。
+const registryAttached = []            // { ws, id }
+let registryIdSeq = 0
+function makeRegistryEntity(path, title, id) {
+  const entityId = id || ('ws-' + (++registryIdSeq))
+  return {
+    id: entityId,
+    path,
+    title: title || path.split('/').pop(),
+    sessionIds: [],
+    status: async () => 'ok',
+    attachSession: async (sid) => { registryAttached.push({ ws: entityId, id: String(sid) }) },
+  }
+}
+const fakeWorkspaceRegistry = {
+  _entities: [],
+  seed() { this._entities = [WORKSPACE, OTHER_WORKSPACE].map((path) => makeRegistryEntity(path)) },
+  list() { return this._entities },
+  get(id) { return this._entities.find((e) => e.id === id) },
+  async resolveByPath(path) { return this._entities.find((e) => e.path === path) },
+  async create(path, title) {
+    // id 走**单调计数器**：原来用 _entities.length + 1，实体一旦被移除（用例里会 pop / 清空）就会重号，
+    // get(id) 随之产生歧义（门槛第二轮 low）。
+    const entity = makeRegistryEntity(path, title)
+    this._entities.push(entity)
+    return entity
+  },
+}
+fakeWorkspaceRegistry.seed()
+
 const ctx = {
   get(key) {
     if (key === 'agents') {
@@ -259,7 +297,14 @@ const ctx = {
           if (opts.setup) await opts.setup({ get: () => ({ mount: async () => {} }) })
           return { agent }
         },
-        resume: async () => { resumedSessions += 1; return { agent } },
+        resume: async (opts) => {
+          resumedSessions += 1
+          // 2026-10-02：resume 之后 cwd 应当回到**那个会话自己的**目录（生产里读的是会话 header）。
+          // mock 原来不改 cwd ⇒ "接管别的工作区的会话"在测试里看起来还在原目录，cwd 相关断言失真。
+          const meta = persistedSessions.find((s) => s.id === (opts && opts.resumeSessionId))
+          if (meta && meta.cwd) agent.session.header.cwd = meta.cwd
+          return { agent }
+        },
         list: () => liveAgents,
       }
     }
@@ -268,6 +313,7 @@ const ctx = {
     if (key === 'goals') return fakeGoals
     if (key === 'commands') return fakeCommands
     if (key === 'sessionPersistence') return fakePersistence
+    if (key === 'workspaceRegistry') return fakeWorkspaceRegistry
     return undefined
   },
   shell: {
@@ -793,98 +839,186 @@ console.log('14) 飞书命令 /goal：目标模式入口（CM 2026-09-16 要求�
   fakeCommands.execute = async () => undefined
 }
 
-console.log('15) /switch：列出可切换的会话/工作区（CM 2026-09-16 需求）')
+// ---- 卡片断言小工具（用例 15 / 15b 共用）----------------------------------------
+// 只认真卡片（带 header）：纯文本回复（sendPlainText）的载荷同样有 elements，
+// 不排除的话在"以纯文本结尾"的窗口里会抓到那条消息，断言失败信息会指向错的东西（门槛第二轮 low）。
+const lastCardFrom = (from) => sentCards.slice(from)
+  .filter((c) => c.op === 'create' && c.payload && c.payload.header && Array.isArray(c.payload.elements)).pop()
+const divRows = (card) => ((card && card.payload && card.payload.elements) || [])
+  .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
+const allButtons = (card) => ((card && card.payload && card.payload.elements) || [])
+  .filter((e) => e.tag === 'action').flatMap((e) => e.actions || [])
+const tapValue = async (value) => {
+  fakeProc.output += JSON.stringify({
+    type: 'event', eventType: 'card.action.trigger',
+    data: { action: { tag: 'button', value }, context: { open_chat_id: CHAT_ID } },
+  }) + '\n'
+  await drain()
+}
+const rowIndexOf = (card, needle) => {
+  const rows = divRows(card)
+  const i = rows.findIndex((e) => String(e.text.content).includes(needle))
+  if (i < 0) return -1
+  const m = /(\d+)\. /.exec(String(rows[i].text.content))
+  return m ? Number(m[1]) - 1 : -1
+}
+
+console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话）（CM 2026-10-02 定稿 A 方案）')
 {
   const mark = sentCards.length
   const summaryText = '帮我看看上周的复盘记录'
   const ownId = createdSessionIds[0]
   persistedSessions = [
-    { version: 0, id: ownId, createdAt: Date.now() - 7200e3, cwd: WORKSPACE },                    // 已在本聊天 → 不应重复列出
+    { version: 0, id: ownId, createdAt: Date.now() - 7200e3, cwd: WORKSPACE },                    // 已在本聊天
     { version: 0, id: 'gui-session-aaaa1111', createdAt: Date.now() - 3600e3, cwd: WORKSPACE },
     { version: 0, id: 'fu-session-bbbb2222', createdAt: Date.now() - 1800e3, cwd: OTHER_WORKSPACE },
     { version: 0, id: 'sub-child-cccc3333', createdAt: Date.now() - 600e3, cwd: WORKSPACE, origin: 'subagent' },
   ]
   persistedFirstText['gui-session-aaaa1111'] = summaryText
 
-  feedInbound('om_switch_list', '/switch')
+  // ① 第一级：工作区卡
+  feedInbound('om_switch_ws', '/switch')
   await drain()
+  const wsCard = lastCardFrom(mark)
+  const wsBody = JSON.stringify(wsCard && wsCard.payload)
+  ok(Boolean(wsCard) && wsBody.includes('第一步：选工作区'), '第一级是工作区卡（卡面写明"第一步"）')
+  ok(wsBody.includes(WORKSPACE) && wsBody.includes(OTHER_WORKSPACE), '两个工作区（注册表）都列出来了')
+  ok(!wsBody.includes('gui-sess') && !wsBody.includes('fu-sess'),
+    '第一级**不列任何会话**（旧卡"标题写其它工作区、其实列的是会话"那个歧义消失）')
+  const wsRowsShown = divRows(wsCard)
+  ok(wsRowsShown.length === 2, '工作区卡共 2 行（' + wsRowsShown.length + '）')
+  const curWsRow = wsRowsShown.find((e) => String(e.text.content).includes(WORKSPACE))
+  ok(Boolean(curWsRow) && String(curWsRow.text.content).includes('▶'), '当前工作区带 ▶ 标记')
+  const wsIndexWork = rowIndexOf(wsCard, WORKSPACE)
+  const wsIndexOther = rowIndexOf(wsCard, OTHER_WORKSPACE)
+  ok(wsIndexWork >= 0 && wsIndexOther >= 0,
+    '两行序号可读（work=' + (wsIndexWork + 1) + ', other=' + (wsIndexOther + 1) + '）')
+  const wsButtons = allButtons(wsCard)
+  ok(wsRowsShown.every((_, i) => wsButtons.some((b) => b.value.fs_level === 'ws' && b.value.fs_i === i)),
+    '每行都有「进入看会话」按钮，且 fs_i 对得上行号')
+  ok(wsRowsShown.every((_, i) => wsButtons.some((b) => b.value.fs_level === 'ws-new' && b.value.fs_i === i)),
+    '每行都有「在这里新建」按钮，且 fs_i 对得上行号')
 
-  const picker = sentCards.slice(mark).filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)).pop()
-  const body = JSON.stringify(picker && picker.payload)
-  ok(Boolean(picker) && body.includes('① 本聊天的会话'), '卡片列了「本聊天的会话」组')
-  ok(body.includes('② 本工作区的其它会话'), '卡片列了「本工作区的其它会话」组')
-  ok(body.includes('③ 其它工作区'), '卡片列了「其它工作区」组')
-  ok(body.includes('gui-sess'), '列出了其它会话（短 id）')
-  ok(body.includes(summaryText), '其它会话带了首条消息摘要（认得出是哪个）')
-  ok(!body.includes('sub-chil'), '子代理子会话不被列为可切换目标')
-
-  // 行号从卡片里读出来（本聊天有几个会话由前面的用例决定，不写死）
-  const rowDivs = (picker.payload.elements || [])
-    .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
-  const indexOfRow = (needle) => {
-    const el = rowDivs.find((e) => String(e.text.content).includes(needle))
-    if (!el) return -1
-    const m = /(\d+)\. /.exec(String(el.text.content))
-    return m ? Number(m[1]) - 1 : -1
-  }
-  const guiIndex = indexOfRow(summaryText)
-  const fuIndex = indexOfRow(OTHER_WORKSPACE)
-  ok(rowDivs.length === 4, '共 4 行（2 个本聊天会话 + 本工作区 1 条 + 其它工作区 1 条），既没重复也没多列（' + rowDivs.length + '）')
-  ok(guiIndex >= 0 && fuIndex > guiIndex, '两个候选行的序号可读且顺序正确（gui=' + (guiIndex + 1) + ', fu=' + (fuIndex + 1) + '）')
-  const ownIdShown = rowDivs.filter((e) => String(e.text.content).includes(ownId.slice(0, 8))).length
-  ok(ownIdShown >= 1 && rowDivs.length === 4, '已在本聊天的会话没有被当成"其它会话"重复列一遍')
-
-  // 点「接管」按钮 → 走真实卡片回调路径（helper 事件 → handleCardAction）
-  const buttons = (picker.payload.elements || [])
-    .filter((e) => e.tag === 'action')
-    .flatMap((e) => e.actions || [])
-  const takeover = buttons.find((b) => b.value && b.value.fs_index === guiIndex && b.value.fs_mode === 'takeover')
+  // ② 点「进入」→ 该工作区的会话卡（走真实卡片回调路径）
+  const enterBtn = wsButtons.find((b) => b.value.fs_level === 'ws' && b.value.fs_i === wsIndexWork)
+  const enterMark = sentCards.length
+  // 按钮缺失时上面那条 ok() 已经记账失败；这里再解引用会崩成 TypeError、把失败信息盖掉。
+  if (enterBtn) await tapValue(enterBtn.value)
+  const sessCard = lastCardFrom(enterMark)
+  const sBody = JSON.stringify(sessCard && sessCard.payload)
+  ok(Boolean(sessCard) && sBody.includes('第二步：选会话'), '第二级是会话卡')
+  ok(sBody.includes('gui-sess'), '列出了该工作区的其它会话（短 id）')
+  ok(sBody.includes(summaryText), '其它会话带了首条消息摘要（认得出是哪个）')
+  ok(!sBody.includes('sub-chil'), '子代理子会话不被列为可切换目标')
+  ok(!sBody.includes('fu-sess'), '**只列这个工作区的会话**（别的工作区的会话不串进来）')
+  ok(sBody.includes('返回工作区列表'), '会话卡底部有「← 返回工作区列表」')
+  const guiIndex = rowIndexOf(sessCard, summaryText)
+  ok(guiIndex >= 0, '候选行的序号可读（gui=' + (guiIndex + 1) + '）')
+  const sessButtons = allButtons(sessCard)
+  const takeover = sessButtons.find((b) => b.value.fs_level === 'sess' && b.value.fs_j === guiIndex
+    && b.value.fs_mode === 'takeover')
   ok(Boolean(takeover), '空闲会话给了「接管」按钮')
   const tookBefore = resumedSessions
-  fakeProc.output += JSON.stringify({
-    type: 'event',
-    eventType: 'card.action.trigger',
-    data: {
-      action: { tag: 'button', value: takeover.value },
-      context: { open_chat_id: CHAT_ID },
-    },
-  }) + '\n'
-  await drain()
-  ok(resumedSessions === tookBefore + 1, '点按钮后真的 resume 了那个会话（接管生效）')
+  if (takeover) await tapValue(takeover.value)
+  ok(resumedSessions === tookBefore + 1, '点「接管」真的 resume 了那个会话（接管生效）')
+  ok(registryAttached.some((a) => a.id === 'gui-session-aaaa1111'),
+    '接管时把会话**挂进了工作区注册表**（与 GUI 同源：侧边栏也看得到）')
 
-  // 文本兜底：/switch <序号> new → 在该工作区新建（cwd 必须是那个工作区）
-  feedInbound('om_switch_new', '/switch ' + (fuIndex + 1) + ' new')
+  // ③ /list ＝ 当前工作区的会话（不再混工作区，也不列别的工作区的会话）
+  const listMark = sentCards.length
+  feedInbound('om_list_ws', '/list')
   await drain()
-  ok(agent.session.header.cwd === OTHER_WORKSPACE, 'new 模式把新会话的 cwd 设成了那个工作区（实际 ' + agent.session.header.cwd + '）')
+  const listBody = JSON.stringify(cardsSince(listMark))
+  ok(listBody.includes('工作区') && listBody.includes(WORKSPACE), '/list 顶部标明当前工作区')
+  ok(listBody.includes(summaryText) || listBody.includes('gui-sess'), '/list 列出当前工作区的会话')
+  ok(!listBody.includes('fu-sess'), '/list 不列别的工作区的会话')
 
-  // 运行中的会话（🟡）不给「接管」：只允许新建
-  // 注意：前面"接管"过的会话已经进了本聊天（切过去只是换序号，不需要 resume），
-  // 所以这里拿**没进本聊天**的「其它工作区」会话来验 🟡 规则。
+  // ④ 文字：/switch <工作区序号> new → 在该工作区新建（cwd 必须是那个工作区）＋ 也挂进注册表
+  const beforeNew = createdSessions
+  feedInbound('om_switch_new', '/switch ' + (wsIndexOther + 1) + ' new')
+  await drain()
+  ok(agent.session.header.cwd === OTHER_WORKSPACE,
+    'new 模式把新会话的 cwd 设成了那个工作区（实际 ' + agent.session.header.cwd + '）')
+  ok(createdSessions === beforeNew + 1, '确实新建了会话')
+  ok(registryAttached.some((a) => a.ws === 'ws-2'), '新建的会话也挂进了那个工作区（GUI 侧边栏能看到）')
+
+  // ⑤ 运行中的会话（🟡）只给「新建」；文字接管也必须被挡住
   liveAgents.push({ id: 'fu-session-bbbb2222', session: agent.session })
-  const mark2 = sentCards.length
-  feedInbound('om_switch_live', '/switch')
+  const liveMark = sentCards.length
+  feedInbound('om_switch_live', '/switch ' + (wsIndexOther + 1))
   await drain()
-  const livePicker = sentCards.slice(mark2).filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)).pop()
-  const liveBody = JSON.stringify(livePicker && livePicker.payload)
-  ok(liveBody.includes('🟡'), '运行中的会话被标成 🟡')
-  ok(liveBody.includes('运行中（只给'), '卡面说明了 🟡 的规则（不让 CM 猜）')
-  const liveRowDivs = (livePicker.payload.elements || [])
-    .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
-  const liveFuRow = liveRowDivs.find((e) => String(e.text.content).includes('fu-sess'))
-  const liveFuIndex = liveFuRow ? Number(/(\d+)\. /.exec(String(liveFuRow.text.content))[1]) - 1 : -1
-  ok(liveFuIndex >= 0, '🟡 那一行还在列表里（序号 ' + (liveFuIndex + 1) + '）')
-  const liveButtons = (livePicker.payload.elements || [])
-    .filter((e) => e.tag === 'action')
-    .flatMap((e) => e.actions || [])
-    .filter((b) => b.value && b.value.fs_index === liveFuIndex)
-  ok(liveButtons.length === 1 && liveButtons[0].value.fs_mode === 'new',
-    '运行中的会话只给了「新建」按钮（' + JSON.stringify(liveButtons.map((b) => b.text.content)) + '）')
-  // 文字路径也必须挡住接管
-  feedInbound('om_switch_live_takeover', '/switch ' + (liveFuIndex + 1))
+  const liveCard = lastCardFrom(liveMark)
+  const liveBody = JSON.stringify(liveCard && liveCard.payload)
+  const liveFuRowEl = divRows(liveCard).find((e) => String(e.text.content).includes('fu-sess'))
+  ok(Boolean(liveFuRowEl) && String(liveFuRowEl.text.content).includes('🟡'),
+    '运行中会话**那一行**被标成 🟡（不是卡面图例里有就算）')
+  ok(liveBody.includes('运行中') && liveBody.includes('只给'), '卡面说明了 🟡 的规则（不让 CM 猜）')
+  const liveFuIndex = rowIndexOf(liveCard, 'fu-sess')
+  ok(liveFuIndex >= 0, '🟡 那一行在列表里（序号 ' + (liveFuIndex + 1) + '）')
+  const liveBtns = allButtons(liveCard)
+    .filter((b) => b.value.fs_level === 'sess' && b.value.fs_j === liveFuIndex)
+  ok(liveBtns.length === 1 && liveBtns[0].value.fs_mode === 'new',
+    '运行中的会话只给了「新建」按钮（' + JSON.stringify(liveBtns.map((b) => b.text.content)) + '）')
+  const blockMark = sentCards.length
+  feedInbound('om_switch_live_takeover', '/switch ' + (wsIndexOther + 1) + ' ' + (liveFuIndex + 1))
   await drain()
-  const warn = sentCards.slice(mark2).filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)).pop()
-  ok(JSON.stringify(warn && warn.payload).includes('正在别处运行'), '文字接管被挡下并说明原因')
+  ok(JSON.stringify(cardsSince(blockMark)).includes('正在别处运行'), '文字接管被挡下并说明原因')
   liveAgents.length = 0
+
+  // ⑥ 「← 返回工作区列表」→ 回到第一级
+  const backBtn = allButtons(sessCard).find((b) => b.value.fs_level === 'ws-back')
+  ok(Boolean(backBtn), '会话卡有「← 返回工作区列表」按钮')
+  const backMark = sentCards.length
+  if (backBtn) await tapValue(backBtn.value)
+  ok(JSON.stringify(cardsSince(backMark)).includes('选择工作区'), '点返回回到工作区卡')
+}
+
+console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注册工作区（门槛第二轮补）')
+{
+  // 用例内会 create 新工作区、追加会话 —— 结束时全部还原，免得污染后面的用例（门槛第二轮 low）。
+  const entitiesBefore = fakeWorkspaceRegistry._entities.slice()
+  const persistedBefore = persistedSessions.slice()
+  // (a) 未注册工作区：目录只从**会话 cwd** 兜底出现，且接管时必须能挂进注册表
+  //     （走 resolveByPath → create → attachSession —— 这条链此前从未被跑过）
+  persistedSessions.push({ version: 0, id: 'third-session-dddd4444', createdAt: Date.now() - 300e3, cwd: THIRD_WORKSPACE })
+  const markA = sentCards.length
+  feedInbound('om_switch_third', '/switch')
+  await drain()
+  const cardA = lastCardFrom(markA)
+  const thirdIndex = rowIndexOf(cardA, THIRD_WORKSPACE)
+  ok(thirdIndex >= 0, '注册表里没有、只在会话 cwd 里出现的目录，也作为兜底工作区出现（序号 ' + (thirdIndex + 1) + '）')
+  const beforeAttach = registryAttached.length
+  feedInbound('om_switch_third_takeover', '/switch ' + (thirdIndex + 1) + ' 1')
+  await drain()
+  ok(registryAttached.length > beforeAttach,
+    '在**未注册**工作区接管时也能挂进注册表（走 resolveByPath/create → attachSession）')
+
+  // (b) 目录不存在 ⇒ ⚠️（以本地目录检查为准，不只信注册表那个 token）
+  fakeWorkspaceRegistry._entities.push(
+    makeRegistryEntity(SMOKE_WS_ROOT + '/fs-smoke-ghost-does-not-exist', 'ghost', 'ws-ghost'))
+  const markB = sentCards.length
+  feedInbound('om_switch_ghost', '/switch')
+  await drain()
+  const ghostCard = lastCardFrom(markB)
+  const ghostRow = divRows(ghostCard).find((e) => String(e.text.content).includes('ghost'))
+  ok(Boolean(ghostRow) && String(ghostRow.text.content).includes('⚠️'),
+    '目录不存在的行标 ⚠️（注册表说 ok 也不算健康）')
+  fakeWorkspaceRegistry._entities.pop()
+
+  // (c) 注册表整个不可用 ⇒ 用会话 cwd 兜底，而不是给一张空卡
+  const saved = fakeWorkspaceRegistry._entities
+  fakeWorkspaceRegistry._entities = []
+  const markC = sentCards.length
+  feedInbound('om_switch_noregistry', '/switch')
+  await drain()
+  const cardC = lastCardFrom(markC)
+  const cBody = JSON.stringify(cardC && cardC.payload)
+  ok(Boolean(cardC) && cBody.includes(WORKSPACE),
+    '注册表不可用（空）时仍列出会话里出现过的工作区（不让用户对着空卡）')
+
+  // 还原这一用例动过的全局状态（见开头快照）
+  fakeWorkspaceRegistry._entities = entitiesBefore
+  persistedSessions = persistedBefore
 }
 
 console.log('16) 目标轮封口必须补扫：收尾汇报不能丢（CM 2026-09-16 实测反馈）')

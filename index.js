@@ -1709,7 +1709,7 @@ export function apply(ctx) {
     if (!resolved) return false
     if (resolved === 'help') {
       await sendPlainText(bot, chatId,
-        '/new [名称] 新建会话\n/switch 切换会话/工作区（列出清单，可点按钮）\n/switch <序号> [new] 按序号切换 / 在该工作区新建\n/list 列出本聊天会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause|resume|clear|edit <目标>\n/compact 压缩上下文（agent 空闲时才可用）\n/model 切换模型（发一张卡，点一下即切）\n/stop 停止当前任务\n/help 帮助')
+        '/new [名称] 新建会话\n/switch 选工作区（第一步）→ 点进去再选该工作区的会话\n/switch <工作区序号> 看该工作区的会话 ｜ /switch <工作区序号> new 在该工作区新建 ｜ /switch <工作区序号> <会话序号> 接管\n/list 列出当前工作区的会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause|resume|clear|edit <目标>\n/compact 压缩上下文（agent 空闲时才可用）\n/model 切换模型（发一张卡，点一下即切）\n/stop 停止当前任务\n/help 帮助')
       return true
     }
     if (resolved === 'model') {
@@ -1957,57 +1957,86 @@ export function apply(ctx) {
       return true
     }
     if (resolved === 'list') {
-      // 2026-10-02 CM 问「为什么没名称的？」：插件此前只显示创建时写死的 label
-      //（主会话 / 主会话（自愈）/ 会话 N），而 dsh 自己早就为会话生成了标题
-      //（会话日志里的 session/title 事件，例：飞书卡片缺失与消息排队问题）。
-      // /switch 一直在用 liveTitle()，只有 /list 没用 —— 这里对齐：
-      //   活着的会话 → liveTitle(agent) 实时读；否则用落盘的 title；再否则退回 label。
+      // 2026-10-02（CM 定稿 A 方案）：/list ＝ **当前工作区的会话**（不再只列"本聊天的会话"，
+      // 也不再与工作区混淆）。当前工作区 ＝ 活跃会话的 cwd。
+      const cands = await sessionCandidates(bot, chat)
+      const wsRows = await buildWorkspaceRows(bot, chat, cands)
+      const current = currentWorkspaceOf(bot, chat)
+      const wsIndex = wsRows.findIndex((r) => sameWorkspace(r.path, current.cwd))
+      const ws = wsIndex >= 0
+        ? wsRows[wsIndex]
+        : { path: current.cwd, title: workspaceLeaf(current.cwd), index: -1 }
+      if (wsIndex >= 0) ws.index = wsIndex
+      const rows = await buildSessionRows(bot, chat, ws, cands)
       const live = liveAgentsById()
       // 顺手把读到的标题落盘（变了才写一次）：/list 是命令、不走消息路径，
       // 所以记录动作必须放在这里，否则"光发 /list"永远补不上真名。
       let titleChanged = false
-      const lines = chat.sessions.map((s, i) => {
-        const agent = live.get(String(s.id)) || (s.handle && s.handle.agent)
-        const t = (agent ? liveTitle(agent) : '') || titleFromLogs(s.id)
-        if (t && s.title !== t) { s.title = t; titleChanged = true }
-        const name = t || s.title || s.label
-        return (i === chat.activeIndex ? '▶ ' : '  ') + (i + 1) + '. ' + name
+      const lines = rows.map((r, i) => {
+        const agent = live.get(String(r.sessionId))
+        const t = (agent ? liveTitle(agent) : '') || r.title
+        const idx = (chat.sessions || []).findIndex((s) => String(s.id) === String(r.sessionId))
+        if (idx >= 0 && t && chat.sessions[idx].title !== t) { chat.sessions[idx].title = t; titleChanged = true }
+        const name = t || r.summary || r.label || shortSessionId(r.sessionId)
+        const flags = []
+        if (r.current) flags.push('当前')
+        else if (r.inChat) flags.push('本聊天')
+        if (r.live) flags.push('🟡 运行中')
+        return (r.current ? '▶ ' : '  ') + (i + 1) + '. ' + name + (flags.length ? '（' + flags.join('·') + '）' : '')
       })
       if (titleChanged) { try { persistChats(bot, bot.chats) } catch { /* 落盘失败不影响展示 */ } }
-      await sendPlainText(bot, chatId, lines.length ? lines.join('\n') : '（无会话）')
+      const head = '**工作区**：' + ws.title + '　`' + (ws.path || '?') + '`'
+        + (wsIndex >= 0 ? '（第 ' + (wsIndex + 1) + ' 个，共 ' + wsRows.length + ' 个）' : '（未在注册表里）')
+      const tail = (rows.length && wsIndex >= 0)
+        ? '发 `/switch ' + (wsIndex + 1) + ' <序号>` 接管 ｜ `/switch ' + (wsIndex + 1) + ' new` 新建 ｜ `/switch` 换工作区'
+        : '发 `/switch` 换工作区'
+      await sendPlainText(bot, chatId, [head, ...(lines.length ? lines : ['（这个工作区还没有会话）']), tail].join('\n'))
       return true
     }
     if (resolved === 'switch') {
+      // 两级：无参数 = 工作区卡；<工作区序号> = 该工作区的会话卡；
+      //        <工作区序号> new = 在该工作区新建；<工作区序号> <会话序号> = 接管。
       const arg = String(cmd.arg || '').trim()
-      // 无参数 = 列出可切换的会话/工作区（卡片 + 文字兜底）。CM 2026-09-16 需求。
+      const cands = await sessionCandidates(bot, chat)
+      const wsRows = await buildWorkspaceRows(bot, chat, cands)
+      if (!wsRows.length) {
+        await sendPlainText(bot, chatId, '没有可切换的工作区：先发一条普通消息建立会话。')
+        return true
+      }
       if (!arg) {
-        const rows = await buildSwitchRows(bot, chat)
-        if (!rows.length) {
-          await sendPlainText(bot, chatId, '没有可切换的会话：先发一条普通消息建立会话。')
-          return true
-        }
-        await sendSwitchCard(bot, chatId, chat, rows)
+        await sendWorkspaceCard(bot, chatId, chat, wsRows)
         return true
       }
-      const parsed = /^(\d+)(?:\s+(new|takeover|接管|新建))?$/iu.exec(arg)
+      const parsed = /^(\d+)(?:\s+(\d+|new|新建))?$/iu.exec(arg)
       if (!parsed) {
-        await sendPlainText(bot, chatId, '用法：/switch（列出可切换的会话/工作区）｜ /switch <序号> ｜ /switch <序号> new')
+        await sendPlainText(bot, chatId, '用法：`/switch`（选工作区）｜ `/switch <工作区序号>`（看它的会话）'
+          + '｜ `/switch <工作区序号> new`（在该工作区新建）｜ `/switch <工作区序号> <会话序号>`（接管）')
         return true
       }
-      const index = Number(parsed[1]) - 1
-      const modeArg = (parsed[2] || '').toLowerCase()
-      const mode = (modeArg === 'new' || modeArg === '新建') ? 'new' : 'takeover'
-      const cached = lastSwitchRows.get(chatId)
-      const rows = (cached && Date.now() - cached.at <= SWITCH_CARD_TTL_MS)
-        ? cached.rows
-        : await buildSwitchRows(bot, chat)
-      if (!cached || Date.now() - cached.at > SWITCH_CARD_TTL_MS) lastSwitchRows.set(chatId, { rows, at: Date.now() })
-      const row = switchRowByIndex(rows, index)
+      const wsIndex = Number(parsed[1]) - 1
+      const ws = switchRowByIndex(wsRows, wsIndex)
+      if (!ws) {
+        await sendPlainText(bot, chatId, '工作区序号无效：当前有 ' + wsRows.length + ' 个，先发 /switch 看列表。')
+        return true
+      }
+      ws.index = wsIndex
+      const second = (parsed[2] || '').toLowerCase()
+      if (second === 'new' || second === '新建') {
+        await applySwitch(bot, chat, chatId, ws, 'new')
+        return true
+      }
+      const sessRows = await buildSessionRows(bot, chat, ws, cands)
+      if (!second) {
+        await sendSessionCard(bot, chatId, chat, ws, sessRows, wsRows)
+        return true
+      }
+      const row = switchRowByIndex(sessRows, Number(second) - 1)
       if (!row) {
-        await sendPlainText(bot, chatId, '序号无效：当前有 ' + rows.length + ' 个可切换项，先发 /switch 看列表。')
+        await sendPlainText(bot, chatId, '会话序号无效：该工作区有 ' + sessRows.length + ' 个会话，'
+          + '先发 /switch ' + (wsIndex + 1) + ' 看列表。')
         return true
       }
-      await applySwitch(bot, chat, chatId, row, mode)
+      await applySwitch(bot, chat, chatId, row, 'takeover')
       return true
     }
     return false
@@ -3139,29 +3168,28 @@ export function apply(ctx) {
     })
   }
 
-  // ─── 会话/工作区切换（CM 2026-09-16 需求）────────────────────────────────────
-  // 需求：① 打一个命令 ② 展示可切换的会话/工作区 ③ 切过去。
-  // 设计：无参数 `/switch` → 一张卡片，分三组列出候选（① 本聊天会话 ② 本工作区其它会话
-  // ③ 其它工作区），每行两个按钮「接管 / 新建」；文本兜底 `/switch <序号> [new]`。
-  // 序号**从本聊天会话开始连续编号** → 老语义 `/switch 1`（= 主会话）不变。
-  //
+  // ─── 工作区 / 会话 两级切换（CM 2026-10-02 定稿 A 方案，与 GUI 同源）────────────
+  // CM 原话：「切换会话 = 可以切到**任何一个工作区**；会话列表 = **同一个工作区里面的不同会话**」——
+  // 这正是 DSH 自己的模型：**工作区是 `workspaceRegistry` 里的注册实体**
+  //（`{path,title,sessionIds[]}`，GUI 侧边栏用的就是它），**会话挂在它下面**（实体的 `sessionIds`）。
+  // 旧实现把两个概念混在一张卡里：第③组标题写"其它工作区"，列的其实是"别的工作区里的会话"，
+  // 而且是**从会话 cwd 反推、从不读注册表**（旧代码里 `workspaceRegistry` 零命中）⇒ 飞书与 GUI 可能各说各话。
+  // 现在分两级：
+  //   ① `/switch` → **工作区卡**（注册表优先 + 会话里出现过的目录兜底），每行「进入看会话」/「在这里新建」；
+  //   ② 点「进入」（或 `/switch <工作区序号>`）→ **该工作区的会话卡**，每行「接管」/「新建」，
+  //      底部有「← 返回工作区列表」；
+  //   ③ `/list` = **当前工作区的会话**（当前工作区 ＝ 活跃会话的 cwd）。
   // 两个安全约束（写进卡面，不让 CM 猜）：
   //  · 正在别处运行的会话（🟡）**不给"接管"** —— DSH 里同一会话被两处同时驱动会写坏历史，
   //    只允许"在该工作区新建"。
-  //  · "新建"不碰任何旧会话：只是在该工作区开一个全新会话（cwd = 那个工作区）。
+  //  · "新建"不碰任何旧会话：只是在该工作区开一个全新会话（cwd = 那个工作区），
+  //    并**顺手挂进 `workspaceRegistry`**（best-effort）⇒ GUI 侧边栏也立刻看得到它。
   const SWITCH_CARD_TTL_MS = 15 * 60 * 1000
-  const SWITCH_OWN_LIMIT = 5          // 本工作区其它会话最多列几条
-  const SWITCH_FOREIGN_LIMIT = 2      // 每个其它工作区最多列几条
-  const SWITCH_FOREIGN_GROUPS = 2     // 最多列几个其它工作区
   const SWITCH_SUMMARY_MAX_BYTES = 4 * 1024 * 1024   // 只对小于此体积的日志读"首条消息"当摘要
   const SWITCH_SUMMARY_TIMEOUT_MS = 1500
-  const SWITCH_GROUP_TITLES = {
-    1: '**① 本聊天的会话**',
-    2: '**② 本工作区的其它会话**（含 GUI 里开的）',
-    3: '**③ 其它工作区**',
-  }
-  const pendingSwitchCards = new Map()   // token -> { bot, chatId, rows, timer }
-  const lastSwitchRows = new Map()       // chatId -> { rows, at }
+  const SWITCH_WS_LIMIT = 12          // 工作区最多列几个（注册表之外从会话兜底补的也算在里面）
+  const SWITCH_SESS_LIMIT = 12        // 单个工作区的会话最多列几行（卡片行数有上限）
+  const pendingSwitchCards = new Map()   // token -> { bot, chatId, wsRows, ws, sessRows, timer }
 
   function shortSessionId(id) { return String(id || '').slice(0, 8) }
 
@@ -3299,6 +3327,9 @@ export function apply(ctx) {
 
   // 首条用户消息（摘要）：只对**体积可控**的日志读，绝不为列个表去解析几百 MB 的历史。
   async function firstUserText(sp, meta, size) {
+    // 2026-10-02 A 方案：调用方现在会传"只有活会话、没有持久化快照"的行（meta === undefined），
+    // 以及注册表/持久化服务缺失的情况 ⇒ 这里必须先挡住，否则整张会话卡会崩在 `meta.id` 上。
+    if (!sp || !meta || !meta.id) return ''
     if (Number.isFinite(size) && size > SWITCH_SUMMARY_MAX_BYTES) return ''
     try {
       const pending = Promise.resolve(sp.readFrom(meta.id, 0))
@@ -3323,125 +3354,347 @@ export function apply(ctx) {
     return ''
   }
 
-  async function buildSwitchRows(bot, chat) {
-    const rows = []
-    const seen = new Set()
-    const live = liveAgentsById()
-    const botWorkspace = (bot.cfg && bot.cfg.workspace) || ''
-    for (let i = 0; i < chat.sessions.length; i++) {
-      const s = chat.sessions[i]
-      const agent = live.get(String(s.id)) || (s.handle && s.handle.agent)
-      const resolved = live.get(String(s.id)) || agent
-      seen.add(String(s.id))
-      rows.push({
-        group: 1,
-        sessionId: String(s.id),
-        workspace: botWorkspace,
-        inChat: true,
-        current: i === chat.activeIndex,
-        live: Boolean(resolved),
-        // 非活跃会话：只读回填（见 titleFromLogs）。只对**本聊天的**这几条做，
-        // 不扩展到 sp.list() 的全量候选 —— 那可能几十条会话，读盘代价不成比例。
-        title: resolved ? liveTitle(resolved) : titleFromLogs(String(s.id)),
-        summary: '',
-        label: s.label || ('会话 ' + (i + 1)),
-        mtime: undefined,
-      })
-    }
-
-    const sp = ctx.get('sessionPersistence')
-    if (!sp || typeof sp.list !== 'function') return rows
-    let all = []
+  // 工作区注册表（DSH 原生，GUI 侧边栏用的就是它）。宿主侧服务名 `workspaceRegistry`，
+  // 客户端侧叫 `workspaces` —— 两个都试；拿不到就退回"从会话 cwd 反推"（见 buildWorkspaceRows）。
+  function registryEntities() {
     try {
-      all = await sp.list()
+      const reg = ctx.get('workspaceRegistry') || ctx.get('workspaces')
+      if (!reg || typeof reg.list !== 'function') return []
+      const list = reg.list()
+      return Array.isArray(list) ? list : []
     } catch (error) {
-      console.log('[fs] switch: persistence.list failed: ' + String(error && error.message || error))
-      return rows
+      console.log('[fs] switch: workspace registry list failed: ' + String(error && error.message || error))
+      return []
     }
-    const candidates = []
-    for (const meta of all) {
-      if (!meta || !meta.id) continue
-      const id = String(meta.id)
-      if (seen.has(id)) continue
-      if (meta.origin === 'subagent' || (meta.delegationDepth || 0) > 0) continue   // 子代理子会话不是可切换目标
-      const info = artifactInfo(sp, meta)
-      candidates.push({ meta, id, cwd: String(meta.cwd || ''), info })
-    }
-    const recency = (c) => (c.info && c.info.mtime) || c.meta.createdAt || 0
-    candidates.sort((a, b) => recency(b) - recency(a))
+  }
 
-    const own = candidates.filter((c) => sameWorkspace(c.cwd, botWorkspace)).slice(0, SWITCH_OWN_LIMIT)
-    const foreign = candidates.filter((c) => !sameWorkspace(c.cwd, botWorkspace))
-    const byWorkspace = new Map()
-    for (const c of foreign) {
-      const key = c.cwd.toLowerCase() || '?'
-      if (!byWorkspace.has(key)) byWorkspace.set(key, [])
-      byWorkspace.get(key).push(c)
-    }
-    const foreignPick = []
-    for (const [, list] of [...byWorkspace.entries()].sort((a, b) => recency(b[1][0]) - recency(a[1][0]))) {
-      if (foreignPick.length >= SWITCH_FOREIGN_GROUPS) break
-      foreignPick.push(...list.slice(0, SWITCH_FOREIGN_LIMIT))
-    }
+  function cwdOfEntry(entry, live) {
+    const agent = live.get(String(entry && entry.id)) || (entry && entry.handle && entry.handle.agent)
+    const header = agent && agent.session && agent.session.header
+    return String((header && header.cwd) || (entry && entry.cwd) || '')
+  }
 
-    const picked = [...own.map((c) => ({ c, group: 2 })), ...foreignPick.map((c) => ({ c, group: 3 }))]
-    const summaries = await Promise.all(picked.map(({ c }) => firstUserText(sp, c.meta, c.info && c.info.size)))
-    picked.forEach(({ c, group }, i) => {
-      const agent = live.get(c.id)
-      rows.push({
-        group,
-        sessionId: c.id,
-        workspace: c.cwd,
-        inChat: false,
-        current: false,
-        live: Boolean(agent),
-        title: agent ? liveTitle(agent) : '',
-        summary: summaries[i] || '',
-        label: workspaceLeaf(c.cwd),
-        mtime: recency(c),
+  // **当前工作区 ＝ 活跃会话的 cwd**（插件里没有"当前工作区"这个独立状态；见背景事实库第九节）。
+  function currentWorkspaceOf(bot, chat) {
+    const live = liveAgentsById()
+    const active = chat && chat.sessions && chat.sessions[chat.activeIndex]
+    const cwd = active ? cwdOfEntry(active, live) : ''
+    return { sessionId: active ? String(active.id) : '', cwd: cwd || String((bot.cfg && bot.cfg.workspace) || '') }
+  }
+
+  // 会话候选三源合并（活 agent / 持久化快照 / 本聊天会话），按 id 去重。
+  // ⚠️ 为什么不能只信注册表：`entity.sessionIds` 是**落盘列表**（只在 bootstrap 重建），
+  //   刚新建的会话不会自动进去 ⇒ 只读注册表会把"刚切过去的那个会话"漏掉。
+  async function sessionCandidates(bot, chat) {
+    const live = liveAgentsById()
+    const out = new Map()
+    for (const [id, agent] of live) {
+      const header = agent && agent.session && agent.session.header
+      // ⚠️ 兜底时间戳**必须稳定**（门槛第二轮 medium）：原来这里写 Date.now()，
+      // 于是"有活会话、但没有持久化快照"的会话每次调用都换时间 ⇒ ① 会话行排序会漂移
+      // （卡片序号与文字命令序号对不上）② 工作区卡上的"最近活动"永远显示当前时刻。
+      // 活性由 🟡 表达就够，时间戳只用 id 里能还原的那部分（认不出＝0，交给 id 字典序兜底）。
+      out.set(String(id), {
+        id: String(id), cwd: String((header && header.cwd) || ''),
+        mtime: sessionIdTime(String(id)), meta: undefined, size: undefined,
       })
-    })
+    }
+    const sp = ctx.get('sessionPersistence')
+    if (sp && typeof sp.list === 'function') {
+      let all = []
+      try { all = await sp.list() } catch (error) {
+        console.log('[fs] switch: persistence.list failed: ' + String(error && error.message || error))
+      }
+      for (const meta of all || []) {
+        if (!meta || !meta.id) continue
+        if (meta.origin === 'subagent' || (meta.delegationDepth || 0) > 0) continue   // 子代理子会话不是可切换目标
+        const id = String(meta.id)
+        const info = artifactInfo(sp, meta)
+        const prev = out.get(id)
+        out.set(id, {
+          id,
+          cwd: String(meta.cwd || (prev && prev.cwd) || ''),
+          mtime: (info && info.mtime) || (prev && prev.mtime) || Number(meta.createdAt) || 0,
+          meta,
+          size: info && info.size,
+        })
+      }
+    }
+    for (const s of (chat && chat.sessions) || []) {
+      const id = String((s && s.id) || '')
+      if (!id) continue
+      const prev = out.get(id)
+      // 会话属于哪个工作区：**持久化值优先**（一旦有快照就以它为准），活 header 只当兜底。
+      // 理由（2026-10-02 冒烟实测）：活 header 是"当前状态"，若被别的东西改过（测试里多个会话
+      // 共用一个 agent 对象、或 resume 后 header 变化），用它覆盖会把会话挪到错误的工作区行下
+      // ⇒ 分组与序号一起错。生产里两者本应一致，一旦不一致也以**落盘的那份**为准。
+      const cwd = (prev && prev.cwd) || cwdOfEntry(s, live)
+      out.set(id, {
+        id,
+        // 空 cwd 的会话（活 agent 没 header.cwd / 快照没 meta.cwd）原来会**从所有列表里消失**
+        // （sameWorkspace('', …) 恒假、make('') 又直接跳过）⇒ 兜到 bot 的默认工作区，
+        // 与 currentWorkspaceOf 同一条兜底规则（门槛第二轮 low）。
+        cwd: cwd || (prev && prev.cwd) || String((bot.cfg && bot.cfg.workspace) || ''),
+        // ⚠️ 兜底时间戳**必须稳定**（2026-10-02 冒烟实测）：原来这里写 Date.now()，
+        // 于是"没有持久化快照的会话"每次调用都拿到新时间 ⇒ 卡片序号与文字命令
+        // `/switch <工作区> <序号>` 重建出来的序号会漂移（同一行指到不同会话）。
+        // 我们自己的会话 id 形如 `fs-main-<base36 时间戳>` ⇒ 直接从 id 里还原真实创建时间。
+        mtime: (prev && prev.mtime) || sessionIdTime(id),
+        meta: prev && prev.meta,
+        size: prev && prev.size,
+      })
+    }
+    return [...out.values()]
+  }
+
+  function dirExists(path) {
+    try { return Boolean(path) && existsSync(String(path)) } catch { return false }
+  }
+
+  // 从我们自己的会话 id 里还原创建时间（`fs-main-<Date.now().toString(36)>`）——
+  // 用于给"没有持久化快照"的会话一个**稳定**的排序时间（见下面那处注释）。认不出就返回 0。
+  function sessionIdTime(id) {
+    const m = /^fs-main-([0-9a-z]+)$/.exec(String(id || ''))
+    if (!m) return 0
+    const t = parseInt(m[1], 36)
+    return Number.isFinite(t) && t > 0 ? t : 0
+  }
+
+  // 第一级：**工作区行**。注册表优先（与 GUI 同源），再用"会话里出现过的目录"兜底
+  //（注册表只在 bootstrap 重建，运行期新建的会话目录可能还没被收录）。
+  async function buildWorkspaceRows(bot, chat, precomputed) {
+    const live = liveAgentsById()
+    // cands 可由调用方传入：/list 与 /switch 都会紧接着再算一次会话行，
+    // 不传的话每次命令都要把 sp.list() + 逐会话 artifactInfo 干两遍（门槛第二轮 medium#2）。
+    const cands = precomputed || await sessionCandidates(bot, chat)
+    const current = currentWorkspaceOf(bot, chat)
+    const regRows = []
+    const fbRows = []
+    const seen = new Set()
+    const make = (path, rec) => {
+      const key = String(path || '').replace(/[\\/]+$/, '').toLowerCase()
+      if (!key || seen.has(key)) return null
+      seen.add(key)
+      return {
+        workspaceId: rec.id || '',
+        workspace: String(path),
+        path: String(path),
+        title: rec.title || workspaceLeaf(path),
+        entity: rec.entity,
+        sessionIds: rec.sessionIds || [],
+      }
+    }
+    for (const e of registryEntities()) {
+      let path = ''
+      try { path = String(e.path || '') } catch { }
+      if (!path) continue
+      let ids = []
+      try { ids = Array.isArray(e.sessionIds) ? e.sessionIds.map(String) : [] } catch { }
+      const row = make(path, { id: e.id, title: e.title, sessionIds: ids, entity: e })
+      if (row) regRows.push(row)
+    }
+    for (const c of cands) {
+      const row = make(c.cwd, { id: '', title: '', sessionIds: [] })
+      if (row) fbRows.push(row)
+    }
+    // 兜底行按**规范化路径**排序（门槛第二轮 medium#5）：注册表顺序本身是稳定的，但兜底行
+    // 原来按 sessionCandidates 的枚举顺序追加 ⇒ 卡片序号与 `/switch <工作区序号>`、`/list` 里的
+    // 「第 N 个」会在两次构建之间漂移（与会话行要修的是同一类缺陷）。
+    fbRows.sort((a, b) => a.path.toLowerCase().localeCompare(b.path.toLowerCase()) || a.path.localeCompare(b.path))
+    // 上限对**注册表行也生效**（门槛第二轮 low#4），但**两段分别限流**（第二轮 medium#1）：
+    // 原来 `[...regRows, ...fbRows].slice(0, 12)` 在注册表 ≥12 条时会把**兜底行全部挤掉**
+    // —— 包括"只从会话 cwd 出现的工作区"，甚至可能是当前工作区 ⇒ 那些工作区再也点不到。
+    const FB_RESERVE = Math.min(fbRows.length, Math.max(2, Math.floor(SWITCH_WS_LIMIT / 3)))
+    let rows = [...regRows.slice(0, SWITCH_WS_LIMIT - FB_RESERVE), ...fbRows.slice(0, FB_RESERVE)]
+    // 当前工作区**必须在卡上**（哪怕它在注册表里排得很后）——不然用户看不到"我在哪、怎么回来"。
+    if (current.cwd && !rows.some((r) => sameWorkspace(r.path, current.cwd))) {
+      const cur = [...regRows, ...fbRows].find((r) => sameWorkspace(r.path, current.cwd))
+      if (cur) rows = [...rows.slice(0, SWITCH_WS_LIMIT - 1), cur]
+    }
+    for (const row of rows) {
+      const ids = new Set(row.sessionIds)
+      let mtime = 0
+      for (const c of cands) {
+        if (!sameWorkspace(c.cwd, row.path)) continue
+        ids.add(String(c.id))
+        mtime = Math.max(mtime, Number(c.mtime) || 0)
+      }
+      row.sessionIds = [...ids]
+      row.sessionCount = row.sessionIds.length
+      row.liveCount = row.sessionIds.filter((id) => live.has(String(id))).length
+      row.mtime = mtime
+      row.current = sameWorkspace(row.path, current.cwd)
+    }
+    // 健康判定（门槛第二轮 medium#6）：**本地目录检查说了算** —— 原来只认 `status()` 返回的
+    // 'missing-dir' 这个 token，上游一旦换了别的值（或返回 undefined）而目录已经没了，
+    // 卡面照样渲染成健康 🟢。⇒ 目录不在就是 ⚠️；目录在但上游说 missing-dir 也按 ⚠️ 处理。
+    // 探活**并发**做（门槛第二轮 low）：串行 await 会把工作区卡的延迟随注册表条数线性拉长。
+    await Promise.all(rows.map(async (row) => {
+      let missing = !dirExists(row.path)
+      try {
+        if (!missing && row.entity && typeof row.entity.status === 'function') {
+          missing = (await row.entity.status()) === 'missing-dir'
+        }
+      } catch { /* 判活失败 ⇒ 以目录检查结果为准 */ }
+      row.status = missing ? 'missing-dir' : 'ok'
+    }))
     return rows
   }
 
-  function buildSwitchCard(bot, chat, rows) {
-    const active = chat.sessions[chat.activeIndex]
+  // 第二级：**某个工作区里的会话行**。
+  async function buildSessionRows(bot, chat, ws, precomputed) {
+    const live = liveAgentsById()
+    const all = precomputed || await sessionCandidates(bot, chat)
+    const cands = all.filter((c) => sameWorkspace(c.cwd, ws && ws.path))
+    // 排序必须**确定**（2026-10-02 冒烟实测）：卡片上的序号就是 `/switch <工作区> <序号>` 的入参，
+    // 两次构建若排出不同顺序，CM 按卡面序号发文字就会接管到另一个会话。
+    // ⇒ 三级稳定键：当前会话最前 → 最近活动在前 → 会话 id 字典序（兜底，保证全序）。
+    // activeId 提到排序外（门槛第二轮 low）：排序期间 chat.activeIndex 不会变，放进比较器等于白算 O(n log n) 次。
+    const activeId = String(((chat.sessions || [])[chat.activeIndex] || {}).id || '')
+    cands.sort((a, b) => {
+      const ca = String(a.id) === activeId ? 1 : 0
+      const cb = String(b.id) === activeId ? 1 : 0
+      const ma = Number(a.mtime) || 0
+      const mb = Number(b.mtime) || 0
+      return (cb - ca) || (mb - ma) || String(a.id).localeCompare(String(b.id))
+    })
+    // titleFromLogs 是**同步读盘**（每个项目目录 readdirSync + 读日志头）；旧实现只在"本聊天那几条"
+    // 上用它。这里最多回填 TITLE_BACKFILL_MAX 条，其余留给下面的首条消息摘要（异步）（门槛第二轮 low#6）。
+    const TITLE_BACKFILL_MAX = 5
+    let backfilled = 0
+    const rows = cands.slice(0, SWITCH_SESS_LIMIT).map((c) => {
+      const idx = (chat.sessions || []).findIndex((s) => String(s.id) === String(c.id))
+      const agent = live.get(String(c.id))
+      let title = agent ? liveTitle(agent) : ''
+      if (!title && backfilled < TITLE_BACKFILL_MAX) {
+        backfilled += 1
+        title = titleFromLogs(String(c.id))
+      }
+      return {
+        sessionId: String(c.id),
+        workspace: (ws && ws.path) ? String(ws.path) : '',
+        // path 与 workspace 同值：attachSessionToWorkspace 的兜底链（resolveByPath / create）
+        // 认的是 path，缺了它"注册表里没有的工作区"就永远挂不上（门槛第二轮 medium#3）。
+        path: (ws && ws.path) ? String(ws.path) : '',
+        workspaceId: (ws && ws.workspaceId) || '',
+        inChat: idx >= 0,
+        current: idx >= 0 && idx === chat.activeIndex,
+        live: Boolean(agent),
+        title,
+        label: idx >= 0 ? String((chat.sessions[idx] && chat.sessions[idx].label) || '') : '',
+        mtime: Number(c.mtime) || 0,
+        summary: '',
+        meta: c.meta,
+        size: c.size,
+      }
+    })
+    // 没标题的补"首条消息"当摘要（认得出是哪一个）；读盘有代价，最多 8 条
+    const need = rows.filter((r) => !r.title).slice(0, 8)
+    if (need.length) {
+      const sp = ctx.get('sessionPersistence')
+      const texts = await Promise.all(need.map((r) => firstUserText(sp, r.meta, r.size)))
+      need.forEach((r, i) => { r.summary = texts[i] || '' })
+    }
+    return rows
+  }
+
+  function buildWorkspaceCard(bot, chat, rows) {
+    const current = currentWorkspaceOf(bot, chat)
     const elements = [{
       tag: 'div',
       text: {
         tag: 'lark_md',
-        content: '**当前**：' + ((active && active.label) || '（无）')
-          + '\n**工作目录**：`' + ((bot.cfg && bot.cfg.workspace) || '?') + '`'
-          + '\n🟢 空闲（可接管） ｜ 🟡 运行中（只给"新建"，避免同一会话被两处同时驱动）',
+        content: '**第一步：选工作区**（共 ' + rows.length + ' 个）'
+          + '\n**当前工作区**：`' + (current.cwd || '?') + '`'
+          + '\n▶ 当前所在 ｜ 🟢 目录正常 ｜ ⚠️ 目录不存在（切之前先看一眼）'
+          + '\n选完工作区，下一步才是**它的会话列表**。',
       },
     }]
-    let group = 0
     rows.forEach((row, i) => {
       const n = i + 1
-      if (row.group !== group) {
-        group = row.group
-        elements.push({ tag: 'hr' })
-        elements.push({ tag: 'div', text: { tag: 'lark_md', content: SWITCH_GROUP_TITLES[group] || '' } })
-      }
-      const what = row.title || row.summary || (row.group === 1 ? row.label : '（未命名会话）')
-      const meta = ['`' + shortSessionId(row.sessionId) + '`']
-      if (row.workspace) meta.push('`' + row.workspace + '`')     // 完整工作区路径：CM 需要知道切过去是哪个目录
+      const kind = row.status === 'missing-dir' ? '⚠️' : '🟢'
+      const meta = ['`' + row.path + '`', row.sessionCount + ' 个会话']
+      if (row.liveCount) meta.push('🟡 ' + row.liveCount + ' 个运行中')
       const clock = fmtClock(row.mtime)
       if (clock) meta.push(clock)
+      elements.push({ tag: 'hr' })
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: (row.current ? '▶ ' : '') + n + '. ' + (row.live ? '🟡 ' : '🟢 ') + '**' + what + '**'
+          content: (row.current ? '▶ ' : '') + n + '. ' + kind + ' **' + row.title + '**'
             + '\n　　' + meta.join(' · '),
+        },
+      })
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button', text: { tag: 'plain_text', content: n + ' 进入看会话' }, type: 'primary',
+            value: { fs_switch: row.token, fs_level: 'ws', fs_i: i },
+          },
+          {
+            tag: 'button', text: { tag: 'plain_text', content: n + ' 在这里新建' }, type: 'default',
+            value: { fs_switch: row.token, fs_level: 'ws-new', fs_i: i },
+          },
+        ],
+      })
+    })
+    elements.push({ tag: 'hr' })
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: '也可以发文字：`/switch <工作区序号>`（看它的会话）｜ `/switch <工作区序号> new`（在该工作区新建）',
+      },
+    })
+    return {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '🗂 选择工作区' }, template: 'blue' },
+      elements,
+    }
+  }
+
+  function buildSessionCard(ws, rows) {
+    const elements = [{
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: '**第二步：选会话** —— 工作区 **' + ws.title + '**'
+          + '\n`' + ws.path + '`'
+          + '\n共 ' + rows.length + ' 个会话 ｜ ▶ 当前 ｜ 🟢 空闲（可接管） ｜ 🟡 运行中（只给"新建"）',
+      },
+    }]
+    if (!rows.length) {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: '（这个工作区还没有会话）' } })
+      elements.push({
+        tag: 'action',
+        actions: [{
+          tag: 'button', text: { tag: 'plain_text', content: '在这里新建会话' }, type: 'primary',
+          value: { fs_switch: ws.token, fs_level: 'ws-new', fs_i: ws.index },
+        }],
+      })
+    }
+    rows.forEach((row, j) => {
+      const n = j + 1
+      const what = row.title || row.summary || row.label || '（未命名会话）'
+      const meta = ['`' + shortSessionId(row.sessionId) + '`']
+      const clock = fmtClock(row.mtime)
+      if (clock) meta.push(clock)
+      if (row.inChat) meta.push('本聊天的会话')
+      elements.push({ tag: 'hr' })
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: (row.current ? '▶ ' : '') + n + '. ' + (row.live ? '🟡 ' : '🟢 ')
+            + '**' + what + '**\n　　' + meta.join(' · '),
         },
       })
       const actions = []
       const push = (label, type, mode) => actions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: label },
-        type,
-        value: { fs_switch: row.token, fs_index: n - 1, fs_mode: mode },
+        tag: 'button', text: { tag: 'plain_text', content: label }, type,
+        value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: mode },
       })
       if (row.inChat) {
         if (!row.current) push(n + ' 切过去', 'primary', 'takeover')
@@ -3455,25 +3708,41 @@ export function apply(ctx) {
     })
     elements.push({ tag: 'hr' })
     elements.push({
-      tag: 'div',
-      text: { tag: 'lark_md', content: '也可以发文字：`/switch <序号>` 接管 ｜ `/switch <序号> new` 在该工作区新建' },
+      tag: 'action',
+      actions: [{
+        tag: 'button', text: { tag: 'plain_text', content: '← 返回工作区列表' }, type: 'default',
+        value: { fs_switch: ws.token, fs_level: 'ws-back', fs_i: ws.index },
+      }],
     })
     return {
       config: { wide_screen_mode: true },
-      header: { title: { tag: 'plain_text', content: '🔀 切换会话 / 工作区' }, template: 'blue' },
+      header: { title: { tag: 'plain_text', content: '💬 ' + ws.title + ' 的会话' }, template: 'turquoise' },
       elements,
     }
   }
 
-  async function sendSwitchCard(bot, chatId, chat, rows) {
+  function registerPendingSwitchCard(record) {
+    record.timer = setTimeout(() => pendingSwitchCards.delete(record.token), SWITCH_CARD_TTL_MS)
+    pendingSwitchCards.set(record.token, record)
+    return record
+  }
+
+  async function sendWorkspaceCard(bot, chatId, chat, rows) {
     const token = randomUUID()
     for (const row of rows) row.token = token
-    lastSwitchRows.set(chatId, { rows, at: Date.now() })
-    const record = { bot, chatId, rows, timer: undefined }
-    record.timer = setTimeout(() => pendingSwitchCards.delete(token), SWITCH_CARD_TTL_MS)
-    pendingSwitchCards.set(token, record)
-    const cardId = await sendInteractive(bot, chatId, buildSwitchCard(bot, chat, rows))
-    console.log('[fs] /switch card sent: rows=' + rows.length + ' card=' + String(cardId || ''))
+    registerPendingSwitchCard({ token, bot, chatId, wsRows: rows, timer: undefined })
+    const cardId = await sendInteractive(bot, chatId, buildWorkspaceCard(bot, chat, rows))
+    console.log('[fs] /switch workspace card sent: workspaces=' + rows.length + ' card=' + String(cardId || ''))
+    return cardId
+  }
+
+  async function sendSessionCard(bot, chatId, chat, ws, rows, wsRows) {
+    const token = randomUUID()
+    const wsRef = { ...ws, token, index: Number.isInteger(ws.index) ? ws.index : 0 }
+    registerPendingSwitchCard({ token, bot, chatId, wsRows: wsRows || [], sessRows: rows, timer: undefined })
+    const cardId = await sendInteractive(bot, chatId, buildSessionCard(wsRef, rows))
+    console.log('[fs] /switch session card sent: ws=' + wsRef.path + ' sessions=' + rows.length
+      + ' card=' + String(cardId || ''))
     return cardId
   }
 
@@ -3483,8 +3752,36 @@ export function apply(ctx) {
     return rows[n]
   }
 
+  // 把会话挂进 DSH 的工作区注册表（best-effort）——**"与 GUI 同源"的关键一步**：
+  // 不挂的话，我们新建的会话在 GUI 侧边栏看不到（`sessionIds` 是落盘列表，只在 bootstrap 重建）。
+  // 任何失败都不影响切换本身（注册表不在、路径不是目录、会话 header 还没 cwd 都会抛）。
+  async function attachSessionToWorkspace(row, sessionId) {
+    try {
+      // 门槛第二轮 medium#3：**服务名要与 registryEntities() 用同一套**（宿主侧 workspaceRegistry、
+      // 客户端侧 workspaces），否则在只暴露后者的环境里，工作区行读得到、会话却一个都挂不上，
+      // 「与 GUI 同源」静默降级成空操作。另外原来用 `reg.get` 一刀切，缺 `get` 的实现连
+      // resolveByPath/create 兜底链都用不上 ⇒ 改成逐个方法判可用。
+      const reg = ctx.get('workspaceRegistry') || ctx.get('workspaces')
+      if (!reg) return false
+      const path = String((row && (row.path || row.workspace)) || '')
+      let entity = (row && row.workspaceId && typeof reg.get === 'function') ? reg.get(row.workspaceId) : undefined
+      if (!entity && typeof reg.resolveByPath === 'function' && path) entity = await reg.resolveByPath(path)
+      // 门槛第二轮 medium#4：会话行的 title 是**某个会话**的标题，拿它去 create 工作区会把工作区
+      // 命名成那个会话的名字。工作区名一律取路径末段（与 DSH 的 defaultWorkspaceTitle 同口径）。
+      if (!entity && typeof reg.create === 'function' && path) entity = await reg.create(path, workspaceLeaf(path))
+      if (!entity || typeof entity.attachSession !== 'function') return false
+      await entity.attachSession(String(sessionId))
+      console.log('[fs] workspace registry: attached session ' + sessionId + ' to '
+        + String((row && (row.workspace || row.path)) || '?'))
+      return true
+    } catch (error) {
+      console.log('[fs] workspace registry attach skipped: ' + String(error && error.message || error))
+      return false
+    }
+  }
+
   async function applySwitch(bot, chat, chatId, row, mode) {
-    const cwd = (row.workspace && String(row.workspace).trim()) || (bot.cfg && bot.cfg.workspace) || ''
+    const cwd = String((row && (row.workspace || row.path)) || '').trim() || ((bot.cfg && bot.cfg.workspace) || '')
     if (mode === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       const handle = await createDedicated(bot, sessionId, cwd)
@@ -3497,11 +3794,12 @@ export function apply(ctx) {
       })
       chat.activeIndex = chat.sessions.length - 1
       persistChats(bot, bot.chats)
+      await attachSessionToWorkspace(row, sessionId)
       console.log('[fs] /switch new session ' + sessionId + ' cwd=' + cwd)
       await sendPlainText(bot, chatId, '✅ 已在工作区 `' + cwd + '` 新建会话并切过去（旧会话一个都没动）。')
       return
     }
-    const idx = chat.sessions.findIndex((s) => String(s.id) === String(row.sessionId))
+    const idx = chat.sessions.findIndex((s) => String(s.id) === String(row && row.sessionId))
     if (idx >= 0) {
       chat.activeIndex = idx
       persistChats(bot, bot.chats)
@@ -3523,6 +3821,7 @@ export function apply(ctx) {
     })
     chat.activeIndex = chat.sessions.length - 1
     persistChats(bot, bot.chats)
+    await attachSessionToWorkspace(row, row.sessionId)
     console.log('[fs] /switch takeover session ' + row.sessionId + ' cwd=' + cwd)
     await sendPlainText(bot, chatId, '✅ 已接管会话 `' + shortSessionId(row.sessionId) + '`'
       + (cwd ? '（工作目录 `' + cwd + '`）' : '') + '，接着往下说就行。')
@@ -3535,16 +3834,45 @@ export function apply(ctx) {
         + '重新发一个 /switch 即可。')
       return
     }
-    const row = switchRowByIndex(record.rows, value.fs_index)
-    if (!row) {
+    const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
+    bot.chats.set(chatId, chat)
+    const level = String(value.fs_level || '')
+    const wsRows = record.wsRows || []
+    const i = Number(value.fs_i)
+    if (level === 'ws-back') {
+      console.log('[fs] /switch back to workspace list')
+      await sendWorkspaceCard(bot, chatId, chat, wsRows)
+      return
+    }
+    const ws = switchRowByIndex(wsRows, i)
+    if (!ws) {
       await sendPlainText(bot, chatId, '这张卡片里的序号已经对不上了，重新发一个 /switch 吧。')
       return
     }
-    const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
-    bot.chats.set(chatId, chat)
-    const mode = value.fs_mode === 'new' ? 'new' : 'takeover'
-    console.log('[fs] /switch click: index=' + value.fs_index + ' mode=' + mode + ' session=' + row.sessionId)
-    await applySwitch(bot, chat, chatId, row, mode)
+    ws.index = i
+    if (level === 'ws') {
+      const sessRows = await buildSessionRows(bot, chat, ws)
+      console.log('[fs] /switch open workspace: ' + ws.path + ' sessions=' + sessRows.length)
+      await sendSessionCard(bot, chatId, chat, ws, sessRows, wsRows)
+      return
+    }
+    if (level === 'ws-new') {
+      console.log('[fs] /switch click: ws=' + ws.path + ' mode=new')
+      await applySwitch(bot, chat, chatId, ws, 'new')
+      return
+    }
+    if (level === 'sess') {
+      const row = switchRowByIndex(record.sessRows || [], Number(value.fs_j))
+      if (!row) {
+        await sendPlainText(bot, chatId, '这张卡片里的会话序号已经对不上了，重新发一个 /switch 吧。')
+        return
+      }
+      const mode = value.fs_mode === 'new' ? 'new' : 'takeover'
+      console.log('[fs] /switch click: ws=' + ws.path + ' session=' + row.sessionId + ' mode=' + mode)
+      await applySwitch(bot, chat, chatId, row, mode)
+      return
+    }
+    await sendPlainText(bot, chatId, '这张卡片已过期，重新发一个 /switch 吧。')
   }
 
   // ---- /model：飞书侧切换模型（CM 2026-10-02）---------------------------------

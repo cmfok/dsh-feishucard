@@ -5,6 +5,74 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-02
+
+### Changed（🔀 `/switch` 重做成**两级**：先选工作区 → 再选该工作区的会话 —— CM 定稿 A 方案）
+
+**CM 原话**：「切换会话的话，就是可以切到**任何一个工作区**；会话列表的话，就是**同一个工作区里面的
+不同会话**，是不是这个意思啊？」⇒ **是**，而且这正是 DSH 的原生模型：
+
+| 概念 | 在 DSH 里 | 出处 |
+|:--|:--|:--|
+| **工作区** | `workspaceRegistry` 里的**注册实体**：`{path,title,sessionIds[]}`，有稳定 id；**GUI 侧边栏用的就是它** | `@deepseek-ai/dsh-workspace/lib/index.js:354,452` |
+| **会话** | **挂在工作区下面**（实体的 `sessionIds`，getter 会按 cwd 校验过滤） | 同上 `:102-104` |
+
+**旧卡为什么会歧义**：三组混排，第③组标题写"其它工作区"，列的其实是"**别的工作区里的会话**"，
+而且是**从会话 cwd 反推、从不读注册表**（旧代码 `workspaceRegistry` 零命中）⇒ 飞书与 GUI 可能各说各话。
+**实测证据**：`~/.dsh/storages/workspace.json` 里注册了 **3 个工作区**（`P:\Qoder\work` / `P:\FU` / `P:\BA`），
+而**我们的飞书会话一个都没挂进去**（`work` 那条只有 6 个 GUI 会话）—— 正是这次要一并修掉的。
+
+**现在长这样**
+
+| 命令 / 动作 | 行为 |
+|:--|:--|
+| `/switch` | **工作区卡**：注册表里的工作区（+ 会话里出现过的目录兜底），每行 `N 进入看会话` / `N 在这里新建`；带 ▶ 当前 · 🟢 目录正常 · ⚠️ 目录不存在 · 会话数 · 🟡 运行中数 |
+| 点「进入」或 `/switch <工作区序号>` | **该工作区的会话卡**：标题 / 短 id / 时间 / 🟡 运行中；每行「接管」「新建」；底部「← 返回工作区列表」 |
+| `/switch <工作区序号> new` | 在该工作区新建会话（cwd = 该工作区）**并挂进 `workspaceRegistry`**（best-effort）⇒ GUI 侧边栏立刻看得到 |
+| `/switch <工作区序号> <会话序号>` | 接管该工作区第 N 个会话 |
+| `/list` | **当前工作区的会话**（当前工作区 ＝ 活跃会话的 cwd），并给出可直接复制的 `/switch` 文字命令 |
+
+**实现要点（都留着踩坑记录）**
+
+- **会话候选三源合并**（活 agent / 持久化快照 / 本聊天会话）：`entity.sessionIds` 是**落盘列表**
+  （只在 bootstrap 重建），刚新建的会话不会自动进去 ⇒ 只信注册表会把"刚切过去的那个会话"漏掉。
+- **排序必须确定**：当前会话最前 → 最近活动 → 会话 id 字典序；没有持久化快照的会话，用
+  `fs-main-<base36 时间戳>` **从 id 还原创建时间**。原来兜底用 `Date.now()`，冒烟实测
+  **卡片序号与文字命令序号会漂移** ⇒ 按卡面序号发文字会接管到另一个会话（这是真机可复现的坑）。
+- `firstUserText()` 增加 `!sp || !meta || !meta.id` 防御：活会话没有持久化快照，
+  原来会**整张会话卡崩在 `meta.id`** 上（被卡片回调的 try 兜住 ⇒ 用户只看到"点了没反应"）。
+- 安全约束不变、且写在卡面：🟡 运行中的会话**只给"新建"**（同一会话被两处同时驱动会写坏历史）。
+
+**独立审查门槛（398s，`fail-on: high`）⇒ WARN：0 critical / 0 high / 6 medium / 8 low —— 14 条全部处置**
+（报告 `output/code-review/dsh-feishucard-20261002-194518/REPORT.md`）：
+
+| 级别 | 问题 | 处置 |
+|:--|:--|:--|
+| medium | **活 agent 的时间戳仍用 `Date.now()`** ⇒ 无快照的活跃会话排序漂移，卡面"最近活动"永远显示当前时刻 | 改用 `sessionIdTime(id)`；**活性交给 🟡 表达**，时间戳只负责排序 |
+| medium | **接管"未注册工作区"的会话时挂不进注册表**：`attachSessionToWorkspace` 的兜底链认 `row.path`，而会话行当时**没有 `path` 字段** ⇒ 三个查法全跳过、静默返回 false（「与 GUI 同源」在这些工作区上不成立） | 会话行补 `path`；attach 改认 `path \|\| workspace` |
+| medium | **工作区行的兜底部分没有排序** ⇒ 卡片序号与 `/switch <工作区序号>`、`/list` 里的「第 N 个」会在两次构建间漂移（与会话行是同一类缺陷） | 兜底行按**规范化路径**排序；注册表行保持注册表顺序 |
+| medium | **健康判定过松**：只认 `status()` 返回的 `missing-dir` 这个 token，上游换值／返回 undefined 时目录已失仍渲染 🟢 | 以**本地目录检查为准**：目录不在即 ⚠️；上游说 missing-dir 也算 ⚠️ |
+| medium×2 | 测试覆盖缺口：注册表不可用时的兜底、⚠️ 分支、`ws-new` 按钮未按行校验 | 新增**用例 15b**（未注册工作区 / 目录不存在 / 注册表整空）＋ 按行校验 `fs_i` |
+| low×8 | 死字段（候选里的 `createdAt`/`inChat`/`label`/`live`、会话行的 `chatIndex`）· mock 里 workspace id 两处各推一遍 · 按钮解引用未保护（缺按钮会崩成 `TypeError` 而不是干净失败）· `SWITCH_WS_LIMIT` 只管兜底行、不管注册表行 · `titleFromLogs` 同步读盘无上限 · 🟡 断言只看卡面图例 | 逐条修：删死字段 · id 复用一处 · 按钮加保护 · 上限对注册表行也生效 · 标题回填每次 ≤5 条 · 🟡 断言改看**那一行** |
+
+**顺带修掉一条夹具失真（A25：验证环境要与生产一致）**：冒烟里三个"工作区"目录此前**并不存在**，
+而新的健康判定以本地目录为准 ⇒ 要么全变 ⚠️、要么测不到真东西。现在三个目录真建出来；
+`agents.resume` 的 mock 也补上"还原该会话自己的 cwd"（生产里 cwd 来自会话 header）。
+
+**门槛第二轮（447s）⇒ WARN：0 critical / 0 high / 4 medium / 8 low —— 12 条同样全部处置**：
+
+| 级别 | 问题 | 处置 |
+|:--|:--|:--|
+| medium | 两段工作区行**合并后**再 `slice(0, 12)` ⇒ 注册表 ≥12 条时**兜底工作区（甚至当前工作区）全被挤掉** | 两段**分别限流**（兜底保留 ≥2 席），且**当前工作区一定在卡上** |
+| medium | `/list` 与 `/switch` 各自再算一遍 `sessionCandidates()`（两遍 `sp.list()` + 逐会话 statSync） | cands 由调用方传入，命令路径**只算一次** |
+| medium | attach 只认 `workspaceRegistry`（与 `registryEntities()` 的 `\|\| workspaces` 不一致），且用 `reg.get` 一刀切 | 服务名对齐；**逐个方法**判可用（缺 `get` 也能走 resolveByPath/create） |
+| medium | 会话卡的「新建」按钮携带的是**会话行**，`reg.create(path, row.title)` 会拿**别的会话的标题**给工作区命名 | 一律用路径末段命名（与 DSH `defaultWorkspaceTitle` 同口径） |
+| low×8 | 空 cwd 的会话从所有列表消失 · 探活串行 `await` · `source` / 待处理卡片记录里的 `ws` 死字段 · 排序比较器里重复取 activeId · mock 的 id 用 `length+1` 会重号且新建实体泄漏到后续用例 · `buildSessionCard(bot, chat)` 死参数 · 测试 `lastCardFrom` 会误抓纯文本消息 · 「进入」按钮只校验了当前行 | 逐条修：空 cwd 兜到 bot 默认工作区 · 探活 `Promise.all` · 删死字段/死参数 · activeId 提到排序外 · mock 改工厂 + 单调 id + 15b 自清场 · `lastCardFrom` 只认带 `header` 的真卡片 · 断言改按行校验 |
+
+**回归**：`node --check`=0；冒烟 **SMOKE PASS (sentCards=191, sessions=7)**、❌ 0 ——
+用例 15 重写成两级流程（第一级不列会话 / 进入后只列该工作区会话 / 接管与新建 / 挂进注册表 /
+🟡 只给新建 / 返回按钮），并新增 `workspaceRegistry` mock（实体 = `{id,path,title,sessionIds,status(),attachSession()}`）。
+
 ## [0.4.25] - 2026-10-02
 
 ### Fixed（独立审查门槛判 **BLOCK** ⇒ 逐条修复：1 high / 3 medium / 8 low 真缺陷）
