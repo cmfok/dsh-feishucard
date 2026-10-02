@@ -1961,21 +1961,21 @@ export function apply(ctx) {
       // 也不再与工作区混淆）。当前工作区 ＝ 活跃会话的 cwd。
       const cands = await sessionCandidates(bot, chat)
       const wsRows = await buildWorkspaceRows(bot, chat, cands)
-      const current = currentWorkspaceOf(bot, chat)
+      const current = currentWorkspaceOf(bot, chat, cands)
       const wsIndex = wsRows.findIndex((r) => sameWorkspace(r.path, current.cwd))
       const ws = wsIndex >= 0
         ? wsRows[wsIndex]
-        : { path: current.cwd, title: workspaceLeaf(current.cwd), index: -1 }
-      if (wsIndex >= 0) ws.index = wsIndex
+        : { path: current.cwd, title: workspaceLeaf(current.cwd) }
       const rows = await buildSessionRows(bot, chat, ws, cands)
-      const live = liveAgentsById()
+      // 会话下标只建一次（原来是每行 findIndex ⇒ O(n²)）；标题也别重算 ——
+      // buildSessionRows 里的 r.title 已经是 "liveTitle 优先、日志回填兜底" 的同一结果（low）。
+      const chatIndexById = new Map((chat.sessions || []).map((s, i) => [String(s.id), i]))
       // 顺手把读到的标题落盘（变了才写一次）：/list 是命令、不走消息路径，
       // 所以记录动作必须放在这里，否则"光发 /list"永远补不上真名。
       let titleChanged = false
       const lines = rows.map((r, i) => {
-        const agent = live.get(String(r.sessionId))
-        const t = (agent ? liveTitle(agent) : '') || r.title
-        const idx = (chat.sessions || []).findIndex((s) => String(s.id) === String(r.sessionId))
+        const t = r.title
+        const idx = chatIndexById.has(String(r.sessionId)) ? chatIndexById.get(String(r.sessionId)) : -1
         if (idx >= 0 && t && chat.sessions[idx].title !== t) { chat.sessions[idx].title = t; titleChanged = true }
         const name = t || r.summary || r.label || shortSessionId(r.sessionId)
         const flags = []
@@ -2004,7 +2004,7 @@ export function apply(ctx) {
         return true
       }
       if (!arg) {
-        await sendWorkspaceCard(bot, chatId, chat, wsRows)
+        await sendWorkspaceCard(bot, chatId, wsRows, undefined, currentWorkspaceOf(bot, chat, cands))
         return true
       }
       const parsed = /^(\d+)(?:\s+(\d+|new|新建))?$/iu.exec(arg)
@@ -2019,7 +2019,6 @@ export function apply(ctx) {
         await sendPlainText(bot, chatId, '工作区序号无效：当前有 ' + wsRows.length + ' 个，先发 /switch 看列表。')
         return true
       }
-      ws.index = wsIndex
       const second = (parsed[2] || '').toLowerCase()
       if (second === 'new' || second === '新建') {
         await applySwitch(bot, chat, chatId, ws, 'new')
@@ -2027,7 +2026,7 @@ export function apply(ctx) {
       }
       const sessRows = await buildSessionRows(bot, chat, ws, cands)
       if (!second) {
-        await sendSessionCard(bot, chatId, chat, ws, sessRows, wsRows)
+        await sendSessionCard(bot, chatId, ws, sessRows, wsRows)
         return true
       }
       const row = switchRowByIndex(sessRows, Number(second) - 1)
@@ -3375,11 +3374,24 @@ export function apply(ctx) {
   }
 
   // **当前工作区 ＝ 活跃会话的 cwd**（插件里没有"当前工作区"这个独立状态；见背景事实库第九节）。
-  function currentWorkspaceOf(bot, chat) {
+  // ⚠️ 口径必须与 sessionCandidates **完全一致**（门槛第三轮 medium#1）：
+  // 那边是"持久化值优先、活 header 只兜底"，这里原来只看活 header/handle ——
+  // 而 `persistChats` 只存 id/label/title/type/gen，**不存 cwd** ⇒ 插件重启后、第一条消息之前，
+  // 活跃会话既没有活 agent 也没有 handle，cwdOfEntry 返回空 ⇒ 退回 bot 默认工作区，
+  // 与同一条会话的候选（有真实持久化 cwd）**不一致** ⇒ /list 会指到默认工作区、
+  // 卡上"当前工作区"也标错，连"当前工作区必在卡上"那条兜底都会找不到对象而静默跳过。
+  // ⇒ 优先用候选集合里那条会话的 cwd（已经过同一套"持久化优先"规则）。
+  function currentWorkspaceOf(bot, chat, cands) {
     const live = liveAgentsById()
     const active = chat && chat.sessions && chat.sessions[chat.activeIndex]
-    const cwd = active ? cwdOfEntry(active, live) : ''
-    return { sessionId: active ? String(active.id) : '', cwd: cwd || String((bot.cfg && bot.cfg.workspace) || '') }
+    const id = active ? String(active.id) : ''
+    let cwd = ''
+    if (cands && id) {
+      const hit = cands.find((c) => String(c.id) === id)
+      if (hit && hit.cwd) cwd = String(hit.cwd)
+    }
+    if (!cwd) cwd = active ? cwdOfEntry(active, live) : ''
+    return { sessionId: id, cwd: cwd || String((bot.cfg && bot.cfg.workspace) || '') }
   }
 
   // 会话候选三源合并（活 agent / 持久化快照 / 本聊天会话），按 id 去重。
@@ -3467,7 +3479,7 @@ export function apply(ctx) {
     // cands 可由调用方传入：/list 与 /switch 都会紧接着再算一次会话行，
     // 不传的话每次命令都要把 sp.list() + 逐会话 artifactInfo 干两遍（门槛第二轮 medium#2）。
     const cands = precomputed || await sessionCandidates(bot, chat)
-    const current = currentWorkspaceOf(bot, chat)
+    const current = currentWorkspaceOf(bot, chat, cands)
     const regRows = []
     const fbRows = []
     const seen = new Set()
@@ -3504,8 +3516,14 @@ export function apply(ctx) {
     // 上限对**注册表行也生效**（门槛第二轮 low#4），但**两段分别限流**（第二轮 medium#1）：
     // 原来 `[...regRows, ...fbRows].slice(0, 12)` 在注册表 ≥12 条时会把**兜底行全部挤掉**
     // —— 包括"只从会话 cwd 出现的工作区"，甚至可能是当前工作区 ⇒ 那些工作区再也点不到。
+    // ⚠️ FB_RESERVE 是**下限保留**，不是"兜底行封顶"（门槛第三轮 medium#3）：
+    // 原来写成 `fbRows.slice(0, FB_RESERVE)` ⇒ 注册表只有 1 条时，兜底行也被压到 ≤4 席，
+    // 剩下 7 个空位白白浪费、那些工作区既上不了卡也选不到（只有"当前工作区"靠兜底append 幸存）。
+    // ⇒ 兜底行先占满注册表没用到的那部分预算，再按下限补齐。
     const FB_RESERVE = Math.min(fbRows.length, Math.max(2, Math.floor(SWITCH_WS_LIMIT / 3)))
-    let rows = [...regRows.slice(0, SWITCH_WS_LIMIT - FB_RESERVE), ...fbRows.slice(0, FB_RESERVE)]
+    const regTake = regRows.slice(0, SWITCH_WS_LIMIT - FB_RESERVE)
+    const fbTake = fbRows.slice(0, Math.max(FB_RESERVE, SWITCH_WS_LIMIT - regTake.length))
+    let rows = [...regTake, ...fbTake]
     // 当前工作区**必须在卡上**（哪怕它在注册表里排得很后）——不然用户看不到"我在哪、怎么回来"。
     if (current.cwd && !rows.some((r) => sameWorkspace(r.path, current.cwd))) {
       const cur = [...regRows, ...fbRows].find((r) => sameWorkspace(r.path, current.cwd))
@@ -3598,8 +3616,7 @@ export function apply(ctx) {
     return rows
   }
 
-  function buildWorkspaceCard(bot, chat, rows) {
-    const current = currentWorkspaceOf(bot, chat)
+  function buildWorkspaceCard(rows, current) {
     const elements = [{
       tag: 'div',
       text: {
@@ -3781,19 +3798,21 @@ export function apply(ctx) {
     }
   }
 
-  async function sendWorkspaceCard(bot, chatId, chat, rows, existing) {
+  // current 由调用方传入（调用方手上已经有 cands）——**别在这里重算一遍候选**：
+  // 那等于每次 /switch、每次"返回"都要把 sp.list() + 逐会话 statSync 再干一遍。
+  async function sendWorkspaceCard(bot, chatId, rows, existing, current) {
     const record = existing || { token: randomUUID(), bot, chatId, timer: undefined, cardId: '' }
     if (!existing) registerPendingSwitchCard(record)
     for (const row of rows) row.token = record.token
     record.wsRows = rows
     record.sessRows = []
-    const cardId = await pushSwitchCard(bot, chatId, record, buildWorkspaceCard(bot, chat, rows))
+    const cardId = await pushSwitchCard(bot, chatId, record, buildWorkspaceCard(rows, current || {}))
     console.log('[fs] /switch workspace card ' + (existing ? 'updated' : 'sent')
       + ': workspaces=' + rows.length + ' card=' + String(cardId || ''))
     return cardId
   }
 
-  async function sendSessionCard(bot, chatId, chat, ws, rows, wsRows, existing) {
+  async function sendSessionCard(bot, chatId, ws, rows, wsRows, existing) {
     const record = existing || { token: randomUUID(), bot, chatId, timer: undefined, cardId: '' }
     if (!existing) registerPendingSwitchCard(record)
     const wsRef = { ...ws, token: record.token, index: Number.isInteger(ws.index) ? ws.index : 0 }
@@ -3913,7 +3932,7 @@ export function apply(ctx) {
       const cands = await sessionCandidates(bot, chat)
       const fresh = await buildWorkspaceRows(bot, chat, cands)
       console.log('[fs] /switch back to workspace list (card updated in place)')
-      await sendWorkspaceCard(bot, chatId, chat, fresh, record)
+      await sendWorkspaceCard(bot, chatId, fresh, record, currentWorkspaceOf(bot, chat, cands))
       return
     }
     const ws = switchRowByIndex(wsRows, i)
@@ -3927,7 +3946,7 @@ export function apply(ctx) {
       const sessRows = await buildSessionRows(bot, chat, ws, cands)
       console.log('[fs] /switch open workspace: ' + ws.path + ' sessions=' + sessRows.length
         + ' (card updated in place)')
-      await sendSessionCard(bot, chatId, chat, ws, sessRows, wsRows, record)
+      await sendSessionCard(bot, chatId, ws, sessRows, wsRows, record)
       return
     }
     if (level === 'ws-new') {
