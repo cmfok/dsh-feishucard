@@ -189,6 +189,14 @@ npm run sync                   # 同步到 profile 副本（含体检 + 校验�
 
 冒烟测试覆盖 / covered by the smoke suite：helper 注册、入站消息管线（会话创建/消息投递）、流式卡片（create/PATCH/schema/工具面板/状态符号/note/seal）、命令处理、链路稳定性。Helper registration, inbound pipeline, streaming card lifecycle, commands, end-to-end stability.
 
+## 独立审查门槛 / Review gate
+
+推送前过一道**独立**的 AI 代码审查（`code-review-gate` skill，底座 [alibaba/open-code-review](https://github.com/alibaba/open-code-review)，模型 `deepseek-flash`）。
+判据：出现 `critical` / `high` 即 **BLOCK，不得放行**；只出现 `medium` 为 WARN。报告落盘 `output/code-review/<repo>-<时间戳>/REPORT.md`。
+
+- 门槛**只审不改** —— 出报告 → **逐条打开源码复核**（区分真缺陷与误报）→ 修 → **重跑一次**取证，不"改了就说好了"。
+- 当前状态：`0.4.25` 修完上一轮 BLOCK 的全部 high/medium（复核 4/4 全真、零误报）。
+
 ## License
 
 MIT

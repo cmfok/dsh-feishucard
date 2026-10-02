@@ -105,8 +105,38 @@ export function apply(ctx) {
   // 两张卡同源镜像同一批会话事件 → 用户看到同内容两张卡。
   // 处置：自动轮开卡前先看这张表 —— 短时间内（AUTO_CARD_REUSE_MS）同一个群刚封过卡，
   // 就把这一轮**接在那张卡上**，不再另开（正文照旧不丢、也不重复）。
-  const recentTurnCards = new Map()
+  // 2026-10-02 代码审查 low#11：这张表也必须**跨代际**共享 —— 两个兄弟
+  // （activeTurns / liveCardRegistry）已经搬到 globalThis，而热重载会清空每代模块状态：
+  // 一重载，3 分钟的复用窗口就没了，紧接着起的 goal 轮又会另开一张卡去镜像同一批事件
+  //（正是这张表要防的"同内容两张卡"）。
+  const recentTurnCards = globalThis.__fsRecentTurnCards
+    || (globalThis.__fsRecentTurnCards = new Map())
   const AUTO_CARD_REUSE_MS = 3 * 60 * 1000
+
+  // 跨代际之后这张表**不再随代际清空**，所以得自己收（2026-10-02 审查 low）：
+  // 每条还钉着封口卡（含 blocks）与**上一代的 bot**，而 agentId 每建一个会话就换一个
+  //（/new、`fs-main-<ts>`）⇒ 不剔就是随会话数无限增长。
+  function pruneRecentTurnCards(now) {
+    const at = Number(now) || Date.now()
+    for (const [key, value] of Array.from(recentTurnCards)) {
+      if (!value || at - (Number(value.sealedAt) || 0) > AUTO_CARD_REUSE_MS) recentTurnCards.delete(key)
+    }
+  }
+
+  // 写入即剔（第三轮门槛 low）：读路径上的 prune 位于一串提前 return **之后**
+  //（关掉自动卡 / per-bot 通知开关时根本走不到）⇒ 剔除必须挂到**写**这一侧，
+  // 否则这张跨代际的表照样按"每个 agentId 一条"无限涨。
+  function rememberRecentTurnCard(agentId, entry) {
+    pruneRecentTurnCards()
+    recentTurnCards.set(agentId, entry)
+  }
+
+  // agent 作用域监听的注销函数（2026-10-02 代码审查 high#1）——
+  // `agent.ctx` 是**长生命周期**的：HMR 只换插件代际、不换 agent。每代都往同一个
+  // agent.ctx 上再挂一条 approval/request / user-questions/request，老闭包就把整代插件
+  // （bots / pendingApprovals …）钉在内存里；而且瀑布流里**最早的监听先被调用**
+  // ⇒ 可能是上一代在应答。这里留住 disposer，随本代卸载一起注销（见 ctx.effect）。
+  const agentScopeDisposers = []
 
   // 载荷/正文指纹（只为留痕：飞书对 2.0 卡片只回占位符，正文读不回来；
   // 有了指纹就能在日志里直接比对"两张卡是不是同一段内容"）。djb2，无依赖。
@@ -173,6 +203,11 @@ export function apply(ctx) {
       const obj = JSON.parse(readFileSync(messageIndexPath(), 'utf8') || '{}')
       for (const [id, value] of Object.entries(obj || {})) {
         if (!id || !value || typeof value.label !== 'string') continue
+        // 2026-10-02 代码审查 low#10：**内存里已有的条目不许被盘上的旧值盖回去**。
+        // quoteHintFor() 每次未命中都会再读一次盘（"每条引用都 readFileSync + JSON.parse"
+        // 就是这么来的），而卡片每次成功同步都会重取标签、只等 300ms 去抖落盘
+        // ⇒ 覆盖会把刚刷新的标签退回旧值。跳过快照里已有的 key，只补磁盘新增的。
+        if (recentMessages.has(id)) continue
         recentMessages.set(id, { label: value.label, at: Number(value.at) || 0 })
         added += 1
       }
@@ -1231,7 +1266,7 @@ export function apply(ctx) {
           try {
             const els = (payload && payload.body && payload.body.elements) || []
             console.log('[fs] card created chat=' + chatId + ' msg=' + messageId
-              + ' elements=' + els.length + ' payload_md5=' + shortHash(JSON.stringify(payload)))
+              + ' elements=' + els.length + ' payload_hash=' + shortHash(JSON.stringify(payload)))
           } catch {}
         }
         card.lastSyncAt = Date.now()
@@ -1402,22 +1437,31 @@ export function apply(ctx) {
     return stop
   }
 
-  // 卸载（含 HMR 热重载）时：停掉全部在跑的 watcher，把它们那张卡就地封口，
-  // 并把**还没结束的活跃回合移交**给全局表（见 activeTurns 上方的说明）。
+  // 卸载（含 HMR 热重载）时：① 注销本代挂在 `agent.ctx`（长生命周期）上的监听；
+  // ② 停掉全部在跑的 watcher —— **但不封口**（卡片留给新实例"续卡"，见下面 ③）。
   ctx.effect(() => () => {
-    // ① 移交活跃回合：新实例靠这张表才知道"上一代那一轮还在跑"，
-    //    否则 CM 的下一条消息会另起一轮、另开一张卡。
+    // ① 活跃回合**不需要"移交"**（2026-10-02 代码审查 low#12）：`activeTurns` 本身就是
+    //    globalThis.__fsActiveTurns 那个 Map（见上方声明）⇒ 跨代际共享是构造上就有的。
+    //    旧那段 `if (!shared.has(key)) shared.set(...)` 永远搬不动任何一条（has 恒为 true），
+    //    `移交 N 个活跃回合` 那行日志不可达 —— 已删除，免得后来者以为还需要一次搬运。
+    // ② 注销本代挂在 **agent.ctx**（长生命周期）上的监听：不注销就是每次热重载往同一个
+    //    agent 上再叠一条，老闭包钉住整代插件状态，且瀑布流里最早的监听先被调用
+    //    ⇒ 可能是上一代在应答（评审 high#1）。
     try {
-      const shared = globalThis.__fsActiveTurns || (globalThis.__fsActiveTurns = new Map())
-      let moved = 0
-      for (const [key, value] of activeTurns) {
-        if (!shared.has(key)) { shared.set(key, value); moved++ }
+      let unbound = 0
+      for (const off of agentScopeDisposers.splice(0)) {
+        // 记**尝试次数**而不是成功次数（2026-10-02 审查 low）：这行日志是"本代监听已注销"的
+        // 可验证信号，若某个 disposer 抛错被静默吞掉，少计就会把"没拆干净"伪装成正常。
+        try { off() } catch (error) {
+          console.log('[fs] dispose(热重载): 某个 agent 作用域监听注销失败 ' + String(error && error.message || error))
+        } finally { unbound += 1 }
       }
-      if (moved > 0) console.log('[fs] dispose(热重载): 移交 ' + moved + ' 个活跃回合给新实例')
+      // 留痕（可复验）：每次热重载都应注销掉**本次挂上去的那几条**；这个数字一直涨才说明在叠。
+      if (unbound > 0) console.log('[fs] dispose(热重载): 注销 ' + unbound + ' 个 agent 作用域监听（防跨代叠加）')
     } catch (error) {
-      console.log('[fs] dispose(热重载): activeTurns 移交失败 ' + String(error && error.message || error))
+      console.log('[fs] dispose(热重载): 注销 agent 作用域监听失败 ' + String(error && error.message || error))
     }
-    // ② 停 watcher — **但不封口**（2026-10-02 实测副作用：一封口就把观众丢在
+    // ③ 停 watcher — **但不封口**（2026-10-02 实测副作用：一封口就把观众丢在
     //    「后续内容见新的卡片」而下面根本没有新卡）。卡片留给新实例"续卡"继续更新：
     //    先把登记表快照下来，停 watcher 时会被顺手删掉，停完再放回去。
     const keep = Array.from(liveCardRegistry.entries())
@@ -2516,7 +2560,7 @@ export function apply(ctx) {
       // 留痕：下次"卡片到底写了什么"不用再靠猜（飞书对 2.0 卡片只回占位符，读不回来）。
       console.log('[fs] turn sealed: status=' + card.status + ' silent=' + silent
         + ' failure=' + (failure ? failure.text : 'none')
-        + ' reply_md5=' + shortHash(String(reply)) + ' reply_len=' + String(reply).length
+        + ' reply_hash=' + shortHash(String(reply)) + ' reply_len=' + String(reply).length
         + ' card=' + (card.token || '-') + ' blocks=' + card.blocks.length
         + ' reply=' + JSON.stringify(String(reply).slice(0, 160)))
       card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
@@ -2546,18 +2590,27 @@ export function apply(ctx) {
       // ⚠️ **只在「本来就会开结论卡」的回合上做去重**：短回合（未达阈值／纯旁白）完全不受影响。
       // 否则同一进程里两轮相同文本的短回复会被误并（冒烟用例大量是短回合）。
       const conclusionEligible = !notSpoken && !narrationOnlyTurn && elapsedMs >= splitMinMs
+      // 2026-10-02 代码审查 low#13：这个 32 位指纹同时充当**结论去重的 key**，撞了就会把
+      // 一条正常结论静默换成"✅ 本轮已完成…"。
+      // ⚠️ 但**不许靠"掺盐"来防撞**（第三轮门槛 medium#2）：这张表挂在 globalThis 上，
+      // 存在的意义就是**跨代际**去重（上一代的旧代码可能还在收尾同一段回复）；一旦改了
+      // key 的推导，旧代码写进去的条目就永远对不上 ⇒ 升级后那一次热重载的去重直接失效，
+      // 用户又会看到一次"同内容两张卡"。⇒ key 推导保持**跨版本稳定**，防撞改用**长度**
+      // 作为**第二判据**（分开存、分开比；旧条目没有 len 时按"兼容"放过）。
       const replyHash = conclusionEligible ? shortHash(String(reply)) : ''
+      const replyLen = String(reply).length
       let duplicateConclusion = false
       if (conclusionEligible) {
         const prevConclusion = conclusionSeen.get(turnAgent.id)
         duplicateConclusion = Boolean(prevConclusion)
           && prevConclusion.hash === replyHash
+          && (prevConclusion.len === undefined || prevConclusion.len === replyLen)
           && (Date.now() - prevConclusion.at) < CONCLUSION_DEDUPE_WINDOW_MS
         if (duplicateConclusion) {
           console.log('[fs] duplicate conclusion suppressed: agent=' + turnAgent.id
             + ' hash=' + replyHash + ' age_ms=' + String(Date.now() - prevConclusion.at))
         } else {
-          conclusionSeen.set(turnAgent.id, { hash: replyHash, at: Date.now() })
+          conclusionSeen.set(turnAgent.id, { hash: replyHash, len: replyLen, at: Date.now() })
         }
       }
       // 纯旁白的一轮不开结论卡：卡面上只有一行 🎯 目的行 = 无信息卡片。
@@ -2594,7 +2647,7 @@ export function apply(ctx) {
       if (!replaced) card.blocks.push({ type: 'message', text: reply })
       // 2026-09-27：记下这张刚封口的回合卡 —— 同一轮里紧接着起的 goal/notice 自动轮
       // 会在 AUTO_CARD_REUSE_MS 内复用它，而不是另开一张（见 recentTurnCards 注释）。
-      recentTurnCards.set(turnAgent.id, { card, bot, chatId, sealedAt: Date.now() })
+      rememberRecentTurnCard(turnAgent.id, { card, bot, chatId, sealedAt: Date.now() })
       if (splitConclusion) {
         console.log('[fs] conclusion split: agent=' + turnAgent.id + ' elapsed=' + elapsedMs
           + 'ms threshold=' + splitMinMs + 'ms tools=' + card.tools.size
@@ -2612,7 +2665,7 @@ export function apply(ctx) {
           //    （日志特征：`conclusion card opened … card=-`）＝结论只靠纯文本兜底、卡片链条断掉。
           //    ⇒ 必须自己检查 token，未拿到就抛进 catch 走单卡回退。
           if (!conclusion.token) throw new Error('conclusion card not created (createFailed/circuitOpen)')
-          recentTurnCards.set(turnAgent.id, { card: conclusion, bot, chatId, sealedAt: Date.now() })
+          rememberRecentTurnCard(turnAgent.id, { card: conclusion, bot, chatId, sealedAt: Date.now() })
           console.log('[fs] conclusion card opened: agent=' + turnAgent.id
             + ' card=' + (conclusion.token || '-'))
           return {
@@ -2874,6 +2927,11 @@ export function apply(ctx) {
       if (pendingQ && text) {
         pendingQuestions.delete(chatId)
         if (pendingQ.timer) clearTimeout(pendingQ.timer)
+        // 2026-10-02 代码审查 medium#3：这条是**文字回答的主路径**（飞书每条纯文本都走这里），
+        // 原来漏了 splitLiveCardAfterAnswer ⇒ 回了"批准"之后，上面那张流式卡不被冻结，
+        // 整轮后续内容继续堆到他已经划过去的那张卡上（＝"我答了，它却没动"那次回归）。
+        // 顺序与 handleInbound 的文字路径一致：先换卡，再改「已收到」态，最后 resolve。
+        splitLiveCardAfterAnswer(pendingQ.agentId)
         // 2026-10-02：卡片要跟着变成「✅ 已收到」态（否则按钮仍可点、点了报 record not found）
         finalizeQuestionCard(pendingQ, text)
         pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
@@ -3778,7 +3836,16 @@ export function apply(ctx) {
     const scope = agent.ctx
     if (!scope || typeof scope.on !== 'function') return
     approvalBoundAgents.add(agent)
-    scope.on('approval/request', (request, next) => handleApprovalRequest(request, next, 'agent-scope'))
+    // 2026-10-02 代码审查 high#1：**必须**留住 disposer —— agent.ctx 活得比插件代际长，
+    // 不注销就是每次热重载都往同一个 agent 上再叠一条（老闭包钉住整代插件状态，
+    // 且瀑布流里最早的监听先被调用 ⇒ 可能是上一代在应答）。注销点见 ctx.effect。
+    // cordis 的 `Scope#on` **确实返回 disposer**（`@deepseek-ai/cordis/lib/index.js:371` 的 JSDoc：
+    // "@returns a disposer removing the listener; `true` if it was still registered"）⇒ 这不是猜的 API。
+    // 但**取不到时必须喊出来**（2026-10-02 审查 medium#1）：一旦上游改了返回值，
+    // 监听会在每一代静默叠加，而日志里一个字都没有 —— 那样这条修复就成了"沉默的空操作"。
+    const off = scope.on('approval/request', (request, next) => handleApprovalRequest(request, next, 'agent-scope'))
+    if (typeof off === 'function') agentScopeDisposers.push(off)
+    else console.log('[fs] approval/request: ⚠️ agent 作用域 disposer 不可用（监听可能跨代叠加）')
     console.log('[fs] approval/request: bound to agent scope for ' + agent.id)
   }
 
@@ -3805,13 +3872,35 @@ export function apply(ctx) {
   const FS_APPROVAL_BRIDGE = globalThis.__fsApprovalBridge
     || (globalThis.__fsApprovalBridge = { decide: null, original: null, service: null })
 
+  // 判断"这个方法是不是本桥包出来的"（2026-10-02 真机取证后补）：
+  // 判据**不能落在对象身份上** —— 实测每次热重载 `ctx.get('approval')` 都给出**新的代理对象**
+  // （日志里 `实例已更换，重新包装 decide()` 每代都打一次），而属性写入落到**同一个底层服务**上。
+  // 若照"身份不同就重包"办，`original` 会指向上一代自己那个 wrapper，**每代再叠一层**
+  // （层数＝热重载次数；非飞书审批要逐层下沉，且最老那层理论上仍可能应答 —— 正是 high#1 的同类隐患）。
+  // ⇒ 三重判据：① 我们打的标记 ② 就是我们上一次装的那个函数 ③ 兜底看函数源码里的标识符
+  //   （③ 只为认领**加标记之前**那几代已经装进去的旧包装层，认出来就补标记、绝不再包）。
+  function isOurApprovalWrapper(fn) {
+    if (typeof fn !== 'function') return false
+    if (fn.__fsApprovalBridgeWrapped) return true
+    if (FS_APPROVAL_BRIDGE.wrapper && fn === FS_APPROVAL_BRIDGE.wrapper) return true
+    try { return /FS_APPROVAL_BRIDGE/.test(Function.prototype.toString.call(fn)) } catch { return false }
+  }
+
   function installApprovalBridge() {
     const approval = ctx.get('approval')
     if (!approval || typeof approval.decide !== 'function') return false
-    if (FS_APPROVAL_BRIDGE.original) return true      // 已装过；decide 由下面的赋值刷新
+    const current = approval.decide
+    // ① 已经包过了（同一个底层服务，只是代理对象又换了新的）⇒ 只刷新指向，**绝不叠第二层**。
+    if (isOurApprovalWrapper(current)) {
+      try { current.__fsApprovalBridgeWrapped = true } catch { }
+      FS_APPROVAL_BRIDGE.service = approval
+      return true
+    }
+    // ② 真换了一个**没被包过的**实例（审批插件重载/升级）⇒ 依实例重包（low#4 原意）。
+    if (FS_APPROVAL_BRIDGE.original) console.log('[fs] approval[service]: 发现未被包装的实例，重包 decide()')
     FS_APPROVAL_BRIDGE.service = approval
-    FS_APPROVAL_BRIDGE.original = approval.decide.bind(approval)
-    approval.decide = function (req, session) {
+    FS_APPROVAL_BRIDGE.original = current.bind(approval)
+    const wrapper = function (req, session) {
       const relay = FS_APPROVAL_BRIDGE.decide
       if (typeof relay === 'function') {
         let out
@@ -3823,7 +3912,10 @@ export function apply(ctx) {
       }
       return FS_APPROVAL_BRIDGE.original(req, session)
     }
-    console.log('[fs] approval[service]: decide() wrapped for Feishu')
+    wrapper.__fsApprovalBridgeWrapped = true
+    FS_APPROVAL_BRIDGE.wrapper = wrapper
+    approval.decide = wrapper
+    console.log('[fs] approval[service]: decide() wrapped for Feishu（只包一层）')
     return true
   }
 
@@ -4342,7 +4434,10 @@ export function apply(ctx) {
     const scope = agent.ctx
     if (!scope || typeof scope.on !== 'function') return
     questionBoundAgents.add(agent)
-    scope.on('user-questions/request', (request, next) => handleUserQuestionRequest(request, next, 'agent-scope'))
+    // 2026-10-02 代码审查 high#1：同 approval —— agent.ctx 长生命周期，disposer 必须留住。
+    const off = scope.on('user-questions/request', (request, next) => handleUserQuestionRequest(request, next, 'agent-scope'))
+    if (typeof off === 'function') agentScopeDisposers.push(off)
+    else console.log('[fs] user-questions/request: ⚠️ agent 作用域 disposer 不可用（监听可能跨代叠加）')
     console.log('[fs] user-questions/request: bound to agent scope for ' + agent.id)
   }
 
@@ -4611,7 +4706,8 @@ export function apply(ctx) {
   }
 
   function openGoalCard(agent, bot, chatId, info, existing) {
-    const state = { card: null, stop: null }
+    // state.rotate：把"表格额度换卡"那条通道交出去（见 makeAutoCardEntry.split —— 评审 low#7）
+    const state = { card: null, stop: null, rotate: null }
     // 表格额度换卡：与普通回合的 rotateTables 同机制（旧卡留表格，后续写新卡，游标接续不丢不重）
     const rotate = () => {
       if (!state.stop || !state.card || state.card.status !== 'running') return
@@ -4628,6 +4724,7 @@ export function apply(ctx) {
       const live = autoCards.get(agent.id)
       if (live) live.card = fresh
     }
+    state.rotate = rotate
     const card = existing || makeCardState(agent)
     if (existing) {
       // 2026-09-27（CM 实证"一个内容发两次"）：复用同一轮刚封口的那张回合卡 ——
@@ -4656,7 +4753,17 @@ export function apply(ctx) {
   // `user/message` + `source.kind === 'subagent-settled'` 就立刻播报 —— 与父回合状态无关。
   // 双层播报：① 纯文本（载荷最简、失败面最小，必达）→ ② 详情卡（复用同一套流式卡）。
   const noticeCursor = new Map()      // agentId -> 已扫过的事件下标
+  // 2026-10-02 代码审查 low#5：这张表按"每个子代理回执一条"增长、**从不清理**，
+  // 而桥是奔着连跑几天的 ⇒ 慢速无界内存增长。改成 FIFO 上限（只留最近若干条去重键）。
   const noticeSeen = new Set()        // childId#seq 去重（进程内；重启后新的回执才有新 seq）
+  const NOTICE_SEEN_MAX = 500
+  function rememberNoticeSeen(key) {
+    noticeSeen.add(key)
+    while (noticeSeen.size > NOTICE_SEEN_MAX) {
+      const oldest = noticeSeen.values().next().value
+      noticeSeen.delete(oldest)
+    }
+  }
 
   // 枚举"绑定了飞书会话的 live agent"（与 findChatForAgent 用同一套注册表结构）
   // ⚠️ 这个函数跑在 1s 定时器里：任何异常都必须在这里吃掉，
@@ -4664,11 +4771,19 @@ export function apply(ctx) {
   function feishuChatAgents() {
     const out = []
     try {
+      // 2026-10-02 代码审查 medium#2：**句柄是不持久化的**（handle 只在内存里有），
+      // 热重载 / 重启后 `s.handle` 还没被下一条入站消息重建，旧实现就整段跳过
+      // ⇒ `pollSubagentNotices` 与 `refreshLiveCards` 对着空集合空转，回执播报和目标条
+      // 刷新静默失效（正是这次要修的那一类缺陷）。改为**先按 session id 找活 agent**
+      //（`ctx.get('agents').list()`，与 resolveAgent 的活会话复用同一条判据），
+      // 找不到才退回句柄。
+      const live = liveAgentsById()
       for (const bot of bots.values()) {
         if (!bot || !bot.chats || typeof bot.chats[Symbol.iterator] !== 'function') continue
         for (const [chatId, chat] of bot.chats) {
           for (const s of (chat && chat.sessions) || []) {
-            const agent = s && s.handle && s.handle.agent
+            if (!s || !s.id) continue
+            const agent = live.get(String(s.id)) || (s.handle && s.handle.agent)
             if (agent && agent.id) out.push({ agent, bot, chatId })
           }
         }
@@ -4766,7 +4881,7 @@ export function apply(ctx) {
         if (src.kind !== 'subagent-settled') continue
         const key = String(src.senderSessionId || '?') + '#' + String(event.seq)
         if (noticeSeen.has(key)) continue
-        noticeSeen.add(key)
+        rememberNoticeSeen(key)
         if (bot.cfg && bot.cfg.notifyAgentNotices === false) continue   // per-bot 开关
         try {
           await announceSubagentNotice(agent, bot, chatId, event, src)
@@ -4837,7 +4952,10 @@ export function apply(ctx) {
           // 必须**立刻**把新卡建出来：只登记不建卡的话，用户点完按钮会看到"什么都没发生"，
           // 直到下一个事件才冒出新卡（runTurn 的 split 也是先 syncCard 再挂 watcher）。
           void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => {})
-          state.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, null)
+          // 2026-10-02 代码审查 low#7：这里原来传 null ⇒ 答题后新开的这张卡**没有换卡通道**，
+          // 一旦满 5 张表还有待镜像事件，demoteOverflowTables() 就会把多出来的表降级成代码块，
+          // 破坏"表格额度换卡…永远不降级表格"那条不变量。改成接上 openGoalCard 的 rotate。
+          state.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, state.rotate || null)
           entry.card = fresh
           console.log('[fs] auto card split after answer: agent=' + agent.id + ' chat=' + entry.chatId)
         } catch (error) {
@@ -4877,6 +4995,13 @@ export function apply(ctx) {
       // 不依赖「先来一条飞书消息」——插件重载后已存在的老 agent 不会再走
       // handleInbound，只靠那条路径会漏挂 ⇒ 审批又被 GUI 桥接抢答。
       bindFeishuAgentApproval(agent)
+      // 2026-10-02（第三轮门槛 medium#1）：**这是上一轮"注销旧监听"修复带出来的新缺口** ——
+      // 提问/计划审查那条 agent 作用域监听原本只从 handleInbound 与 /plan 补挂；
+      // 以前"从不注销"把这个不对称掩盖住了，现在每次重载都会拆掉旧监听，于是
+      // **老 agent 起自动轮（goal/notice，不走 handleInbound）时手上没有 agent 作用域监听**，
+      // 而根级监听又被 GUI 桥接抢在前面 ⇒ 提问/计划审查只弹电脑、飞书收不到卡。
+      // 两条水位线必须共用同一个补挂点（agent/status 是唯一"与入站无关"的那一个）。
+      bindFeishuAgentQuestions(agent)
 
       if (status === 'idle') {
         const live = autoCards.get(agent.id)
@@ -4921,7 +5046,7 @@ export function apply(ctx) {
           card.status = (failure || silent) ? 'error' : 'sealed'
           card.blocks.push({ type: 'message', text: (failure || silent) ? '❌ 本轮失败' : '✅ 本轮结束' })
           console.log('[fs] auto card sealed: agent=' + agent.id + ' kind=' + (live.kind || 'goal') + ' failure=' + (failure ? failure.text : 'none') + ' silent=' + silent
-            + ' closing_md5=' + shortHash(String(closing.text || '')) + ' closing_len=' + String(closing.text || '').length
+            + ' closing_hash=' + shortHash(String(closing.text || '')) + ' closing_len=' + String(closing.text || '').length
             + ' card=' + (card.token || '-') + ' blocks=' + card.blocks.length)
           void syncCard(live.bot, live.chatId, card, true).catch(() => {})
         }
@@ -4951,6 +5076,7 @@ export function apply(ctx) {
       // 2026-09-27（CM 实证"一个内容发两次"）：**目标轮**在同一轮里紧跟着普通回合卡起来时，
       // 接在那张卡上、**不再另开**（两张卡同源镜像同一批事件 = 用户看到同内容两张卡）。
       // 回执轮（notice）保持原行为 —— 它是子代理/后台 job 唤起的独立一轮，单独一张卡更好认（smoke 22/23 覆盖）。
+      pruneRecentTurnCards()      // 读之前先剔过期项（见 pruneRecentTurnCards 上方说明）
       const recent = recentTurnCards.get(agent.id)
       const reuse = (info.kind === 'goal' && recent && recent.chatId === where.chatId
         && (Date.now() - recent.sealedAt) <= AUTO_CARD_REUSE_MS

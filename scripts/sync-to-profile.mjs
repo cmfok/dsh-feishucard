@@ -53,16 +53,38 @@ if (!existsSync(target)) {
 }
 
 // 守卫（见文件头）：target 已经是链接 ⇒ 它就是源码目录，绝不能往里面写备份/拷贝。
-const isLink = (() => { try { return lstatSync(target).isSymbolicLink() } catch { return false } })()
-const sameReal = (() => {
-  try { return realpathSync(target).toLowerCase() === realpathSync(PKG_ROOT).toLowerCase() } catch { return false }
+const linkTarget = (() => {
+  try { return lstatSync(target).isSymbolicLink() ? realpathSync(target) : '' } catch { return '' }
 })()
-if (isLink || sameReal) {
-  console.error('[sync] REFUSED: target is a link to the source, not a real copy.')
+const isLink = linkTarget !== ''
+// 2026-10-02 代码审查 low#2：大小写只在 Windows 上折叠 —— 大小写敏感的文件系统里，
+// 仅大小写不同的**两个真目录**会被误判成同一个，从而挡住一次合法同步。
+const sameReal = (() => {
+  try {
+    const [t, s] = [realpathSync(target), realpathSync(PKG_ROOT)]
+    return process.platform === 'win32' ? t.toLowerCase() === s.toLowerCase() : t === s
+  } catch { return false }
+})()
+// 2026-10-02 代码审查 low#3：`--dry-run` 什么都不写，是**只读诊断**入口 —— 守卫要放在它后面，
+// 否则链接形态下连"看一眼文件清单"都做不到（原来直接 exit 3）。
+if (!dryRun && (isLink || sameReal)) {
+  console.error('[sync] REFUSED: target is not a real copy (it is / resolves to the source itself).')
   console.error('[sync]   target = ' + target)
-  console.error('[sync]   real   = ' + (sameReal ? realpathSync(target) : '(link)'))
-  console.error('[sync]   这种形态下运行时**直接加载源码**，改完即由 HMR 自动重载 —— 既不需要、也不要再跑 sync。')
-  console.error('[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 CM 授权后重启 dsh web。')
+  console.error('[sync]   real   = ' + (isLink ? linkTarget : realpathSync(target)))
+  if (sameReal) {
+    console.error('[sync]   它**就是源码目录**：运行时直接加载源码，改完即由 HMR 自动重载 —— 既不需要、也不要再跑 sync。')
+    // 第四轮门槛 low：这条建议必须与**实际形态**匹配 —— 真身是链接时才说"删掉链接"；
+    // 若 target 本身就是实体目录、只是 realpath 恰好等于源码根（例如两者就是同一条路径），
+    // 那就没有链接可删，"删掉该链接"会把人带沟里。
+    console.error(isLink
+      ? '[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 CM 授权后重启 dsh web。'
+      : '[sync]   若要退回实体副本：把它换成独立副本（或改用指向源码的链接）→ 重跑本脚本 → 经 CM 授权后重启 dsh web。')
+  } else {
+    // 2026-10-02 代码审查 low#1：链接指向的是**别处**时，"link to the source"是错的，
+    // 而照旧建议"删掉该链接"可能毁掉一个刻意搭的暂存检出 —— 先把真实目标打出来再让人决定。
+    console.error('[sync]   ⚠️ 它是一条指向**别处**的链接（不是本仓库源码）。先看清上面的 real 再决定，')
+    console.error('[sync]      不要盲目删除（那可能是刻意搭的暂存检出）。要同步就先把这条链接换成实体副本。')
+  }
   process.exit(3)
 }
 
@@ -119,7 +141,14 @@ for (const r of rows) {
   if (!same) { bad += 1; console.error('[sync] MISMATCH after copy: ' + r.rel) }
 }
 console.log(bad === 0 ? '[sync] OK: deployed copy is byte-identical to source' : '[sync] FAIL: ' + bad + ' file(s) mismatch')
-// 🔴 2026-10-01 CM 明令「禁止随意重启」：sync 之后改动是**待生效**，
-// 只有 CM 明确授权才重启（见 ~/.dsh/AGENTS.md ①-补）。
-console.log('[sync] 改动已进入「待生效」队列：需 CM 授权重启后才会生效（不许自行重启）。')
+if (bad === 0) {
+  // 🔴 2026-10-01 CM 明令「禁止随意重启」：sync 之后改动是**待生效**，
+  // 只有 CM 明确授权才重启（见 ~/.dsh/AGENTS.md ①-补）。
+  console.log('[sync] 改动已进入「待生效」队列：需 CM 授权重启后才会生效（不许自行重启）。')
+} else {
+  // 2026-10-02 代码审查 medium#1：原来这一行**无条件**打印 ⇒ 复验失败的同步也会被读成
+  // "进队列了、重启就生效"，等于把失败伪装成成功。失败必须显式说"没部署"。
+  console.error('[sync] 🔴 同步未成功：改动**未**部署（上面 ' + bad + ' 个文件哈希不一致）。')
+  console.error('[sync]    请先查清 mismatch 再重试；**不要**按"待生效"处理 —— 重启也不会生效。')
+}
 process.exit(bad === 0 ? 0 : 1)

@@ -98,10 +98,55 @@ globalThis.fetch = async (url, init) => {
   return { status: 404, text: () => Promise.resolve('unhandled: ' + u) }
 }
 
+// ---- mocked agent.ctx（2026-10-02 补；评审 low#3）------------------------------
+// 插件把 approval/request 与 user-questions/request 挂在 **agent.ctx**（长生命周期）上，
+// 卸载时靠 disposer 注销。此前 mock agent **没有 ctx** ⇒ `scope.on` 从不被调用、
+// `agentScopeDisposers` 恒为空 ⇒ "忘了注销 / 注销不生效"在冒烟里永远不会变红。
+// 这里补一个真的返回 disposer 的 `on`，并记账。
+// 两个 mock agent 共用**一个工厂**（第四轮门槛 low）：此前 `agentCtx.on` 与 `freshCtx.on`
+// 是两份近乎一样的复制品，只差一个计数器 —— 以后修"注销记账"很容易只改一处、两处漂移。
+function makeScopedCtx(onDispose) {
+  const store = new Map()               // event -> [listener]
+  return {
+    count: (name) => (store.get(name) || []).length,
+    ctx: {
+      on(name, listener) {
+        if (!store.has(name)) store.set(name, [])
+        store.get(name).push(listener)
+        return () => {
+          const list = store.get(name) || []
+          const i = list.indexOf(listener)
+          // 第四轮门槛 low：**只有真的移除了才计数**（原来重复 dispose / 拆不存在的条目也 +1，
+          // 于是这个数字不再是"移除了几条监听"的忠实信号）。
+          if (i < 0) return
+          list.splice(i, 1)
+          if (typeof onDispose === 'function') onDispose()
+        }
+      },
+    },
+  }
+}
+let agentScopeDisposed = 0              // disposer **真正移除**掉一条监听的次数
+const primaryScope = makeScopedCtx(() => { agentScopeDisposed += 1 })
+const agentCtx = primaryScope.ctx
+function agentScopeCount(name) { return primaryScope.count(name) }
+
+// 第二个 mock agent：**从未收到过任何飞书消息**（＝重载后自己起自动轮的老 agent）。
+// 它只该靠 agent/status 那一条补挂路径拿到两条水位线 —— 用它来验"两条必须共用同一补挂点"。
+const freshScope = makeScopedCtx()
+const freshCtx = freshScope.ctx
+function freshCount(name) { return freshScope.count(name) }
+const freshAgent = {
+  id: 'agent-smoke-auto',
+  ctx: freshCtx,
+  session: { header: { cwd: WORKSPACE }, snapshotEvents: () => [], events: [] },
+}
+
 // ---- mocked agent ------------------------------------------------------------
 const agentEvents = []
 const agent = {
   id: 'agent-smoke-1',
+  ctx: agentCtx,
   session: {
     header: { cwd: WORKSPACE },
     snapshotEvents: () => agentEvents,
@@ -124,6 +169,10 @@ const agent = {
 // ---- mocked DSH context --------------------------------------------------------
 const intervals = []
 const effects = []
+// ctx.effect 的 setup 若**返回函数**，那个返回值就是真实的 cleanup（卸载钩子就是这么注册的）。
+// 收集起来，用例 47 才能**按行为**找到卸载钩子，而不是假设"index.js 里第一个 ctx.effect"
+//（第四轮门槛 medium：位置假设会让用例与 index.js 的注册顺序耦合）。
+const effectCleanups = []
 const registeredRoutes = []
 const registeredTools = []
 let createdSessions = 0
@@ -229,7 +278,12 @@ const ctx = {
     },
   },
   interval(fn) { intervals.push(fn); return () => {} },
-  effect(fn) { effects.push(fn); const cleanup = fn(); return cleanup },
+  effect(fn) {
+    effects.push(fn)
+    const cleanup = fn()
+    if (typeof cleanup === 'function') effectCleanups.push(cleanup)
+    return cleanup
+  },
   webServer: { register: (route) => registeredRoutes.push(route) },
   tools: { register: (t) => registeredTools.push(t) },
   inject(keys, callback) {
@@ -2003,7 +2057,6 @@ console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/
   ok(a2.answers[0].selected[0] === 'Keep planning', '第二个选项回传 `Keep planning`')
 
   // (e) 文字「批准」＝ 批准（CM 习惯回中文；批准标签是英文硬约定）
-  const mark3 = sentCards.length
   const r3 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
   await drain()
   feedInbound('om_plan_approve_text', '批准')
@@ -2013,7 +2066,6 @@ console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/
 
   // (f) 带补充说明的文字 ⇒ 仍按"继续修改"的反馈回给模型。
   //     方向是刻意的：误判成"留在计划模式"可恢复，误判成"已批准"不可恢复（直接开工）。
-  const mark4 = sentCards.length
   const r4 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
   await drain()
   feedInbound('om_plan_feedback_text', '同意，但第 2 步先改成只读排查')
@@ -2208,6 +2260,47 @@ console.log('46) 插话必须【新开卡片】+ 醒目彩色块（2026-10-02 CM
   release()
   agent.whenIdle = prevIdle
   await drain()
+}
+
+console.log('47) 热重载卸载：agent.ctx 上的监听必须被注销（high#1 的核心修法，此前零覆盖）')
+{
+  // ⭐ 敏感性检查（第三轮门槛 medium#1 的修复）：**从未收到过飞书消息**的 agent，
+  // 只靠 agent/status 一次补挂，就必须同时拿到 approval/request **和** user-questions/request。
+  // 上一版代码只挂前者 ⇒ 重载后它起自动轮（goal/notice）时问句会只弹电脑、飞书收不到卡；
+  // 那条缺陷在**这里会变红**（不是"写了就算验过"）。
+  emitCtx('agent/status', { agent: freshAgent, status: 'stopped' })
+  await drain()
+  ok(freshCount('approval/request') === 1, '新 agent 靠 agent/status 挂上审批水位线')
+  ok(freshCount('user-questions/request') === 1, '新 agent 靠 agent/status 也挂上问句水位线（上一版会漏）')
+
+  // 再确保本代已经绑过（agent/status 的任何状态都会补挂审批水位线）
+  emitCtx('agent/status', { agent, status: 'stopped' })
+  await drain()
+  const bound = agentScopeCount('approval/request')
+  ok(bound >= 1, '插件确实把 approval/request 挂到了 agent.ctx 上（本次 ' + bound + ' 条）')
+
+  // 再取一次：同一个 agent 重复绑定**不许**叠加（WeakSet 幂等）
+  emitCtx('agent/status', { agent, status: 'stopped' })
+  await drain()
+  ok(agentScopeCount('approval/request') === bound, '同一代重复绑定不叠加（仍是 ' + bound + ' 条）')
+
+  // 模拟 HMR 卸载：**按行为**找出卸载钩子（第四轮门槛 medium）—— 不再假设
+  // "第一个 ctx.effect 就是卸载钩子"（那样 index.js 一旦在前面多注册一个 effect，
+  // 这个用例要么误报失败、要么去卸载别的东西）。判据就是它该有的效果：
+  // 执行后本代挂上去的 agent 作用域监听必须**全部**消失（两个 mock agent 都算）。
+  const beforeDisposed = agentScopeDisposed
+  ok(effectCleanups.length >= 1, '捕获到 ctx.effect 的 cleanup（' + effectCleanups.length + ' 个）')
+  let unloaded = false
+  for (const cleanup of effectCleanups) {
+    cleanup()
+    if (agentScopeCount('approval/request') === 0 && agentScopeCount('user-questions/request') === 0
+      && freshCount('approval/request') === 0 && freshCount('user-questions/request') === 0) {
+      unloaded = true
+      break
+    }
+  }
+  ok(unloaded, '卸载钩子执行后两条水位线均已注销（不再跨代叠加）')
+  ok(agentScopeDisposed > beforeDisposed, 'disposer 确实移除过监听（移除次数 ' + agentScopeDisposed + '）')
 }
 
 console.log('')

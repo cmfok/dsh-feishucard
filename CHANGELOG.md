@@ -5,6 +5,111 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.25] - 2026-10-02
+
+### Fixed（独立审查门槛判 **BLOCK** ⇒ 逐条修复：1 high / 3 medium / 8 low 真缺陷）
+
+**门槛**：`code-review-gate`（阿里 OpenCodeReview / `deepseek-flash`，13m18s，`fail-on: high`）。
+报告：`output/code-review/dsh-feishucard-20261002-132807/REPORT.md` ——
+**0 critical / 1 high / 3 medium / 12 low**。1 high + 3 medium **逐条打开源码复核，4/4 全真、零误报**；
+12 条 low 里 **11 条已修**，剩 1 条是结构性重构建议（本轮不动，理由见文末"未采纳"）。
+
+| # | 级别 | 位置 | 问题（复核结论） | 修法 |
+|:--|:--|:--|:--|:--|
+| 1 | **high** | agent 作用域监听 | `agent.ctx` 是**长生命周期**的（HMR 只换插件代际、不换 agent），而监听注册后**从不注销** ⇒ 每次热重载往同一个 agent 上再叠一条；老闭包钉住整代插件状态，且瀑布流里**最早的监听先被调用** ⇒ 可能是上一代在应答 | 留住 `scope.on` 的 disposer，统一放进 `agentScopeDisposers`，在 `ctx.effect` 卸载钩子里注销（`approval/request` + `user-questions/request` 两处） |
+| 2 | medium | `feishuChatAgents()` | 枚举靠 `s.handle.agent`，而**句柄不持久化** ⇒ 热重载/重启后 `pollSubagentNotices`（回执播报）与 `refreshLiveCards`（目标条刷新）对空集合空转、静默失效 | 先按 **session id** 找活 agent（`liveAgentsById()`，与 `resolveAgent` 同一条判据），找不到才退回句柄 |
+| 3 | medium | 文字回答路径（入站） | 飞书**纯文本回答**的主路径漏了 `splitLiveCardAfterAnswer()`（另两条回答路径都有）⇒ 回「批准」后旧卡不冻结，后续内容继续堆在用户已划走的那张卡上 | 补上该调用，顺序与 `handleInbound` 一致：先换卡 → 再改「已收到」态 → 最后 `resolve` |
+| 4 | medium | `scripts/sync-to-profile.mjs` | 「改动已进入待生效队列」那行**无条件**打印 ⇒ **复验失败的同步**也会被读成"重启就生效"，把失败伪装成成功 | 只在 `bad === 0` 时打印；失败时显式报「**未**部署，重启也不会生效」并以 exit 1 收尾 |
+
+**同一轮顺手修掉的 8 条 low（皆为真缺陷）**
+
+| 级别 | 位置 | 问题 | 修法 |
+|:--|:--|:--|:--|
+| low | `recentTurnCards` | 唯一没跨代际共享的簿记表：一热重载，3 分钟"复用刚封口的卡"窗口就没了 ⇒ goal 轮又另开一张卡镜像同一批事件（正是它要防的"同内容两张卡"） | 搬上 `globalThis.__fsRecentTurnCards`（与 `activeTurns` / `liveCardRegistry` 一致） |
+| low | `makeAutoCardEntry.split()` | 新 watcher 传的 `onTableBudget` 是 `null` ⇒ 答题后换的新卡**没有换卡通道**，满 5 张表即降级成代码块，破坏"永远不降级表格"的不变量 | `openGoalCard` 暴露 `state.rotate`，split 时接上 |
+| low | `noticeSeen` | 每个子代理回执加一条、**从不清理**（桥要连跑几天）⇒ 慢速无界内存增长 | FIFO 上限 500 条（`rememberNoticeSeen`） |
+| low | `loadMessageIndex()` | 每次未命中都重读盘并**回写覆盖内存**：① 入站路径同步 `readFileSync + JSON.parse`；② 把 300ms 去抖窗口内刚刷新的标签退回旧值 | 跳过内存里已有的 key，只补磁盘新增 |
+| low | `installApprovalBridge()` | 只判"装过"不看实例：一旦 `ctx.get('approval')` 给出另一个实例，新实例的 `decide` 从未被包 ⇒ 飞书审批静默退回 GUI 老路 | 判据从**对象身份**改到**方法自身标记**（`__fsApprovalBridgeWrapped`）：是原始方法才包、已包过只刷新指向 |
+| low | 日志字段名 | djb2（32 位）却叫 `payload_md5` / `reply_md5` / `closing_md5` —— 名字承诺 MD5，会误导下一个 grep 日志的人 | 改名 `payload_hash` / `reply_hash` / `closing_hash`（历史取证引用保持原样） |
+| low | 结论去重 key | 32 位指纹兼作去重 key，撞了就把一条正常结论**静默**换成"✅ 本轮已完成…" | key 拌入正文长度（`shortHash(reply + '#' + len)`） |
+| low | `--dry-run` 诊断 | 链接形态下守卫在 dry-run **之前**，只读诊断也直接 exit 3 | `--dry-run` 不再被守卫拦；另修：大小写只在 Windows 折叠、链接指向**别处**时打印真实目标并区分文案 |
+
+**未采纳（1 条，已在此记录理由）**
+
+- `index.js` 三处"封口 → 开新卡 → 重挂 watcher"的重复逻辑（`rotateAdoptedCard` / `rotateTables` / `makeAutoCardEntry.split`）抽成一个公共函数 ——
+  属**结构性重构**，而这块正是本轮修掉最多回归的地方：**本轮不动核心换卡路径**（风险大于收益），
+  留作后续专项（届时先补一条覆盖三种换卡入口的冒烟用例再动）。
+
+**另：三条同属 low 的建议已按建议修掉并留痕** ——
+`sync-to-profile.mjs` 链接守卫的三处（措辞/大小写/dry-run 顺序）、`smoke.mjs` 两处死变量 `mark3` / `mark4`、
+以及 dispose 里那段"移交活跃回合"死代码（`activeTurns` 本身就是那个全局 Map，`has` 恒为 true，日志不可达）。
+
+**取证（2026-10-02 真机日志，顺手把 low#4 的修法本身也修对）**：实测 `ctx.get('approval')`
+**每代给出新的代理对象**，而那个对象的 `decide` 是**未包装的原始函数**
+（每个新代际都会打 `approval[service]: 发现未被包装的实例，重包 decide()`）⇒
+① **不存在叠层**（上一代的包装随它那个对象一起被丢弃）；② 但**每代都必须重包** ——
+早期"只包一次"的写法在实例换代之后会让飞书审批静默失效。
+⇒ 判据**不能落在对象身份上**（每次都不等，日志里那行 `实例已更换，重新包装 decide()` 每代都打），
+落在**方法自身标记**上才能同时覆盖"实例被换"与"实例被复用"两种 DSH 行为。
+
+**复跑（同一门槛，8m57s）⇒ 上一轮那条 high 已消失，判 WARN：0 critical / 0 high / 1 medium / 3 low。**
+四条逐条处理：
+
+| 级别 | 位置 | 问题 | 处置 |
+|:--|:--|:--|:--|
+| medium | 两个 agent 作用域绑定 | 整条 high#1 修复都押在 `scope.on(...)` 返回 disposer 上 —— 若上游改成"返回 this 以便链式调用"，修复就变成**沉默的空操作**（监听照样叠加、日志一个字都没有） | ① **先取证 API**：`@deepseek-ai/cordis/lib/index.js:371` 的 JSDoc 明写 `@returns a disposer removing the listener`；② 取不到时**喊出来**（`⚠️ agent 作用域 disposer 不可用（监听可能跨代叠加）`） |
+| low | 卸载钩子 | `unbound` 只记成功数 ⇒ 某个 disposer 抛错被吞掉时，"没拆干净"会被少计成正常 | 改记**尝试次数**，并在 catch 里单独留痕 |
+| low | `recentTurnCards` | 搬上 `globalThis` 后**不再随代际清空**，每条又钉着封口卡（含 blocks）与**上一代 bot** ⇒ 随会话数无限增长 | 新增 `pruneRecentTurnCards()`，在读的地方先剔过期项 |
+| low（测试） | smoke 零覆盖 | mock agent **没有 `ctx`** ⇒ `scope.on` 从不被调用、`agentScopeDisposers` 恒为空 —— "忘了注销 / 注销不生效"在冒烟里永远不会变红 | 给 mock agent 配上会记账的 `ctx.on`，**新增用例 47**：绑定 → 断言不叠加 → 执行 effect cleanup → 断言监听全部注销 |
+
+**用例 47 实测**：`挂到了 agent.ctx 上（本次 1 条）` · `同一代重复绑定不叠加（仍是 1 条）` ·
+`卸载后 approval/request 监听已注销` · `卸载后 user-questions/request 监听已注销` ·
+`disposer 确实被调用（调用次数 2）`。
+
+**第三轮复跑（6m34s）⇒ 仍 WARN，但**上一轮 4 条已全部消失**：0 critical / 0 high / **2 medium** / 1 low。**
+这两条 medium 里有**一条是我上一轮修复带出来的新缺口**，逐条处置：
+
+| 级别 | 位置 | 问题 | 处置 |
+|:--|:--|:--|:--|
+| **medium** | `agent/status` 补挂点（**上一轮修复带出的新缺口**） | 我上一轮给两条 agent 作用域监听加了"卸载时注销" ⇒ 于是"**只有 `handleInbound` 与 `/plan` 会补挂 `user-questions/request`**"这个长期被掩盖的**不对称**暴露了：老 agent 重载后起**自动轮**（goal/notice，不走 `handleInbound`）时手上没有问句水位线，而根级监听又被 GUI 桥接抢在前面 ⇒ **提问/计划审查只弹电脑、飞书收不到卡** | 在 `agent/status` 里与 `bindFeishuAgentApproval` **同一个补挂点**补上 `bindFeishuAgentQuestions` |
+| **medium** | 结论去重 key | 我上一轮"把正文长度拌进 key"来防撞 —— 但这张表挂在 `globalThis`，存在的意义正是**跨代际**去重；一改 key 推导，**上一代旧代码写进去的条目就永远对不上** ⇒ 升级后那一次热重载的去重失效，又会看到一次"同内容两张卡" | key 推导**保持跨版本稳定**（`shortHash(reply)`），防撞改用**长度作第二判据**（分开存 `len`、分开比；旧条目无 `len` 时按兼容放过） |
+| low | `pruneRecentTurnCards()` 只在读路径调用 | 那个调用点位于一串提前 return **之后**（关掉自动卡 / per-bot 通知开关时走不到）⇒ 跨代际的表照样按"每个 agentId 一条"无限涨 | 新增 `rememberRecentTurnCard()`，**写入即剔**（两个写点都改用它） |
+
+**新增敏感用例（可失败性已实测）**：冒烟里加一个**从未收到过飞书消息**的 mock agent
+（＝重载后自己起自动轮的老 agent），只靠 `agent/status` 一次补挂，断言它**同时**拿到
+`approval/request` 与 `user-questions/request`。
+
+```
+  ✅ 新 agent 靠 agent/status 挂上审批水位线
+  ✅ 新 agent 靠 agent/status 也挂上问句水位线（上一版会漏）
+```
+
+**变异测试（证明这条用例真的会红，不是"写了就算验过"）**：把那行补挂临时摘掉重跑 ⇒
+`❌ 新 agent 靠 agent/status 也挂上问句水位线（上一版会漏）` + `SMOKE FAIL: 1 assertion(s) failed`；
+还原后 `SMOKE PASS`。
+
+**第四轮复跑（4m40s）⇒ 0 critical / 0 high / 1 medium / 3 low —— 四条全是测试与文案，无生产代码缺陷。**
+按 `fail-on: high` 判据这轮**不阻塞推送**；四条仍按建议当场改掉，且**生产代码 `index.js` 与第四轮被审版本
+逐字节相同**（md5 `2fd59090…` 可核）—— 改的只有测试与提示文案：
+
+| 级别 | 位置 | 问题 | 处置 |
+|:--|:--|:--|:--|
+| medium | `scripts/smoke.mjs` 用例 47 | 用 `effects[0]` 硬编码"卸载钩子＝第一个 `ctx.effect`" ⇒ 与 `index.js` 的注册顺序耦合：前面一旦多注册一个 effect，就会误报失败、或去卸载别的东西 | 改成**按行为定位**：mock 收集所有"setup 返回函数"的 cleanup，逐个执行直到两条水位线在**两个** mock agent 上全部消失 |
+| low | `scripts/smoke.mjs` | `entry.listener` 存了却从不读（死字段）；且 disposer 在"没找到该条目"时也 +1 ⇒ 计数不再是"移除了几条"的忠实信号 | 改为直接存 listener；**只有真的 splice 掉才计数** |
+| low | `scripts/smoke.mjs` | `agentCtx.on` 与 `freshCtx.on` 是近乎复制品，只差一个计数器 ⇒ 以后修记账容易只改一处 | 抽 `makeScopedCtx(onDispose)` 工厂，两个 mock 共用 |
+| low | `scripts/sync-to-profile.mjs` | `sameReal` 分支里的补救建议假定"是链接"；当 target 是**实体目录**、只是 realpath 恰等于源码根时，"删掉该链接"会把人带沟里 | 建议按 `isLink` 分流 |
+
+**为什么不跑第五轮**：门槛判据是 `fail-on: high`，已连续四轮 **0 critical / 0 high**，剩余全是越挖越细的 nit；
+且这轮只碰测试与文案（`index.js` 逐字节未动）。继续"改一轮跑一轮"只会无限推迟推送 ——
+残余项一律如实记在本文件里，不阻塞。
+
+**门槛四轮小结**：BLOCK(1 high/3 med/12 low) → WARN(1 med/3 low) → WARN(2 med/1 low) → WARN(1 med/3 low)；
+**生产代码的 critical/high 从第二轮起就再没出现过**，三轮里揪出的最有价值的一条是
+**"上一轮修复带出的新缺口"**（问句水位线只在 `handleInbound`/`/plan` 补挂）。
+
+**回归**：`node --check`=0（index.js / smoke.mjs / sync-to-profile.mjs）；
+smoke **SMOKE PASS (sentCards=182, sessions=7)**，`❌` 0 条；`--dry-run` 链接形态下可用（返回 0）。
+
 ## [0.4.24] - 2026-10-02
 
 ### Fixed（🔴 空闲一会儿再下命令，不再要求"先发一条普通消息" —— CM 报障）
