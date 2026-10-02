@@ -445,6 +445,18 @@ if (COLD) {
       'approvalForm 未开启 ⇒ feishu_approval_form **根本不注册**（零噪声）')
     ok(consoleLines.some((l) => l.includes('approval form tool NOT registered')), '并留痕（可日志复验）')
     ok(registeredTools.some((t) => t && t.name === 'feishu_send'), '（前提）别的工具照常注册 —— 证明不是"啥都没加载"')
+    // 0.6.4（CM 2026-10-03：「公司电脑的 BOT 想开怎么办？」）：**热开启必须免重启生效**
+    writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+      bots: [{
+        name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+        reactionEmoji: 'GLANCE', approvalForm: true,
+      }],
+    }, null, 2))
+    await new Promise((r) => setTimeout(r, 11000))   // 等过热读节拍（ensureHelpers 每 10 秒重读配置）
+    await drain()
+    ok(registeredTools.some((t) => t && t.name === 'feishu_approval_form'),
+      '★ 运行中把 approvalForm 改成 true ⇒ **10 秒内工具自动注册**（不用重启）')
+    ok(consoleLines.some((l) => l.includes('approval form tool registered')), '并留痕（可日志复验）')
   }
   console.log(failures === 0 ? 'COLD PASS (' + COLD + ')' : 'COLD FAIL (' + COLD + '): ' + failures + ' 条')
   process.exit(failures === 0 ? 0 : 1)

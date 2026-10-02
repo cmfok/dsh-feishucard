@@ -138,6 +138,10 @@ export function apply(ctx) {
   // ⇒ 可能是上一代在应答。这里留住 disposer，随本代卸载一起注销（见 ctx.effect）。
   const agentScopeDisposers = []
 
+  // 审批单工具（可选通道）的注册 disposer —— 声明放在**最前面**：`ensureHelpers()`（每 10 秒热读配置）
+  // 会在 apply 流程之外调用 `maybeRegisterApprovalFormTool()`，不能让它撞上 TDZ。
+  let approvalFormDisposer = null
+
   // 载荷/正文指纹（只为留痕：飞书对 2.0 卡片只回占位符，正文读不回来；
   // 有了指纹就能在日志里直接比对"两张卡是不是同一段内容"）。djb2，无依赖。
   function shortHash(s) {
@@ -3028,6 +3032,9 @@ export function apply(ctx) {
     const refresh = now - lastConfigCheck >= CONFIG_REFRESH_MS
     if (refresh) lastConfigCheck = now
     const list = await readConfig()
+    // 可选通道（审批单）**热开启**：配置里出现 `approvalForm: true` ⇒ 本次热读就把工具注册上
+    // （10 秒内生效，不用重启；已经注册过则是空操作）。
+    maybeRegisterApprovalFormTool(list)
 
     // Stop helpers whose bot was removed from config.
     for (const [appId, bot] of bots) {
@@ -5819,25 +5826,34 @@ export function apply(ctx) {
   })
   // 注册**按配置**（2026-10-03）：审批单是可选通道 ⇒ 没有任何 bot 打开 `approvalForm` 时
   // **一个工具都不注册**（对外部使用者＝零噪声，连工具名都看不到）。
-  // 配置是异步读的，所以用 effect 包住：卸载时把已注册的那个一起撤掉。
+  // ⚠️ 但是"开了要能自己冒出来"（CM 2026-10-03 追问「公司电脑的 BOT 想开怎么办」）：
+  //    只做启动时读一次是不够的 —— 启动时没人开会话里就永远没有这个工具。
+  //    ⇒ 同一个函数也挂在 `ensureHelpers()`（每 10 秒热读配置）里，**改完配置 10 秒内自动注册**，不用重启。
+  function maybeRegisterApprovalFormTool(list) {
+    if (approvalFormDisposer) return                                   // 已注册（幂等）
+    if (!Array.isArray(list) || !list.some((c) => c && c.approvalForm === true)) return
+    try {
+      approvalFormDisposer = ctx.tools.register(approvalFormTool)
+      console.log('[fs] approval form tool registered（approvalForm: true）')
+    } catch (error) {
+      console.log('[fs] approval form tool registration failed: ' + String(error && error.message || error))
+    }
+  }
   ctx.effect(() => {
-    let cancelled = false
-    let disposer
     void readConfig().then((list) => {
-      if (cancelled) return
-      const on = Array.isArray(list) && list.some((c) => c && c.approvalForm === true)
-      if (!on) {
+      if (!Array.isArray(list) || !list.some((c) => c && c.approvalForm === true)) {
         console.log('[fs] approval form tool NOT registered（没有 bot 打开 approvalForm）')
         return
       }
-      disposer = ctx.tools.register(approvalFormTool)
-      console.log('[fs] approval form tool registered（approvalForm: true）')
+      maybeRegisterApprovalFormTool(list)
     }).catch((error) => {
       console.log('[fs] approval form tool registration skipped: ' + String(error && error.message || error))
     })
     return () => {
-      cancelled = true
-      if (typeof disposer === 'function') disposer()
+      if (typeof approvalFormDisposer === 'function') {
+        try { approvalFormDisposer() } catch { /* 卸载时失败不影响别的 */ }
+      }
+      approvalFormDisposer = null
     }
   })
 

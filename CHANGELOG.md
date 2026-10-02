@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] - 2026-10-03
+
+### Fixed（可选通道的**热开启**缺口：运行中打开 `approvalForm`，工具 10 秒内自己冒出来）
+
+**CM 2026-10-03 追问**：「那有个问题，如果公司电脑的 BOT 想开怎么办？」——这一问查出 0.6.2 的实现**只在插件启动那一刻**读一次配置：
+若启动时没有任何 bot 打开 `approvalForm`，之后**就算把配置改成 true，工具也不会出现**（必须重载/重启），
+与文档承诺的"改完 10 秒生效、不用重启"**不一致**。
+
+**处置**：把注册逻辑抽成 `maybeRegisterApprovalFormTool(list)`，同时挂在两处 ——
+① 启动时读一次配置；② **`ensureHelpers()`（每 10 秒热读配置）**。⇒ 任何一台机器上把 `approvalForm` 改成 true，
+**10 秒内工具自动注册**，不用重启；已注册则空操作（幂等），插件卸载时注销。
+
+**顺带把"公司电脑怎么开"写清楚**：开关是**每台机器、每个 bot**各自的，配置在各自的
+`%USERPROFILE%\.dsh-feishucard\feishu.config.json` —— **不在仓库里**，所以 Syncthing 只同步代码、**不会同步开关**；
+那台是否生效，看它日志里的 `[fs] approval form tool registered（approvalForm: true）`。
+
+**防回归（都会变红，写在冒烟里）**：冷启动变体 `SMOKE_COLD=form-off` 新增 2 条 ——
+启动时不开 ⇒ 工具**不注册** + 留痕；运行中把配置改成 `true` + 过 10 秒 ⇒ **自动注册** + 留痕。
+
 ## [0.6.3] - 2026-10-03
 
 ### Added（静默看门狗：把"多久没动"改成**有诊断含义**的提示；上游没回包时**另发一条纯文本**）
