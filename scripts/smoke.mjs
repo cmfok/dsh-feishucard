@@ -259,6 +259,7 @@ const fakePersistence = {
 // 插件现在**先读它**（与 GUI 侧边栏同源），所以要能验证：① 工作区列表来自它 ② 切换后把会话挂回去。
 const registryAttached = []            // { ws, id }
 let registryIdSeq = 0
+let registryOverride = null        // 非空 = 只用 'workspaces' 这个服务名暴露给插件（见 ctx.get）
 function makeRegistryEntity(path, title, id) {
   const entityId = id || ('ws-' + (++registryIdSeq))
   return {
@@ -313,7 +314,10 @@ const ctx = {
     if (key === 'goals') return fakeGoals
     if (key === 'commands') return fakeCommands
     if (key === 'sessionPersistence') return fakePersistence
-    if (key === 'workspaceRegistry') return fakeWorkspaceRegistry
+    // 门槛第三轮 low：允许把注册表**只**以客户端服务名 workspaces 暴露（且可以没有 get()），
+    // 用来锁住"服务名两种都认 + 逐个方法判可用"这两条兜底（否则它们永远没被跑过）。
+    if (key === 'workspaceRegistry') return registryOverride ? undefined : fakeWorkspaceRegistry
+    if (key === 'workspaces') return registryOverride || undefined
     return undefined
   },
   shell: {
@@ -896,6 +900,10 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(wsRowsShown.length === 2, '工作区卡共 2 行（' + wsRowsShown.length + '）')
   const curWsRow = wsRowsShown.find((e) => String(e.text.content).includes(WORKSPACE))
   ok(Boolean(curWsRow) && String(curWsRow.text.content).includes('▶'), '当前工作区带 ▶ 标记')
+  // 正例（门槛第三轮 medium）：15b 只验了"目录不存在 ⇒ ⚠️"。若 dirExists() 因路径写法/失效而恒假，
+  // 所有行都会变 ⚠️，那条 ⚠️ 断言照样通过 ⇒ 必须有"存在的目录 ⇒ 🟢"这一侧才有对照。
+  ok(wsRowsShown.every((e) => String(e.text.content).includes('🟢')),
+    '已存在的目录标 🟢（与 15b 的 ⚠️ 形成对照）')
   const wsIndexWork = rowIndexOf(wsCard, WORKSPACE)
   const wsIndexOther = rowIndexOf(wsCard, OTHER_WORKSPACE)
   ok(wsIndexWork >= 0 && wsIndexOther >= 0,
@@ -957,7 +965,10 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(agent.session.header.cwd === OTHER_WORKSPACE,
     'new 模式把新会话的 cwd 设成了那个工作区（实际 ' + agent.session.header.cwd + '）')
   ok(createdSessions === beforeNew + 1, '确实新建了会话')
-  ok(registryAttached.some((a) => a.ws === 'ws-2'), '新建的会话也挂进了那个工作区（GUI 侧边栏能看到）')
+  // 别硬编码 'ws-2'：那只是 seed() 顺序的副产物。从注册表里按路径取真 id（门槛第三轮 low）。
+  const otherEntity = fakeWorkspaceRegistry._entities.find((e) => e.path === OTHER_WORKSPACE)
+  ok(Boolean(otherEntity) && registryAttached.some((a) => a.ws === otherEntity.id),
+    '新建的会话也挂进了那个工作区（GUI 侧边栏能看到）')
 
   // ⑤ 运行中的会话（🟡）只给「新建」；文字接管也必须被挡住
   liveAgents.push({ id: 'fu-session-bbbb2222', session: agent.session })
@@ -991,52 +1002,82 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(cardsSince(backMark).filter((c) => c.op === 'create').length === 0, '点「返回」也没有新发卡片')
 }
 
-console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注册工作区（门槛第二轮补）')
+console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注册工作区 / 服务名与方法缺失（门槛第二、三轮补）')
 {
-  // 用例内会 create 新工作区、追加会话 —— 结束时全部还原，免得污染后面的用例（门槛第二轮 low）。
+  // ⚠️ 用例内会 create 新工作区、追加会话、动 mock 的 cwd —— 用 try/finally 保证**无论中途是否抛**
+  // 都还原（原来不是 guarded：中途一抛，_entities 会停在空数组上，把后面所有用例都毒掉）。
+  // 注：chat.sessions/activeIndex 在插件内部、测试拿不到，只能保证持久化与注册表两侧自洽 ——
+  // 所以这里**保留**追加的那条 third 会话（不还原 persistedSessions），避免"chat 还引用着、
+  // 持久化里却没了"的悬空状态。
   const entitiesBefore = fakeWorkspaceRegistry._entities.slice()
-  const persistedBefore = persistedSessions.slice()
-  // (a) 未注册工作区：目录只从**会话 cwd** 兜底出现，且接管时必须能挂进注册表
-  //     （走 resolveByPath → create → attachSession —— 这条链此前从未被跑过）
-  persistedSessions.push({ version: 0, id: 'third-session-dddd4444', createdAt: Date.now() - 300e3, cwd: THIRD_WORKSPACE })
-  const markA = sentCards.length
-  feedInbound('om_switch_third', '/switch')
-  await drain()
-  const cardA = lastCardFrom(markA)
-  const thirdIndex = rowIndexOf(cardA, THIRD_WORKSPACE)
-  ok(thirdIndex >= 0, '注册表里没有、只在会话 cwd 里出现的目录，也作为兜底工作区出现（序号 ' + (thirdIndex + 1) + '）')
-  const beforeAttach = registryAttached.length
-  feedInbound('om_switch_third_takeover', '/switch ' + (thirdIndex + 1) + ' 1')
-  await drain()
-  ok(registryAttached.length > beforeAttach,
-    '在**未注册**工作区接管时也能挂进注册表（走 resolveByPath/create → attachSession）')
+  const cwdBefore = agent.session.header.cwd
+  try {
+    // (a) 未注册工作区：目录只从**会话 cwd** 兜底出现，且接管时必须能挂进注册表
+    //     （走 resolveByPath → create → attachSession —— 这条链此前从未被跑过）
+    persistedSessions.push({ version: 0, id: 'third-session-dddd4444', createdAt: Date.now() - 300e3, cwd: THIRD_WORKSPACE })
+    const markA = sentCards.length
+    feedInbound('om_switch_third', '/switch')
+    await drain()
+    const cardA = lastCardFrom(markA)
+    const thirdIndex = rowIndexOf(cardA, THIRD_WORKSPACE)
+    ok(thirdIndex >= 0, '注册表里没有、只在会话 cwd 里出现的目录，也作为兜底工作区出现（序号 ' + (thirdIndex + 1) + '）')
+    // 序号从卡面读回来（别写死），并让下面按同一个序号接管
+    feedInbound('om_switch_third_takeover', '/switch ' + (thirdIndex + 1) + ' 1')
+    await drain()
+    // 断言钉住**是哪条会话**挂上了：只判"有东西挂上"的话，就算挂错了工作区也会绿（门槛第三轮 low）。
+    ok(registryAttached.some((a) => a.id === 'third-session-dddd4444'),
+      '在**未注册**工作区接管时，**这条会话**挂进了注册表（走 resolveByPath/create → attachSession）')
 
-  // (b) 目录不存在 ⇒ ⚠️（以本地目录检查为准，不只信注册表那个 token）
-  fakeWorkspaceRegistry._entities.push(
-    makeRegistryEntity(SMOKE_WS_ROOT + '/fs-smoke-ghost-does-not-exist', 'ghost', 'ws-ghost'))
-  const markB = sentCards.length
-  feedInbound('om_switch_ghost', '/switch')
-  await drain()
-  const ghostCard = lastCardFrom(markB)
-  const ghostRow = divRows(ghostCard).find((e) => String(e.text.content).includes('ghost'))
-  ok(Boolean(ghostRow) && String(ghostRow.text.content).includes('⚠️'),
-    '目录不存在的行标 ⚠️（注册表说 ok 也不算健康）')
-  fakeWorkspaceRegistry._entities.pop()
+    // (b) 目录不存在 ⇒ ⚠️（以本地目录检查为准，不只信注册表那个 token）
+    fakeWorkspaceRegistry._entities.push(
+      makeRegistryEntity(SMOKE_WS_ROOT + '/fs-smoke-ghost-does-not-exist', 'ghost', 'ws-ghost'))
+    const markB = sentCards.length
+    feedInbound('om_switch_ghost', '/switch')
+    await drain()
+    const ghostCard = lastCardFrom(markB)
+    const ghostRow = divRows(ghostCard).find((e) => String(e.text.content).includes('ghost'))
+    ok(Boolean(ghostRow) && String(ghostRow.text.content).includes('⚠️'),
+      '目录不存在的行标 ⚠️（注册表说 ok 也不算健康）')
+    fakeWorkspaceRegistry._entities.pop()
 
-  // (c) 注册表整个不可用 ⇒ 用会话 cwd 兜底，而不是给一张空卡
-  const saved = fakeWorkspaceRegistry._entities
-  fakeWorkspaceRegistry._entities = []
-  const markC = sentCards.length
-  feedInbound('om_switch_noregistry', '/switch')
-  await drain()
-  const cardC = lastCardFrom(markC)
-  const cBody = JSON.stringify(cardC && cardC.payload)
-  ok(Boolean(cardC) && cBody.includes(WORKSPACE),
-    '注册表不可用（空）时仍列出会话里出现过的工作区（不让用户对着空卡）')
+    // (c) 注册表整个不可用 ⇒ 用会话 cwd 兜底，而不是给一张空卡
+    fakeWorkspaceRegistry._entities = []
+    const markC = sentCards.length
+    feedInbound('om_switch_noregistry', '/switch')
+    await drain()
+    const cardC = lastCardFrom(markC)
+    const cBody = JSON.stringify(cardC && cardC.payload)
+    ok(Boolean(cardC) && cBody.includes(WORKSPACE),
+      '注册表不可用（空）时仍列出会话里出现过的工作区（不让用户对着空卡）')
+    fakeWorkspaceRegistry._entities = entitiesBefore
 
-  // 还原这一用例动过的全局状态（见开头快照）
-  fakeWorkspaceRegistry._entities = entitiesBefore
-  persistedSessions = persistedBefore
+    // (d) 注册表**只**以客户端服务名 workspaces 暴露、而且**没有 get()**：
+    //     ① 工作区卡照样读得到（服务名两种都认）② 接管时的挂载走 resolveByPath/create（逐个方法判可用）
+    const clientOnly = {
+      list: () => fakeWorkspaceRegistry.list(),
+      resolveByPath: async (p) => fakeWorkspaceRegistry._entities.find((e) => e.path === p),
+      create: async (p, t) => fakeWorkspaceRegistry.create(p, t),
+    }
+    registryOverride = clientOnly
+    const markD = sentCards.length
+    feedInbound('om_switch_clientonly', '/switch')
+    await drain()
+    const cardD = lastCardFrom(markD)
+    const dBody = JSON.stringify(cardD && cardD.payload)
+    ok(Boolean(cardD) && dBody.includes(WORKSPACE) && dBody.includes('选择工作区'),
+      '注册表只以 workspaces 暴露时，工作区卡照样出得来（服务名两种都认）')
+    const dIndex = rowIndexOf(cardD, OTHER_WORKSPACE)
+    const attachBeforeD = registryAttached.length
+    feedInbound('om_switch_clientonly_takeover', '/switch ' + (dIndex + 1) + ' 1')
+    await drain()
+    ok(registryAttached.length > attachBeforeD,
+      '该注册表没有 get() 时，挂载仍能走 resolveByPath/create（逐个方法判可用）')
+    registryOverride = null
+  } finally {
+    registryOverride = null
+    fakeWorkspaceRegistry._entities = entitiesBefore
+    agent.session.header.cwd = cwdBefore
+  }
 }
 
 console.log('16) 目标轮封口必须补扫：收尾汇报不能丢（CM 2026-09-16 实测反馈）')

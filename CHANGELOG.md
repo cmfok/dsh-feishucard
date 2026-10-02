@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-10-02
+
+### Fixed（门槛第三轮：0 critical / 0 high / 4 medium / 8 low —— 逐条收口）
+
+> 说明：这一轮跑的是 **0.5.0** 的快照，其中一条 medium 正是"每步发新卡"（已在 0.5.1 修掉，见上）。
+> 其余逐条对当前代码复核后**全部为真**，处置如下：
+
+| 级别 | 问题 | 处置 |
+|:--|:--|:--|
+| medium | **"当前工作区"与"会话候选"两处 cwd 口径不一致**：`currentWorkspaceOf` 只看活 header/handle，而 `persistChats` **不存 cwd** ⇒ 插件重启后、第一条消息之前，活跃会话 cwd 为空 ⇒ 退回默认工作区；`/list` 会指到默认工作区、卡上"当前工作区"标错，连"当前工作区必在卡上"那条兜底都会找不到对象而静默跳过 | `currentWorkspaceOf(bot, chat, cands)` 改为**优先取候选里那条会话的 cwd**（候选已按"持久化优先"规则算过），活 header 只兜底 |
+| medium | **限流的语义写反了**：`FB_RESERVE` 本意是"兜底行保留席位"，却写成"兜底行封顶" ⇒ 注册表只有 1 条时兜底行也被压到 ≤4，剩下 7 个空位浪费、那些工作区既上不了卡也选不到 | 兜底行先**占满注册表没用到**的预算（`max(FB_RESERVE, 12 - regTake.length)`），再按下限补齐 |
+| medium | 冒烟只验了"目录不存在 ⇒ ⚠️"，**没有正例** ⇒ `dirExists()` 若恒假（路径写法/失效），所有行都变 ⚠️ 而 ⚠️ 那条断言照样通过 | 新增"已存在的目录标 🟢"断言形成对照 |
+| medium | （0.5.0 快照）每步发新卡 | 已在 **0.5.1** 修掉 |
+| low×8 | `/list` 里重复 `liveTitle()` + 每行 `findIndex`（O(n²)）· `sendSessionCard` / `sendWorkspaceCard` 的 `chat` 死参数 · `/list` 路径上死的 `ws.index` 与 `index: -1` · 冒烟里死的 `saved` · 硬编码 mock 内部 id `ws-2` · 15b 清理不完整（chat 状态外还有 cwd 与"持久化里删了、chat 还引用着"的悬空）且**没有 try/finally**（中途一抛就把 `_entities` 停在空数组上、毒掉后面所有用例）· 挂载断言只判"有东西挂上"（挂错工作区也会绿）· mock 只暴露 `workspaceRegistry`（"两种服务名"与"逐个方法判可用"两条兜底从未被跑过） | 逐条修：`r.title` 直接用 + 预建 `Map` 索引 · 删死参数/死字段 · 删死变量 · id 从注册表按路径取 · 15b 改 `try/finally` 并还原 cwd、保留追加会话避免悬空 · 断言钉住 `third-session-dddd4444` · 新增 (d) 分支：注册表**只以 `workspaces` 暴露且没有 `get()`**，锁住这两条兜底 |
+
+**回归**：`node --check`=0；冒烟 **SMOKE PASS (sentCards=195, sessions=7)**、❌ 0。
+
 ## [0.5.1] - 2026-10-02
 
 ### Fixed（🔁 切换卡片**原地更新** —— CM 实测：「点一下就弹一张新卡片，切一次能弹三四张，按返回还继续弹」）
