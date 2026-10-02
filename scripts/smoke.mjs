@@ -69,6 +69,8 @@ const reactionCalls = []  // { method, url, body } —— 打字提示（reactio
 // 入站附件下载（用例 49）：记录被请求的资源 URL，并可切换成"下载失败"。
 const resourceDownloads = []
 let resourceShouldFail = false
+// 下载回来的字节可切换（用例 49 验"按文件头补扩展名"：PNG 魔数 / 认不出的字节）。
+let resourceBytes = Buffer.from('hello-from-feishu')
 let tenantTokenCalls = 0
 let createReturnsEmptyId = false   // 建卡幂等测试：模拟返回体缺 message_id
 // 2026-10-01（用例 34）：只让"从此刻起的第 N 次建卡"失败 —— 用来精确打到
@@ -91,7 +93,7 @@ globalThis.fetch = async (url, init) => {
   if (u.includes('/resources/')) {
     resourceDownloads.push({ url: u })
     if (resourceShouldFail) return { ok: false, status: 403, text: () => Promise.resolve('forbidden') }
-    return { ok: true, status: 200, arrayBuffer: async () => Buffer.from('hello-from-feishu') }
+    return { ok: true, status: 200, arrayBuffer: async () => resourceBytes }
   }
   if (u.includes('/im/v1/messages')) {
     const raw = JSON.parse(init.body)
@@ -523,19 +525,24 @@ async function drain() {
     await new Promise((r) => setTimeout(r, 150))
   }
 }
-// 触发一条**文件**入站消息（message_type='file'，正文形如 {"file_key":…,"file_name":…}）
-// —— 用例 49 用它验「飞书发文件 ⇒ 插件自己下载并告知」（CM 2026-10-02）。
+// 触发一条入站**附件**消息 —— 用例 49 用它验「飞书发文件/图片 ⇒ 插件自己下载并告知」（CM 2026-10-02）。
+// `file.type` 默认 'file'（正文 {"file_key","file_name"}）；传 'image' 走图片形态
+// （正文只有 {"image_key"} —— **飞书图片消息不给文件名**，正是"没有扩展名"那个坑的来源）。
 function feedInboundFile(msgId, file) {
+  const msgType = file.type || 'file'
+  const content = msgType === 'image'
+    ? { image_key: file.key }
+    : { file_key: file.key, file_name: file.name }
   fakeProc.output += JSON.stringify({
     type: 'event',
     eventType: 'im.message.receive_v1',
     data: {
       message: {
         message_id: msgId,
-        message_type: 'file',
+        message_type: msgType,
         chat_id: CHAT_ID,
         chat_type: 'p2p',
-        content: JSON.stringify({ file_key: file.key, file_name: file.name }),
+        content: JSON.stringify(content),
       },
       sender: { sender_id: { open_id: 'ou_test' } },
     },
@@ -2807,6 +2814,26 @@ console.log('49) 入站文件自动收：飞书发文件 ⇒ 插件自己下载�
   ok(seen.includes('收到文件') && seen.includes('季度报表'), '插件自己把文件喂给模型（不用 CM 再口头告诉我一遍）')
   ok(seen.includes('downloaded_files'), '并把落盘路径一起给模型')
   ok(consoleLines.some((l) => l.includes('inbound file saved:')), '留痕 `inbound file saved:`（可日志复验）')
+  // ①b 有扩展名的（文件消息带 file_name）**原样保留**，不许被文件头嗅探改写
+  ok(after.some((n) => n.endsWith('_季度报表.xlsx')), '带扩展名的文件名原样保留（实际 ' + String(after[after.length - 1] || '-') + '）')
+
+  // ② 图片：飞书**不给文件名**（只有 image_key）⇒ 必须按**文件头**补扩展名。
+  //    真机实例：CM 发的截图存成 `2026-10-02-15-52-19_image`（内容是 JPEG），光看名字看不出格式。
+  resourceBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])
+  feedInboundFile('om_file_img', { type: 'image', key: 'img_v3_png' })
+  await drain()
+  const pngFiles = readdirSync(dir).filter((n) => n.endsWith('_image.png'))
+  ok(pngFiles.length === 1, '图片消息按文件头补上扩展名（…_image.png，PNG 魔数）')
+  ok(/^\d{4}-\d{2}-\d{2}-\d{6}_/.test(String(pngFiles[0] || '')),
+    '时间戳换成本地时间格式 YYYY-MM-DD-HHMMSS（旧版是 UTC 的 YYYY-MM-DD-HH-MM-SS）')
+  ok(consoleLines.some((l) => l.includes('inbound file saved:') && l.includes('_image.png')),
+    '留痕里也能看到补好的扩展名')
+
+  // ③ 认不出的字节 ⇒ `.bin`（**不猜**格式）
+  resourceBytes = Buffer.from('hello-from-feishu')
+  feedInboundFile('om_file_noext', { key: 'file_v3_noext', name: '没有扩展名' })
+  await drain()
+  ok(readdirSync(dir).some((n) => n.endsWith('_没有扩展名.bin')), '认不出的格式补 .bin（不瞎猜）')
 
   // 失败也要**可见**：不再静默吞掉（CM 原话正是"你不知道，要我告诉你"）
   resourceShouldFail = true

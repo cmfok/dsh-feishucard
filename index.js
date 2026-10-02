@@ -2206,6 +2206,23 @@ export function apply(ctx) {
   // text note with its local path so the agent session can read the file.
   // Destination: bot.fileInbox, else <bot.workspace>/downloaded_files (config
   // driven, never a hardcoded absolute path).
+  // 按**文件头**认扩展名（2026-10-03 CM：「修吧」）。
+  // 为什么需要：飞书**图片**消息只给 `image_key`、**不给文件名** ⇒ 旧实现写死 'image'，
+  // 落盘成 `…_image` 这种"看不出格式"的名字（真机实例：CM 发的截图存成 `2026-10-02-15-52-19_image`，
+  // 而内容是 JPEG）。**只认确定无疑的几个魔数**，认不出就 `.bin` —— 不猜、不编。
+  function sniffExt(buf) {
+    if (!buf || buf.length < 12) return '.bin'
+    const hex = (i, n) => buf.slice(i, i + n).toString('hex')
+    if (hex(0, 3) === 'ffd8ff') return '.jpg'
+    if (hex(0, 8) === '89504e470d0a1a0a') return '.png'
+    if (hex(0, 6) === '474946383961' || hex(0, 6) === '474946383761') return '.gif'
+    if (hex(0, 4) === '52494646' && hex(8, 4) === '57454250') return '.webp'
+    if (hex(0, 2) === '424d') return '.bmp'
+    if (hex(0, 4) === '25504446') return '.pdf'
+    if (hex(0, 4) === '504b0304') return '.zip'    // 也覆盖 xlsx/docx/pptx（ooxml 就是 zip）
+    return '.bin'
+  }
+
   async function downloadInboundFile(bot, evt) {
     try {
       const msgType = String(evt.msg_type || evt.message_type || '')
@@ -2238,12 +2255,20 @@ export function apply(ctx) {
           + '（多为该应用缺 `im:resource` 权限 —— 见 dsh 日志）'
       }
       const buf = Buffer.from(await res.arrayBuffer())
-      const safe = String(fileName || type + '-' + Date.now()).replace(/[\\/:*?"<>|\r\n]/g, '_').slice(0, 120)
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
-      const path = join(base, stamp + '_' + safe)
+      const safe = String(fileName || type || 'file').replace(/[\\/:*?"<>|\r\n]/g, '_').slice(0, 120)
+      // 口径：**已经有扩展名就尊重它**（文件消息带 file_name，pdf/xlsx/pdf 不受影响）；
+      //       没有扩展名（图片/语音这类）才**按文件头**补一个。
+      const withExt = /\.[A-Za-z0-9]{1,8}$/.test(safe) ? safe : safe + sniffExt(buf)
+      // 时间戳用**本地时间**（旧实现用 `toISOString()`＝UTC ⇒ CM 本地 23:52 的图存成 `15-52-19`，
+      // 翻目录时对不上时间）。格式 `YYYY-MM-DD-HHMMSS`（秒前不加横杠，一眼能读）。
+      const d = new Date()
+      const p2 = (n) => String(n).padStart(2, '0')
+      const stamp = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
+        + '-' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds())
+      const path = join(base, stamp + '_' + withExt)
       writeFileSync(path, buf)
       console.log('[fs] inbound file saved: ' + path + ' (' + buf.length + ' bytes)')
-      return '📎 收到文件：' + (fileName || '(无文件名)') + '\n已保存到：' + path
+      return '📎 收到文件：' + (fileName || withExt) + '\n已保存到：' + path
         + '\n（先只回我一句确认收到即可，等我说要做什么再动它；要读就用文件工具读上面这个路径）'
     } catch (e) {
       console.log('[fs] inbound file handler error: ' + String(e && e.message || e))

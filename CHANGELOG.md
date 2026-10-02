@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-10-03
+
+### Fixed（入站附件落盘：图片没有扩展名 / 时间戳是 UTC）
+
+**CM 2026-10-03**：看到真机存下来的文件名 `P:\Qoder\work\downloaded_files\2026-10-02-15-52-19_image` 后说「修吧」。
+两个毛病都在这一个文件名里：
+
+| # | 现象 | 根因 | 处置 |
+|:--|:--|:--|:--|
+| 1 | 图片存成 `…_image`，**没有扩展名**（实际内容是 JPEG：文件头 `ff d8 ff e0 … JFIF`） | 飞书**图片**消息只给 `image_key`、**不给 file_name**，旧实现写死占位名 `image` ⇒ 光看名字看不出格式 | 新增 `sniffExt()`：**按文件头**认扩展名（jpg/png/gif/webp/bmp/pdf/zip，认不出 ⇒ `.bin`，**不猜**）；口径是"**已经有扩展名就原样保留**"（文件消息带的 `季度报表.xlsx` 不受影响），只有没扩展名时才补 |
+| 2 | 时间戳 `15-52-19` 其实是**本地 23:52**（UTC 差 8 小时） | 旧实现用 `new Date().toISOString()`（UTC） | 改用**本地时间**，格式 `YYYY-MM-DD-HHMMSS`（例：`2026-10-02-235219_image.jpg`） |
+
+**防回归（都会变红，写在冒烟里）**
+
+- 用例 49 新增 4 条：① 带扩展名的文件名**原样保留**；② 图片消息（只有 `image_key`）按魔数补 `…_image.png`；
+  ③ 时间戳形如 `YYYY-MM-DD-HHMMSS`（旧版是 UTC + 秒前带横杠）；④ 认不出的字节补 `.bin`（不瞎猜）。
+- 夹具同步：REST mock 的附件字节可切换（`resourceBytes`），`feedInboundFile()` 支持图片形态。
+
 ## [0.5.6] - 2026-10-02
 
 ### Fixed（真机两处格式问题：「批准」看不到绿 / 文字后面漏出一串英文 + 不居中）
