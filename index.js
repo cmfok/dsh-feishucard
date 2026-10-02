@@ -1464,6 +1464,27 @@ export function apply(ctx) {
   // 卸载（含 HMR 热重载）时：① 注销本代挂在 `agent.ctx`（长生命周期）上的监听；
   // ② 停掉全部在跑的 watcher —— **但不封口**（卡片留给新实例"续卡"，见下面 ③）。
   ctx.effect(() => () => {
+    // ⓪ 热重载「打断播报」的承前启后（2026-10-02 CM：「热重载打断会话要在会话里发提示」）。
+    //    abort 发生在 dispose **之后** ~40ms（agent 生命周期 effect 被拆 ⇒
+    //    agent-loop `machine.cancel({kind:'disposed'})`），那时本代 watcher 已经停了 ⇒ 抓不到。
+    //    这里只留"有哪些回合在跑"的线索，由**新实例**播报（见 announceReloadInterrupts）。
+    try {
+      const interrupted = []
+      for (const [agentId, entry] of Array.from(activeTurns)) {
+        if (!entry || !entry.bot || !entry.chatId) continue
+        interrupted.push({
+          sessionId: String(agentId),
+          chatId: String(entry.chatId),
+          appId: String((entry.bot.cfg && entry.bot.cfg.appId) || ''),
+        })
+      }
+      if (interrupted.length > 0) {
+        globalThis.__fsReloadHint = { at: Date.now(), items: interrupted }
+        console.log('[fs] dispose(热重载): 登记 ' + interrupted.length + ' 个可能被中断的回合（由新实例播报）')
+      }
+    } catch (error) {
+      console.log('[fs] dispose(热重载): 登记中断线索失败 ' + String(error && error.message || error))
+    }
     // ① 活跃回合**不需要"移交"**（2026-10-02 代码审查 low#12）：`activeTurns` 本身就是
     //    globalThis.__fsActiveTurns 那个 Map（见上方声明）⇒ 跨代际共享是构造上就有的。
     //    旧那段 `if (!shared.has(key)) shared.set(...)` 永远搬不动任何一条（has 恒为 true），
@@ -1532,6 +1553,55 @@ export function apply(ctx) {
       entry.stop = startCardWatcher(entry.agent, card, entry.bot, entry.chatId, () => rotateAdoptedCard(entry.agent))
     } catch (error) {
       console.log('[fs] 热重载续卡失败（不影响其它功能）: ' + String(error && error.message || error))
+    }
+  }
+
+  // ---- 热重载「打断播报」（2026-10-02 CM：热重载打断会话，必须在会话里说清）-------------------
+  // 由来（有出处）：0.4.20 曾在 dispose 时把旧卡就地封口并留一行
+  //   `♻️ 插件已热重载：本卡停止更新，后续内容见新的卡片。`（CHANGELOG 0.4.20）；
+  // 0.4.22 改成"续卡"（新实例接管同一张卡）时把这行删了 ⇒ 之后热重载打断回合变成**完全无声**：
+  // abort 被当正常收尾（卡片 status=sealed），一个字都不解释。CM 2026-10-02 追问"为什么现在没了"。
+  // 抓法：上一代在 dispose 时留线索（见 dispose 钩子 ⓪），本代在**有 bot 之后**播报 ——
+  //   不看"谁先跑"的竞态，也不依赖旧实例的 watcher 还活着。
+  // 边界：只对"重载时确实有回合在跑"的情况播报（线索为空 ⇒ 不发任何东西，杜绝噪声）；
+  //   每会话只播一次（globalThis 去重，幂等）；窗口外的旧线索直接丢弃。
+  const RELOAD_NOTICE_WINDOW_MS = 120000
+  function announceReloadInterrupts(attempt) {
+    const hint = globalThis.__fsReloadHint
+    if (!hint) return
+    const items = Array.isArray(hint.items) ? hint.items : []
+    const tries = Number(attempt) || 0
+    if (!items.length || Date.now() - Number(hint.at || 0) > RELOAD_NOTICE_WINDOW_MS) {
+      globalThis.__fsReloadHint = null
+      return
+    }
+    // apply 期 ensureHelpers() 是异步的 ⇒ bot 可能还没进表。留住线索、稍后再播，
+    // 绝不因为"来得太早"把提示吞掉（这正是本次要修的毛病）。
+    if (bots.size === 0) {
+      if (tries < 30) setTimeout(() => announceReloadInterrupts(tries + 1), 300)
+      return
+    }
+    globalThis.__fsReloadHint = null
+    const notified = globalThis.__fsReloadNotified || (globalThis.__fsReloadNotified = new Map())
+    for (const [key, at] of Array.from(notified)) {
+      if (Date.now() - Number(at || 0) > RELOAD_NOTICE_WINDOW_MS) notified.delete(key)
+    }
+    for (const item of items) {
+      try {
+        const sessionId = String((item && item.sessionId) || '')
+        const chatId = String((item && item.chatId) || '')
+        if (!sessionId || !chatId) continue
+        if (notified.has(sessionId)) continue          // 同一会话只提示一次
+        const bot = bots.get(String((item && item.appId) || '')) || Array.from(bots.values())[0]
+        if (!bot) continue
+        notified.set(sessionId, Date.now())
+        void sendPlainText(bot, chatId,
+          '♻️ 插件已热重载：上一轮被热重载打断（不是模型出错，也不是你的操作）。'
+          + '刚才那轮没说完的不会自己继续 —— 你回我一句就行。').catch(() => { })
+        console.log('[fs] hot reload interrupt notice: agent=' + sessionId + ' chat=' + chatId)
+      } catch (error) {
+        console.log('[fs] hot reload interrupt notice failed: ' + String(error && error.message || error))
+      }
     }
   }
 
@@ -2079,6 +2149,11 @@ export function apply(ctx) {
     return {
       message_id: message.message_id,
       message_type: message.message_type,
+      // 2026-10-02 修复：附件下载那条链读的是 `msg_type`（见 downloadInboundFile），
+      // 而这里**只**给了 `message_type` ⇒ 文件/图片消息恒判"没有 key" ⇒ 被静默丢弃
+      // （web.log 里连一条 `inbound file saved` / `download failed` 都没有）。
+      // 两个键都给：新读法用 msg_type，旧读法照旧能用 message_type。
+      msg_type: message.message_type,
       chat_id: message.chat_id,
       chat_type: message.chat_type,
       content: message.content,
@@ -2133,7 +2208,7 @@ export function apply(ctx) {
   // driven, never a hardcoded absolute path).
   async function downloadInboundFile(bot, evt) {
     try {
-      const msgType = String(evt.msg_type || '')
+      const msgType = String(evt.msg_type || evt.message_type || '')
       const parsed = JSON.parse(evt.content || '{}')
       let key = ''
       let type = ''
@@ -2142,7 +2217,12 @@ export function apply(ctx) {
       else if (msgType === 'image') { type = 'image'; key = parsed.image_key || ''; fileName = 'image' }
       else if (msgType === 'audio') { type = 'file'; key = parsed.file_key || parsed.audio_key || ''; fileName = parsed.file_name || 'audio' }
       else if (msgType === 'media') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || 'media' }
-      if (!key || !type) return ''
+      if (!key || !type) {
+        // 不支持的附件类型（sticker / share_chat / 系统消息…）也要留痕：旧实现直接
+        // `return ''`，日志里与"插件根本没收到"完全无法区分 —— 正是 CM 说的那种盲区。
+        console.log('[fs] inbound non-text ignored: type=' + (msgType || '?') + ' hasKey=' + Boolean(key))
+        return ''
+      }
       const ws = bot.cfg.workspace && String(bot.cfg.workspace).trim() ? String(bot.cfg.workspace).trim() : ''
       const base = (bot.cfg.fileInbox && String(bot.cfg.fileInbox).trim())
         || (ws ? join(ws, 'downloaded_files') : join(homedir(), 'downloaded_files'))
@@ -2153,7 +2233,9 @@ export function apply(ctx) {
       const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } })
       if (!res.ok) {
         console.log('[fs] inbound file download failed: HTTP ' + res.status + ' (' + fileName + ')')
-        return ''
+        // 失败必须**可见**（否则又回到"我不知道你发了文件"）：回一条文本，让插件照常起轮告诉 CM。
+        return '⚠️ 收到文件「' + (fileName || '(无文件名)') + '」但下载失败（HTTP ' + res.status + '）。'
+          + '（多为该应用缺 `im:resource` 权限 —— 见 dsh 日志）'
       }
       const buf = Buffer.from(await res.arrayBuffer())
       const safe = String(fileName || type + '-' + Date.now()).replace(/[\\/:*?"<>|\r\n]/g, '_').slice(0, 120)
@@ -2161,10 +2243,12 @@ export function apply(ctx) {
       const path = join(base, stamp + '_' + safe)
       writeFileSync(path, buf)
       console.log('[fs] inbound file saved: ' + path + ' (' + buf.length + ' bytes)')
-      return '📎 收到文件：' + (fileName || '(无文件名)') + '\n已保存到：' + path + '\n（需要时请用文件工具读取该路径）'
+      return '📎 收到文件：' + (fileName || '(无文件名)') + '\n已保存到：' + path
+        + '\n（先只回我一句确认收到即可，等我说要做什么再动它；要读就用文件工具读上面这个路径）'
     } catch (e) {
       console.log('[fs] inbound file handler error: ' + String(e && e.message || e))
-      return ''
+      // 同样不许无声：解析/写盘炸了也要让 CM 看到（否则他只会以为"你又不知道"）。
+      return '⚠️ 收到一个我没能处理的附件消息：' + String(e && e.message || e)
     }
   }
 
@@ -3727,6 +3811,13 @@ export function apply(ctx) {
   //   · **会话之间加一条分隔线**（CM：「这样看起来就更好看」）
   //   · **每页 5 个**，底部给「← 上一页 / 下一页 →」（翻页是 PATCH 同一张卡，不弹新卡）
   //   · 底部**只留 返回 / 取消**（新建收回到一级菜单的那个按钮上）
+  // 会话名进按钮前的截断（CM 2026-10-02：按钮里的文字一旦超长就会被截成省略号）
+  const SESSION_NAME_MAX = 16
+  function clipSessionName(name) {
+    const chars = [...String(name || '')]
+    return chars.length > SESSION_NAME_MAX ? chars.slice(0, SESSION_NAME_MAX).join('') + '…' : chars.join('')
+  }
+
   function buildSessionCard(ws, rows, pageInfo) {
     const info = pageInfo || { page: 0, pages: 1, total: rows.length }
     const elements = [{
@@ -3738,31 +3829,32 @@ export function apply(ctx) {
     if (!rows.length) {
       elements.push({ tag: 'markdown', content: '（这个工作区还没有会话）' })
     }
+    // CM 2026-10-02 选定 **L1 版式**：**会话名直接做成整行按钮**（点名字即切换）。
+    // 为什么不是"左名字 + 右按钮"：真机实测（K1 左边只 3 个字）也会被渲染成**上下两行** ——
+    // 手机端「文字 + 按钮」同行排不了，而**纯按钮行**能并排（K4 并排）。所以让按钮自己承载名字。
     rows.forEach((row, j) => {
       const n = j + 1
-      const what = row.title || row.summary || row.label || '（未命名会话）'
+      const what = clipSessionName(row.title || row.summary || row.label || '（未命名会话）')
       const blocked = row.live && !row.inChat && !row.current
-      // 徽标只在**会影响你点哪个按钮**时才出（当前 / 不能切换）；否则留空 ——
-      // CM：「为什么全部都显示'本聊天'？」（全行同一个标签＝噪声）
-      const badge = row.current ? '当前' : (blocked ? '🟡 运行中' : '')
-      const left = (row.current ? '▶ ' : '') + n + '. ' + '**' + what + '**'
-        + (badge ? '　<font color=\'grey\'>' + badge + '</font>' : '')
-        + (blocked ? '\n<font color=\'grey\'>正在别处运行，不能切换</font>' : '')
-      // 会话之间加分隔线（第一条之前不加，免得卡片顶部先来一条横杠）
-      if (j > 0) elements.push({ tag: 'hr' })
-      const cells = [{ tag: 'column', width: 'weighted', weight: 5, vertical_align: 'center', elements: [{ tag: 'markdown', content: left }] }]
-      if (!row.current && !blocked) {
-        cells.push({
-          tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
-          elements: [{
-            tag: 'button', type: 'primary', width: 'fill',
-            text: { tag: 'plain_text', content: '切换' },
-            behaviors: [{ type: 'callback', value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: 'takeover' } }],
-          }],
+      if (j > 0) elements.push({ tag: 'hr' })      // CM：会话之间要分隔线
+      if (blocked) {
+        // 不能切换的行**不给按钮**（给了只会点出一句"不能接管"），用一行文字写清
+        elements.push({
+          tag: 'markdown',
+          content: n + '. **' + what + '**　<font color=\'grey\'>🟡 正在别处运行，不能切换</font>',
         })
+        return
       }
-      // ⚠️ 带按钮的 column_set **不能用 flex_mode: 'none'**（CM 实测：按钮全被压成省略号）。
-      elements.push({ tag: 'column_set', flex_mode: 'stretch', columns: cells })
+      elements.push({
+        tag: 'button',
+        type: row.current ? 'default' : 'primary',
+        width: 'fill',
+        text: { tag: 'plain_text', content: (row.current ? '▶ ' : '') + n + '. ' + what },
+        behaviors: [{
+          type: 'callback',
+          value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: 'takeover' },
+        }],
+      })
     })
     elements.push({ tag: 'hr' })
     // 翻页（有第二页才出现）：一排两个等分；只有一侧可点时用 stretch 单个铺满
@@ -3835,9 +3927,12 @@ export function apply(ctx) {
     return cardId
   }
 
-  // 操作结果也**写回同一张卡**（不再另发一条纯文本）：按钮保留「← 回到工作区列表」，
-  // 用户想继续切就直接点，不会被一串消息刷屏。
-  function buildSwitchResultCard(record, kind, message, wsIndex) {
+  // 操作结果也**写回同一张卡**（不再另发一条纯文本）。
+  // 🔴 CM 2026-10-02：「切换完了之后，你画蛇添足搞一个返回按钮干什么？切换了，你就直接的卡，
+  //    那个卡片就是已切换就行了，就不要有一个返回按钮啊。他再切换的时候就再输入命令了」
+  //    ⇒ 结果卡＝**终态卡：不带任何按钮**；要再切换就重新发 `/switch`。
+  //    （旧写法是"结果卡上保留『← 回到工作区列表』"，已被上面这句话推翻 ⇒ 直接删，不留旧锚。）
+  function buildSwitchResultCard(kind, message) {
     const ok = kind === 'ok'
     return {
       schema: '2.0',
@@ -3849,10 +3944,6 @@ export function apply(ctx) {
       body: {
         elements: [
           { tag: 'markdown', content: message },
-          switchButtonsRow([
-            { label: '返回', type: 'default',
-              value: { fs_switch: record.token, fs_level: 'ws-back', fs_i: Number.isInteger(wsIndex) ? wsIndex : 0 } },
-          ]),
         ],
       },
     }
@@ -3889,7 +3980,7 @@ export function apply(ctx) {
     }
     try {
       if (record && record.cardId) {
-        await updateInteractive(bot, record.cardId, buildSwitchResultCard(record, 'warn', '已取消。要再切就发 `/switch`。', 0))
+        await updateInteractive(bot, record.cardId, buildSwitchResultCard('warn', '已取消。要再切就发 `/switch`。'))
         console.log('[fs] /switch card cancelled (patched to cancelled state)')
         return
       }
@@ -3961,7 +4052,7 @@ export function apply(ctx) {
     }
     if (row.live) {
       await say('🟡 这个会话**正在别处运行**，不能同时接管（会把同一份历史写坏）。'
-        + '等它结束再来，或者点「← 回到工作区列表」后用「新建」在该工作区开一个新会话。', 'warn')
+        + '等它结束再来；或者重新发 `/switch`，在该工作区用「新建」开一个新会话。', 'warn')
       return
     }
     const handle = await resumeDedicated(bot, row.sessionId)
@@ -3998,7 +4089,7 @@ export function apply(ctx) {
     }
     // 反馈一律**写回这张卡**（不再另发消息）——见 pushSwitchCard 上方说明。
     const feedback = (text, kind) => pushSwitchCard(bot, chatId, record,
-      buildSwitchResultCard(record, kind || 'ok', text, i))
+      buildSwitchResultCard(kind || 'ok', text))
     const wsRows = record.wsRows || []
     if (level === 'ws-back') {
       // 返回：重新读一次工作区（可能已有新会话/新目录），再 PATCH 回第一级
@@ -4010,7 +4101,7 @@ export function apply(ctx) {
     }
     const ws = switchRowByIndex(wsRows, i)
     if (!ws) {
-      await feedback('这张卡片里的序号已经对不上了，点下面「← 回到工作区列表」重新选。', 'warn')
+      await feedback('这张卡片里的序号已经对不上了，重新发 `/switch` 再选一次。', 'warn')
       return
     }
     ws.index = i
@@ -4036,7 +4127,7 @@ export function apply(ctx) {
     if (level === 'sess') {
       const row = switchRowByIndex(record.sessRows || [], Number(value.fs_j))
       if (!row) {
-        await feedback('这张卡片里的会话序号已经对不上了，点下面「← 回到工作区列表」重新选。', 'warn')
+        await feedback('这张卡片里的会话序号已经对不上了，重新发 `/switch` 再选一次。', 'warn')
         return
       }
       const mode = value.fs_mode === 'new' ? 'new' : 'takeover'
@@ -4044,7 +4135,7 @@ export function apply(ctx) {
       await applySwitch(bot, chat, chatId, row, mode, feedback)
       return
     }
-    await feedback('这张卡片已过期，点下面「← 回到工作区列表」重新选。', 'warn')
+    await feedback('这张卡片已过期，重新发 `/switch` 再选一次。', 'warn')
   }
 
   // ---- /model：飞书侧切换模型（CM 2026-10-02）---------------------------------
@@ -4607,7 +4698,7 @@ export function apply(ctx) {
   }
   function questionHint(q) {
     return isPlanReview(q)
-      ? '点右侧「选它」＝ 按这一行处理；也可以直接回文字给我修改意见（回「批准」/「同意」＝ 批准）。'
+      ? '点「批准」＝ 我退出计划模式、按这份计划开工；点「拒绝」或直接回我文字 ＝ 我按你的意见改（留在计划模式）。'
       : '点右侧「选它」按钮，或直接回复文字。'
   }
   // 批准标签是英文 `Approve`（harness 硬约定），而 CM 习惯回中文 ⇒ **整条消息精确命中**
@@ -4681,9 +4772,58 @@ export function apply(ctx) {
     }
   }
 
+  // 计划审批卡专用的「两个按钮」布局（2026-10-02 CM：「审批文字+按钮+拒绝文字+按钮 ⇒
+  // 文字放到按钮上，审批绿、拒绝红」）。为什么是这个形状：
+  //   · 飞书 2.0 按钮**没有绿色**（官方枚举 default / primary / danger / text / primary_text /
+  //     danger_text / primary_filled / danger_filled / laser）⇒「绿」只能落在**绿底块**上：
+  //     column.background_style='green-50'（区块背景语义，本仓 steer 提示已在用同一套色板）；
+  //   · 两个按钮**同一排**（flex_mode:'bisect' 两等分）—— CM 2026-10-02 定的口径；
+  //   · 文案固定 2 字（窄列按钮超过 2 字会被截成省略号，见 smoke 用例 48）；
+  //   · 回调**协议不动**：仍是 { fs_question, fs_option }，回传 harness 的仍是原 label
+  //     （Approve / Keep planning，由 buildQuestionAnswer 负责中文别名映射）。
+  // 找不到 approve 标签、或凑不出第二项时返回 null ⇒ 调用方回退旧布局（绝不把审批卡搞成没按钮）。
+  function planReviewButtonsRow(q, token) {
+    const opts = Array.isArray(q.options) ? q.options : []
+    if (opts.length < 2) return null
+    const approveLabel = String(planApproveLabel(q) || '')
+    const approveIndex = opts.findIndex((o) => String((o && o.label) || '') === approveLabel)
+    if (approveIndex < 0) return null
+    const rejectIndex = opts.findIndex((_, i) => i !== approveIndex)
+    if (rejectIndex < 0) return null
+    const mk = (label, index, type) => ({
+      tag: 'button',
+      type,
+      width: 'fill',
+      text: { tag: 'plain_text', content: label },
+      behaviors: [{ type: 'callback', value: { fs_question: token, fs_option: index } }],
+    })
+    return {
+      tag: 'column_set',
+      flex_mode: 'bisect',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
+          background_style: 'green-50',        // 「审批绿」＝ 绿底块（按钮本色没有绿）
+          elements: [mk('批准', approveIndex, 'default')],
+        },
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
+          elements: [mk('拒绝', rejectIndex, 'danger_filled')],   // 「拒绝红」＝ 红底白字
+        },
+      ],
+    }
+  }
+
   function questionCardPayload(q, token) {
     const opts = Array.isArray(q.options) ? q.options : []
     const plan = isPlanReview(q)
+    const planButtons = plan ? planReviewButtonsRow(q, token) : null
     return {
       schema: '2.0',
       config: { wide_screen_mode: true },
@@ -4702,7 +4842,9 @@ export function apply(ctx) {
               + (q.detail ? '\n\n' + q.detail : '')
               + '\n\n' + questionHint(q),
           },
-          ...opts.map((option, index) => questionOptionRow(option, token, index, optionDisplayLabel(q, option))),
+          ...(planButtons
+            ? [planButtons]
+            : opts.map((option, index) => questionOptionRow(option, token, index, optionDisplayLabel(q, option)))),
         ],
       },
     }
@@ -5607,5 +5749,7 @@ export function apply(ctx) {
   })
 
   console.log('[fs] bridge active. config: ' + configPath())
+  // 上一代若因热重载打断了回合，这里立刻在**该会话里**说明白（见 announceReloadInterrupts）。
+  announceReloadInterrupts(0)
   void ensureHelpers()
 }

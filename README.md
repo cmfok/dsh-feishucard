@@ -68,7 +68,8 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 - **`/goal` 命令 / Goal command**：飞书里直接 ` /goal <目标> ` 即可让当前会话进入目标模式（透传到 harness 的 `command-goal`，`pause`/`resume`/`clear`/`edit <新目标>` 子命令同样可用；无参数 = 查看状态）。命令注册表不可用时兜底直连 `goals` 服务创建目标。`/goal <objective>` starts goal mode for that chat's session from Feishu; subcommands pass through to the harness command.
 - **`/switch` 两级：工作区 → 会话 / Two-level workspace & session picker（2026-10-02 重做，CM 定稿 A 方案）**：`/switch` 先发**工作区卡** —— 列出 DSH `workspaceRegistry` 里注册的工作区（**与 GUI 侧边栏同源**），每行显示路径、会话数、🟡 运行中数量、目录是否还在（⚠️ 不存在），并标出 ▶ 当前工作区，按钮「N 进入看会话」/「N 在这里新建」；点「进入」（或 `/switch <工作区序号>`）再发**该工作区的会话卡**，每行「接管 / 新建」，底部「← 返回工作区列表」。🟡 运行中的会话只给"新建"（同一会话被两处同时驱动会写坏历史）。文字兜底 `/switch <工作区序号> [<会话序号>|new]`；`/list` ＝ **当前工作区的会话**（当前工作区 ＝ 活跃会话的 cwd）。新建/接管时会话会**挂进工作区注册表**（best-effort）⇒ GUI 侧边栏也立刻看得到。`/switch` posts a workspace card first (from the DSH `workspaceRegistry`, the same source the GUI sidebar uses), then that workspace's session card; text fallbacks `/switch <ws> [<session>|new]`, and `/list` lists the current workspace's sessions.
 
-- **文件收件 / File inbox（2026-09-09）**：飞书文件/图片/语音消息不再被静默丢弃——自动下载到 ileInbox（配置项，缺省 <workspace>/downloaded_files），并向会话注入「收到文件+本地路径」，agent 可直接读取。Inbound Feishu file/image/audio messages are downloaded to ileInbox and surfaced to the agent with a local path.
+- **文件收件 / File inbox（2026-09-09）**：飞书文件/图片/语音消息不再被静默丢弃——自动下载到 fileInbox（配置项，缺省 <workspace>/downloaded_files；**2026-10-02 前实际从未生效**：下载链读 `evt.msg_type` 而 `normalizeEvent()` 只给 `message_type` ⇒ 文件消息被静默丢弃；现在两个键都给，**失败也会明说** HTTP 码），并向会话注入「收到文件+本地路径」，agent 可直接读取。Inbound Feishu file/image/audio messages are downloaded to fileInbox and surfaced to the agent with a local path.
+- **热重载打断提示 / Hot-reload interrupt notice（2026-10-02 复原并加固）**：保存插件源码即热重载（junction + HMR），而重载会拆掉插件作用域 ⇒ 正在跑的回合被 `aborted(disposed)` 中断。此时插件会在**该会话里**发一条纯文本说明（「♻️ 插件已热重载：上一轮被热重载打断（不是模型出错，也不是你的操作）…」），免得看起来像"说到一半莫名停了"。同一会话只提示一次（幂等）；重载时本来没有回合在跑 ⇒ **不发任何东西**（无噪声）。When a hot reload aborts an in-flight turn, the plugin posts an explanatory notice into that chat (once per session; silent when nothing was running).
 - **子代理回执即播报 / Subagent settlement broadcast（2026-10-01 改造①）**：子代理一完成**立刻**播报 ——
   ① 纯文本（必达）② 详情卡（带**正确的子代理 id**）。判据是会话事件里的正式字段 `source.kind === 'subagent-settled'`，
   **不看回合状态**（旧实现在"回合启动那一拍"回扫，而回执比它晚落盘 ⇒ 永远不开卡）。
@@ -84,9 +85,12 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 - **引用回复透传 / Quote passthrough（2026-10-01 改造⑤）**：长按引用某条消息/某张卡片再回复时，
   被引内容的摘要会随正文一起进会话（「（你在引用这条消息：…）」）；只用本地登记表，不新增飞书权限。
   Quoted-message摘要 is injected into the session so the agent knows what the reply refers to; no extra Feishu scope needed.
-- **计划审查卡 / Plan-review card（2026-10-01，0.4.14）**：计划模式里 `exit_plan_mode` 提交的**退出申请**现在会发到飞书 ——
-  卡头「📋 计划已写好，等你批准」，正文是**完整计划**，两个按钮「批准并执行（退出计划模式）」/「继续修改（留在计划模式）」；
+- **计划审查卡 / Plan-review card（2026-10-01 起；2026-10-02 改版）**：计划模式里 `exit_plan_mode` 提交的**退出申请**现在会发到飞书 ——
+  卡头「📋 计划已写好，等你批准」，正文是**完整计划**，底下一排**两个按钮**：
+  **`批准`（绿底块）** / **`拒绝`（红底白字）** —— 文字写在按钮上，不再"文字 + 选它"各占一行。
   也可以直接回文字（精确回「批准」/「同意」＝批准；带补充说明＝修改意见回给模型）。
+  两条实现约束：飞书 2.0 按钮的**颜色枚举里没有绿色**（default/primary/danger/…_filled/laser）⇒「绿」落在
+  `column.background_style='green-50'` 这个**绿底块**上；窄列按钮**文案 ≤2 字**（超过会被截成省略号），所以是「批准」/「拒绝」。
   **为什么以前收不到**：`exit_plan_mode` 走的是 `userQuestions` **服务**（不是 `ask_user_question` 工具），
   旧实现只拦了工具那一层 ⇒ 申请只发给了连着的 GUI 客户端。现在补了服务层 `user-questions/request` 接管
   （与 `approval/request` 同构，仅接管飞书自己的会话；GUI/子代理的提问一律交回 harness）。

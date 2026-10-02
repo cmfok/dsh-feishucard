@@ -5,7 +5,7 @@
 //   (create + PATCH updates) -> seal -> final reply on card.
 //
 // Run: node scripts/smoke.mjs   (from the package root)
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { EventEmitter } from 'node:events'
@@ -66,6 +66,9 @@ function ok(cond, label) {
 // ---- mocked Feishu REST (captures card payloads) -----------------------------
 const sentCards = []      // { op, payload }
 const reactionCalls = []  // { method, url, body } —— 打字提示（reaction）生命周期，用例 40 用
+// 入站附件下载（用例 49）：记录被请求的资源 URL，并可切换成"下载失败"。
+const resourceDownloads = []
+let resourceShouldFail = false
 let tenantTokenCalls = 0
 let createReturnsEmptyId = false   // 建卡幂等测试：模拟返回体缺 message_id
 // 2026-10-01（用例 34）：只让"从此刻起的第 N 次建卡"失败 —— 用来精确打到
@@ -81,6 +84,14 @@ globalThis.fetch = async (url, init) => {
   if (u.includes('/reactions') && (init.method === 'POST' || init.method === 'DELETE')) {
     reactionCalls.push({ method: init.method, url: u, body: String(init.body || '') })
     return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: { reaction_id: 're_1' } })) }
+  }
+  // 入站附件下载（用例 49）：资源 URL 形状是 /im/v1/messages/<msg_id>/resources/<key>?type=file，
+  // **也含** '/im/v1/messages' ⇒ 必须排在建卡分支**之前**，否则会被当成建卡请求
+  //（那里 `JSON.parse(init.body)`，而下载是 GET 没有 body ⇒ 直接抛错，测出来的是 mock 的毛病）。
+  if (u.includes('/resources/')) {
+    resourceDownloads.push({ url: u })
+    if (resourceShouldFail) return { ok: false, status: 403, text: () => Promise.resolve('forbidden') }
+    return { ok: true, status: 200, arrayBuffer: async () => Buffer.from('hello-from-feishu') }
   }
   if (u.includes('/im/v1/messages')) {
     const raw = JSON.parse(init.body)
@@ -512,6 +523,24 @@ async function drain() {
     await new Promise((r) => setTimeout(r, 150))
   }
 }
+// 触发一条**文件**入站消息（message_type='file'，正文形如 {"file_key":…,"file_name":…}）
+// —— 用例 49 用它验「飞书发文件 ⇒ 插件自己下载并告知」（CM 2026-10-02）。
+function feedInboundFile(msgId, file) {
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: msgId,
+        message_type: 'file',
+        chat_id: CHAT_ID,
+        chat_type: 'p2p',
+        content: JSON.stringify({ file_key: file.key, file_name: file.name }),
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+}
 function cardsSince(n) {
   return sentCards.slice(n)
 }
@@ -896,6 +925,13 @@ const tapValue = async (value) => {
   }) + '\n'
   await drain()
 }
+// L1 版式（CM 2026-10-02 选定）：会话行本身就是一个**整行按钮**，名字在按钮文字里。
+// 所以"按名字找行"要查按钮的 fs_j，而不是 divRows。
+const sessBtnIndexOf = (card, needle) => {
+  const b = allButtons(card).find((x) => x.value && x.value.fs_level === 'sess'
+    && String((x.text && x.text.content) || '').includes(needle))
+  return b ? Number(b.value.fs_j) : -1
+}
 const rowIndexOf = (card, needle) => {
   const rows = divRows(card)
   const i = rows.findIndex((e) => String(e.text.content).includes(needle))
@@ -988,8 +1024,11 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(sessBottom.includes('ws-back'), '底部有「← 返回」')
   ok(sessBottom.includes('cancel'), '底部有「✕ 取消」（一按就撤销整张卡）')
   ok(cardElements(sessCard).filter((e) => e.tag === 'hr').length >= 1, '会话之间有分隔线')
+  ok(allButtons(sessCard).some((b) => b.value && b.value.fs_level === 'sess'
+    && String((b.text && b.text.content) || '').includes(summaryText)),
+    'L1 版式：会话名**写在整行按钮里**（点名字即切换）')
   ok(JSON.stringify(sessCard.payload).includes('第 1/'), '二级卡片标明页码（第 1/N 页）')
-  const guiIndex = rowIndexOf(sessCard, summaryText)
+  const guiIndex = sessBtnIndexOf(sessCard, summaryText)
   ok(guiIndex >= 0, '候选行的序号可读（gui=' + (guiIndex + 1) + '）')
   const sessRowBtns = allButtons(sessCard).filter((b) => b.value && b.value.fs_level === 'sess')
   ok(sessRowBtns.length > 0 && sessRowBtns.every((b) => b.value.fs_mode === 'takeover'),
@@ -1009,6 +1048,13 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(cardsSince(takeoverMark).filter((c) => c.op === 'create').length === 0,
     '接管后**没有新发卡片**（结果写回同一张）')
   ok(JSON.stringify(cardsSince(takeoverMark)).includes('已接管'), '结果直接显示在原来那张卡上')
+  // 2026-10-02 CM：「切换了…那个卡片就是已切换就行了，就不要有一个返回按钮啊」
+  // ⇒ 结果卡＝**终态卡**：一个按钮都不留（旧写法挂了个「← 回到工作区列表」）。
+  const resultCard = sentCards.slice(takeoverMark).filter((c) => c.op === 'update').pop()
+  ok(Boolean(resultCard) && allButtons(resultCard).length === 0,
+    '结果卡是终态卡：一个按钮都没有（实际 ' + (resultCard ? allButtons(resultCard).length : '?') + ' 个）')
+  ok(!JSON.stringify(cardsSince(takeoverMark)).includes('回到工作区列表'),
+    '结果卡/提示文案里不再出现「回到工作区列表」（那个按钮已经删了，留着就是让人去点空气）')
   ok(registryAttached.some((a) => a.id === 'gui-session-aaaa1111'),
     '接管时把会话**挂进了工作区注册表**（与 GUI 同源：侧边栏也看得到）')
 
@@ -1206,7 +1252,8 @@ console.log('15d) 二级卡片：每页 5 个 + 翻页 + 会话间分隔线（CM
     const page1 = upd.length ? upd[upd.length - 1] : lastCardFrom(openMark)
     const p1Body = JSON.stringify(page1 && page1.payload)
     ok(p1Body.includes('第 1/'), '第 1 页标明「第 1/N 页」')
-    ok(divRows(page1).length === 5, '每页只列 5 个会话（实际 ' + divRows(page1).length + '）')
+    const page1Rows = allButtons(page1).filter((b) => b.value && b.value.fs_level === 'sess').length
+    ok(page1Rows === 5, '每页只列 5 个会话（实际 ' + page1Rows + '）')
     ok(cardElements(page1).filter((e) => e.tag === 'hr').length >= 4,
       '会话之间加了分隔线（' + cardElements(page1).filter((e) => e.tag === 'hr').length + ' 条 hr）')
     const nextBtn = allButtons(page1).find((b) => b.value.fs_level === 'page' && b.value.fs_page === 1)
@@ -1216,8 +1263,8 @@ console.log('15d) 二级卡片：每页 5 个 + 翻页 + 会话间分隔线（CM
     const upd2 = sentCards.slice(p2Mark).filter((c) => c.op === 'update')
     const page2 = upd2.length ? upd2[upd2.length - 1] : undefined
     ok(JSON.stringify(page2 && page2.payload).includes('第 2/'), '翻到第 2 页')
-    ok(divRows(page2).length >= 1 && divRows(page2).length <= 5,
-      '第 2 页列出剩下的会话（' + divRows(page2).length + ' 个）')
+    const page2Rows = allButtons(page2).filter((b) => b.value && b.value.fs_level === 'sess').length
+    ok(page2Rows >= 1 && page2Rows <= 5, '第 2 页列出剩下的会话（' + page2Rows + ' 个）')
     ok(cardsSince(p2Mark).filter((c) => c.op === 'create').length === 0, '翻页是原地更新（不弹新卡）')
     ok(allButtons(page2).some((b) => b.value.fs_level === 'page' && b.value.fs_page === 0), '第 2 页有「← 上一页」')
   } finally {
@@ -2374,11 +2421,28 @@ console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/
   ok(body.includes('把计划审查搬到飞书') && body.includes('只读排查调用链'),
     '计划正文**完整**在卡上（含标题与正文，不是只有标题的空卡）')
   const rows = rowsOf(card)
-  ok(rows.length === 2, '两个选项各占一行分栏（实际 ' + rows.length + ' 行）')
-  ok(body.includes('批准并执行（退出计划模式）') && body.includes('继续修改'), '选项给了中文说明')
+  // 2026-10-02 CM：「审批文字+按钮+拒绝文字+按钮 ⇒ 文字放在按钮上，审批绿、拒绝红」。
+  ok(rows.length === 1, '审批卡只有**一排**按钮（不是"文字 + 按钮"各占一行；实际 ' + rows.length + ' 排）')
+  const row = rows[0]
+  ok(Boolean(row) && row.flex_mode === 'bisect', '两个按钮**同一排**等分（flex_mode=bisect）')
+  const btns = ((row && row.columns) || []).map((c) => (c.elements || [])[0])
+  const approveBtn = btns[0]
+  const rejectBtn = btns[1]
+  ok(btns.length === 2, '正好两个按钮（实际 ' + btns.length + ' 个）')
+  ok(Boolean(approveBtn) && Boolean(rejectBtn)
+    && approveBtn.text.content === '批准' && rejectBtn.text.content === '拒绝',
+    '文字写在按钮上：批准 / 拒绝（实际 ' + (approveBtn && approveBtn.text.content) + ' / '
+      + (rejectBtn && rejectBtn.text.content) + '）')
+  ok(Boolean(row) && row.columns[0].background_style === 'green-50',
+    '「批准」＝绿底块（飞书 2.0 按钮没有绿色，绿只能落在底块上）')
+  ok(Boolean(rejectBtn) && rejectBtn.type === 'danger_filled', '「拒绝」＝红底白字（danger_filled）')
+  ok(Boolean(approveBtn) && Boolean(rejectBtn)
+    && approveBtn.behaviors[0].value.fs_option === 0 && rejectBtn.behaviors[0].value.fs_option === 1,
+    '按钮序号仍指向原选项（0=Approve / 1=Keep planning）—— 协议没动')
+  ok(body.includes('点「批准」') && !body.includes('选它'), '提示文案跟着改（不再是"点右侧选它"）')
 
   // (c) 点「批准」按钮 ⇒ 回传 harness 的**必须是原 label `Approve`**（plan-mode 按它判批准）
-  await tap(tokenOf(rows), 0)
+  await tapValue(approveBtn.behaviors[0].value)
   const a1 = await pending
   ok(a1 && a1.answers && a1.answers.length === 1 && a1.answers[0].id === 'plan-review',
     '答案按 question.id 原样回传（id=plan-review）')
@@ -2390,7 +2454,9 @@ console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/
   const mark2 = sentCards.length
   const r2 = emitCtx('user-questions/request', { questions, agent, signal: undefined }, nextSpy)
   await drain()
-  await tap(tokenOf(rowsOf(cardOf(mark2))), 1)
+  const rows2 = rowsOf(cardOf(mark2))
+  const rejectBtn2 = rows2[0] && ((rows2[0].columns || [])[1] || {}).elements[0]
+  await tapValue(rejectBtn2.behaviors[0].value)
   const a2 = await r2[0]
   ok(a2.answers[0].selected[0] === 'Keep planning', '第二个选项回传 `Keep planning`')
 
@@ -2682,26 +2748,121 @@ console.log('48) 卡片 schema 校验：schema 2.0 不许出现 tag=action（真
       if (hasButton && (!e.flex_mode || e.flex_mode === 'none')) noneWithButton.push(String(e.flex_mode))
     })
   }
-  // 按钮文字 ≤2 字（CM 2026-10-02 实测：「按钮里面最多两个字…但凡超过两个字就会变省略号」）。
-  // 这条只对 schema 2.0 卡片成立（1.0 的审批卡长标签照样正常显示）。
-  const longLabels = []
+  // 按钮文字长度（CM 2026-10-02 实测）：
+  //  · **窄列里的按钮**（放在 column 里）文字 ≤2 字 —— 「但凡超过两个字就会变省略号」
+  //  · **整行按钮**（顶层、width:fill）可以长（L1 版式就是把会话名写进按钮），但也要有上限，
+  //    免得名字过长把按钮文字挤掉。上限与 index.js 的 SESSION_NAME_MAX(16) + '▶ 12. ' 前缀 对应。
+  const longNarrow = []
+  const longWide = []
+  const walkBtn = (els, inColumn) => {
+    for (const e of els || []) {
+      if (!e || typeof e !== 'object') continue
+      if (e.tag === 'button') {
+        const t = String((e.text && e.text.content) || '')
+        const n = [...t].length
+        if (inColumn ? n > 2 : n > 24) (inColumn ? longNarrow : longWide).push(t)
+      }
+      if (Array.isArray(e.elements)) walkBtn(e.elements, inColumn)
+      for (const col of (e.columns || [])) walkBtn(col && col.elements, true)
+    }
+  }
   for (const c of sentCards) {
     const p = c.payload
     if (!p || p.schema !== '2.0') continue
-    walk(p.body && p.body.elements, (e) => {
-      if (!e || e.tag !== 'button') return
-      const t = String((e.text && e.text.content) || '')
-      if ([...t].length > 2) longLabels.push(t)
-    })
+    walkBtn(p.body && p.body.elements, false)
   }
-  ok(longLabels.length === 0, 'schema 2.0 卡片的按钮文字都 ≤2 字'
-    + (longLabels.length ? ' —— 超长：' + longLabels.slice(0, 3).join(' / ') : ''))
+  ok(longNarrow.length === 0, '窄列里的按钮文字都 ≤2 字（超过会被截成省略号）'
+    + (longNarrow.length ? ' —— 超长：' + longNarrow.slice(0, 3).join(' / ') : ''))
+  ok(longWide.length === 0, '整行按钮文字都在上限内（≤24 字，含序号与 ▶ 前缀）'
+    + (longWide.length ? ' —— 超长：' + longWide.slice(0, 2).join(' / ') : ''))
   ok(noneWithButton.length === 0,
     '带按钮的 column_set 都用等分/拉伸（不用 none，否则按钮会被压成省略号）'
     + (noneWithButton.length ? ' —— 违规 ' + noneWithButton.length + ' 处' : ''))
   ok(v2 > 0, '本轮确实建过 schema 2.0 的卡（' + v2 + ' 张，否则这条校验没意义）')
   ok(bad.length === 0, 'schema 2.0 卡片全部合法（无 action 元素、按钮走 behaviors）'
     + (bad.length ? ' —— 首个问题：' + bad[0] : ''))
+}
+
+console.log('49) 入站文件自动收：飞书发文件 ⇒ 插件自己下载并告知（CM 2026-10-02）')
+{
+  const dir = join(WORKSPACE, 'downloaded_files')
+  const before = existsSync(dir) ? readdirSync(dir).length : 0
+  feedInboundFile('om_file_001', { key: 'file_v3_abc', name: '季度报表.xlsx' })
+  await drain()
+  const after = existsSync(dir) ? readdirSync(dir) : []
+  ok(after.length === before + 1,
+    '文件真的落盘（' + dir + ' 里多了 ' + (after.length - before) + ' 个）')
+  ok(after.some((n) => n.includes('季度报表')), '文件名保留下来（' + String(after[after.length - 1] || '-') + '）')
+  ok(resourceDownloads.length >= 1 && /\/resources\/file_v3_abc\?type=file/.test(resourceDownloads[0].url),
+    '走的是消息资源接口（/messages/<id>/resources/<file_key>?type=file）')
+  const seen = JSON.stringify(agent.sent)
+  ok(seen.includes('收到文件') && seen.includes('季度报表'), '插件自己把文件喂给模型（不用 CM 再口头告诉我一遍）')
+  ok(seen.includes('downloaded_files'), '并把落盘路径一起给模型')
+  ok(consoleLines.some((l) => l.includes('inbound file saved:')), '留痕 `inbound file saved:`（可日志复验）')
+
+  // 失败也要**可见**：不再静默吞掉（CM 原话正是"你不知道，要我告诉你"）
+  resourceShouldFail = true
+  feedInboundFile('om_file_002', { key: 'file_v3_bad', name: '坏文件.pdf' })
+  await drain()
+  resourceShouldFail = false
+  ok(JSON.stringify(agent.sent).includes('下载失败'), '下载失败时明说失败（HTTP 码 + 文件名），不再无声')
+  ok(consoleLines.some((l) => l.includes('inbound file download failed: HTTP 403')), '并留痕 HTTP 状态码')
+}
+
+console.log('50) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10-02：0.4.22 之后这条提示没了）')
+{
+  const activeTurns = globalThis.__fsActiveTurns
+  ok(Boolean(activeTurns) && typeof activeTurns.set === 'function',
+    '（前提）活跃回合表挂在 globalThis 上（跨代际，新实例看得见）')
+  // (a) 旧实例 dispose 侧：重载那一刻有回合在跑 ⇒ 必须留下"待播报"线索
+  activeTurns.set('fs-main-reloadtest', {
+    bot: { cfg: { appId: APP_ID }, chats: new Map() },
+    chatId: CHAT_ID,
+    card: { token: 'om_reload_card' },
+    split: null,
+  })
+  globalThis.__fsReloadHint = null
+  for (const cleanup of effectCleanups) {
+    try { cleanup() } catch { /* 卸载钩子里有别的副作用，这里只关心线索 */ }
+  }
+  const hint = globalThis.__fsReloadHint
+  ok(Boolean(hint) && Array.isArray(hint.items) && hint.items.length === 1,
+    '重载前把"可能被中断的回合"登记下来（' + ((hint && hint.items) ? hint.items.length : 0) + ' 条）')
+  ok(Boolean(hint) && hint.items[0] && hint.items[0].sessionId === 'fs-main-reloadtest'
+    && hint.items[0].chatId === CHAT_ID, '登记的是**那个会话**（sessionId + chatId 都对）')
+  ok(consoleLines.some((l) => l.includes('登记 1 个可能被中断的回合')), '旧实例留痕（可日志复验）')
+  activeTurns.delete('fs-main-reloadtest')
+
+  // (b) 新实例侧：apply 时读线索 ⇒ 往那个会话发一条说明，且每会话只提示一次
+  globalThis.__fsReloadHint = {
+    at: Date.now(),
+    items: [{ sessionId: 'fs-main-reloadtest', chatId: CHAT_ID, appId: APP_ID }],
+  }
+  const before = sentCards.length
+  const mod2 = await import('../index.js')
+  mod2.apply(ctx)
+  await drain()
+  await drain()
+  const texts = sentCards.slice(before).map((c) => JSON.stringify(c.payload))
+  ok(texts.some((t) => t.includes('热重载') && t.includes('打断')),
+    '重载后在该会话发了提示：说明是**热重载打断**的（不是模型出错）')
+  ok(consoleLines.some((l) => l.includes('hot reload interrupt notice')), '留痕 `hot reload interrupt notice`（可日志复验）')
+  const notified = globalThis.__fsReloadNotified
+  ok(Boolean(notified) && typeof notified.has === 'function' && notified.has('fs-main-reloadtest'),
+    '记下"这个会话已提示过"（第二次重载不会重复刷屏）')
+
+  // (c) 幂等：同样的线索再来一次 ⇒ 不再发第二条
+  const before2 = sentCards.length
+  globalThis.__fsReloadHint = {
+    at: Date.now(),
+    items: [{ sessionId: 'fs-main-reloadtest', chatId: CHAT_ID, appId: APP_ID }],
+  }
+  const mod3 = await import('../index.js')
+  mod3.apply(ctx)
+  await drain()
+  await drain()
+  const texts2 = sentCards.slice(before2).map((c) => JSON.stringify(c.payload))
+  ok(!texts2.some((t) => t.includes('热重载')), '同一个会话不会提示第二遍（幂等）')
 }
 
 console.log('')

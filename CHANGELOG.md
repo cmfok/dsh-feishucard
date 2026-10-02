@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-10-02
+
+### Fixed（四件事：结果卡收口 / 热重载打断提示（复原）/ 审批卡按钮化 / 入站文件自动收）
+
+**CM 原话**（2026-10-02）：「把你发现的问题先修复好」「之前我已经要求了说要加热重载的情况下，在会话里面要发提示，说明是热重载打断了会话的。这个之前有测试过是生效的，为什么现在没了？」「计划审批最后现在是审批文字+按钮+拒绝文字+按钮，我要改成文字在按钮上，审批绿，拒绝红」「现在我往飞书发文件，你不知道，要我告诉你，你才去找，改成发你就自动收到」。
+
+| # | 问题 | 根因（都有出处） | 处置 |
+|:--|:--|:--|:--|
+| 1 | `/switch` 结果卡显示「⚠️ 没能切换」+ 正文只有 `ok`/`warn` | 上一轮把 `buildSwitchResultCard` 签名从 4 参改成 2 参，**漏改调用点**（仍传 `(record, kind, text, i)`）⇒ 参数串位 | 调用点改为 `(kind, text)`；并清掉 **4 处**指向**已删除按钮**的「点下面「← 回到工作区列表」重新选」⇒ 改成「重新发 `/switch`」（那个按钮 0.5.4 已按 CM 原话删掉，留着就是让人去点空气） |
+| 2 | 热重载打断会话**完全没提示** | 0.4.20 曾在 dispose 时把旧卡封口并留一行 `♻️ 插件已热重载：本卡停止更新…`；**0.4.22 改"续卡"时把这行删了** ⇒ 之后 abort 被当正常收尾（`status=sealed`），一个字都不解释 | **复原并加固**：旧实例在 dispose 时登记"这一刻有哪些回合在跑"（`globalThis.__fsReloadHint`）→ 新实例有 bot 之后向**该会话**发纯文本说明；每会话只提示一次（`__fsReloadNotified` 幂等）；线索为空则**不发**（无噪声）；`apply` 期 bot 未就绪时**留住线索重试**，绝不因为"来得太早"把提示吞掉 |
+| 3 | 计划审批卡是"审批文字+按钮 / 拒绝文字+按钮" | plan-review 与通用提问**共用** `questionOptionRow`（左 markdown 文字 + 右「选它」按钮） | 审批卡改用**一排两个按钮**：`批准`（**绿底块** `green-50` —— 飞书 2.0 按钮枚举**没有绿色**）+ `拒绝`（`danger_filled` 红底白字）；`flex_mode:'bisect'` 同一排；回调**协议不变**（仍回 `Approve` / `Keep planning`）；文案 2 字（窄列 >2 字会被截断）；找不到 approve 标签时**回退旧布局**（绝不把审批卡搞成没按钮） |
+| 4 | 往飞书发文件，插件**不知道** | `downloadInboundFile`（2026-09-09 就有）读 `evt.msg_type`，而 `normalizeEvent` 只产出 `message_type` ⇒ 恒 `undefined` ⇒ 静默 `return ''`（`web.log` 里连一条 `inbound file saved` / `download failed` 都没有） | `normalizeEvent` 补 `msg_type`（两个键都给）；**失败与不支持的类型都必须可见**（失败回一条带 HTTP 码的说明、不支持的类型留日志），不再无声吞掉；注入文案改为"先回一句确认，等指示再动" |
+
+**防回归（都会变红，写在冒烟里）**
+
+- 用例 15：结果卡必须**零按钮**（CM 原话「就不要有一个返回按钮啊」）+ 文案里不许再出现「回到工作区列表」。
+- 用例 45：审批卡**只有一排**按钮、`flex_mode='bisect'`、文案 `批准`/`拒绝`、`green-50` / `danger_filled`、序号仍指向原选项；点按钮回传的仍是 `Approve` / `Keep planning`。
+- 用例 49（新）：文件消息 ⇒ 真的落盘 + 走 `/resources/<key>?type=file` + 路径喂给模型；**下载失败**也必须明说（HTTP 403 分支）。
+- 用例 50（新）：dispose 登记线索 → apply 播报提示 → 同会话不重复提示（幂等）。
+- 冒烟夹具同时修掉一处**假绿**：REST mock 会把 `/im/v1/messages/<id>/resources/...` 误当建卡请求（GET 没有 body ⇒ `JSON.parse(undefined)` 抛错）—— 不加 `/resources/` 分支的话，第 4 项的测试根本跑不起来。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=212, sessions=10)**，`❌` 0 条。
+
 ## [0.5.4] - 2026-10-02
 
 ### Fixed（按 CM 拿到真卡后的逐条反馈收口：徽标噪声 / 省略号 / 分隔线 / 翻页 / 两字按钮）
