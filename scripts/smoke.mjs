@@ -984,16 +984,18 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(!sBody.includes('sub-chil'), '子代理子会话不被列为可切换目标')
   ok(!sBody.includes('fu-sess'), '**只列这个工作区的会话**（别的工作区的会话不串进来）')
   const sessBottom = allButtons(sessCard).map((b) => b.value && b.value.fs_level)
-  ok(sessBottom.includes('ws-new'), '底部有「➕ 新建」（整卡动作，不挂在某一行）')
+  ok(!sessBottom.includes('ws-new'), '二级底部**没有**「新建」（CM：下面新建不要，只留返回、取消）')
   ok(sessBottom.includes('ws-back'), '底部有「← 返回」')
-  ok(sessBottom.includes('cancel'), '底部有「✕ 取消」（CM 2026-10-02 要求：一按就撤销整张卡）')
+  ok(sessBottom.includes('cancel'), '底部有「✕ 取消」（一按就撤销整张卡）')
+  ok(cardElements(sessCard).filter((e) => e.tag === 'hr').length >= 1, '会话之间有分隔线')
+  ok(JSON.stringify(sessCard.payload).includes('第 1/'), '二级卡片标明页码（第 1/N 页）')
   const guiIndex = rowIndexOf(sessCard, summaryText)
   ok(guiIndex >= 0, '候选行的序号可读（gui=' + (guiIndex + 1) + '）')
   const sessRowBtns = allButtons(sessCard).filter((b) => b.value && b.value.fs_level === 'sess')
   ok(sessRowBtns.length > 0 && sessRowBtns.every((b) => b.value.fs_mode === 'takeover'),
     '会话行的按钮全部是「切换」语义（CM：这里应该是切换，不是新建）')
-  ok(allButtons(sessCard).some((b) => b.value && b.value.fs_level === 'ws-new'),
-    '「新建」收成卡片底部一个按钮（不再是每行一个）')
+  ok(!allButtons(sessCard).some((b) => b.value && b.value.fs_level === 'ws-new'),
+    '二级卡片上没有「新建」（CM：下面新建不要，只留返回、取消）')
   ok(allButtons(sessCard).some((b) => b.value && b.value.fs_level === 'ws-back'),
     '底部同排还有「返回工作区」')
   const sessButtons = allButtons(sessCard)
@@ -1165,14 +1167,61 @@ console.log('15c) 文字命令的会话卡：按钮序号必须指向**那个**�
     const sessCard15c = lastCardFrom(sessMark)
     ok(Boolean(sessCard15c) && JSON.stringify(sessCard15c.payload).includes('还没有会话'),
       '空工作区在会话卡上给出「在这里新建会话」入口')
-    const newBtn = allButtons(sessCard15c).find((b) => b.value && b.value.fs_level === 'ws-new')
-    ok(Boolean(newBtn) && newBtn.value.fs_i === emptyIndex,
-      '按钮序号指向**这个**工作区（fs_i=' + (newBtn && newBtn.value.fs_i) + '，期望 ' + emptyIndex + '）')
+    // 二级现在没有「新建」了（CM 要求）⇒ 新建走**一级菜单**那个按钮，它同样必须带上正确的工作区序号
+    const newBtn = allButtons(wsCard15c).find((b) => b.value && b.value.fs_level === 'ws-new' && b.value.fs_i === emptyIndex)
+    ok(Boolean(newBtn), '一级菜单上「新建」按钮指向这个工作区（fs_i=' + emptyIndex + '）')
     if (newBtn) await tapValue(newBtn.value)
     ok(agent.session.header.cwd === emptyPath,
       '点它新建出来的会话 cwd 就是该工作区（实际 ' + agent.session.header.cwd + '）')
+    // 二级卡片的按钮（返回/取消）也必须带**那个**工作区的序号：
+    // 缺了 ws.index 它们会全变 0 ⇒ 返回/翻页会跑到第一个工作区去（这正是门槛抓到的回归）。
+    const backOnEmpty = allButtons(sessCard15c).find((b) => b.value && b.value.fs_level === 'ws-back')
+    ok(Boolean(backOnEmpty) && backOnEmpty.value.fs_i === emptyIndex,
+      '二级卡片的按钮序号也指向这个工作区（fs_i=' + (backOnEmpty && backOnEmpty.value.fs_i) + '，期望 ' + emptyIndex + '）')
   } finally {
     fakeWorkspaceRegistry._entities = entitiesBefore15c
+  }
+}
+
+console.log('15d) 二级卡片：每页 5 个 + 翻页 + 会话间分隔线（CM 2026-10-02 三条）')
+{
+  const persistedBefore15d = persistedSessions.slice()
+  try {
+    for (let i = 0; i < 7; i++) {
+      persistedSessions.push({
+        version: 0, id: 'page-session-' + i,
+        createdAt: Date.now() - (i + 1) * 60e3, cwd: WORKSPACE,
+      })
+    }
+    const mark = sentCards.length
+    feedInbound('om_page_ws', '/switch')
+    await drain()
+    const wsCard = lastCardFrom(mark)
+    const wsIdx = rowIndexOf(wsCard, WS_TITLE_WORK)
+    ok(wsIdx >= 0, '工作区卡上找到 work（序号 ' + (wsIdx + 1) + '）')
+    const enterBtn = allButtons(wsCard).find((b) => b.value.fs_level === 'ws' && b.value.fs_i === wsIdx)
+    const openMark = sentCards.length
+    if (enterBtn) await tapValue(enterBtn.value)
+    const upd = sentCards.slice(openMark).filter((c) => c.op === 'update')
+    const page1 = upd.length ? upd[upd.length - 1] : lastCardFrom(openMark)
+    const p1Body = JSON.stringify(page1 && page1.payload)
+    ok(p1Body.includes('第 1/'), '第 1 页标明「第 1/N 页」')
+    ok(divRows(page1).length === 5, '每页只列 5 个会话（实际 ' + divRows(page1).length + '）')
+    ok(cardElements(page1).filter((e) => e.tag === 'hr').length >= 4,
+      '会话之间加了分隔线（' + cardElements(page1).filter((e) => e.tag === 'hr').length + ' 条 hr）')
+    const nextBtn = allButtons(page1).find((b) => b.value.fs_level === 'page' && b.value.fs_page === 1)
+    ok(Boolean(nextBtn), '第 1 页有「下一页 →」')
+    const p2Mark = sentCards.length
+    if (nextBtn) await tapValue(nextBtn.value)
+    const upd2 = sentCards.slice(p2Mark).filter((c) => c.op === 'update')
+    const page2 = upd2.length ? upd2[upd2.length - 1] : undefined
+    ok(JSON.stringify(page2 && page2.payload).includes('第 2/'), '翻到第 2 页')
+    ok(divRows(page2).length >= 1 && divRows(page2).length <= 5,
+      '第 2 页列出剩下的会话（' + divRows(page2).length + ' 个）')
+    ok(cardsSince(p2Mark).filter((c) => c.op === 'create').length === 0, '翻页是原地更新（不弹新卡）')
+    ok(allButtons(page2).some((b) => b.value.fs_level === 'page' && b.value.fs_page === 0), '第 2 页有「← 上一页」')
+  } finally {
+    persistedSessions = persistedBefore15d
   }
 }
 
@@ -2619,6 +2668,37 @@ console.log('48) 卡片 schema 校验：schema 2.0 不许出现 tag=action（真
       if (e.tag === 'button' && !Array.isArray(e.behaviors)) bad.push('2.0 按钮缺 behaviors')
     })
   }
+  // 带**按钮**的 column_set 不能是 flex_mode='none'（CM 2026-10-02 实测：按钮全被压成省略号）。
+  // 'none' 是按内容自适应宽度：纯文本列没问题（工具面板就是），按钮列会塌成一点点。
+  // 生产里渲染正常的是 stretch / bisect + width:'weighted'（提问卡、一级 F 都是这套）。
+  const noneWithButton = []
+  for (const c of sentCards) {
+    const p = c.payload
+    if (!p || p.schema !== '2.0') continue
+    walk(p.body && p.body.elements, (e) => {
+      if (e.tag !== 'column_set') return
+      const hasButton = (e.columns || []).some((col) => ((col && col.elements) || [])
+        .some((el) => el && el.tag === 'button'))
+      if (hasButton && (!e.flex_mode || e.flex_mode === 'none')) noneWithButton.push(String(e.flex_mode))
+    })
+  }
+  // 按钮文字 ≤2 字（CM 2026-10-02 实测：「按钮里面最多两个字…但凡超过两个字就会变省略号」）。
+  // 这条只对 schema 2.0 卡片成立（1.0 的审批卡长标签照样正常显示）。
+  const longLabels = []
+  for (const c of sentCards) {
+    const p = c.payload
+    if (!p || p.schema !== '2.0') continue
+    walk(p.body && p.body.elements, (e) => {
+      if (!e || e.tag !== 'button') return
+      const t = String((e.text && e.text.content) || '')
+      if ([...t].length > 2) longLabels.push(t)
+    })
+  }
+  ok(longLabels.length === 0, 'schema 2.0 卡片的按钮文字都 ≤2 字'
+    + (longLabels.length ? ' —— 超长：' + longLabels.slice(0, 3).join(' / ') : ''))
+  ok(noneWithButton.length === 0,
+    '带按钮的 column_set 都用等分/拉伸（不用 none，否则按钮会被压成省略号）'
+    + (noneWithButton.length ? ' —— 违规 ' + noneWithButton.length + ' 处' : ''))
   ok(v2 > 0, '本轮确实建过 schema 2.0 的卡（' + v2 + ' 张，否则这条校验没意义）')
   ok(bad.length === 0, 'schema 2.0 卡片全部合法（无 action 元素、按钮走 behaviors）'
     + (bad.length ? ' —— 首个问题：' + bad[0] : ''))

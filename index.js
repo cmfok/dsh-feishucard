@@ -2054,7 +2054,9 @@ export function apply(ctx) {
         // 缺了它按钮全带 fs_i=0 ⇒ 空工作区点「在这里新建会话」会在**第一个**工作区建会话。
         // （/list 分支里那句才是真死的，已删；这句是活的，当初一起删错了。）
         ws.index = wsIndex
-        await sendSessionCard(bot, chatId, ws, sessRows, wsRows)
+        // 文字命令路径：给这次会话列表**新开一张卡**（带自己的 pending 记录）
+        const rec = registerPendingSwitchCard({ token: randomUUID(), bot, chatId, timer: undefined, cardId: '', wsRows })
+        await showSessionPage(bot, chatId, ws, rec, sessRows, 0)
         return true
       }
       const row = switchRowByIndex(sessRows, Number(second) - 1)
@@ -3216,6 +3218,8 @@ export function apply(ctx) {
   const SWITCH_SUMMARY_TIMEOUT_MS = 1500
   const SWITCH_WS_LIMIT = 12          // 工作区最多列几个（注册表之外从会话兜底补的也算在里面）
   const SWITCH_SESS_LIMIT = 12        // 单个工作区的会话最多列几行（卡片行数有上限）
+  const SWITCH_SESS_PAGE = 5          // CM 2026-10-02：「只显示 5 个会话，每一页显示 5 个，做一个翻页」
+  const SWITCH_SESS_MAX = 50          // 翻页也只翻最近 50 个（避免为一个工作区读上百条会话）
   const pendingSwitchCards = new Map()   // token -> { bot, chatId, wsRows, ws, sessRows, timer }
 
   function shortSessionId(id) { return String(id || '').slice(0, 8) }
@@ -3708,7 +3712,7 @@ export function apply(ctx) {
     })
     // CM：「加一个取消按钮，一按取消的话，这个卡片就撤销掉」
     elements.push(switchButtonsRow([
-      { label: '✕ 取消', type: 'default', value: { fs_switch: (rows[0] && rows[0].token) || '', fs_level: 'cancel', fs_i: 0 } },
+      { label: '取消', type: 'default', value: { fs_switch: (rows[0] && rows[0].token) || '', fs_level: 'cancel', fs_i: 0 } },
     ]))
     return {
       schema: '2.0',
@@ -3718,55 +3722,88 @@ export function apply(ctx) {
     }
   }
 
-  function buildSessionCard(ws, rows) {
+  // 二级卡片（CM 2026-10-02 选定 C 版式 + 当晚三条修改）：
+  //   · 一行一个会话：「序号. 标题 (+状态徽标)」 ｜ 右侧「切换」
+  //   · **会话之间加一条分隔线**（CM：「这样看起来就更好看」）
+  //   · **每页 5 个**，底部给「← 上一页 / 下一页 →」（翻页是 PATCH 同一张卡，不弹新卡）
+  //   · 底部**只留 返回 / 取消**（新建收回到一级菜单的那个按钮上）
+  function buildSessionCard(ws, rows, pageInfo) {
+    const info = pageInfo || { page: 0, pages: 1, total: rows.length }
     const elements = [{
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: '**第二步：选会话** —— 工作区 **' + ws.title + '**'
-          + '\n`' + ws.path + '`'
-          + '\n共 ' + rows.length + ' 个会话 ｜ ▶ 当前 ｜ 🟢 可切换 ｜ 🟡 正在别处运行（不能切换）'
-          + '\n点行末的按钮**切换**到那个会话；要开新的会话用**最下面**那个按钮。',
-      },
+      tag: 'markdown',
+      content: '**第二步：选会话** —— **' + ws.title + '**'
+        + '　' + info.total + ' 个会话（第 ' + (info.page + 1) + '/' + info.pages + ' 页）'
+        + '\n<font color=\'grey\'>▶ 当前 ｜ 按最近活跃排序 ｜ 🟡 正在别处运行（不能切换）</font>',
     }]
     if (!rows.length) {
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: '（这个工作区还没有会话）' } })
+      elements.push({ tag: 'markdown', content: '（这个工作区还没有会话）' })
     }
-    // CM 2026-10-02 选定 **二级 C 版式**：**一行一个会话** —— 左边「标题 + 状态徽标」，右边「切换」。
-    // 没有分隔线、没有短 id、没有时间戳（那些是高度的元凶）；运行中的行不给按钮、只写清楚。
     rows.forEach((row, j) => {
       const n = j + 1
       const what = row.title || row.summary || row.label || '（未命名会话）'
       const blocked = row.live && !row.inChat && !row.current
-      const badge = row.current ? '当前' : (blocked ? '🟡 运行中' : (row.inChat ? '本聊天' : '🟢'))
-      const left = (row.current ? '▶ ' : '') + n + '. ' + '**' + what + '**　<font color=\'grey\'>' + badge + '</font>'
+      // 徽标只在**会影响你点哪个按钮**时才出（当前 / 不能切换）；否则留空 ——
+      // CM：「为什么全部都显示'本聊天'？」（全行同一个标签＝噪声）
+      const badge = row.current ? '当前' : (blocked ? '🟡 运行中' : '')
+      const left = (row.current ? '▶ ' : '') + n + '. ' + '**' + what + '**'
+        + (badge ? '　<font color=\'grey\'>' + badge + '</font>' : '')
         + (blocked ? '\n<font color=\'grey\'>正在别处运行，不能切换</font>' : '')
+      // 会话之间加分隔线（第一条之前不加，免得卡片顶部先来一条横杠）
+      if (j > 0) elements.push({ tag: 'hr' })
       const cells = [{ tag: 'column', width: 'weighted', weight: 5, vertical_align: 'center', elements: [{ tag: 'markdown', content: left }] }]
       if (!row.current && !blocked) {
         cells.push({
           tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
           elements: [{
             tag: 'button', type: 'primary', width: 'fill',
-            text: { tag: 'plain_text', content: row.inChat ? '切过去' : '切换' },
+            text: { tag: 'plain_text', content: '切换' },
             behaviors: [{ type: 'callback', value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: 'takeover' } }],
           }],
         })
       }
-      elements.push({ tag: 'column_set', flex_mode: 'none', columns: cells })
+      // ⚠️ 带按钮的 column_set **不能用 flex_mode: 'none'**（CM 实测：按钮全被压成省略号）。
+      elements.push({ tag: 'column_set', flex_mode: 'stretch', columns: cells })
     })
     elements.push({ tag: 'hr' })
-    // 底部整卡动作：新建 ｜ 返回 ｜ 取消（三等分，标签都短，不会被挤成省略号）
+    // 翻页（有第二页才出现）：一排两个等分；只有一侧可点时用 stretch 单个铺满
+    if (info.pages > 1) {
+      const pageBtns = []
+      if (info.page > 0) {
+        pageBtns.push({ label: '上页', type: 'default', value: { fs_switch: ws.token, fs_level: 'page', fs_i: ws.index, fs_page: info.page - 1 } })
+      }
+      if (info.page < info.pages - 1) {
+        pageBtns.push({ label: '下页', type: 'default', value: { fs_switch: ws.token, fs_level: 'page', fs_i: ws.index, fs_page: info.page + 1 } })
+      }
+      elements.push(switchButtonsRow(pageBtns, pageBtns.length === 2 ? 'bisect' : 'stretch'))
+    }
+    // 底部整卡动作：**只留 返回 / 取消**（CM：「下面新建不要、只留返回、取消」）
     elements.push(switchButtonsRow([
-      { label: '➕ 新建', type: 'default', value: { fs_switch: ws.token, fs_level: 'ws-new', fs_i: ws.index } },
-      { label: '← 返回', type: 'default', value: { fs_switch: ws.token, fs_level: 'ws-back', fs_i: ws.index } },
-      { label: '✕ 取消', type: 'default', value: { fs_switch: ws.token, fs_level: 'cancel', fs_i: ws.index } },
-    ], 'trisect'))
+      { label: '返回', type: 'default', value: { fs_switch: ws.token, fs_level: 'ws-back', fs_i: ws.index } },
+      { label: '取消', type: 'default', value: { fs_switch: ws.token, fs_level: 'cancel', fs_i: ws.index } },
+    ], 'bisect'))
     return {
       schema: '2.0',
       config: { wide_screen_mode: true },
       header: { title: { tag: 'plain_text', content: '💬 ' + ws.title + ' 的会话' }, template: 'turquoise' },
       body: { elements },
     }
+  }
+
+  // 渲染二级卡片的**某一页**（翻页/首次进入都走这里；翻页＝PATCH 同一张卡）
+  async function showSessionPage(bot, chatId, ws, record, all, page) {
+    const total = (all || []).length
+    const pages = Math.max(1, Math.ceil(total / SWITCH_SESS_PAGE))
+    const p = Math.min(Math.max(0, Number(page) || 0), pages - 1)
+    const rows = (all || []).slice(p * SWITCH_SESS_PAGE, p * SWITCH_SESS_PAGE + SWITCH_SESS_PAGE)
+    const wsRef = { ...ws, token: record.token, index: Number.isInteger(ws.index) ? ws.index : 0 }
+    record.sessAll = all || []
+    record.page = p
+    record.sessRows = rows
+    const hadCard = Boolean(record.cardId)
+    const cardId = await pushSwitchCard(bot, chatId, record, buildSessionCard(wsRef, rows, { page: p, pages, total }))
+    console.log('[fs] /switch session card ' + (hadCard ? 'updated' : 'sent') + ': ws=' + wsRef.path
+      + ' page=' + (p + 1) + '/' + pages + ' total=' + total + ' card=' + String(cardId || ''))
+    return cardId
   }
 
   function registerPendingSwitchCard(record) {
@@ -3813,7 +3850,7 @@ export function apply(ctx) {
         elements: [
           { tag: 'markdown', content: message },
           switchButtonsRow([
-            { label: '← 回到工作区列表', type: 'default',
+            { label: '返回', type: 'default',
               value: { fs_switch: record.token, fs_level: 'ws-back', fs_i: Number.isInteger(wsIndex) ? wsIndex : 0 } },
           ]),
         ],
@@ -3832,18 +3869,6 @@ export function apply(ctx) {
     const cardId = await pushSwitchCard(bot, chatId, record, buildWorkspaceCard(rows, current || {}))
     console.log('[fs] /switch workspace card ' + (existing ? 'updated' : 'sent')
       + ': workspaces=' + rows.length + ' card=' + String(cardId || ''))
-    return cardId
-  }
-
-  async function sendSessionCard(bot, chatId, ws, rows, wsRows, existing) {
-    const record = existing || { token: randomUUID(), bot, chatId, timer: undefined, cardId: '' }
-    if (!existing) registerPendingSwitchCard(record)
-    const wsRef = { ...ws, token: record.token, index: Number.isInteger(ws.index) ? ws.index : 0 }
-    record.wsRows = wsRows || []
-    record.sessRows = rows
-    const cardId = await pushSwitchCard(bot, chatId, record, buildSessionCard(wsRef, rows))
-    console.log('[fs] /switch session card ' + (existing ? 'updated' : 'sent')
-      + ': ws=' + wsRef.path + ' sessions=' + rows.length + ' card=' + String(cardId || ''))
     return cardId
   }
 
@@ -3994,7 +4019,13 @@ export function apply(ctx) {
       const sessRows = await buildSessionRows(bot, chat, ws, cands)
       console.log('[fs] /switch open workspace: ' + ws.path + ' sessions=' + sessRows.length
         + ' (card updated in place)')
-      await sendSessionCard(bot, chatId, ws, sessRows, wsRows, record)
+      await showSessionPage(bot, chatId, ws, record, sessRows, 0)
+      return
+    }
+    if (level === 'page') {
+      // 翻页：同一张卡 PATCH 成下一页（CM：「每一页显示 5 个，做一个翻页」）
+      console.log('[fs] /switch page: ws=' + ws.path + ' -> page ' + (Number(value.fs_page) + 1))
+      await showSessionPage(bot, chatId, ws, record, record.sessAll || [], Number(value.fs_page))
       return
     }
     if (level === 'ws-new') {
