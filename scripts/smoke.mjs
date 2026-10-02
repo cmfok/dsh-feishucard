@@ -840,13 +840,20 @@ console.log('14) 飞书命令 /goal：目标模式入口（CM 2026-09-16 要求�
 }
 
 // ---- 卡片断言小工具（用例 15 / 15b 共用）----------------------------------------
+// 卡片元素取法：切换卡现在是 **schema 2.0 + body.elements**（与流式卡/提问卡同形状，
+// 那种形状在真机上被 PATCH 过成千上万次）；这里兼容两种形状，免得断言跟着形状走。
+const cardElements = (card) => {
+  const p = (card && card.payload) || {}
+  if (p.body && Array.isArray(p.body.elements)) return p.body.elements
+  return Array.isArray(p.elements) ? p.elements : []
+}
 // 只认真卡片（带 header）：纯文本回复（sendPlainText）的载荷同样有 elements，
-// 不排除的话在"以纯文本结尾"的窗口里会抓到那条消息，断言失败信息会指向错的东西（门槛第二轮 low）。
+// 不排除的话在"以纯文本结尾"的窗口里会抓到那条消息，断言失败信息会指向错的东西。
 const lastCardFrom = (from) => sentCards.slice(from)
-  .filter((c) => c.op === 'create' && c.payload && c.payload.header && Array.isArray(c.payload.elements)).pop()
-const divRows = (card) => ((card && card.payload && card.payload.elements) || [])
+  .filter((c) => c.op === 'create' && c.payload && c.payload.header && cardElements(c).length).pop()
+const divRows = (card) => cardElements(card)
   .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
-const allButtons = (card) => ((card && card.payload && card.payload.elements) || [])
+const allButtons = (card) => cardElements(card)
   .filter((e) => e.tag === 'action').flatMap((e) => e.actions || [])
 const tapValue = async (value) => {
   fakeProc.output += JSON.stringify({
@@ -904,7 +911,13 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   const enterMark = sentCards.length
   // 按钮缺失时上面那条 ok() 已经记账失败；这里再解引用会崩成 TypeError、把失败信息盖掉。
   if (enterBtn) await tapValue(enterBtn.value)
-  const sessCard = lastCardFrom(enterMark)
+  // ⭐ CM 2026-10-02 实测投诉：「点一下就弹一张新卡片」「切一次能弹三四张」⇒ 必须**原地更新**
+  const enterUpdates = sentCards.slice(enterMark).filter((c) => c.op === 'update')
+  ok(sentCards.slice(enterMark).filter((c) => c.op === 'create').length === 0,
+    '点「进入」**没有新发卡片**（原地更新同一张）')
+  ok(enterUpdates.length > 0, '而是 PATCH 了原来那张卡')
+  // 原地更新后，"会话卡"的内容要从那条 update 里取（不是新建的卡）
+  const sessCard = enterUpdates.length ? enterUpdates[enterUpdates.length - 1] : undefined
   const sBody = JSON.stringify(sessCard && sessCard.payload)
   ok(Boolean(sessCard) && sBody.includes('第二步：选会话'), '第二级是会话卡')
   ok(sBody.includes('gui-sess'), '列出了该工作区的其它会话（短 id）')
@@ -919,8 +932,12 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
     && b.value.fs_mode === 'takeover')
   ok(Boolean(takeover), '空闲会话给了「接管」按钮')
   const tookBefore = resumedSessions
+  const takeoverMark = sentCards.length
   if (takeover) await tapValue(takeover.value)
   ok(resumedSessions === tookBefore + 1, '点「接管」真的 resume 了那个会话（接管生效）')
+  ok(cardsSince(takeoverMark).filter((c) => c.op === 'create').length === 0,
+    '接管后**没有新发卡片**（结果写回同一张）')
+  ok(JSON.stringify(cardsSince(takeoverMark)).includes('已接管'), '结果直接显示在原来那张卡上')
   ok(registryAttached.some((a) => a.id === 'gui-session-aaaa1111'),
     '接管时把会话**挂进了工作区注册表**（与 GUI 同源：侧边栏也看得到）')
 
@@ -971,6 +988,7 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   const backMark = sentCards.length
   if (backBtn) await tapValue(backBtn.value)
   ok(JSON.stringify(cardsSince(backMark)).includes('选择工作区'), '点返回回到工作区卡')
+  ok(cardsSince(backMark).filter((c) => c.op === 'create').length === 0, '点「返回」也没有新发卡片')
 }
 
 console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注册工作区（门槛第二轮补）')

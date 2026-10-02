@@ -3648,10 +3648,14 @@ export function apply(ctx) {
         content: '也可以发文字：`/switch <工作区序号>`（看它的会话）｜ `/switch <工作区序号> new`（在该工作区新建）',
       },
     })
+    // 2026-10-02：改成 **schema 2.0 + body.elements** —— 与提问卡、流式卡同形状。
+    // 那两种卡在真机上被 PATCH 过成千上万次（本插件唯一的"已验证可更新"形状）；
+    // 旧的 1.0 形状只验证过"能创建"，不敢拿它赌"能更新"。
     return {
+      schema: '2.0',
       config: { wide_screen_mode: true },
       header: { title: { tag: 'plain_text', content: '🗂 选择工作区' }, template: 'blue' },
-      elements,
+      body: { elements },
     }
   }
 
@@ -3715,34 +3719,89 @@ export function apply(ctx) {
       }],
     })
     return {
+      schema: '2.0',
       config: { wide_screen_mode: true },
       header: { title: { tag: 'plain_text', content: '💬 ' + ws.title + ' 的会话' }, template: 'turquoise' },
-      elements,
+      body: { elements },
     }
   }
 
   function registerPendingSwitchCard(record) {
+    if (typeof record.cardId !== 'string') record.cardId = ''
     record.timer = setTimeout(() => pendingSwitchCards.delete(record.token), SWITCH_CARD_TTL_MS)
     pendingSwitchCards.set(record.token, record)
     return record
   }
 
-  async function sendWorkspaceCard(bot, chatId, chat, rows) {
-    const token = randomUUID()
-    for (const row of rows) row.token = token
-    registerPendingSwitchCard({ token, bot, chatId, wsRows: rows, timer: undefined })
-    const cardId = await sendInteractive(bot, chatId, buildWorkspaceCard(bot, chat, rows))
-    console.log('[fs] /switch workspace card sent: workspaces=' + rows.length + ' card=' + String(cardId || ''))
+  // ---- 卡片**原地更新**（CM 2026-10-02 实测：「这卡片就不能更新吗？我点了一下，它会弹一张新卡片出来。
+  // 我切换个会话，就可能弹三四个卡片，然后按返回还继续弹新的卡片」）--------------------------
+  // 卡片当然能更新 —— 本插件早就在这么干（提问卡、流式卡都是 PATCH 同一条消息）。
+  // 原来我把"进入工作区 / 返回 / 结果提示"全写成"发一张新卡" ⇒ 切一次会话能弹三四张。
+  // ⇒ 现在整条链路**只用一张卡**：进入 / 返回 / 结果都 PATCH 同一条消息（message_id 记在 pending 记录里）。
+  // 兜底：消息太老或被删（PATCH 失败）时退回"发一张新的"，绝不让用户点了没反应。
+  async function pushSwitchCard(bot, chatId, record, payload) {
+    if (record && record.cardId) {
+      try {
+        await updateInteractive(bot, record.cardId, payload)
+        return record.cardId
+      } catch (error) {
+        console.log('[fs] /switch card patch failed, falling back to a new card: '
+          + String(error && error.message || error))
+        record.cardId = ''
+      }
+    }
+    const cardId = await sendInteractive(bot, chatId, payload)
+    if (record) record.cardId = cardId
     return cardId
   }
 
-  async function sendSessionCard(bot, chatId, chat, ws, rows, wsRows) {
-    const token = randomUUID()
-    const wsRef = { ...ws, token, index: Number.isInteger(ws.index) ? ws.index : 0 }
-    registerPendingSwitchCard({ token, bot, chatId, wsRows: wsRows || [], sessRows: rows, timer: undefined })
-    const cardId = await sendInteractive(bot, chatId, buildSessionCard(wsRef, rows))
-    console.log('[fs] /switch session card sent: ws=' + wsRef.path + ' sessions=' + rows.length
-      + ' card=' + String(cardId || ''))
+  // 操作结果也**写回同一张卡**（不再另发一条纯文本）：按钮保留「← 回到工作区列表」，
+  // 用户想继续切就直接点，不会被一串消息刷屏。
+  function buildSwitchResultCard(record, kind, message, wsIndex) {
+    const ok = kind === 'ok'
+    return {
+      schema: '2.0',
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: ok ? '✅ 已切换' : '⚠️ 没能切换' },
+        template: ok ? 'green' : 'orange',
+      },
+      body: {
+        elements: [
+          { tag: 'markdown', content: message },
+          {
+            tag: 'action',
+            actions: [{
+              tag: 'button', text: { tag: 'plain_text', content: '← 回到工作区列表' }, type: 'default',
+              value: { fs_switch: record.token, fs_level: 'ws-back', fs_i: Number.isInteger(wsIndex) ? wsIndex : 0 },
+            }],
+          },
+        ],
+      },
+    }
+  }
+
+  async function sendWorkspaceCard(bot, chatId, chat, rows, existing) {
+    const record = existing || { token: randomUUID(), bot, chatId, timer: undefined, cardId: '' }
+    if (!existing) registerPendingSwitchCard(record)
+    for (const row of rows) row.token = record.token
+    record.wsRows = rows
+    record.sessRows = []
+    const cardId = await pushSwitchCard(bot, chatId, record, buildWorkspaceCard(bot, chat, rows))
+    console.log('[fs] /switch workspace card ' + (existing ? 'updated' : 'sent')
+      + ': workspaces=' + rows.length + ' card=' + String(cardId || ''))
+    return cardId
+  }
+
+  async function sendSessionCard(bot, chatId, chat, ws, rows, wsRows, existing) {
+    const record = existing || { token: randomUUID(), bot, chatId, timer: undefined, cardId: '' }
+    if (!existing) registerPendingSwitchCard(record)
+    const wsRef = { ...ws, token: record.token, index: Number.isInteger(ws.index) ? ws.index : 0 }
+    record.wsRows = wsRows || []
+    record.sessRows = rows
+    const cardId = await pushSwitchCard(bot, chatId, record, buildSessionCard(wsRef, rows))
+    console.log('[fs] /switch session card ' + (existing ? 'updated' : 'sent')
+      + ': ws=' + wsRef.path + ' sessions=' + rows.length + ' card=' + String(cardId || ''))
     return cardId
   }
 
@@ -3780,8 +3839,13 @@ export function apply(ctx) {
     }
   }
 
-  async function applySwitch(bot, chat, chatId, row, mode) {
+  // feedback(text, kind)：点卡片进来时为"把结果写回那张卡"，发文字命令时为 undefined（走纯文本回复）。
+  async function applySwitch(bot, chat, chatId, row, mode, feedback) {
     const cwd = String((row && (row.workspace || row.path)) || '').trim() || ((bot.cfg && bot.cfg.workspace) || '')
+    const say = async (text, kind) => {
+      if (typeof feedback === 'function') { await feedback(text, kind || 'ok'); return }
+      await sendPlainText(bot, chatId, text)
+    }
     if (mode === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       const handle = await createDedicated(bot, sessionId, cwd)
@@ -3796,19 +3860,20 @@ export function apply(ctx) {
       persistChats(bot, bot.chats)
       await attachSessionToWorkspace(row, sessionId)
       console.log('[fs] /switch new session ' + sessionId + ' cwd=' + cwd)
-      await sendPlainText(bot, chatId, '✅ 已在工作区 `' + cwd + '` 新建会话并切过去（旧会话一个都没动）。')
+      await say('✅ 已在工作区 `' + cwd + '` **新建会话并切过去**（旧会话一个都没动，会话 id `'
+        + shortSessionId(sessionId) + '`）。接着往下说就行。')
       return
     }
     const idx = chat.sessions.findIndex((s) => String(s.id) === String(row && row.sessionId))
     if (idx >= 0) {
       chat.activeIndex = idx
       persistChats(bot, bot.chats)
-      await sendPlainText(bot, chatId, '✅ 已切换到会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」。')
+      await say('✅ 已切到本聊天已有的会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」。')
       return
     }
     if (row.live) {
-      await sendPlainText(bot, chatId, '🟡 这个会话正在别处运行，不能同时接管（会把同一份历史写坏）。'
-        + '等它结束再来，或者点「新建」在该工作区开一个新会话。')
+      await say('🟡 这个会话**正在别处运行**，不能同时接管（会把同一份历史写坏）。'
+        + '等它结束再来，或者点「← 回到工作区列表」后用「新建」在该工作区开一个新会话。', 'warn')
       return
     }
     const handle = await resumeDedicated(bot, row.sessionId)
@@ -3823,13 +3888,14 @@ export function apply(ctx) {
     persistChats(bot, bot.chats)
     await attachSessionToWorkspace(row, row.sessionId)
     console.log('[fs] /switch takeover session ' + row.sessionId + ' cwd=' + cwd)
-    await sendPlainText(bot, chatId, '✅ 已接管会话 `' + shortSessionId(row.sessionId) + '`'
+    await say('✅ 已接管会话 `' + shortSessionId(row.sessionId) + '`'
       + (cwd ? '（工作目录 `' + cwd + '`）' : '') + '，接着往下说就行。')
   }
 
   async function handleSwitchAction(bot, chatId, value) {
     const record = pendingSwitchCards.get(String(value.fs_switch || ''))
     if (!record) {
+      // 记录已过期（>15 分钟）：没有 message_id 可改，只能发一条提示（这是唯一会"另起一条"的情况）。
       await sendPlainText(bot, chatId, '这张切换卡片已过期（超过 ' + Math.round(SWITCH_CARD_TTL_MS / 60000) + ' 分钟）。'
         + '重新发一个 /switch 即可。')
       return
@@ -3837,42 +3903,50 @@ export function apply(ctx) {
     const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
     bot.chats.set(chatId, chat)
     const level = String(value.fs_level || '')
-    const wsRows = record.wsRows || []
     const i = Number(value.fs_i)
+    // 反馈一律**写回这张卡**（不再另发消息）——见 pushSwitchCard 上方说明。
+    const feedback = (text, kind) => pushSwitchCard(bot, chatId, record,
+      buildSwitchResultCard(record, kind || 'ok', text, i))
+    const wsRows = record.wsRows || []
     if (level === 'ws-back') {
-      console.log('[fs] /switch back to workspace list')
-      await sendWorkspaceCard(bot, chatId, chat, wsRows)
+      // 返回：重新读一次工作区（可能已有新会话/新目录），再 PATCH 回第一级
+      const cands = await sessionCandidates(bot, chat)
+      const fresh = await buildWorkspaceRows(bot, chat, cands)
+      console.log('[fs] /switch back to workspace list (card updated in place)')
+      await sendWorkspaceCard(bot, chatId, chat, fresh, record)
       return
     }
     const ws = switchRowByIndex(wsRows, i)
     if (!ws) {
-      await sendPlainText(bot, chatId, '这张卡片里的序号已经对不上了，重新发一个 /switch 吧。')
+      await feedback('这张卡片里的序号已经对不上了，点下面「← 回到工作区列表」重新选。', 'warn')
       return
     }
     ws.index = i
     if (level === 'ws') {
-      const sessRows = await buildSessionRows(bot, chat, ws)
-      console.log('[fs] /switch open workspace: ' + ws.path + ' sessions=' + sessRows.length)
-      await sendSessionCard(bot, chatId, chat, ws, sessRows, wsRows)
+      const cands = await sessionCandidates(bot, chat)
+      const sessRows = await buildSessionRows(bot, chat, ws, cands)
+      console.log('[fs] /switch open workspace: ' + ws.path + ' sessions=' + sessRows.length
+        + ' (card updated in place)')
+      await sendSessionCard(bot, chatId, chat, ws, sessRows, wsRows, record)
       return
     }
     if (level === 'ws-new') {
       console.log('[fs] /switch click: ws=' + ws.path + ' mode=new')
-      await applySwitch(bot, chat, chatId, ws, 'new')
+      await applySwitch(bot, chat, chatId, ws, 'new', feedback)
       return
     }
     if (level === 'sess') {
       const row = switchRowByIndex(record.sessRows || [], Number(value.fs_j))
       if (!row) {
-        await sendPlainText(bot, chatId, '这张卡片里的会话序号已经对不上了，重新发一个 /switch 吧。')
+        await feedback('这张卡片里的会话序号已经对不上了，点下面「← 回到工作区列表」重新选。', 'warn')
         return
       }
       const mode = value.fs_mode === 'new' ? 'new' : 'takeover'
       console.log('[fs] /switch click: ws=' + ws.path + ' session=' + row.sessionId + ' mode=' + mode)
-      await applySwitch(bot, chat, chatId, row, mode)
+      await applySwitch(bot, chat, chatId, row, mode, feedback)
       return
     }
-    await sendPlainText(bot, chatId, '这张卡片已过期，重新发一个 /switch 吧。')
+    await feedback('这张卡片已过期，点下面「← 回到工作区列表」重新选。', 'warn')
   }
 
   // ---- /model：飞书侧切换模型（CM 2026-10-02）---------------------------------
