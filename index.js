@@ -451,6 +451,30 @@ export function apply(ctx) {
     }
   }
 
+  // 删掉一条自己发的消息（2026-10-02 CM：「加一个取消按钮，一按取消，这个卡片就撤销掉」）
+  async function deleteMessage(bot, messageId) {
+    if (!bot || !messageId) return false
+    try {
+      const accessToken = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
+      const res = await httpJson(
+        'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(messageId),
+        'DELETE',
+        { Authorization: 'Bearer ' + accessToken },
+        undefined,
+      )
+      const parsed = parseJson(res.text)
+      const okDel = res.status >= 200 && res.status < 300 && parsed && parsed.code === 0
+      if (!okDel) {
+        console.log('[fs] delete message failed: status=' + res.status + ' '
+          + String(res.text || '').slice(0, 160))
+      }
+      return okDel
+    } catch (error) {
+      console.log('[fs] delete message error: ' + String(error && error.message || error))
+      return false
+    }
+  }
+
   async function sendPlainText(bot, chatId, text) {
     const cfg = bot.cfg
     const hasCreds = typeof cfg.appId === 'string' && cfg.appId
@@ -2026,6 +2050,10 @@ export function apply(ctx) {
       }
       const sessRows = await buildSessionRows(bot, chat, ws, cands)
       if (!second) {
+        // ⚠️ 这里**必须**带上序号（门槛第四轮 medium）：卡片按钮里的 fs_i 取自 ws.index，
+        // 缺了它按钮全带 fs_i=0 ⇒ 空工作区点「在这里新建会话」会在**第一个**工作区建会话。
+        // （/list 分支里那句才是真死的，已删；这句是活的，当初一起删错了。）
+        ws.index = wsIndex
         await sendSessionCard(bot, chatId, ws, sessRows, wsRows)
         return true
       }
@@ -3391,7 +3419,7 @@ export function apply(ctx) {
       if (hit && hit.cwd) cwd = String(hit.cwd)
     }
     if (!cwd) cwd = active ? cwdOfEntry(active, live) : ''
-    return { sessionId: id, cwd: cwd || String((bot.cfg && bot.cfg.workspace) || '') }
+    return { cwd: cwd || String((bot.cfg && bot.cfg.workspace) || '') }
   }
 
   // 会话候选三源合并（活 agent / 持久化快照 / 本聊天会话），按 id 去重。
@@ -3522,7 +3550,9 @@ export function apply(ctx) {
     // ⇒ 兜底行先占满注册表没用到的那部分预算，再按下限补齐。
     const FB_RESERVE = Math.min(fbRows.length, Math.max(2, Math.floor(SWITCH_WS_LIMIT / 3)))
     const regTake = regRows.slice(0, SWITCH_WS_LIMIT - FB_RESERVE)
-    const fbTake = fbRows.slice(0, Math.max(FB_RESERVE, SWITCH_WS_LIMIT - regTake.length))
+    // regTake 已被 12-FB_RESERVE 压住 ⇒ 12-regTake.length 恒 ≥ FB_RESERVE，
+    // "下限保留"其实是 regTake 那一刀保证的（门槛第四轮 low：原来写成 Math.max(...) 是永远不成立的分支）。
+    const fbTake = fbRows.slice(0, SWITCH_WS_LIMIT - regTake.length)
     let rows = [...regTake, ...fbTake]
     // 当前工作区**必须在卡上**（哪怕它在注册表里排得很后）——不然用户看不到"我在哪、怎么回来"。
     if (current.cwd && !rows.some((r) => sameWorkspace(r.path, current.cwd))) {
@@ -3616,58 +3646,70 @@ export function apply(ctx) {
     return rows
   }
 
+  // ---- schema 2.0 的按钮行（2026-10-02 血泪）------------------------------------------
+  // 旧版 1.0 用 `{ tag: 'action', actions: [...] }` 包按钮；**schema 2.0 不再支持 action**
+  // ——飞书直接拒建卡：`code 230099 / ErrCode 200861  ErrPath: ROOT -> body -> elements -> [3](tag: action)
+  //   ErrMsg: cards of schema V2 no longer support this capability; unsupported tag action`（真机日志）。
+  // 2.0 的写法（照抄本仓库**已在生产跑通**的提问卡 questionOptionRow）：
+  //   column_set → column → button，且按钮回调走 `behaviors: [{ type: 'callback', value }]`。
+  function switchButtonsRow(buttons, flexMode) {
+    const list = buttons || []
+    return {
+      tag: 'column_set',
+      // CM 2026-10-02：「两个按钮要**同一排**，不要分成两行」。
+      // 两个按钮时用飞书文档里的 **bisect（二等分）** —— 这是"固定两列并排"的语义；
+      // 其它数量退回 stretch。另：不写 background_style（默认值没必要，少一个不确定项）。
+      flex_mode: flexMode || (list.length === 2 ? 'bisect' : 'stretch'),
+      columns: list.map((b) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [{
+          tag: 'button',
+          type: b.type || 'default',
+          width: 'fill',
+          text: { tag: 'plain_text', content: b.label },
+          behaviors: [{ type: 'callback', value: b.value }],
+        }],
+      })),
+    }
+  }
+
+  // CM 2026-10-02 选定 **一级 F 版式**（在三个候选里挑的）：
+  //   每个工作区两行 —— ① 名字 + 会话数（+ 真的有时才显示 🟡 运行中）
+  //                     ② 「进入」「新建」两个按钮**并排**（bisect 等分，不会再被挤成省略号）
+  //   卡片底部一个「✕ 取消」（撤销整张卡）。
+  // 按他三条原则：**不显示**完整路径、时间戳、短 id、目录健康标记（除非真的有问题 ——
+  // 目录不存在时把那一条的路径显示出来，因为那时"是哪个目录"才是必要信息）。
   function buildWorkspaceCard(rows, current) {
+    const curName = current && current.cwd ? workspaceLeaf(current.cwd) : '（未定）'
     const elements = [{
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: '**第一步：选工作区**（共 ' + rows.length + ' 个）'
-          + '\n**当前工作区**：`' + (current.cwd || '?') + '`'
-          + '\n▶ 当前所在 ｜ 🟢 目录正常 ｜ ⚠️ 目录不存在（切之前先看一眼）'
-          + '\n选完工作区，下一步才是**它的会话列表**。',
-      },
+      tag: 'markdown',
+      content: '**第一步：选工作区**（共 ' + rows.length + ' 个）　当前：**' + curName + '**',
     }]
     rows.forEach((row, i) => {
-      const n = i + 1
-      const kind = row.status === 'missing-dir' ? '⚠️' : '🟢'
-      const meta = ['`' + row.path + '`', row.sessionCount + ' 个会话']
-      if (row.liveCount) meta.push('🟡 ' + row.liveCount + ' 个运行中')
-      const clock = fmtClock(row.mtime)
-      if (clock) meta.push(clock)
-      elements.push({ tag: 'hr' })
-      elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: (row.current ? '▶ ' : '') + n + '. ' + kind + ' **' + row.title + '**'
-            + '\n　　' + meta.join(' · '),
-        },
-      })
-      elements.push({
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button', text: { tag: 'plain_text', content: n + ' 进入看会话' }, type: 'primary',
-            value: { fs_switch: row.token, fs_level: 'ws', fs_i: i },
-          },
-          {
-            tag: 'button', text: { tag: 'plain_text', content: n + ' 在这里新建' }, type: 'default',
-            value: { fs_switch: row.token, fs_level: 'ws-new', fs_i: i },
-          },
-        ],
-      })
+      const bits = []
+      if (row.sessionCount) bits.push(row.sessionCount + ' 个会话')
+      if (row.liveCount) bits.push('🟡 ' + row.liveCount + ' 运行中')
+      let line = (row.current ? '▶ ' : '') + (i + 1) + '. **' + row.title + '**'
+      if (bits.length) line += '　' + bits.join(' · ')
+      if (row.status === 'missing-dir') line += '　⚠️ 目录不存在\n　　`' + row.path + '`'
+      elements.push({ tag: 'markdown', content: line })
+      elements.push(switchButtonsRow([
+        { label: '进入', type: 'primary', value: { fs_switch: row.token, fs_level: 'ws', fs_i: i } },
+        { label: '新建', type: 'default', value: { fs_switch: row.token, fs_level: 'ws-new', fs_i: i } },
+      ], 'bisect'))
     })
     elements.push({ tag: 'hr' })
     elements.push({
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: '也可以发文字：`/switch <工作区序号>`（看它的会话）｜ `/switch <工作区序号> new`（在该工作区新建）',
-      },
+      tag: 'markdown',
+      content: '<font color=\'grey\'>也可以发文字：`/switch <序号>` 看它的会话 ｜ `/switch <序号> new` 在该工作区新建</font>',
     })
-    // 2026-10-02：改成 **schema 2.0 + body.elements** —— 与提问卡、流式卡同形状。
-    // 那两种卡在真机上被 PATCH 过成千上万次（本插件唯一的"已验证可更新"形状）；
-    // 旧的 1.0 形状只验证过"能创建"，不敢拿它赌"能更新"。
+    // CM：「加一个取消按钮，一按取消的话，这个卡片就撤销掉」
+    elements.push(switchButtonsRow([
+      { label: '✕ 取消', type: 'default', value: { fs_switch: (rows[0] && rows[0].token) || '', fs_level: 'cancel', fs_i: 0 } },
+    ]))
     return {
       schema: '2.0',
       config: { wide_screen_mode: true },
@@ -3683,58 +3725,42 @@ export function apply(ctx) {
         tag: 'lark_md',
         content: '**第二步：选会话** —— 工作区 **' + ws.title + '**'
           + '\n`' + ws.path + '`'
-          + '\n共 ' + rows.length + ' 个会话 ｜ ▶ 当前 ｜ 🟢 空闲（可接管） ｜ 🟡 运行中（只给"新建"）',
+          + '\n共 ' + rows.length + ' 个会话 ｜ ▶ 当前 ｜ 🟢 可切换 ｜ 🟡 正在别处运行（不能切换）'
+          + '\n点行末的按钮**切换**到那个会话；要开新的会话用**最下面**那个按钮。',
       },
     }]
     if (!rows.length) {
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: '（这个工作区还没有会话）' } })
-      elements.push({
-        tag: 'action',
-        actions: [{
-          tag: 'button', text: { tag: 'plain_text', content: '在这里新建会话' }, type: 'primary',
-          value: { fs_switch: ws.token, fs_level: 'ws-new', fs_i: ws.index },
-        }],
-      })
     }
+    // CM 2026-10-02 选定 **二级 C 版式**：**一行一个会话** —— 左边「标题 + 状态徽标」，右边「切换」。
+    // 没有分隔线、没有短 id、没有时间戳（那些是高度的元凶）；运行中的行不给按钮、只写清楚。
     rows.forEach((row, j) => {
       const n = j + 1
       const what = row.title || row.summary || row.label || '（未命名会话）'
-      const meta = ['`' + shortSessionId(row.sessionId) + '`']
-      const clock = fmtClock(row.mtime)
-      if (clock) meta.push(clock)
-      if (row.inChat) meta.push('本聊天的会话')
-      elements.push({ tag: 'hr' })
-      elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: (row.current ? '▶ ' : '') + n + '. ' + (row.live ? '🟡 ' : '🟢 ')
-            + '**' + what + '**\n　　' + meta.join(' · '),
-        },
-      })
-      const actions = []
-      const push = (label, type, mode) => actions.push({
-        tag: 'button', text: { tag: 'plain_text', content: label }, type,
-        value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: mode },
-      })
-      if (row.inChat) {
-        if (!row.current) push(n + ' 切过去', 'primary', 'takeover')
-      } else if (row.live) {
-        push(n + ' 新建', 'default', 'new')
-      } else {
-        push(n + ' 接管', 'primary', 'takeover')
-        push(n + ' 新建', 'default', 'new')
+      const blocked = row.live && !row.inChat && !row.current
+      const badge = row.current ? '当前' : (blocked ? '🟡 运行中' : (row.inChat ? '本聊天' : '🟢'))
+      const left = (row.current ? '▶ ' : '') + n + '. ' + '**' + what + '**　<font color=\'grey\'>' + badge + '</font>'
+        + (blocked ? '\n<font color=\'grey\'>正在别处运行，不能切换</font>' : '')
+      const cells = [{ tag: 'column', width: 'weighted', weight: 5, vertical_align: 'center', elements: [{ tag: 'markdown', content: left }] }]
+      if (!row.current && !blocked) {
+        cells.push({
+          tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
+          elements: [{
+            tag: 'button', type: 'primary', width: 'fill',
+            text: { tag: 'plain_text', content: row.inChat ? '切过去' : '切换' },
+            behaviors: [{ type: 'callback', value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: 'takeover' } }],
+          }],
+        })
       }
-      if (actions.length) elements.push({ tag: 'action', actions })
+      elements.push({ tag: 'column_set', flex_mode: 'none', columns: cells })
     })
     elements.push({ tag: 'hr' })
-    elements.push({
-      tag: 'action',
-      actions: [{
-        tag: 'button', text: { tag: 'plain_text', content: '← 返回工作区列表' }, type: 'default',
-        value: { fs_switch: ws.token, fs_level: 'ws-back', fs_i: ws.index },
-      }],
-    })
+    // 底部整卡动作：新建 ｜ 返回 ｜ 取消（三等分，标签都短，不会被挤成省略号）
+    elements.push(switchButtonsRow([
+      { label: '➕ 新建', type: 'default', value: { fs_switch: ws.token, fs_level: 'ws-new', fs_i: ws.index } },
+      { label: '← 返回', type: 'default', value: { fs_switch: ws.token, fs_level: 'ws-back', fs_i: ws.index } },
+      { label: '✕ 取消', type: 'default', value: { fs_switch: ws.token, fs_level: 'cancel', fs_i: ws.index } },
+    ], 'trisect'))
     return {
       schema: '2.0',
       config: { wide_screen_mode: true },
@@ -3786,13 +3812,10 @@ export function apply(ctx) {
       body: {
         elements: [
           { tag: 'markdown', content: message },
-          {
-            tag: 'action',
-            actions: [{
-              tag: 'button', text: { tag: 'plain_text', content: '← 回到工作区列表' }, type: 'default',
-              value: { fs_switch: record.token, fs_level: 'ws-back', fs_i: Number.isInteger(wsIndex) ? wsIndex : 0 },
-            }],
-          },
+          switchButtonsRow([
+            { label: '← 回到工作区列表', type: 'default',
+              value: { fs_switch: record.token, fs_level: 'ws-back', fs_i: Number.isInteger(wsIndex) ? wsIndex : 0 } },
+          ]),
         ],
       },
     }
@@ -3828,6 +3851,27 @@ export function apply(ctx) {
     const n = Number(index)
     if (!Number.isInteger(n) || n < 0 || n >= rows.length) return undefined
     return rows[n]
+  }
+
+  // 「取消」＝撤销整张卡（CM 2026-10-02 要求）。优先**删消息**；删不掉就 PATCH 成一张"已取消"小卡，
+  // 至少不会留一张还能点的旧卡在那儿。
+  async function cancelSwitchCard(bot, chatId, record) {
+    const gone = (record && record.cardId) ? await deleteMessage(bot, record.cardId) : false
+    if (record) pendingSwitchCards.delete(record.token)
+    if (gone) {
+      console.log('[fs] /switch card cancelled (message deleted)')
+      return
+    }
+    try {
+      if (record && record.cardId) {
+        await updateInteractive(bot, record.cardId, buildSwitchResultCard(record, 'warn', '已取消。要再切就发 `/switch`。', 0))
+        console.log('[fs] /switch card cancelled (patched to cancelled state)')
+        return
+      }
+    } catch (error) {
+      console.log('[fs] /switch cancel patch failed: ' + String(error && error.message || error))
+    }
+    await sendPlainText(bot, chatId, '已取消。要再切就发 `/switch`。')
   }
 
   // 把会话挂进 DSH 的工作区注册表（best-effort）——**"与 GUI 同源"的关键一步**：
@@ -3923,6 +3967,10 @@ export function apply(ctx) {
     bot.chats.set(chatId, chat)
     const level = String(value.fs_level || '')
     const i = Number(value.fs_i)
+    if (level === 'cancel') {
+      await cancelSwitchCard(bot, chatId, record)
+      return
+    }
     // 反馈一律**写回这张卡**（不再另发消息）——见 pushSwitchCard 上方说明。
     const feedback = (text, kind) => pushSwitchCard(bot, chatId, record,
       buildSwitchResultCard(record, kind || 'ok', text, i))
@@ -4098,6 +4146,20 @@ export function apply(ctx) {
     console.log('[fs] card action event received: tag=' + (data && data.action && data.action.tag || '?'))
     const action = data && data.action ? data.action : {}
     const value = action.value || {}
+    // 演示/候选卡片的「✕ 取消」：把**这张**消息直接删掉 —— 让 CM 真能体验"一按取消就撤销"
+    // （正式卡片的取消走 fs_level='cancel' + pendingSwitchCards 里的 message_id）。
+    if (value.fs_demo_cancel) {
+      const chatId = data && data.context && data.context.open_chat_id
+      const msgId = data && data.context && data.context.open_message_id
+      const ownerBot = chatId ? findBotForChat(chatId) : undefined
+      console.log('[fs] demo card cancel: chat=' + String(chatId || '') + ' msg=' + String(msgId || ''))
+      if (ownerBot && msgId) {
+        void deleteMessage(ownerBot, msgId).then((okDel) => {
+          if (!okDel) console.log('[fs] demo card cancel failed (delete rejected)')
+        })
+      }
+      return
+    }
     // Model-switch buttons (the /model card) — CM 2026-10-02.
     if (value.fs_model !== undefined) {
       const chatId = data && data.context && data.context.open_chat_id

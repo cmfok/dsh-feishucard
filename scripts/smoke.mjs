@@ -855,10 +855,40 @@ const cardElements = (card) => {
 // 不排除的话在"以纯文本结尾"的窗口里会抓到那条消息，断言失败信息会指向错的东西。
 const lastCardFrom = (from) => sentCards.slice(from)
   .filter((c) => c.op === 'create' && c.payload && c.payload.header && cardElements(c).length).pop()
-const divRows = (card) => cardElements(card)
-  .filter((e) => e.tag === 'div' && /(^|\n)\s*(▶ )?\d+\. /.test(String((e.text && e.text.content) || '')))
-const allButtons = (card) => cardElements(card)
-  .filter((e) => e.tag === 'action').flatMap((e) => e.actions || [])
+// 行文本可能落在两种地方：① 顶层 div（旧版式）② column_set → column → markdown（C 版式"一行一个"）。
+// 统一收成 { text: { content } } 形状，老断言不用改。
+const divRows = (card) => {
+  const out = []
+  const take = (e) => {
+    if (!e) return
+    const c = String((e.text && e.text.content) || e.content || '')
+    if (/(^|\n)\s*(▶ )?\d+\. /.test(c)) out.push({ text: { content: c } })
+  }
+  for (const e of cardElements(card)) {
+    if (e.tag === 'column_set') {
+      for (const col of (e.columns || [])) for (const el of ((col && col.elements) || [])) take(el)
+    } else take(e)
+  }
+  return out
+}
+// 按钮取法要兼容两种卡片形状：
+//  · 1.0：`{ tag: 'action', actions: [...] }`，按钮自带 `value`
+//  · 2.0：`column_set → column → button`，回调走 `behaviors: [{ type: 'callback', value }]`
+//    （**2.0 不再支持 action 元素** —— 真机报 230099/200861，见用例 48 的校验）
+const allButtons = (card) => {
+  const out = []
+  const take = (e) => {
+    if (!e || e.tag !== 'button') return
+    const value = e.value || (Array.isArray(e.behaviors) && e.behaviors[0] && e.behaviors[0].value)
+    out.push({ ...e, value })
+  }
+  for (const e of cardElements(card)) {
+    if (e.tag === 'action') for (const b of (e.actions || [])) take(b)
+    else take(e)
+    for (const col of (e.columns || [])) for (const el of (col && col.elements) || []) take(el)
+  }
+  return out
+}
 const tapValue = async (value) => {
   fakeProc.output += JSON.stringify({
     type: 'event', eventType: 'card.action.trigger',
@@ -874,6 +904,12 @@ const rowIndexOf = (card, needle) => {
   return m ? Number(m[1]) - 1 : -1
 }
 
+// 一级 F 版式（CM 2026-10-02 选定）**不显示路径**，只显示工作区标题 ⇒ 卡片断言按标题定位。
+// 标题就是路径末段（workspaceLeaf 的口径，与 DSH 的 defaultWorkspaceTitle 一致）。
+const WS_TITLE_WORK = WORKSPACE.split('/').pop()
+const WS_TITLE_OTHER = OTHER_WORKSPACE.split('/').pop()
+const WS_TITLE_THIRD = THIRD_WORKSPACE.split('/').pop()
+
 console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话）（CM 2026-10-02 定稿 A 方案）')
 {
   const mark = sentCards.length
@@ -886,6 +922,7 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
     { version: 0, id: 'sub-child-cccc3333', createdAt: Date.now() - 600e3, cwd: WORKSPACE, origin: 'subagent' },
   ]
   persistedFirstText['gui-session-aaaa1111'] = summaryText
+  persistedFirstText['fu-session-bbbb2222'] = 'FU 会话（示例标题）'
 
   // ① 第一级：工作区卡
   feedInbound('om_switch_ws', '/switch')
@@ -893,26 +930,39 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   const wsCard = lastCardFrom(mark)
   const wsBody = JSON.stringify(wsCard && wsCard.payload)
   ok(Boolean(wsCard) && wsBody.includes('第一步：选工作区'), '第一级是工作区卡（卡面写明"第一步"）')
-  ok(wsBody.includes(WORKSPACE) && wsBody.includes(OTHER_WORKSPACE), '两个工作区（注册表）都列出来了')
+  ok(wsBody.includes(WS_TITLE_WORK) && wsBody.includes(WS_TITLE_OTHER), '两个工作区（按标题）都列出来了')
   ok(!wsBody.includes('gui-sess') && !wsBody.includes('fu-sess'),
     '第一级**不列任何会话**（旧卡"标题写其它工作区、其实列的是会话"那个歧义消失）')
   const wsRowsShown = divRows(wsCard)
   ok(wsRowsShown.length === 2, '工作区卡共 2 行（' + wsRowsShown.length + '）')
-  const curWsRow = wsRowsShown.find((e) => String(e.text.content).includes(WORKSPACE))
+  const curWsRow = wsRowsShown.find((e) => String(e.text.content).includes(WS_TITLE_WORK))
   ok(Boolean(curWsRow) && String(curWsRow.text.content).includes('▶'), '当前工作区带 ▶ 标记')
-  // 正例（门槛第三轮 medium）：15b 只验了"目录不存在 ⇒ ⚠️"。若 dirExists() 因路径写法/失效而恒假，
-  // 所有行都会变 ⚠️，那条 ⚠️ 断言照样通过 ⇒ 必须有"存在的目录 ⇒ 🟢"这一侧才有对照。
-  ok(wsRowsShown.every((e) => String(e.text.content).includes('🟢')),
-    '已存在的目录标 🟢（与 15b 的 ⚠️ 形成对照）')
-  const wsIndexWork = rowIndexOf(wsCard, WORKSPACE)
-  const wsIndexOther = rowIndexOf(wsCard, OTHER_WORKSPACE)
+  // 正例（门槛第三轮 medium，按 CM 选定的一级 F 版式调整）：F 版式**不显示** 🟢（无用的信息不显示），
+  // 只在目录**真的不存在**时显示 ⚠️ ⇒ 这里反过来断言"存在的目录**不许**出现 ⚠️"，
+  // 与 15b 的"目录不存在 ⇒ ⚠️"形成对照。若 dirExists() 恒假，这条会立刻变红。
+  ok(wsRowsShown.every((e) => !String(e.text.content).includes('⚠️')),
+    '存在的目录**不出现** ⚠️（与 15b 的"目录不存在 ⇒ ⚠️"形成对照）')
+  const wsIndexWork = rowIndexOf(wsCard, WS_TITLE_WORK)
+  const wsIndexOther = rowIndexOf(wsCard, WS_TITLE_OTHER)
   ok(wsIndexWork >= 0 && wsIndexOther >= 0,
     '两行序号可读（work=' + (wsIndexWork + 1) + ', other=' + (wsIndexOther + 1) + '）')
   const wsButtons = allButtons(wsCard)
   ok(wsRowsShown.every((_, i) => wsButtons.some((b) => b.value.fs_level === 'ws' && b.value.fs_i === i)),
     '每行都有「进入看会话」按钮，且 fs_i 对得上行号')
   ok(wsRowsShown.every((_, i) => wsButtons.some((b) => b.value.fs_level === 'ws-new' && b.value.fs_i === i)),
-    '每行都有「在这里新建」按钮，且 fs_i 对得上行号')
+    '每行都有「新建」按钮，且 fs_i 对得上行号')
+  // CM 2026-10-02：「两个按钮要**同一排**，不要分成两行」。
+  // 渲染在飞书侧，冒烟看不到像素 —— 但能验结构：那两行按钮必须落在**同一个 column_set**
+  // （两列 + flex_mode='bisect' 等分），而不是两个独立元素（那就必然上下两行）。
+  const oneRowOk = wsRowsShown.every((_, i) => {
+    const rowEl = cardElements(wsCard).find((e) => e.tag === 'column_set'
+      && (e.columns || []).some((c) => ((c && c.elements) || []).some((el) => {
+        const v = el && el.behaviors && el.behaviors[0] && el.behaviors[0].value
+        return v && v.fs_level && v.fs_i === i
+      })))
+    return Boolean(rowEl) && rowEl.columns.length === 2 && rowEl.flex_mode === 'bisect'
+  })
+  ok(oneRowOk, '每个工作区行的两个按钮在**同一排**（同一 column_set、两列、bisect 等分）')
 
   // ② 点「进入」→ 该工作区的会话卡（走真实卡片回调路径）
   const enterBtn = wsButtons.find((b) => b.value.fs_level === 'ws' && b.value.fs_i === wsIndexWork)
@@ -928,13 +978,24 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   const sessCard = enterUpdates.length ? enterUpdates[enterUpdates.length - 1] : undefined
   const sBody = JSON.stringify(sessCard && sessCard.payload)
   ok(Boolean(sessCard) && sBody.includes('第二步：选会话'), '第二级是会话卡')
-  ok(sBody.includes('gui-sess'), '列出了该工作区的其它会话（短 id）')
+  // CM 2026-10-02 选定 **二级 C 版式**（一行一个会话：标题 + 状态徽标）⇒ 卡上**不再显示短 id**
+  ok(!sBody.includes('gui-sess'), 'C 版式不显示短 id（只有标题 + 状态徽标）')
   ok(sBody.includes(summaryText), '其它会话带了首条消息摘要（认得出是哪个）')
   ok(!sBody.includes('sub-chil'), '子代理子会话不被列为可切换目标')
   ok(!sBody.includes('fu-sess'), '**只列这个工作区的会话**（别的工作区的会话不串进来）')
-  ok(sBody.includes('返回工作区列表'), '会话卡底部有「← 返回工作区列表」')
+  const sessBottom = allButtons(sessCard).map((b) => b.value && b.value.fs_level)
+  ok(sessBottom.includes('ws-new'), '底部有「➕ 新建」（整卡动作，不挂在某一行）')
+  ok(sessBottom.includes('ws-back'), '底部有「← 返回」')
+  ok(sessBottom.includes('cancel'), '底部有「✕ 取消」（CM 2026-10-02 要求：一按就撤销整张卡）')
   const guiIndex = rowIndexOf(sessCard, summaryText)
   ok(guiIndex >= 0, '候选行的序号可读（gui=' + (guiIndex + 1) + '）')
+  const sessRowBtns = allButtons(sessCard).filter((b) => b.value && b.value.fs_level === 'sess')
+  ok(sessRowBtns.length > 0 && sessRowBtns.every((b) => b.value.fs_mode === 'takeover'),
+    '会话行的按钮全部是「切换」语义（CM：这里应该是切换，不是新建）')
+  ok(allButtons(sessCard).some((b) => b.value && b.value.fs_level === 'ws-new'),
+    '「新建」收成卡片底部一个按钮（不再是每行一个）')
+  ok(allButtons(sessCard).some((b) => b.value && b.value.fs_level === 'ws-back'),
+    '底部同排还有「返回工作区」')
   const sessButtons = allButtons(sessCard)
   const takeover = sessButtons.find((b) => b.value.fs_level === 'sess' && b.value.fs_j === guiIndex
     && b.value.fs_mode === 'takeover')
@@ -977,16 +1038,18 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   await drain()
   const liveCard = lastCardFrom(liveMark)
   const liveBody = JSON.stringify(liveCard && liveCard.payload)
-  const liveFuRowEl = divRows(liveCard).find((e) => String(e.text.content).includes('fu-sess'))
+  const liveFuRowEl = divRows(liveCard).find((e) => String(e.text.content).includes('FU 会话（示例标题）'))
   ok(Boolean(liveFuRowEl) && String(liveFuRowEl.text.content).includes('🟡'),
     '运行中会话**那一行**被标成 🟡（不是卡面图例里有就算）')
-  ok(liveBody.includes('运行中') && liveBody.includes('只给'), '卡面说明了 🟡 的规则（不让 CM 猜）')
-  const liveFuIndex = rowIndexOf(liveCard, 'fu-sess')
+  ok(liveBody.includes('不能切换'), '卡面说明了 🟡 的规则（不让 CM 猜）')
+  const liveFuIndex = rowIndexOf(liveCard, 'FU 会话（示例标题）')
   ok(liveFuIndex >= 0, '🟡 那一行在列表里（序号 ' + (liveFuIndex + 1) + '）')
   const liveBtns = allButtons(liveCard)
     .filter((b) => b.value.fs_level === 'sess' && b.value.fs_j === liveFuIndex)
-  ok(liveBtns.length === 1 && liveBtns[0].value.fs_mode === 'new',
-    '运行中的会话只给了「新建」按钮（' + JSON.stringify(liveBtns.map((b) => b.text.content)) + '）')
+  ok(liveBtns.length === 0,
+    '运行中的会话**那一行不给按钮**（原来给的是「新建」，语义错位；现在只写"不能切换"）')
+  ok(String(liveFuRowEl.text.content).includes('不能切换'),
+    '并在那一行写明"正在别处运行 —— 不能切换"')
   const blockMark = sentCards.length
   feedInbound('om_switch_live_takeover', '/switch ' + (wsIndexOther + 1) + ' ' + (liveFuIndex + 1))
   await drain()
@@ -995,7 +1058,7 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
 
   // ⑥ 「← 返回工作区列表」→ 回到第一级
   const backBtn = allButtons(sessCard).find((b) => b.value.fs_level === 'ws-back')
-  ok(Boolean(backBtn), '会话卡有「← 返回工作区列表」按钮')
+  ok(Boolean(backBtn), '会话卡有「← 返回」按钮')
   const backMark = sentCards.length
   if (backBtn) await tapValue(backBtn.value)
   ok(JSON.stringify(cardsSince(backMark)).includes('选择工作区'), '点返回回到工作区卡')
@@ -1019,7 +1082,7 @@ console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注
     feedInbound('om_switch_third', '/switch')
     await drain()
     const cardA = lastCardFrom(markA)
-    const thirdIndex = rowIndexOf(cardA, THIRD_WORKSPACE)
+    const thirdIndex = rowIndexOf(cardA, WS_TITLE_THIRD)
     ok(thirdIndex >= 0, '注册表里没有、只在会话 cwd 里出现的目录，也作为兜底工作区出现（序号 ' + (thirdIndex + 1) + '）')
     // 序号从卡面读回来（别写死），并让下面按同一个序号接管
     feedInbound('om_switch_third_takeover', '/switch ' + (thirdIndex + 1) + ' 1')
@@ -1047,7 +1110,7 @@ console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注
     await drain()
     const cardC = lastCardFrom(markC)
     const cBody = JSON.stringify(cardC && cardC.payload)
-    ok(Boolean(cardC) && cBody.includes(WORKSPACE),
+    ok(Boolean(cardC) && cBody.includes(WS_TITLE_WORK),
       '注册表不可用（空）时仍列出会话里出现过的工作区（不让用户对着空卡）')
     fakeWorkspaceRegistry._entities = entitiesBefore
 
@@ -1064,9 +1127,9 @@ console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注
     await drain()
     const cardD = lastCardFrom(markD)
     const dBody = JSON.stringify(cardD && cardD.payload)
-    ok(Boolean(cardD) && dBody.includes(WORKSPACE) && dBody.includes('选择工作区'),
+    ok(Boolean(cardD) && dBody.includes(WS_TITLE_WORK) && dBody.includes('选择工作区'),
       '注册表只以 workspaces 暴露时，工作区卡照样出得来（服务名两种都认）')
-    const dIndex = rowIndexOf(cardD, OTHER_WORKSPACE)
+    const dIndex = rowIndexOf(cardD, WS_TITLE_OTHER)
     const attachBeforeD = registryAttached.length
     feedInbound('om_switch_clientonly_takeover', '/switch ' + (dIndex + 1) + ' 1')
     await drain()
@@ -1077,6 +1140,39 @@ console.log('15b) /switch 边界：注册表不可用 / 目录不存在 / 未注
     registryOverride = null
     fakeWorkspaceRegistry._entities = entitiesBefore
     agent.session.header.cwd = cwdBefore
+  }
+}
+
+console.log('15c) 文字命令的会话卡：按钮序号必须指向**那个**工作区（门槛第四轮抓到的回归）')
+{
+  // 回归原形：我在 0.5.2 里把 /list 路径上真死的那句 `ws.index = wsIndex` 连**文字命令路径上活着的那句**
+  // 一起删了 ⇒ /switch <n> 出来的会话卡里，按钮的 fs_i 全是 0 ⇒
+  // 在**空工作区**点「在这里新建会话」会在**第一个**工作区建会话（用户选的工作区被无视）。
+  const emptyPath = SMOKE_WS_ROOT + '/fs-smoke-empty'
+  try { mkdirSync(emptyPath, { recursive: true }) } catch { /* 已存在 */ }
+  const entitiesBefore15c = fakeWorkspaceRegistry._entities.slice()
+  try {
+    fakeWorkspaceRegistry._entities.push(makeRegistryEntity(emptyPath, 'empty-ws', 'ws-empty'))
+    const mark = sentCards.length
+    feedInbound('om_switch_empty', '/switch')
+    await drain()
+    const wsCard15c = lastCardFrom(mark)
+    const emptyIndex = rowIndexOf(wsCard15c, 'empty-ws')
+    ok(emptyIndex >= 0, '空工作区出现在工作区卡上（序号 ' + (emptyIndex + 1) + '）')
+    const sessMark = sentCards.length
+    feedInbound('om_switch_empty_open', '/switch ' + (emptyIndex + 1))
+    await drain()
+    const sessCard15c = lastCardFrom(sessMark)
+    ok(Boolean(sessCard15c) && JSON.stringify(sessCard15c.payload).includes('还没有会话'),
+      '空工作区在会话卡上给出「在这里新建会话」入口')
+    const newBtn = allButtons(sessCard15c).find((b) => b.value && b.value.fs_level === 'ws-new')
+    ok(Boolean(newBtn) && newBtn.value.fs_i === emptyIndex,
+      '按钮序号指向**这个**工作区（fs_i=' + (newBtn && newBtn.value.fs_i) + '，期望 ' + emptyIndex + '）')
+    if (newBtn) await tapValue(newBtn.value)
+    ok(agent.session.header.cwd === emptyPath,
+      '点它新建出来的会话 cwd 就是该工作区（实际 ' + agent.session.header.cwd + '）')
+  } finally {
+    fakeWorkspaceRegistry._entities = entitiesBefore15c
   }
 }
 
@@ -2494,6 +2590,38 @@ console.log('47) 热重载卸载：agent.ctx 上的监听必须被注销（high#
   }
   ok(unloaded, '卸载钩子执行后两条水位线均已注销（不再跨代叠加）')
   ok(agentScopeDisposed > beforeDisposed, 'disposer 确实移除过监听（移除次数 ' + agentScopeDisposed + '）')
+}
+
+console.log('48) 卡片 schema 校验：schema 2.0 不许出现 tag=action（真机 230099/200861 报错）')
+{
+  // 2026-10-02 真机事故（CM：「我发了指令，它没弹出这个卡片」）：
+  // 我把切换卡从 1.0 形状换成 schema 2.0，却留着 1.0 的 `tag: 'action'` 包按钮 ⇒ 飞书**直接拒建卡**：
+  //   code 230099 / ErrCode 200861  ErrPath: ROOT -> body -> elements -> [3](tag: action)
+  //   ErrMsg: cards of schema V2 no longer support this capability; unsupported tag action
+  // mock 的 fetch 不校验卡片结构 ⇒ 冒烟全绿、真机全废。这条用例把飞书那条规则**前移**到本地。
+  const walk = (els, visit) => {
+    for (const e of els || []) {
+      if (!e || typeof e !== 'object') continue
+      visit(e)
+      if (Array.isArray(e.elements)) walk(e.elements, visit)
+      for (const col of (e.columns || [])) walk(col && col.elements, visit)
+    }
+  }
+  let v2 = 0
+  const bad = []
+  for (const c of sentCards) {
+    const p = c.payload
+    if (!p || p.schema !== '2.0') continue
+    v2 += 1
+    if (!p.body || !Array.isArray(p.body.elements)) bad.push('schema 2.0 卡缺 body.elements')
+    walk(p.body && p.body.elements, (e) => {
+      if (e.tag === 'action') bad.push('出现 1.0 的 tag=action（2.0 不支持）')
+      if (e.tag === 'button' && !Array.isArray(e.behaviors)) bad.push('2.0 按钮缺 behaviors')
+    })
+  }
+  ok(v2 > 0, '本轮确实建过 schema 2.0 的卡（' + v2 + ' 张，否则这条校验没意义）')
+  ok(bad.length === 0, 'schema 2.0 卡片全部合法（无 action 元素、按钮走 behaviors）'
+    + (bad.length ? ' —— 首个问题：' + bad[0] : ''))
 }
 
 console.log('')
