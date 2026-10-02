@@ -2801,13 +2801,17 @@ console.log('48) 卡片 schema 校验：schema 2.0 不许出现 tag=action（真
 console.log('49) 入站文件自动收：飞书发文件 ⇒ 插件自己下载并告知（CM 2026-10-02）')
 {
   const dir = join(WORKSPACE, 'downloaded_files')
-  const before = existsSync(dir) ? readdirSync(dir).length : 0
+  // ⚠️ 收件目录**跨轮累积**（它是 tmpdir 下的固定路径，上一次跑的文件还在）——
+  //    所以断言一律只看"**这一轮新增**的文件名"，绝不用绝对计数。
+  //    （0.5.7 落地后冒烟红 1 条就是踩了这个：`pngFiles.length === 1` 在第二次跑时变成 2。）
+  const namesOf = () => (existsSync(dir) ? readdirSync(dir) : [])
+  const beforeNames = new Set(namesOf())
+  const newNames = () => namesOf().filter((n) => !beforeNames.has(n))
   feedInboundFile('om_file_001', { key: 'file_v3_abc', name: '季度报表.xlsx' })
   await drain()
-  const after = existsSync(dir) ? readdirSync(dir) : []
-  ok(after.length === before + 1,
-    '文件真的落盘（' + dir + ' 里多了 ' + (after.length - before) + ' 个）')
-  ok(after.some((n) => n.includes('季度报表')), '文件名保留下来（' + String(after[after.length - 1] || '-') + '）')
+  const added = newNames()
+  ok(added.length === 1, '文件真的落盘（新增 ' + added.length + ' 个）')
+  ok(added.some((n) => n.includes('季度报表')), '文件名保留下来（' + String(added[0] || '-') + '）')
   ok(resourceDownloads.length >= 1 && /\/resources\/file_v3_abc\?type=file/.test(resourceDownloads[0].url),
     '走的是消息资源接口（/messages/<id>/resources/<file_key>?type=file）')
   const seen = JSON.stringify(agent.sent)
@@ -2815,25 +2819,29 @@ console.log('49) 入站文件自动收：飞书发文件 ⇒ 插件自己下载�
   ok(seen.includes('downloaded_files'), '并把落盘路径一起给模型')
   ok(consoleLines.some((l) => l.includes('inbound file saved:')), '留痕 `inbound file saved:`（可日志复验）')
   // ①b 有扩展名的（文件消息带 file_name）**原样保留**，不许被文件头嗅探改写
-  ok(after.some((n) => n.endsWith('_季度报表.xlsx')), '带扩展名的文件名原样保留（实际 ' + String(after[after.length - 1] || '-') + '）')
+  ok(added.some((n) => n.endsWith('_季度报表.xlsx')), '带扩展名的文件名原样保留（实际 ' + String(added[0] || '-') + '）')
 
   // ② 图片：飞书**不给文件名**（只有 image_key）⇒ 必须按**文件头**补扩展名。
   //    真机实例：CM 发的截图存成 `2026-10-02-15-52-19_image`（内容是 JPEG），光看名字看不出格式。
+  const beforeImg = new Set(namesOf())
   resourceBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])
   feedInboundFile('om_file_img', { type: 'image', key: 'img_v3_png' })
   await drain()
-  const pngFiles = readdirSync(dir).filter((n) => n.endsWith('_image.png'))
-  ok(pngFiles.length === 1, '图片消息按文件头补上扩展名（…_image.png，PNG 魔数）')
-  ok(/^\d{4}-\d{2}-\d{2}-\d{6}_/.test(String(pngFiles[0] || '')),
+  const newImgs = namesOf().filter((n) => !beforeImg.has(n))
+  ok(newImgs.length === 1 && newImgs[0].endsWith('_image.png'),
+    '图片消息按文件头补上扩展名（本轮新增 ' + String(newImgs[0] || '-') + '）')
+  ok(/^\d{4}-\d{2}-\d{2}-\d{6}_/.test(String(newImgs[0] || '')),
     '时间戳换成本地时间格式 YYYY-MM-DD-HHMMSS（旧版是 UTC 的 YYYY-MM-DD-HH-MM-SS）')
   ok(consoleLines.some((l) => l.includes('inbound file saved:') && l.includes('_image.png')),
     '留痕里也能看到补好的扩展名')
 
   // ③ 认不出的字节 ⇒ `.bin`（**不猜**格式）
+  const beforeBin = new Set(namesOf())
   resourceBytes = Buffer.from('hello-from-feishu')
   feedInboundFile('om_file_noext', { key: 'file_v3_noext', name: '没有扩展名' })
   await drain()
-  ok(readdirSync(dir).some((n) => n.endsWith('_没有扩展名.bin')), '认不出的格式补 .bin（不瞎猜）')
+  ok(namesOf().filter((n) => !beforeBin.has(n)).some((n) => n.endsWith('_没有扩展名.bin')),
+    '认不出的格式补 .bin（不瞎猜）')
 
   // 失败也要**可见**：不再静默吞掉（CM 原话正是"你不知道，要我告诉你"）
   resourceShouldFail = true
