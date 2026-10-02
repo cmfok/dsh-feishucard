@@ -50,7 +50,14 @@ mkdirSync(OTHER_WORKSPACE, { recursive: true })
 mkdirSync(THIRD_WORKSPACE, { recursive: true })
 writeFileSync(join(FAKE_HOME, '.dsh-feishucard', 'feishu.config.json'),
   // reactionEmoji 一开始就设成非默认值（默认 'OnIt'）—— 用例 40 用它验证 cfg.reactionEmoji 通道
-  JSON.stringify({ bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE' }] }, null, 2))
+  // approvalForm：审批单卡通道是**默认关**的可选通道 ⇒ 主用例集把它打开（用例 51 验通路），
+  // 冷启动变体 `SMOKE_COLD=form-off` 则故意关掉，验「没开就一个工具都不注册」。
+  JSON.stringify({
+    bots: [{
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: COLD !== 'form-off',
+    }],
+  }, null, 2))
 process.env.FS_CONFIG_DIR = join(FAKE_HOME, '.dsh-feishucard')
 
 let failures = 0
@@ -431,6 +438,13 @@ if (COLD) {
     await drain()
     ok(createsSince(before).length === 0, 'DSH_FEISHU_GOAL_CARDS=0 ⇒ 目标轮不自动建卡（不刷屏）')
     emitCtx('agent/status', { agent, status: 'idle' })
+  } else if (COLD === 'form-off') {
+    // 2026-10-03：审批单是**可选通道，默认关** —— 配置里没写 approvalForm（或 false）时
+    // **一个工具都不注册**（对外部使用者＝零噪声），并留痕。
+    ok(!registeredTools.some((t) => t && t.name === 'feishu_approval_form'),
+      'approvalForm 未开启 ⇒ feishu_approval_form **根本不注册**（零噪声）')
+    ok(consoleLines.some((l) => l.includes('approval form tool NOT registered')), '并留痕（可日志复验）')
+    ok(registeredTools.some((t) => t && t.name === 'feishu_send'), '（前提）别的工具照常注册 —— 证明不是"啥都没加载"')
   }
   console.log(failures === 0 ? 'COLD PASS (' + COLD + ')' : 'COLD FAIL (' + COLD + '): ' + failures + ' 条')
   process.exit(failures === 0 ? 0 : 1)
@@ -2237,6 +2251,7 @@ console.log('38) bot 配置热读通道：splitConclusionMinMs 优先级 + notif
       splitConclusionMinMs: 600000,   // bot 配置说：几乎不分卡 ⇒ 应当**压过** env
       notifyAgentNotices: false,      // 关掉回执播报
       reactionEmoji: 'GLANCE',        // 别把用例 40 要验的字段洗掉
+      approvalForm: true,             // 可选通道：别在这里顺手关掉（用例 51 还要用）
     }],
   }, null, 2))
   await new Promise((r) => setTimeout(r, 11000))   // 等过热读节拍
@@ -2325,7 +2340,7 @@ console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 
 
   // 收尾：把配置恢复成 smoke 的标准 bot，避免影响后续（reactionEmoji 要保留，用例 40 还要用）
   writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
-    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE' }],
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE', approvalForm: true }],
   }, null, 2))
 }
 
@@ -2852,7 +2867,46 @@ console.log('49) 入站文件自动收：飞书发文件 ⇒ 插件自己下载�
   ok(consoleLines.some((l) => l.includes('inbound file download failed: HTTP 403')), '并留痕 HTTP 状态码')
 }
 
-console.log('50) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10-02：0.4.22 之后这条提示没了）')
+console.log('50) 静默看门狗：提示必须**有诊断含义**（CM 2026-10-03：「我以为你一直在做事」）')
+{
+  // ⚠️ 本条**必须排在热重载用例之前**：那个用例会把已注册的 ctx.effect cleanup 全跑一遍
+  //    （模拟卸载）⇒ 之后**没有任何 watcher 还活着**（第一版排后面，日志里 0 条 buildCardPayload，
+  //    断言全绿不了也说明不了问题）。
+  // 让这一轮"挂住"（whenIdle 不返回）⇒ 卡保持 running，才走得到静默分支
+  let release
+  const gate = new Promise((r) => { release = r })
+  const prevIdle = agent.whenIdle.bind(agent)
+  agent.whenIdle = () => gate
+  const logMark = consoleLines.length
+  feedInbound('om_stall_watchdog', '看门狗用例')
+  await drain()
+  ok(consoleLines.slice(logMark).some((l) => l.includes('card created')), '（前提）这一轮建了卡')
+
+  const realNow = Date.now
+  const before = sentCards.length
+  Date.now = () => realNow() + 6 * 60 * 1000      // 假装已静默 6 分钟（这期间没有任何新事件）
+  await drain()
+  const slice = JSON.stringify(sentCards.slice(before))
+  ok(slice.includes('没有回包'), '★ 零动作静默 6 分钟 ⇒ 卡面写「上游已 N 分钟没有回包」（不是含糊的"无新动作"）')
+  ok(slice.includes('不是卡片坏了'), '★ 并写明"不是卡片坏了"（CM：我不知道你在干什么）')
+  ok(!slice.includes('还在跑'), '（反例）没有误报成"工具还在跑（正常）"')
+  const plain = cardsSince(before).filter((c) => c.op === 'create' && c.payload && !c.payload.schema).length
+  ok(plain >= 1, '★ 另发了一条**纯文本**提示（新消息才会提醒，不只是悄悄改卡上一行）')
+  ok(consoleLines.slice(logMark).some((l) => l.includes('stall notice sent')), '并留痕 `stall notice sent`')
+
+  // 再跑一轮：每轮只发一次（不刷屏）
+  const before2 = sentCards.length
+  await drain()
+  const plain2 = cardsSince(before2).filter((c) => c.op === 'create' && c.payload && !c.payload.schema).length
+  ok(plain2 === 0, '同一轮不重复发（每轮只提示一次）')
+
+  Date.now = realNow
+  release()
+  agent.whenIdle = prevIdle
+  await drain()
+}
+
+console.log('51) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10-02：0.4.22 之后这条提示没了）')
 {
   const activeTurns = globalThis.__fsActiveTurns
   ok(Boolean(activeTurns) && typeof activeTurns.set === 'function',
@@ -2908,7 +2962,7 @@ console.log('50) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10
   ok(!texts2.some((t) => t.includes('热重载')), '同一个会话不会提示第二遍（幂等）')
 }
 
-console.log('51) 审批单卡通道（feishu_approval_form）：工具 / 版式 / 点击 / stale / 超时 / 适配（2026-10-03 任务）')
+console.log('52) 审批单卡通道（feishu_approval_form）：工具 / 版式 / 点击 / stale / 超时 / 适配（2026-10-03 任务）')
 {
   // ⚠️ 取**第一次**注册的那个工具（第一代）。原因：冒烟的 `drain()` 会把**所有代际**的轮询回调
   //    都跑一遍，而注入的 helper 事件总是由**排在最前的第一代**消费 ⇒ 处理卡片点击的是第一代的
@@ -2949,6 +3003,11 @@ console.log('51) 审批单卡通道（feishu_approval_form）：工具 / 版式 
     risk: ['继续用旧标签 ⇒ 他看到不完整数据'],
     chatId: CHAT_ID,
   }
+  // ⚠️ 夹具时序（第一版踩了）：前面用例 38/39 改写过配置（还写过别的 appId），
+  //    而 `bot.cfg`/`bots` 是**每 10 秒热读一次**才回填 ⇒ 这里必须先等过热读节拍，
+  //    否则 `findBotForChat(CHAT_ID)` 解析不到 bot（日志特征：`approval form target: ... bot=no`）。
+  await new Promise((r) => setTimeout(r, 11000))
+  await drain()
   const mark = sentCards.length
   const pendingForm = Promise.resolve()
     .then(() => formTool.execute(formArgs, { agent, signal: undefined }))
@@ -2970,24 +3029,38 @@ console.log('51) 审批单卡通道（feishu_approval_form）：工具 / 版式 
   ok(JSON.stringify((fp.header && fp.header.title) || '').includes('身份标签变更单 · 曹伟轩'), '卡头带人名的标题')
   const fEls = ((fp.body && fp.body.elements) || [])
   const fieldDiv = fEls.find((e) => e.tag === 'div' && Array.isArray(e.fields))
-  ok(Boolean(fieldDiv) && fieldDiv.fields.length === 4
+  // 2026-10-03 CM 真机反馈：短值并排（单号 + 置信度）；长值各占一行（变更类型 / 证据来源）
+  ok(Boolean(fieldDiv) && fieldDiv.fields.length === 2
     && fieldDiv.fields.every((f) => f.is_short === true),
-    '双列字段区：4 个 label/value 且 is_short=true（' + (fieldDiv ? fieldDiv.fields.length : 0) + ' 个）')
+    '短值两列并排：只有 单号 + 置信度 进 fields 区且 is_short=true（实际 '
+      + (fieldDiv ? fieldDiv.fields.length : 0) + ' 个）')
+  const divText = JSON.stringify((fieldDiv && fieldDiv.fields) || [])
+  ok(!divText.includes('身份标签（数据域收窄）') && !divText.includes('企微通讯录'),
+    '长文本**没有**被塞进双列框里')
+  const longRows = fEls.filter((e) => e.tag === 'markdown' && /^\*\*.+\*\*\n/.test(String(e.content || '')))
+  ok(longRows.some((e) => String(e.content).includes('变更类型') && String(e.content).includes('身份标签（数据域收窄）')),
+    '「变更类型」这类长文本**单独一行**')
+  ok(longRows.some((e) => String(e.content).includes('证据来源') && String(e.content).includes('企微通讯录')),
+    '「证据来源」这类长文本**单独一行**')
   const flat = JSON.stringify(fEls)
-  ok(['①', '②', '③', '④', '⑤', '⑥'].every((n) => flat.includes('【' + n + '】'.slice(0, 0) + n) || flat.includes(n)),
-    '六个分区标题都在（①~⑥）')
+  ok(['①', '②', '③', '④', '⑤'].every((n) => flat.includes(n)),
+    '五个分区标题都在（①~⑤）')
+  ok(!flat.includes('⑥ 操作'), '不再有「⑥ 操作」这行标题（CM 2026-10-03：「这几个文本不需要」）')
   ok(flat.includes('🔹') && flat.includes('🔸'), '① 用 🔹/🔸 区分「不变 / 收窄」')
   ok(flat.includes('➕') && flat.includes('➖'), '② 用 ➕/➖ 表示新增/取消')
   ok(flat.includes('> 他三季度只报财务口径'), '③ 证据渲染成引用块')
   ok(fEls.filter((e) => e.tag === 'hr').length >= 5, '分区之间有 hr 分隔（' + fEls.filter((e) => e.tag === 'hr').length + ' 条）')
   const actionRow = fEls.find((e) => e.tag === 'column_set')
   const actionBtns = ((actionRow && actionRow.columns) || []).map((c) => (c.elements || [])[0])
-  ok(Boolean(actionRow) && actionRow.flex_mode === 'trisect', '⑥ 操作行＝三列等分')
-  ok(actionBtns.length === 3, '三个按钮（实际 ' + actionBtns.length + '）')
-  ok(actionBtns[0] && actionBtns[0].type === 'primary' && actionBtns[1] && actionBtns[1].type === 'danger'
-    && actionBtns[2] && actionBtns[2].type === 'default', '★ 按钮**带色**：primary / danger / default')
+  ok(Boolean(actionRow) && actionRow.flex_mode === 'bisect', '操作行＝两列等分（bisect）')
+  ok(actionBtns.length === 2, '★ **只有两个按钮**：采纳 / 驳回（实际 ' + actionBtns.length + ' 个）')
+  ok(Boolean(actionBtns[0]) && actionBtns[0].type === 'primary'
+    && Boolean(actionBtns[1]) && actionBtns[1].type === 'danger',
+    '★ 按钮**带色**：采纳=primary(蓝) / 驳回=danger(红)')
+  ok(actionBtns.every((b) => b && b.text && (b.text.content === '✅ 采纳' || b.text.content === '❌ 驳回')),
+    '按钮文案就是 采纳 / 驳回（没有第三个「我要改」）')
   ok(actionBtns.every((b) => b && b.behaviors && b.behaviors[0].value.fs_form !== undefined
-    && b.behaviors[0].value.fs_choice !== undefined), '三个按钮都带 { fs_form, fs_choice }')
+    && b.behaviors[0].value.fs_choice !== undefined), '两个按钮都带 { fs_form, fs_choice }')
   const formToken = actionBtns[0].behaviors[0].value.fs_form
   ok(consoleLines.some((l) => l.includes('approval form sent:') && l.includes('token=' + formToken)),
     '留痕 `approval form sent`（可日志复验）')
@@ -3049,7 +3122,8 @@ console.log('51) 审批单卡通道（feishu_approval_form）：工具 / 版式 
   ok(JSON.stringify((adaptCard && adaptCard.payload) || {}).includes('身份标签变更单 · 曹伟轩（适配通道）'),
     '★ askUserQuestion 带 card 字段 ⇒ 走审批单卡（不是"文字 + 选它"简卡）')
   const adaptBtns = allButtons(adaptCard)
-  ok(adaptBtns.length === 3, '适配通道的卡也是三个带色按钮（' + adaptBtns.length + ' 个）')
+  ok(adaptBtns.length === 2 && adaptBtns[0].type === 'primary' && adaptBtns[1].type === 'danger',
+    '适配通道的卡也是两个带色按钮（采纳/驳回，实际 ' + adaptBtns.length + ' 个）')
   await tapValue(adaptBtns[1].value)
   // 多个代际都挂在同一条水位线上（用例 50 重载过），`r[0]` 可能是"交回下一个"那条 ⇒
   // 从**所有**返回值里挑出真正带 answers 的那个（这才是接管成功的那条）。
@@ -3063,6 +3137,58 @@ console.log('51) 审批单卡通道（feishu_approval_form）：工具 / 版式 
   const foreign = await formTool.execute({ title: '不该发出去的单' }, { agent: { id: 'agent-not-feishu' }, signal: undefined })
   ok(foreign && foreign.ok === false && String(foreign.detail).includes('不是飞书会话'),
     '★ 非飞书会话 ⇒ 明确报错（不瞎发到别人的会话）')
+
+  // ---- 泛化通道（0.6.2）：`sections` 用**任意**审批单，标题自动补 ①~⑩
+  const mark4 = sentCards.length
+  const genericPromise = formTool.execute({
+    title: '权限申请单 · 通用形态',
+    meta: [{ label: '申请单号', value: 'REQ-2026-1' }, { label: '紧急度', value: 'P1' }],
+    sections: [
+      { title: '申请内容', lines: ['开通「财务域」只读'] },
+      { title: '理由', lines: ['季度对账需要'] },
+      { title: '不会越权的地方', lines: ['不改数据、不外发'] },
+    ],
+    chatId: CHAT_ID,
+  }, { agent, signal: undefined })
+  await drain()
+  const genericCard = lastCardFrom(mark4)
+  const gp = JSON.stringify((genericCard && genericCard.payload) || {})
+  ok(gp.includes('① 申请内容') && gp.includes('② 理由') && gp.includes('③ 不会越权的地方'),
+    '★ 泛化 `sections` ⇒ 任意审批单，标题自动补 ①~③（不必套"类别×L档"那套）')
+  ok(gp.includes('开通「财务域」只读') && gp.includes('REQ-2026-1'), '泛化段内容与短字段原样上卡')
+  const genericBtns = allButtons(genericCard)
+  ok(genericBtns.length === 2 && genericBtns[0].type === 'primary' && genericBtns[1].type === 'danger',
+    '泛化卡同样是两个带色按钮（采纳/驳回）')
+  await tapValue(genericBtns[0].value)          // 别让这张卡挂着没人点
+  await settle(genericPromise, 4000)
+
+  // ---- 开关（0.6.2）：approvalForm 关掉 ⇒ 工具**明确拒绝** + 适配通道**回退**普通提问卡
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: false,
+    }],
+  }, null, 2))
+  await new Promise((r) => setTimeout(r, 11000))   // 等过热读节拍（bot.cfg 每 10 秒重读一次）
+  await drain()
+  // 注意：这里必须显式给 chatId —— 否则先撞"不是飞书会话"那条护栏（本用例要把闸门压到开关这一层）
+  const refused = await formTool.execute({ title: '关掉开关后不该发', chatId: CHAT_ID }, { agent, signal: undefined })
+  ok(refused && refused.ok === false && String(refused.detail).includes('没打开审批单通道'),
+    '★ approvalForm=false ⇒ 工具**明确拒绝**（不发卡，并给出"怎么打开"的一句话）—— 实际：' + JSON.stringify(refused))
+  ok(consoleLines.some((l) => l.includes('approval form refused')), '并留痕 `approval form refused`')
+
+  const mark5 = sentCards.length
+  const q2 = [{
+    id: 'plain-1', question: '普通提问（开关关掉后）',
+    options: [{ label: '甲' }, { label: '乙' }],
+    card: { title: '关掉后不该走审批单卡' },
+  }]
+  emitCtx('user-questions/request', { questions: q2, agent: adaptAgent, signal: undefined }, () => Promise.resolve('next'))
+  await drain()
+  const fallbackCard = lastCardFrom(mark5)
+  const fbText = JSON.stringify((fallbackCard && fallbackCard.payload) || {})
+  ok(fbText.includes('选它') && !fbText.includes('关掉后不该走审批单卡'),
+    '★ 开关关掉 ⇒ 带 `card` 的提问**回退**成普通提问卡（绝不误发审批单）')
 }
 
 console.log('')

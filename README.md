@@ -98,14 +98,22 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   （与 `approval/request` 同构，仅接管飞书自己的会话；GUI/子代理的提问一律交回 harness）。
   `exit_plan_mode`'s review prompt now reaches Feishu via a service-level `user-questions/request` takeover, not just the tool-level one.
 
-- **审批单卡 / Approval form（2026-10-03，0.6.0 新增通道）**：AI 要发「权限变更审批单」这类**可读可点**的单子时用它 ——
-  卡面固定六段：双列字段区（单号/变更类型/置信度/证据来源…）→ ① 类别 × L 档变化（🔹不变 / 🔸收窄）→ ② 技能变化（➕/➖/✅）→
-  ③ 证据原文（引用块）→ ④ 影响面 → ⑤ 不批的后果 → ⑥ 操作行**三个带色按钮**：`✅ 采纳`(primary 蓝) / `❌ 驳回`(danger 红) / `✍️ 我要改`(default 灰)。
+- **审批单卡 / Approval form（2026-10-03 新增；0.6.1 按真机反馈改版；0.6.2 起为**可选通道）**：AI 要发「权限变更审批单」这类**可读可点**的单子时用它 ——
+  卡面：**短值字段两列并排**（单号 / 置信度…）· **长文本各占一整行**（变更类型 / 证据来源…；判据见下）→
+  ① 类别 × L 档变化（🔹不变 / 🔸收窄）→ ② 技能变化（➕新增 / ➖取消 / ✅不变）→ ③ 证据原文（引用块）→ ④ 影响面 → ⑤ 不批的后果 →
+  **两个带色按钮**：`✅ 采纳`(primary 蓝) / `❌ 驳回`(danger 红)（没有「⑥ 操作」标题，也没有第三个「我要改」——要提意见直接回消息）。
+  **短/长判据**：字段显式 `short:true/false` 优先；否则**纯 ASCII/数字且 ≤24 字 ⇒ 短**（并排）、**含中日韩文字 ⇒ 长**（独占一行）。
+  **⚠️ 默认关（可选通道）**：要在 `~/.dsh-feishucard/feishu.config.json` 里给某个 bot 加 `"approvalForm": true` 才启用 ——
+  没开时**连工具都不注册**（外部使用者零噪声），开了但某个 bot 没开则该 bot 调用被明确拒绝。**改完 10 秒内自动生效，不用重启**。
+  **分区可泛化**：除了本仓的「身份标签」预设（`categories/skills/evidence/impact/risk`），也可以直接给
+  `sections: [{title, lines}]` 做**任意**审批单（标题自动补 ①~⑩）。
   两条触达入口：**工具 `feishu_approval_form`**（结构化参数，发卡后**等他点**，把选择当**工具结果**返回；
   目标会话自动取调用方 agent 的飞书会话，非飞书会话明确报错、绝不瞎发）· 或 `ask_user_question` 的
   `questions[0].card` 适配（回答按 `selected:[选择]` 回传，调用方零改动）。
   **硬规矩**：一张卡只装一个人、一件事；30 分钟没点 ⇒ **可见地**作废（卡变超时态 + 一条纯文本，**绝不默认通过或驳回**）；
-  点完卡**就地变回执卡**，旧卡再点给可见提示而不是静默失败。An `feishu_approval_form` tool (and an `ask_user_question` adapter) renders a readable, tappable approval form with a colored action row; one card = one person/matter, 30-minute visible timeout, in-place receipt after a tap.
+  点完卡**就地变回执卡**，旧卡再点给可见提示而不是静默失败。Opt-in only (`"approvalForm": true` per bot; the tool is not even
+  registered when nobody enables it) — sections are generic (`sections: [{title, lines}]`) with the repo's identity-tag layout kept as a preset;
+  one card = one person/matter, 30-minute visible timeout, in-place receipt after a tap.
 - **提问卡按钮上色 / Colored option buttons（2026-10-03）**：选项按钮现在带 `type`（飞书不传就是灰的）——
   规则：显式 `buttonType` > 词义（驳回/拒绝/取消… ⇒ 红）> 第一个 ⇒ 蓝 > 其余灰；**向后兼容**，不传不报错。
   `ask_user_question` option buttons now carry a `type` (primary / danger / default) instead of all being grey.

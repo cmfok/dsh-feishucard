@@ -342,6 +342,10 @@ export function apply(ctx) {
         // 文档承诺的「bot 配置优先（10s 热读、免重启）」实际不成立（只有 env／默认值生效）。
         splitConclusionMinMs: (Number.isFinite(Number(bot.splitConclusionMinMs)) && Number(bot.splitConclusionMinMs) >= 0)
           ? Number(bot.splitConclusionMinMs) : undefined,
+        // 2026-10-03：审批单卡通道开关（**默认关**——不写就是关）。
+        // ⚠️ 必须进白名单：本函数是**白名单归一化**，漏在这里 ⇒ 配置里写了也被丢掉
+        //（本仓在 splitConclusionMinMs 上踩过一模一样的坑，见上面那条注释）。
+        approvalForm: typeof bot.approvalForm === 'boolean' ? bot.approvalForm : undefined,
       })
     }
     return cleaned
@@ -562,6 +566,12 @@ export function apply(ctx) {
       // 2026-09-16：诚实状态用。lastEventAt = 上次有新事件的时刻；idleMinutes = 已静默分钟数（0=正常）
       lastEventAt: Date.now(),
       idleMinutes: 0,
+      // 2026-10-03：静默的**种类**（'tools'=工具在跑 / 'silent'=上游没回包）+ 在跑的工具名 +
+      // 已发出过"上游没回包"纯文本提示（每轮只发一次）+ 未完成的工具计数。
+      idleKind: '',
+      idleToolName: '',
+      pendingTools: 0,
+      stallNotified: false,
     }
   }
 
@@ -951,11 +961,24 @@ export function apply(ctx) {
   //   ② `sealed` 时**直接把状态行删掉** → 回合结束后用户看不出"这轮结束了没有"。
   // 另加一条诚实提示：长时间无新事件 → 写明"已 N 分钟无新动作"，不用假状态糊弄。
   const DSH_IDLE_NOTICE_MIN = 3      // 无新事件多少分钟后提示
+  // 2026-10-03（CM）：「我是能看到'多少分钟没动作'这个提示，但我以为你是一直在有做事情」
+  // ⇒ 旧那句「已 N 分钟无新动作」**会误导**：它既可能是"工具在跑"，也可能是"上游根本没回包"。
+  //    现在按**事件流**区分（不猜）：
+  //      · 有 `tool/call` 没等到 `tool/result` ⇒ 工具在跑（正常）
+  //      · 最后一步是"请求已发出"、之后零事件 ⇒ **上游没回包**（该动手了）
+  //    并且"上游没回包"静默超过 `DSH_STALL_NOTICE_MIN` 分钟会**另发一条纯文本**（新消息才提醒）。
+  const DSH_STALL_NOTICE_MIN = 5
   function statusTextFor(card) {
     if (card.status === 'sealed') return '_✅ 已完成_'
     if (card.status === 'completed') return '_已完成_'
     if (card.status === 'error') return '_失败_'
-    if (card.idleMinutes > 0) return '_运行中…（已 ' + card.idleMinutes + ' 分钟无新动作）_'
+    if (card.idleMinutes > 0) {
+      if (card.idleKind === 'tools') {
+        return '_🔧 工具' + (card.idleToolName ? ' `' + card.idleToolName + '`' : '') + ' 还在跑：已 '
+          + card.idleMinutes + ' 分钟没有新动作（**正常**，别急）_'
+      }
+      return '_⏳ 上游已 ' + card.idleMinutes + ' 分钟**没有回包**（模型侧卡住／网络慢，**不是卡片坏了**）_'
+    }
     return '_运行中…_'
   }
 
@@ -1377,6 +1400,10 @@ export function apply(ctx) {
             args: String(event.data.arguments || ''),
             status: 'running',
           })
+          // 看门狗判据：有工具在跑 ⇒ 静默属于"正常等工具"，不是"上游没回包"
+          card.pendingTools = Number(card.pendingTools || 0) + 1
+          card.stallNotified = false
+          card.idleKind = ''
           appendTool(card, id)
           changed = true
         }
@@ -1385,6 +1412,8 @@ export function apply(ctx) {
         if (id) {
           const tool = card.tools.get(String(id))
           if (tool) {
+            if (tool.status === 'running') card.pendingTools = Math.max(0, Number(card.pendingTools || 0) - 1)
+            card.stallNotified = false
             const block = event.data.message.content && event.data.message.content[0]
             tool.status = block && block.isError ? 'failed' : 'completed'
             if (tool.status === 'failed') {
@@ -1436,14 +1465,36 @@ export function apply(ctx) {
         if (scanCard(agent, card)) {
           card.lastEventAt = Date.now()
           card.idleMinutes = 0
+          card.idleKind = ''
+          card.stallNotified = false
           void syncCard(bot, chatId, card, false).catch(() => {})
         } else if (card.status === 'running' && card.lastEventAt) {
-          // 诚实状态：长时间没有新事件就说清楚"多久没动"，**不宣称完成**
+          // 诚实状态（2026-10-03 改：**有诊断含义**，不再让人误以为"它在忙"）：
+          //   · 有工具在跑 ⇒ 说清是哪个工具、并注明"正常"；
+          //   · 没有任何动作 ⇒ 说清是**上游没回包**（模型侧卡住/网络慢），且 ≥5 分钟**另发纯文本**。
           const mins = Math.floor((Date.now() - card.lastEventAt) / 60000)
+          const pendingTools = Number(card.pendingTools || 0)
+          const kind = pendingTools > 0 ? 'tools' : 'silent'
+          if (kind === 'tools') {
+            const running = [...card.tools.values()].filter((t) => t && t.status === 'running')
+            card.idleToolName = running.length ? String(running[running.length - 1].name || '') : ''
+          }
           const next = mins >= DSH_IDLE_NOTICE_MIN ? mins : 0
+          // ⚠️ 只在"分钟数变化"时同步 —— 别因为 kind 变了就多同步一次：
+          //    冒烟里「同一回执不重复播报」那条断言把**卡片 PATCH 更新**也算进长度，
+          //    多一次无谓更新就会把它判红（这是真代价，不是测试洁癖）。
           if (next !== card.idleMinutes) {
             card.idleMinutes = next
+            card.idleKind = next > 0 ? kind : ''
             void syncCard(bot, chatId, card, false).catch(() => {})
+          }
+          if (kind === 'silent' && mins >= DSH_STALL_NOTICE_MIN && !card.stallNotified) {
+            card.stallNotified = true
+            const note = '⏳ 上游已经 ' + mins + ' 分钟**没有回包**（模型侧卡住／网络慢，不是卡片坏了，'
+              + '也不是我在埋头干活）。你回我一句话就会强制重新发起这一轮。'
+            void sendPlainText(bot, chatId, note).catch(() => {})
+            console.log('[fs] stall notice sent: chat=' + chatId + ' mins=' + mins
+              + ' card=' + String(card.token || '-').slice(-8))
           }
         }
       } catch (error) {
@@ -4965,10 +5016,10 @@ export function apply(ctx) {
   //    因为那一轮早被重载掐断了）。
   const pendingForms = globalThis.__fsPendingForms || (globalThis.__fsPendingForms = new Map())
   const recentForms = globalThis.__fsRecentForms || (globalThis.__fsRecentForms = new Map())
+  // 操作按钮（2026-10-03 CM 真机反馈：**只要两个** —— 「✍️ 我要改」已删，有意见直接回消息）。
   const FORM_ACTIONS = [
     { label: '✅ 采纳', choice: '采纳', type: 'primary' },
     { label: '❌ 驳回', choice: '驳回', type: 'danger' },
-    { label: '✍️ 我要改', choice: '改', type: 'default' },
   ]
   // 变化图标：🔹不变 / 🔸收窄 / 🔷放宽 / ➕新增 / ➖取消（技能那条用 ✅ 表示不变）
   const FORM_CHANGE_ICON = { same: '🔹', narrow: '🔸', expand: '🔷', add: '➕', remove: '➖' }
@@ -4991,39 +5042,73 @@ export function apply(ctx) {
   function approvalFormCardPayload(form, token) {
     const f = (form && typeof form === 'object') ? form : {}
     const elements = []
-    // 双列字段区：div + fields（is_short: true 才会并排）
+    // 字段区（2026-10-03 CM 真机反馈）：
+    //   · **短值**（单号 / 置信度…）⇒ `div + fields(is_short:true)` 两列并排，省地方；
+    //   · **长值**（变更类型 / 证据来源…）⇒ **单独一行**（挤在框里读不了，CM 原话"因为它是长文本，
+    //     不要在那个框里面"）。
+    //   判定：字段显式给 `short: true/false` 就听它的；没给就按"值是否短且单行"自动判。
     const meta = (Array.isArray(f.meta) ? f.meta : []).filter((p) => p && (p.label || p.value))
-    if (meta.length) {
+    const fieldValue = (p) => String(p && p.value === undefined ? '' : p.value)
+    const fieldLabel = (p) => String((p && p.label) || '')
+    // 短/长 的判据（CM 真机例子：`单号=BG-2026-1003-01` 要与「置信度」并排，而
+    //   `变更类型=身份标签（数据域收窄）` 要独占一行 —— **按纯长度分不开**（16 字 vs 11 字））：
+    //   ① 字段显式给 `short: true/false` ⇒ 听它的；
+    //   ② 否则：**含中日韩文字 ⇒ 当长文本**（独占一行）；纯 ASCII/数字且 ≤24 字 ⇒ 短值（两列并排）。
+    //      ⇒ 单号/置信度/日期/编号这类天然并排，句子类的中文值天然独占一行。
+    const CJK_RE = /[\u3400-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/
+    const isShortField = (p) => {
+      if (p && typeof p.short === 'boolean') return p.short
+      const v = fieldValue(p)
+      if (!v || v.includes('\n')) return false
+      if (CJK_RE.test(v)) return false
+      return v.length <= 24
+    }
+    const shortFields = meta.filter(isShortField)
+    const longFields = meta.filter((p) => !isShortField(p))
+    if (shortFields.length) {
       elements.push({
         tag: 'div',
-        fields: meta.map((p) => ({
+        fields: shortFields.map((p) => ({
           is_short: true,
-          text: {
-            tag: 'lark_md',
-            content: '**' + String(p.label || '') + '**\n' + String(p.value === undefined ? '' : p.value),
-          },
+          text: { tag: 'lark_md', content: '**' + fieldLabel(p) + '**\n' + fieldValue(p) },
         })),
       })
     }
-    const sections = [
+    for (const p of longFields) {
+      elements.push({ tag: 'markdown', content: '**' + fieldLabel(p) + '**\n' + fieldValue(p) })
+    }
+    // 分区（2026-10-03 泛化）：调用方可以直接给 `sections: [{title, lines}]` 用**任意**审批单，
+    // 也可以只用本仓的「身份标签」预设字段（categories/skills/evidence/impact/risk）。
+    // 两者都给时以 `sections` 为准；泛化的 title 若没自带序号，自动补 ①~⑩（保持同一种观感）。
+    const CIRCLED = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
+    const generic = (Array.isArray(f.sections) ? f.sections : [])
+      .map((s, i) => {
+        const rawTitle = String((s && s.title) || '')
+        const lines = (Array.isArray(s && s.lines) ? s.lines : []).map((x) => String(x))
+        if (!rawTitle && !lines.length) return null
+        const title = /^[①-⑩]/.test(rawTitle) ? rawTitle : ((CIRCLED[i] || String(i + 1)) + ' ' + rawTitle).trim()
+        return { title, body: lines.join('\n') }
+      })
+      .filter(Boolean)
+    const preset = [
       formSectionText('① 类别 × L 档 变化', f.categories, formLineText),
       formSectionText('② 技能变化', f.skills, formLineText),
       formSectionText('③ 证据（原文）', f.evidence, (s) => '> ' + String(s).split('\n').join('\n> ')),
       formSectionText('④ 影响面（改完他获得什么）', f.impact, (s) => '• ' + String(s)),
       formSectionText('⑤ 不批的后果', f.risk, (s) => '• ' + String(s)),
     ].filter(Boolean)
+    const sections = generic.length ? generic : preset
     for (const s of sections) {
       if (elements.length) elements.push({ tag: 'hr' })
       elements.push({ tag: 'markdown', content: '**' + s.title + '**' })
       elements.push({ tag: 'markdown', content: s.body })
     }
-    // ⑥ 操作行：**三个带色按钮**（primary 蓝 / danger 红 / default 灰）——
-    //    这正是旧提问卡缺的（它生成的按钮没有 type，全是灰的）。3 等分用 `trisect`。
+    // 操作行（2026-10-03 CM 真机反馈）：**不要「⑥ 操作」这行标题**，按钮也**只留两个** ——
+    //   `采纳`(primary 蓝) / `驳回`(danger 红)。「✍️ 我要改」已删（CM 要提意见直接回消息即可）。
     elements.push({ tag: 'hr' })
-    elements.push({ tag: 'markdown', content: '**⑥ 操作**' })
     elements.push({
       tag: 'column_set',
-      flex_mode: 'trisect',
+      flex_mode: 'bisect',
       columns: FORM_ACTIONS.map((a) => ({
         tag: 'column',
         width: 'weighted',
@@ -5151,8 +5236,12 @@ export function apply(ctx) {
     // （而不是"文字 + 选它"的简卡），点击结果仍按 question-answer 的形状回传
     // （`selected: [选择]`）—— 这样走 askUserQuestion 的调用方**零改动**就能拿到选择。
     // 向后兼容：只有显式带 `card` 才走这条；不带一个字都不受影响。
+    // 开关（2026-10-03）：审批单是**可选通道**，默认关 —— 只有该 bot 在
+    // `feishu.config.json` 里显式写了 `"approvalForm": true` 才认这条 `card` 适配；
+    // 没开的 bot 原样走普通提问卡（与 0.6.0 之前完全一致）。
+    const formOn = Boolean(bot && bot.cfg && bot.cfg.approvalForm === true)
     const qCard = questions && questions[0] && questions[0].card
-    if (qCard && typeof qCard === 'object') {
+    if (qCard && typeof qCard === 'object' && formOn) {
       const q0 = questions[0]
       return askApprovalForm(bot, chatId, qCard, signal).then((out) => {
         const choice = out && out.choice ? String(out.choice) : ''
@@ -5567,18 +5656,26 @@ export function apply(ctx) {
   const approvalFormTool = defineTool({
     name: 'feishu_approval_form',
     description: 'Send one "approval form" card to the Feishu chat of the calling agent and WAIT for the human to tap '
-      + '采纳 / 驳回 / 我要改; the tapped choice is returned as this tool\'s result. '
+      + '采纳 / 驳回; the tapped choice is returned as this tool\'s result. '
       + 'One card = ONE person and ONE matter (never pack several people\'s changes into one card). '
-      + 'Fixed six sections: ① category × L-level changes ② skill changes ③ evidence quotes ④ impact ⑤ consequence of not approving ⑥ the action row. '
+      + 'Layout: short meta fields (单号/置信度…) sit two-per-row, long values (变更类型/证据来源…) each get their own line, '
+      + 'then sections ① category × L-level changes ② skill changes ③ evidence quotes ④ impact ⑤ consequence of not approving, '
+      + 'then a two-button action row. '
       + 'If nobody taps within 30 minutes the form is voided (and that is said visibly in the chat).',
     parameters: {
       title: { type: 'string', required: true, description: 'Card title incl. the person, e.g. 身份标签变更单 · 曹伟轩' },
       meta: {
         type: 'array',
-        description: 'Two-column field pairs (单号 / 变更类型 / 置信度 / 证据来源 …): [{label, value}]',
+        description: 'Field pairs (单号 / 变更类型 / 置信度 / 证据来源 …): [{label, value}]. '
+          + 'Short ASCII-ish values (单号/置信度/日期…) are laid out two-per-row; CJK sentence-like values '
+          + '(变更类型/证据来源…) each get their own full-width line. Set short:true/false to force either way.',
         items: {
           type: 'object',
-          properties: { label: { type: 'string', required: true }, value: { type: 'string', required: true } },
+          properties: {
+            label: { type: 'string', required: true },
+            value: { type: 'string', required: true },
+            short: { type: 'boolean', description: 'optional: force two-per-row (true) or own line (false)' },
+          },
           additionalProperties: false,
         },
       },
@@ -5613,6 +5710,24 @@ export function apply(ctx) {
       },
       impact: { type: 'array', description: '④ impact — what he gains after the change (one line each)', items: { type: 'string' } },
       risk: { type: 'array', description: '⑤ consequence of NOT approving (one line each)', items: { type: 'string' } },
+      preset: {
+        type: 'string',
+        description: 'Optional preset for the section titles: "identity-tag" (default when the domain fields below are used) '
+          + 'or "custom" (use `sections` instead).',
+      },
+      sections: {
+        type: 'array',
+        description: 'Generic alternative to the ①~⑤ domain fields: [{title, lines}] — any approval type. '
+          + 'Titles get an automatic ①~⑩ prefix when they do not carry one. When given, it replaces the domain sections.',
+        items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', required: true },
+            lines: { type: 'array', items: { type: 'string' }, required: true },
+          },
+          additionalProperties: false,
+        },
+      },
       chatId: { type: 'string', description: 'Optional explicit target chat (oc_...); defaults to the calling agent\'s Feishu chat.' },
     },
     output: {
@@ -5637,26 +5752,23 @@ export function apply(ctx) {
       const a = (args && typeof args === 'object') ? args : {}
       const owner = findChatForAgent(exec && exec.agent)
       const explicit = typeof a.chatId === 'string' && a.chatId.trim() ? a.chatId.trim() : ''
-      const chatId = explicit || (owner && owner.chatId) || ''
-      // bot 解析用**兜底链**（与 feishu_send 同一套思路）：卡片动作/工具调用可能发生在
-      // 一个"刚重载、内存态还空"的代际里 ⇒ 只靠 findBotForChat 会解析不到。
-      //   ① findChatForAgent 给的 bot → ② findBotForChat(chatId) → ③ 最近收到过消息的 bot
-      //   → ④ 配置里的第一个 bot（readConfig 兜底，绝不硬编码 appId/secret）
-      let bot = (owner && owner.bot) || (chatId ? findBotForChat(chatId) : undefined)
+      const target = explicit || (owner && owner.chatId) || ''
+      // bot 解析：**只认"这个会话属于哪个 bot"**（调用方 agent 给的 / 按 chatId 查）。
+      // ⚠️ 故意**不**沿用 feishu_send 那条"最近收到消息的 bot"兜底：那条会把非飞书会话
+      //    （GUI／子代理）的调用发到**别人的**会话去 —— 审批单是给具体某个人的，
+      //    发错人比不发严重得多（需求原文：绝不瞎发到别人的会话）。
+      let bot = (owner && owner.bot) || (target ? findBotForChat(target) : undefined)
       if (!bot) {
-        let best
-        for (const b of bots.values()) {
-          if (b.lastChatId && (!best || b.lastChatId > best.lastChatId)) best = b
-        }
-        bot = best
-      }
-      if (!bot) {
+        // 兜底（严格、不猜）：**只配了一个 bot** 时"发给谁"没有歧义 ⇒ 用它；
+        // 多个 bot 而认不出归属 ⇒ 直接拒绝（宁可让 AI 拿到明确失败，也不发错人）。
+        // 这一段同时修掉一个真实场景：bot 刚从配置里增删过、`chats` 还没回填的空窗。
         try {
           const list = await readConfig()
-          if (Array.isArray(list) && list.length > 0) bot = bots.get(list[0].appId) || { cfg: list[0], lastChatId: '' }
+          if (Array.isArray(list) && list.length === 1) {
+            bot = bots.get(list[0].appId) || { cfg: list[0], lastChatId: '' }
+          }
         } catch { /* 读配置失败就走下面的明确报错 */ }
       }
-      const target = chatId || (bot && bot.lastChatId) || ''
       console.log('[fs] approval form target: agent=' + String((exec && exec.agent && exec.agent.id) || '-')
         + ' owner=' + String((owner && owner.chatId) || '-') + ' explicit=' + String(explicit || '-')
         + ' chat=' + String(target || '-') + ' bot=' + (bot ? String((bot.cfg && bot.cfg.appId) || 'yes') : 'no'))
@@ -5664,13 +5776,26 @@ export function apply(ctx) {
         return {
           ok: false, choice: '', timedOut: false, cardId: '',
           detail: '这个会话不是飞书会话（或拿不到飞书归属），审批单卡无处可发。'
-            + '（chatId=' + String(chatId || '-') + ' bot=' + (bot ? 'yes' : 'no') + '）',
+            + '（chatId=' + String(explicit || '-') + ' bot=' + (bot ? 'yes' : 'no') + '）',
+        }
+      }
+      // 可选通道（2026-10-03）：**默认关** —— 对外发布时"多一个工具、多一种卡"对别人是噪声，
+      // 所以配置里没显式打开 `approvalForm` 的 bot 一律拒绝（连卡都不发）。
+      // 注意：bot.cfg 由 `ensureHelpers()` 每 10 秒重读一次 ⇒ 改配置**不用重启**就生效。
+      if (bot.cfg && bot.cfg.approvalForm !== true) {
+        console.log('[fs] approval form refused: bot=' + String((bot.cfg && bot.cfg.appId) || '?')
+          + ' approvalForm 未开启')
+        return {
+          ok: false, choice: '', timedOut: false, cardId: '',
+          detail: '这个会话的 bot 没打开审批单通道：在 ~/.dsh-feishucard/feishu.config.json 里给该 bot 加 '
+            + '"approvalForm": true（改完 10 秒内自动生效，不用重启）。',
         }
       }
       const form = {
         title: String(a.title || '审批单'),
         meta: a.meta, categories: a.categories, skills: a.skills,
         evidence: a.evidence, impact: a.impact, risk: a.risk,
+        preset: a.preset, sections: a.sections,
       }
       try {
         const out = await askApprovalForm(bot, target, form, exec && exec.signal)
@@ -5692,7 +5817,29 @@ export function apply(ctx) {
       }
     },
   })
-  ctx.effect(() => ctx.tools.register(approvalFormTool))
+  // 注册**按配置**（2026-10-03）：审批单是可选通道 ⇒ 没有任何 bot 打开 `approvalForm` 时
+  // **一个工具都不注册**（对外部使用者＝零噪声，连工具名都看不到）。
+  // 配置是异步读的，所以用 effect 包住：卸载时把已注册的那个一起撤掉。
+  ctx.effect(() => {
+    let cancelled = false
+    let disposer
+    void readConfig().then((list) => {
+      if (cancelled) return
+      const on = Array.isArray(list) && list.some((c) => c && c.approvalForm === true)
+      if (!on) {
+        console.log('[fs] approval form tool NOT registered（没有 bot 打开 approvalForm）')
+        return
+      }
+      disposer = ctx.tools.register(approvalFormTool)
+      console.log('[fs] approval form tool registered（approvalForm: true）')
+    }).catch((error) => {
+      console.log('[fs] approval form tool registration skipped: ' + String(error && error.message || error))
+    })
+    return () => {
+      cancelled = true
+      if (typeof disposer === 'function') disposer()
+    }
+  })
 
 
   // ---- 目标模式（goal round）过程上飞书 · 2026-09-16 CM 要求 -------------------
