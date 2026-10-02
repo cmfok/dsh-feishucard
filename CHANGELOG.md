@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.24] - 2026-10-02
+
+### Fixed（🔴 空闲一会儿再下命令，不再要求"先发一条普通消息" —— CM 报障）
+
+**CM 原话**：「经常我隔开一段时间没跟机器人说话以后，我突然跟它说话，我发目标、发计划，
+或者想去改模型，我发指令过去，它会弹一句说『**目前没有会话，先发一条普通消息**』。这是为什么呢？」
+
+**根因**：**命令通道和普通消息走的不是同一条取 agent 的路**。
+
+| 通道 | 取 agent 的方式 | 空闲/重启/热重载后 |
+|:--|:--|:--|
+| **普通消息** | `resolveAgent(bot, chat)`：① 复用**活着的**会话 ② 否则 `resumeDedicated()` 恢复持久化会话 | ✅ 照样能用 |
+| **命令**（`/goal` `/plan` `/model` `/stop` `/compact`） | 只读 `chat.sessions[activeIndex].handle`——**内存里的活句柄** | ❌ 句柄没了 ⇒ 弹"先发一条普通消息" |
+
+⇒ 句柄是内存态，**空闲久了 / dsh 重启 / 插件热重载之后就不在了**；而会话其实一直都在磁盘上。
+
+**修法**：新增 `commandAgent(bot, chat)` —— 先找活句柄，找不到就**走 `resolveAgent()` 同一条路**
+（复用活会话，否则恢复持久化会话）。五条命令分支 + `/model` 卡片点击全部改用它。
+
+- 留痕：冷启动那次会打 `[fs] command channel: resumed session for command (agent=…)`。
+- 顺带把 `/stop` 里那段重复的"活句柄 + 兜底"查法一并删掉（同一件事只留一处）。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=182, sessions=7)**，`❌` 0 条。
+
 ## [0.4.23] - 2026-10-02
 
 ### Added（`/model` —— 飞书侧切换模型，CM 2026-10-02 提）

@@ -1670,7 +1670,7 @@ export function apply(ctx) {
     }
     if (resolved === 'model') {
       // CM 2026-10-02：「飞书上切换不了模型，你现在能发个卡片给我选择吗」
-      const agent = liveAgentForChat(chat)
+      const agent = await commandAgent(bot, chat)
       if (!agent) {
         await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /model。')
         return true
@@ -1691,24 +1691,9 @@ export function apply(ctx) {
       return true
     }
     if (resolved === 'stop') {
-      const active = chat.sessions[chat.activeIndex]
-      if (!active) {
-        await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /stop。')
-        return true
-      }
-      // Resolve the CURRENT live agent (a cached handle may point at a stale
-      // instance after hmr reloads) — mirror resolveAgent's live lookup so
-      // cancel() hits the agent actually running the turn.
-      let agent
-      try {
-        const agents = ctx.get('agents')
-        const list = agents && typeof agents.list === 'function' ? agents.list() : []
-        agent = list.find((a) => a && a.id === active.id) || null
-      } catch (error) {
-        console.log('[fs] /stop live lookup failed: ' + String(error && error.message || error))
-        agent = null
-      }
-      if (!agent && active.handle) agent = active.handle.agent
+      // 2026-10-02：改用 commandAgent（活会话 → resume 持久化会话），
+      // 空闲久了也能直接下命令，不再要求"先发一条普通消息"。
+      const agent = await commandAgent(bot, chat)
       if (!agent) {
         await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /stop。')
         return true
@@ -1726,7 +1711,7 @@ export function apply(ctx) {
     }
     if (resolved === 'plan') {
       const active = chat.sessions[chat.activeIndex]
-      const agent = active && active.handle && active.handle.agent
+      const agent = await commandAgent(bot, chat)
       // 2026-10-01：飞书 agent 的提问水位线必须挂到 agent scope（只挂根级会被 GUI 桥接
       // 抢答，计划审批只到电脑端）——见 handleUserQuestionRequest 上方注释。
       bindFeishuAgentQuestions(agent)
@@ -1788,7 +1773,7 @@ export function apply(ctx) {
     }
     if (resolved === 'goal') {
       const active = chat.sessions[chat.activeIndex]
-      const agent = active && active.handle && active.handle.agent
+      const agent = await commandAgent(bot, chat)
       if (!agent) {
         await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /goal <目标>。')
         return true
@@ -1841,7 +1826,7 @@ export function apply(ctx) {
       // 旧实现的问题：`compact` 不在 COMMANDS 白名单里 ⇒ `/compact` 被当成**普通消息**发给模型，
       // 压缩根本不会发生（用户以为按了、实际什么都没做）。
       const active = chat.sessions[chat.activeIndex]
-      const agent = active && active.handle && active.handle.agent
+      const agent = await commandAgent(bot, chat)
       if (!agent) {
         await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /compact。')
         return true
@@ -3611,6 +3596,25 @@ export function apply(ctx) {
     return 'append'
   }
 
+  // 命令通道取 agent（2026-10-02 CM：「隔一段时间没说话，发 /goal /plan /model 都回我
+  // 『先发一条普通消息』」）—— **根因**：命令分支原来只看 `entry.handle`（**内存里的活句柄**），
+  // 空闲久了 / dsh 重启 / 插件热重载之后它就不在了；而**普通消息走的是 `resolveAgent()`**
+  // （先复用活会话，否则 resume 持久化会话）⇒ 命令照走同一条路，就不会再要求"先发一条消息"。
+  async function commandAgent(bot, chat) {
+    const live = liveAgentForChat(chat)
+    if (live) return live
+    try {
+      const resumed = await resolveAgent(bot, chat)
+      if (resumed) {
+        console.log('[fs] command channel: resumed session for command (agent=' + resumed.id + ')')
+        return resumed
+      }
+    } catch (error) {
+      console.log('[fs] command channel resume failed: ' + String(error && error.message || error))
+    }
+    return null
+  }
+
   function handleCardAction(data) {
     console.log('[fs] card action event received: tag=' + (data && data.action && data.action.tag || '?'))
     const action = data && data.action ? data.action : {}
@@ -3620,25 +3624,30 @@ export function apply(ctx) {
       const chatId = data && data.context && data.context.open_chat_id
       const ownerBot = chatId ? findBotForChat(chatId) : undefined
       const chat = ownerBot && chatId ? ownerBot.chats.get(chatId) : undefined
-      const agent = liveAgentForChat(chat)
       const parts = String(value.fs_model).split('|')
       const provider = parts[0]
       const model = parts[1]
-      console.log('[fs] /model click: ' + String(value.fs_model) + ' chat=' + String(chatId || '')
-        + ' agent=' + String(agent && agent.id || 'none'))
       if (!chatId || !ownerBot) return
-      if (!agent || !provider || !model) {
-        void sendPlainText(ownerBot, chatId, '切换失败：当前没有可用会话（先发一条普通消息建立会话，再 /model）。').catch(() => { })
-        return
-      }
-      try {
-        const how = switchModelForAgent(agent, provider, model)
-        void sendPlainText(ownerBot, chatId, '✅ 模型已切换为 `' + provider + '/' + model
-          + '`（按会话生效，下一次请求开始用；via ' + how + '）').catch(() => { })
-      } catch (error) {
-        console.log('[fs] /model 切换失败: ' + String(error && error.stack || error))
-        void sendPlainText(ownerBot, chatId, '切换失败：' + String(error && error.message || error)).catch(() => { })
-      }
+      // 2026-10-02：卡片点击也走 commandAgent（活会话 → resume），空闲久了点击同样生效。
+      void (async () => {
+        const agent = await commandAgent(ownerBot, chat)
+        console.log('[fs] /model click: ' + String(value.fs_model) + ' chat=' + String(chatId)
+          + ' agent=' + String(agent && agent.id || 'none'))
+        if (!agent || !provider || !model) {
+          await sendPlainText(ownerBot, chatId, '切换失败：当前没有可用会话（先发一条普通消息建立会话，再 /model）。')
+          return
+        }
+        try {
+          const how = switchModelForAgent(agent, provider, model)
+          await sendPlainText(ownerBot, chatId, '✅ 模型已切换为 `' + provider + '/' + model
+            + '`（按会话生效，下一次请求开始用；via ' + how + '）')
+        } catch (error) {
+          console.log('[fs] /model 切换失败: ' + String(error && error.stack || error))
+          await sendPlainText(ownerBot, chatId, '切换失败：' + String(error && error.message || error))
+        }
+      })().catch((error) => {
+        console.log('[fs] /model 点击处理异常: ' + String(error && error.message || error))
+      })
       return
     }
     // Session/workspace switch buttons (the /switch picker card).
