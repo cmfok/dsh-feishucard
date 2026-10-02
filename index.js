@@ -4352,6 +4352,41 @@ export function apply(ctx) {
       })
       return
     }
+    // 审批单卡的三个按钮（feishu_approval_form / 卡片适配通道）：value = { fs_form, fs_choice }
+    // —— **只新增**这一条分派，既有 fs_switch / fs_question / fs_approval 一行不动。
+    if (value.fs_form !== undefined && value.fs_choice !== undefined) {
+      const chatId = data && data.context && data.context.open_chat_id
+      const record = chatId ? pendingForms.get(chatId) : undefined
+      if (!record || record.token !== value.fs_form) {
+        // stale 点击**绝不静默**（照抄 fs_question 那条的做法）。
+        console.log('[fs] form button: record not found for chat ' + chatId + ' token=' + value.fs_form)
+        const stale = chatId ? recentForms.get(chatId) : undefined
+        const hint = (stale && stale.token === value.fs_form)
+          ? '这张审批单已经处理过了（点过即生效，重复点击不会再变）。'
+          : '这张审批单已过期或已作废。请看我最新一条卡片，或让 AI 重新发一张。'
+        if (chatId) {
+          const ownerBot = findBotForChat(chatId)
+          if (ownerBot) sendPlainText(ownerBot, chatId, '⚠️ ' + hint).catch(() => {})
+        }
+        return
+      }
+      const choice = String(value.fs_choice)
+      pendingForms.delete(chatId)
+      if (record.timer) clearTimeout(record.timer)
+      console.log('[fs] approval form decided: ' + String((record.form && record.form.title) || '')
+        + ' -> ' + choice + ' chat=' + chatId)
+      recentForms.set(chatId, { token: value.fs_form, answeredAt: Date.now() })
+      try { record.resolve({ choice, timedOut: false, form: record.form, cardId: record.cardId }) } catch { }
+      if (record.cardId) {
+        updateInteractive(record.bot, record.cardId, formResultCardPayload(record.form, choice))
+          .catch((error) => {
+            console.log('[fs] form card update failed: ' + String(error && error.message || error))
+            // 兜底：卡改不动也必须有一条可见反馈，绝不让点击看起来"死了"。
+            sendPlainText(record.bot, chatId, '✅ 已记录你的选择：' + choice).catch(() => {})
+          })
+      }
+      return
+    }
     // Question-option buttons (ask_user_question card).
     if (value.fs_question !== undefined && value.fs_option !== undefined) {
       const chatId = data && data.context && data.context.open_chat_id
@@ -4764,6 +4799,18 @@ export function apply(ctx) {
   const QUESTION_TEXT_WEIGHT = 4
   const QUESTION_BUTTON_WEIGHT = 1
 
+  // 选项按钮的**颜色规则**（2026-10-03 任务③）：飞书按钮带 `type` 才有色（不传就是灰的）。
+  //   优先级：option 上显式写的 > 「否定/危险」词义 > 第一个选项 primary > 其余 default。
+  // 向后兼容：不传任何字段也不报错（走下面的默认规则）；显式值只认飞书支持的枚举。
+  const QUESTION_BUTTON_TYPES = ['default', 'primary', 'danger', 'primary_filled', 'danger_filled', 'text']
+  function optionButtonType(option, displayLabel, index) {
+    const explicit = String((option && (option.buttonType || option.button_type || option.type)) || '').toLowerCase()
+    if (QUESTION_BUTTON_TYPES.includes(explicit)) return explicit
+    const label = String(displayLabel !== undefined ? displayLabel : ((option && option.label) || ''))
+    if (/驳回|拒绝|拒绝|取消|不同意|不批|否决|reject|deny|refuse|cancel|no\b/i.test(label)) return 'danger'
+    return index === 0 ? 'primary' : 'default'
+  }
+
   function questionOptionRow(option, token, index, displayLabel) {
     const shown = displayLabel !== undefined
       ? String(displayLabel)
@@ -4787,7 +4834,7 @@ export function apply(ctx) {
           vertical_align: 'center',
           elements: [{
             tag: 'button',
-            type: 'primary',
+            type: optionButtonType(option, shown, index),
             width: 'fill',
             text: { tag: 'plain_text', content: '选它' },
             behaviors: [{ type: 'callback', value: { fs_question: token, fs_option: index } }],
@@ -4903,6 +4950,181 @@ export function apply(ctx) {
     }
   }
 
+  // ---- 审批单卡（approval form）· 2026-10-03 新增通道 --------------------------------
+  // 需求方原话：AI 要发「权限变更审批单」，需要**在飞书里可读、可点**；而 ask_user_question 发出来的
+  // 简卡是「一个问题 + 一排无色按钮」，信息全堆成一坨，读不了。
+  // 硬要求（逐条落在下面）：**一张卡只装一个人、一件事**；30 分钟超时要**可见地**说明（不静默）；
+  // 点击后卡必须变（回执卡），旧卡再点给可见提示而不是静默失败。
+  // 与既有三类分派（`fs_switch` / `fs_question` / `fs_approval`）**完全并存** —— 只新增 `fs_form` / `fs_choice`。
+  const FORM_TIMEOUT_MIN = 30
+  // ⚠️ 两张表都挂 `globalThis`（**跨插件代际**）—— 与 `activeTurns` / `liveCardRegistry` /
+  //    `recentTurnCards` 同一套理由：热重载会重建每代的模块状态，而**卡片留在飞书上**。
+  //    若只放本代闭包：重载后用户点那张单子 ⇒ 新一代的 handleCardAction 查不到 token ⇒
+  //    「这张单已过期」——可他明明刚要处理它（真机里每一次保存都会造成这种窗口）。
+  //    挂全局后：点击仍被认出、**真实选择写回卡面**（唯一拿不到的是"上一代那条工具调用的返回值"，
+  //    因为那一轮早被重载掐断了）。
+  const pendingForms = globalThis.__fsPendingForms || (globalThis.__fsPendingForms = new Map())
+  const recentForms = globalThis.__fsRecentForms || (globalThis.__fsRecentForms = new Map())
+  const FORM_ACTIONS = [
+    { label: '✅ 采纳', choice: '采纳', type: 'primary' },
+    { label: '❌ 驳回', choice: '驳回', type: 'danger' },
+    { label: '✍️ 我要改', choice: '改', type: 'default' },
+  ]
+  // 变化图标：🔹不变 / 🔸收窄 / 🔷放宽 / ➕新增 / ➖取消（技能那条用 ✅ 表示不变）
+  const FORM_CHANGE_ICON = { same: '🔹', narrow: '🔸', expand: '🔷', add: '➕', remove: '➖' }
+
+  function formLineText(item) {
+    const it = (item && typeof item === 'object') ? item : { text: item }
+    const kind = String(it.change || it.kind || 'same')
+    const icon = FORM_CHANGE_ICON[kind] || '🔹'
+    return icon + ' ' + String(it.text || it.label || '')
+  }
+
+  function formSectionText(title, lines, render) {
+    const list = (Array.isArray(lines) ? lines : [])
+      .filter((x) => String((x && typeof x === 'object') ? (x.text || x.label || '') : x || '').trim() !== '')
+    if (!list.length) return null
+    return { title, body: list.map(render).join('\n') }
+  }
+
+  /** 审批单卡的版式（需求方给定：卡头蓝 · 双列字段 · ①~⑥ 分区 · 带色操作行）。 */
+  function approvalFormCardPayload(form, token) {
+    const f = (form && typeof form === 'object') ? form : {}
+    const elements = []
+    // 双列字段区：div + fields（is_short: true 才会并排）
+    const meta = (Array.isArray(f.meta) ? f.meta : []).filter((p) => p && (p.label || p.value))
+    if (meta.length) {
+      elements.push({
+        tag: 'div',
+        fields: meta.map((p) => ({
+          is_short: true,
+          text: {
+            tag: 'lark_md',
+            content: '**' + String(p.label || '') + '**\n' + String(p.value === undefined ? '' : p.value),
+          },
+        })),
+      })
+    }
+    const sections = [
+      formSectionText('① 类别 × L 档 变化', f.categories, formLineText),
+      formSectionText('② 技能变化', f.skills, formLineText),
+      formSectionText('③ 证据（原文）', f.evidence, (s) => '> ' + String(s).split('\n').join('\n> ')),
+      formSectionText('④ 影响面（改完他获得什么）', f.impact, (s) => '• ' + String(s)),
+      formSectionText('⑤ 不批的后果', f.risk, (s) => '• ' + String(s)),
+    ].filter(Boolean)
+    for (const s of sections) {
+      if (elements.length) elements.push({ tag: 'hr' })
+      elements.push({ tag: 'markdown', content: '**' + s.title + '**' })
+      elements.push({ tag: 'markdown', content: s.body })
+    }
+    // ⑥ 操作行：**三个带色按钮**（primary 蓝 / danger 红 / default 灰）——
+    //    这正是旧提问卡缺的（它生成的按钮没有 type，全是灰的）。3 等分用 `trisect`。
+    elements.push({ tag: 'hr' })
+    elements.push({ tag: 'markdown', content: '**⑥ 操作**' })
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'trisect',
+      columns: FORM_ACTIONS.map((a) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [{
+          tag: 'button',
+          type: a.type,
+          width: 'fill',
+          text: { tag: 'plain_text', content: a.label },
+          behaviors: [{ type: 'callback', value: { fs_form: token, fs_choice: a.choice } }],
+        }],
+      })),
+    })
+    elements.push({
+      tag: 'markdown',
+      content: '<font color=\'grey\'>⏰ ' + FORM_TIMEOUT_MIN + ' 分钟内未操作将**自动作废**（会在这里说明，不会替你默认通过）。'
+        + '一张卡只装一个人、一件事。</font>',
+    })
+    return {
+      schema: '2.0',
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
+        template: 'blue',
+      },
+      body: { elements },
+    }
+  }
+
+  /** 点完后的回执卡（就地替换，旧卡不再可点）。 */
+  function formResultCardPayload(form, choice, note) {
+    const f = (form && typeof form === 'object') ? form : {}
+    return {
+      schema: '2.0',
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
+        template: choice === '驳回' ? 'red' : (choice === '改' ? 'orange' : 'green'),
+      },
+      body: {
+        elements: [
+          { tag: 'markdown', content: '**已记录你的选择：' + String(choice) + '**' },
+          {
+            tag: 'markdown',
+            content: String(note || (choice === '改'
+              ? '请直接把要改的地方回复给我（例如"只加台账回填，别动舆情抓取"）。'
+              : '这张单已回执 —— 重复点击不会再生效。')),
+          },
+        ],
+      },
+    }
+  }
+
+  // 发一张审批单卡并**等他点选**（Promise 模式仿 askUserQuestion；30 分钟定时器）。
+  // 超时/中止都**可见**：既把卡改成回执/超时态，也发一条纯文本说明（硬要求：不许静默）。
+  function askApprovalForm(bot, chatId, form, signal) {
+    return new Promise((resolve, reject) => {
+      const record = {
+        resolve, reject, form, timer: undefined, token: randomUUID(), cardId: undefined, bot, chatId,
+      }
+      pendingForms.set(chatId, record)
+      record.timer = setTimeout(() => {
+        if (pendingForms.get(chatId) === record) pendingForms.delete(chatId)
+        console.log('[fs] approval form timed out: ' + String((form && form.title) || '') + ' chat=' + chatId)
+        if (record.cardId) {
+          void updateInteractive(record.bot, record.cardId, formResultCardPayload(form, '（超时未操作）',
+            '⏰ 已超过 ' + FORM_TIMEOUT_MIN + ' 分钟未操作，这张单**自动作废**。要办的话请让 AI 重新发一张。')).catch(() => {})
+        }
+        void sendPlainText(record.bot, chatId, '⏰ 审批单「' + String((form && form.title) || '') + '」超过 '
+          + FORM_TIMEOUT_MIN + ' 分钟未操作，**已自动作废**（没有替你默认通过或驳回）。').catch(() => {})
+        resolve({ choice: '', timedOut: true })
+      }, FORM_TIMEOUT_MIN * 60 * 1000)
+      if (signal && typeof signal.addEventListener === 'function') {
+        const onAbort = () => {
+          if (pendingForms.get(chatId) === record) pendingForms.delete(chatId)
+          clearTimeout(record.timer)
+          if (record.cardId) {
+            void updateInteractive(record.bot, record.cardId, formResultCardPayload(form, '（已作废）',
+              '这一轮已经结束了，这张单作废 —— 要办的话请让 AI 重新发一张。')).catch(() => {})
+          }
+          reject(new Error('approval form aborted'))
+        }
+        signal.addEventListener('abort', onAbort)
+      }
+      sendInteractive(bot, chatId, approvalFormCardPayload(form, record.token))
+        .then((msgId) => {
+          record.cardId = msgId
+          try { rememberMessage(msgId, 'bot 的审批单：' + String((form && form.title) || '')) } catch { }
+          console.log('[fs] approval form sent: ' + String((form && form.title) || '')
+            + ' token=' + record.token + ' msg=' + String(msgId || ''))
+        })
+        .catch((error) => {
+          console.log('[fs] approval form send failed: ' + String(error && error.message || error))
+          if (pendingForms.get(chatId) === record) pendingForms.delete(chatId)
+          clearTimeout(record.timer)
+          reject(new Error('approval form send failed: ' + String(error && error.message || error)))
+        })
+    })
+  }
+
   // 文字回答后把问题卡**就地改成「✅ 已收到」态**（2026-10-02 CM 实测：原先只有**按钮**路径
   // 会更新卡片，文字回答后卡片原封不动 ⇒ 按钮仍可点、点了报
   // 「question button: record not found for chat …」，用户以为没生效）。
@@ -4925,6 +5147,23 @@ export function apply(ctx) {
   }
 
   function askUserQuestion(bot, chatId, questions, signal, agentId) {
+    // 卡片适配通道（任务④ 的第二条入口，2026-10-03）：`questions[0].card` 存在时渲染成**审批单卡**
+    // （而不是"文字 + 选它"的简卡），点击结果仍按 question-answer 的形状回传
+    // （`selected: [选择]`）—— 这样走 askUserQuestion 的调用方**零改动**就能拿到选择。
+    // 向后兼容：只有显式带 `card` 才走这条；不带一个字都不受影响。
+    const qCard = questions && questions[0] && questions[0].card
+    if (qCard && typeof qCard === 'object') {
+      const q0 = questions[0]
+      return askApprovalForm(bot, chatId, qCard, signal).then((out) => {
+        const choice = out && out.choice ? String(out.choice) : ''
+        console.log('[fs] approval form answered: ' + String(q0.id || '') + ' -> ' + (choice || '（未操作）'))
+        return {
+          answers: [choice
+            ? { id: q0.id, selected: [choice] }
+            : { id: q0.id, selected: [], custom: out && out.timedOut ? '（超时未操作）' : '（未操作）' }],
+        }
+      })
+    }
     return new Promise((resolve, reject) => {
       const q = questions[0]
       const opts = Array.isArray(q.options) ? q.options : []
@@ -5319,6 +5558,142 @@ export function apply(ctx) {
     },
   })
   ctx.effect(() => ctx.tools.register(tool))
+
+  // ---- 审批单卡工具（`feishu_approval_form`）· 2026-10-03 任务④ 方案 a ----------------
+  // AI 显式调它 → 本插件发卡 → **等点击**（最长 30 分钟）→ 把选择当**工具结果**返回给 AI。
+  // 目标会话自动取「调用方 agent 所在的飞书会话」（`exec.agent` → `findChatForAgent`）——
+  // AI 不用传 chatId；拿不到飞书归属就明确报错，**绝不瞎发到别人的会话**。
+  // 规矩：**一张卡只装一个人、一件事**（description 里写给 AI 看）。
+  const approvalFormTool = defineTool({
+    name: 'feishu_approval_form',
+    description: 'Send one "approval form" card to the Feishu chat of the calling agent and WAIT for the human to tap '
+      + '采纳 / 驳回 / 我要改; the tapped choice is returned as this tool\'s result. '
+      + 'One card = ONE person and ONE matter (never pack several people\'s changes into one card). '
+      + 'Fixed six sections: ① category × L-level changes ② skill changes ③ evidence quotes ④ impact ⑤ consequence of not approving ⑥ the action row. '
+      + 'If nobody taps within 30 minutes the form is voided (and that is said visibly in the chat).',
+    parameters: {
+      title: { type: 'string', required: true, description: 'Card title incl. the person, e.g. 身份标签变更单 · 曹伟轩' },
+      meta: {
+        type: 'array',
+        description: 'Two-column field pairs (单号 / 变更类型 / 置信度 / 证据来源 …): [{label, value}]',
+        items: {
+          type: 'object',
+          properties: { label: { type: 'string', required: true }, value: { type: 'string', required: true } },
+          additionalProperties: false,
+        },
+      },
+      categories: {
+        type: 'array',
+        description: '① category × L-level changes: [{text, change}] with change = same(🔹unchanged) | narrow(🔸narrowed) | expand(🔷widened)',
+        items: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', required: true },
+            change: { type: 'string', description: 'same | narrow | expand (default same)' },
+          },
+          additionalProperties: false,
+        },
+      },
+      skills: {
+        type: 'array',
+        description: '② skill changes: [{text, change}] with change = add(➕) | remove(➖) | same(✅)',
+        items: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', required: true },
+            change: { type: 'string', description: 'add | remove | same (default same)' },
+          },
+          additionalProperties: false,
+        },
+      },
+      evidence: {
+        type: 'array',
+        description: '③ evidence quotes — each item is rendered as a block quote',
+        items: { type: 'string' },
+      },
+      impact: { type: 'array', description: '④ impact — what he gains after the change (one line each)', items: { type: 'string' } },
+      risk: { type: 'array', description: '⑤ consequence of NOT approving (one line each)', items: { type: 'string' } },
+      chatId: { type: 'string', description: 'Optional explicit target chat (oc_...); defaults to the calling agent\'s Feishu chat.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', required: true },
+          choice: { type: 'string', required: true },
+          timedOut: { type: 'boolean', required: true },
+          cardId: { type: 'string', required: true },
+          detail: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (args, value) => [{
+        type: 'text',
+        text: 'feishu_approval_form -> ' + JSON.stringify(value),
+      }],
+    },
+    timeoutMs: (FORM_TIMEOUT_MIN + 2) * 60 * 1000,
+    async execute(args, exec) {
+      const a = (args && typeof args === 'object') ? args : {}
+      const owner = findChatForAgent(exec && exec.agent)
+      const explicit = typeof a.chatId === 'string' && a.chatId.trim() ? a.chatId.trim() : ''
+      const chatId = explicit || (owner && owner.chatId) || ''
+      // bot 解析用**兜底链**（与 feishu_send 同一套思路）：卡片动作/工具调用可能发生在
+      // 一个"刚重载、内存态还空"的代际里 ⇒ 只靠 findBotForChat 会解析不到。
+      //   ① findChatForAgent 给的 bot → ② findBotForChat(chatId) → ③ 最近收到过消息的 bot
+      //   → ④ 配置里的第一个 bot（readConfig 兜底，绝不硬编码 appId/secret）
+      let bot = (owner && owner.bot) || (chatId ? findBotForChat(chatId) : undefined)
+      if (!bot) {
+        let best
+        for (const b of bots.values()) {
+          if (b.lastChatId && (!best || b.lastChatId > best.lastChatId)) best = b
+        }
+        bot = best
+      }
+      if (!bot) {
+        try {
+          const list = await readConfig()
+          if (Array.isArray(list) && list.length > 0) bot = bots.get(list[0].appId) || { cfg: list[0], lastChatId: '' }
+        } catch { /* 读配置失败就走下面的明确报错 */ }
+      }
+      const target = chatId || (bot && bot.lastChatId) || ''
+      console.log('[fs] approval form target: agent=' + String((exec && exec.agent && exec.agent.id) || '-')
+        + ' owner=' + String((owner && owner.chatId) || '-') + ' explicit=' + String(explicit || '-')
+        + ' chat=' + String(target || '-') + ' bot=' + (bot ? String((bot.cfg && bot.cfg.appId) || 'yes') : 'no'))
+      if (!target || !bot) {
+        return {
+          ok: false, choice: '', timedOut: false, cardId: '',
+          detail: '这个会话不是飞书会话（或拿不到飞书归属），审批单卡无处可发。'
+            + '（chatId=' + String(chatId || '-') + ' bot=' + (bot ? 'yes' : 'no') + '）',
+        }
+      }
+      const form = {
+        title: String(a.title || '审批单'),
+        meta: a.meta, categories: a.categories, skills: a.skills,
+        evidence: a.evidence, impact: a.impact, risk: a.risk,
+      }
+      try {
+        const out = await askApprovalForm(bot, target, form, exec && exec.signal)
+        const choice = out && out.choice ? String(out.choice) : ''
+        return {
+          ok: true,
+          choice,
+          timedOut: Boolean(out && out.timedOut),
+          cardId: String((out && out.cardId) || ''),
+          detail: choice
+            ? '他点了：' + choice + '（卡已就地改成回执卡）'
+            : '超过 ' + FORM_TIMEOUT_MIN + ' 分钟没操作，这张单已作废（现场有可见说明）。',
+        }
+      } catch (error) {
+        return {
+          ok: false, choice: '', timedOut: false, cardId: '',
+          detail: String(error && error.message || error),
+        }
+      }
+    },
+  })
+  ctx.effect(() => ctx.tools.register(approvalFormTool))
+
 
   // ---- 目标模式（goal round）过程上飞书 · 2026-09-16 CM 要求 -------------------
   // 背景：目标续轮由 `@deepseek-ai/dsh-goal-round-driver` 以「**同会话**注入一条

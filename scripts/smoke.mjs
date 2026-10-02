@@ -2908,6 +2908,163 @@ console.log('50) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10
   ok(!texts2.some((t) => t.includes('热重载')), '同一个会话不会提示第二遍（幂等）')
 }
 
+console.log('51) 审批单卡通道（feishu_approval_form）：工具 / 版式 / 点击 / stale / 超时 / 适配（2026-10-03 任务）')
+{
+  // ⚠️ 取**第一次**注册的那个工具（第一代）。原因：冒烟的 `drain()` 会把**所有代际**的轮询回调
+  //    都跑一遍，而注入的 helper 事件总是由**排在最前的第一代**消费 ⇒ 处理卡片点击的是第一代的
+  //    `handleCardAction`，token 也只可能在第一代的 `pendingForms` 里。用别的代际的工具就会出现
+  //    "卡发出去了、点击却 record not found"（本用例第一版就踩了这个，白等 4 秒）。
+  const formTool = registeredTools.find((t) => t && t.name === 'feishu_approval_form')
+  ok(Boolean(formTool), 'feishu_approval_form 工具已注册')
+  ok(Boolean(formTool) && typeof formTool.execute === 'function', '工具有 execute')
+  // 任何一步没走通都不许把整套用例挂死：给工具结果加一个"很短"的观察窗口
+  const settle = (p, ms) => Promise.race([
+    p,
+    new Promise((r) => setTimeout(() => r({ ok: false, choice: '', timedOut: false, cardId: '', detail: '（还没结算：' + ms + 'ms 内没等到点击/超时）' }), ms)),
+  ])
+
+  // 30 分钟的定时器拦下来手动触发（不然用例要等半小时）——只拦这一个时长，其余 setTimeout 照跑
+  const origSetTimeout = globalThis.setTimeout
+  const formTimers = []
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    if (ms === 30 * 60 * 1000) { formTimers.push(fn); return 0 }
+    return origSetTimeout(fn, ms, ...rest)
+  }
+
+  const formArgs = {
+    title: '身份标签变更单 · 曹伟轩',
+    meta: [
+      { label: '单号', value: 'BG-2026-1003-01' },
+      { label: '变更类型', value: '身份标签（数据域收窄）' },
+      { label: '置信度', value: '0.86' },
+      { label: '证据来源', value: '企微通讯录 + 三季度汇报' },
+    ],
+    categories: [
+      { text: '财经：L2 → L2（不变）', change: 'same' },
+      { text: '数据域：全量 → 财务（收窄）', change: 'narrow' },
+    ],
+    skills: [{ text: '台账回填', change: 'add' }, { text: '舆情抓取', change: 'remove' }],
+    evidence: ['他三季度只报财务口径', '通讯录显示岗位为财务分析'],
+    impact: ['能看到财务域全量台账'],
+    risk: ['继续用旧标签 ⇒ 他看到不完整数据'],
+    chatId: CHAT_ID,
+  }
+  const mark = sentCards.length
+  const pendingForm = Promise.resolve()
+    .then(() => formTool.execute(formArgs, { agent, signal: undefined }))
+    .catch((e) => ({ ok: false, choice: '', timedOut: false, cardId: '', detail: 'THREW: ' + String(e && e.message || e) }))
+  await drain()
+  const formCard = lastCardFrom(mark)
+  if (!formCard) {
+    // 失败也要把**原因**打出来（否则只能猜）——等一个很短的时间看工具返回了什么
+    const probe = await Promise.race([
+      pendingForm,
+      new Promise((r) => setTimeout(() => r({ detail: '（工具还在等点击，说明卡其实发了但没被 lastCardFrom 认出来）' }), 300)),
+    ])
+    ok(false, '审批单卡已发出 —— 实际：' + JSON.stringify(probe))
+  } else {
+    ok(true, '审批单卡已发出')
+  }
+  const fp = (formCard && formCard.payload) || {}
+  ok(fp.schema === '2.0' && Boolean(fp.header) && fp.header.template === 'blue', '卡头＝蓝色')
+  ok(JSON.stringify((fp.header && fp.header.title) || '').includes('身份标签变更单 · 曹伟轩'), '卡头带人名的标题')
+  const fEls = ((fp.body && fp.body.elements) || [])
+  const fieldDiv = fEls.find((e) => e.tag === 'div' && Array.isArray(e.fields))
+  ok(Boolean(fieldDiv) && fieldDiv.fields.length === 4
+    && fieldDiv.fields.every((f) => f.is_short === true),
+    '双列字段区：4 个 label/value 且 is_short=true（' + (fieldDiv ? fieldDiv.fields.length : 0) + ' 个）')
+  const flat = JSON.stringify(fEls)
+  ok(['①', '②', '③', '④', '⑤', '⑥'].every((n) => flat.includes('【' + n + '】'.slice(0, 0) + n) || flat.includes(n)),
+    '六个分区标题都在（①~⑥）')
+  ok(flat.includes('🔹') && flat.includes('🔸'), '① 用 🔹/🔸 区分「不变 / 收窄」')
+  ok(flat.includes('➕') && flat.includes('➖'), '② 用 ➕/➖ 表示新增/取消')
+  ok(flat.includes('> 他三季度只报财务口径'), '③ 证据渲染成引用块')
+  ok(fEls.filter((e) => e.tag === 'hr').length >= 5, '分区之间有 hr 分隔（' + fEls.filter((e) => e.tag === 'hr').length + ' 条）')
+  const actionRow = fEls.find((e) => e.tag === 'column_set')
+  const actionBtns = ((actionRow && actionRow.columns) || []).map((c) => (c.elements || [])[0])
+  ok(Boolean(actionRow) && actionRow.flex_mode === 'trisect', '⑥ 操作行＝三列等分')
+  ok(actionBtns.length === 3, '三个按钮（实际 ' + actionBtns.length + '）')
+  ok(actionBtns[0] && actionBtns[0].type === 'primary' && actionBtns[1] && actionBtns[1].type === 'danger'
+    && actionBtns[2] && actionBtns[2].type === 'default', '★ 按钮**带色**：primary / danger / default')
+  ok(actionBtns.every((b) => b && b.behaviors && b.behaviors[0].value.fs_form !== undefined
+    && b.behaviors[0].value.fs_choice !== undefined), '三个按钮都带 { fs_form, fs_choice }')
+  const formToken = actionBtns[0].behaviors[0].value.fs_form
+  ok(consoleLines.some((l) => l.includes('approval form sent:') && l.includes('token=' + formToken)),
+    '留痕 `approval form sent`（可日志复验）')
+
+  // 点击「采纳」⇒ 工具拿到选择 + 卡就地变回执卡
+  const decideMark = sentCards.length
+  await tapValue(actionBtns[0].behaviors[0].value)
+  const decided = await settle(pendingForm, 4000)
+  ok(decided && decided.ok === true && decided.choice === '采纳', '★ 点「采纳」⇒ 工具结果拿到 choice=采纳（' + JSON.stringify(decided && decided.choice) + '）')
+  ok(decided && decided.timedOut === false && String(decided.cardId || '').length > 0, '工具结果带 cardId 且非超时')
+  const receipt = sentCards.slice(decideMark).filter((c) => c.op === 'update').pop()
+  const rp = (receipt && receipt.payload) || {}
+  ok(JSON.stringify(rp).includes('已记录你的选择：采纳'), '★ 卡**就地变回执卡**（旧卡不再可点）')
+  ok(rp.header && rp.header.template === 'green', '采纳 ⇒ 回执卡头绿色')
+  ok(consoleLines.some((l) => l.includes('approval form decided:') && l.includes('-> 采纳')), '留痕 `approval form decided`')
+
+  // stale 点击（同一张卡再点一次）：**不许静默**，必须一条可见提示
+  const staleMark = sentCards.length
+  await tapValue(actionBtns[0].behaviors[0].value)
+  const staleText = JSON.stringify(sentCards.slice(staleMark))
+  ok(staleText.includes('已经处理过了') || staleText.includes('已过期'), '★ 旧卡再点 ⇒ 可见提示（不是静默 no-op）')
+  ok(consoleLines.some((l) => l.includes('form button: record not found')), '并留痕 `form button: record not found`')
+
+  // 超时（30 分钟）：可见告知 + 卡变超时态 + 工具结果 timedOut
+  const mark2 = sentCards.length
+  formTimers.length = 0          // 只认本用例自己那个定时器（前面那条早被点击结算掉了）
+  const pendingTimeout = formTool.execute(Object.assign({}, formArgs, { title: '超时用例单' }), { agent, signal: undefined })
+  await drain()
+  ok(formTimers.length >= 1, '捕获到 30 分钟定时器（' + formTimers.length + ' 个）')
+  const fireTimeout = formTimers.pop()
+  if (typeof fireTimeout === 'function') fireTimeout()
+  const timedOut = await settle(pendingTimeout, 4000)
+  ok(timedOut && timedOut.timedOut === true && timedOut.choice === '', '★ 超时 ⇒ 工具结果 timedOut=true（choice 为空）')
+  const timeoutText = JSON.stringify(sentCards.slice(mark2))
+  ok(timeoutText.includes('自动作废'), '★ 超时**可见地**说明（纯文本 + 卡面都写了"自动作废"）')
+  ok(timeoutText.includes('（超时未操作）'), '超时后卡面也换成超时态')
+
+  globalThis.setTimeout = origSetTimeout
+
+  // askUserQuestion 适配通道：questions[0].card ⇒ 直接渲染审批单卡，回答按 question-answer 形状回传
+  //
+  // ⚠️ 夹具坑（第一版就踩了）：`findChatForAgent` 跨代际**只认「会话 id == agent id」**这条
+  //    （生产实测两者同为 `fs-main-*`，且会话 id 已落盘 ⇒ 重载后照样认得出）。而冒烟的假 agent
+  //    id 是 `agent-smoke-1`、会话 id 是 `fs-main-*`，只有"活 handle"那条路能匹配 —— 用例 50
+  //    重载过两代之后 handle 早没了 ⇒ 日志「no chat owner for agent agent-smoke-1, delegating」
+  //    ⇒ 根本没有卡。这里按生产的形态传 id（用**已落盘的会话 id**），验的才是插件逻辑。
+  const adaptAgentId = createdSessionIds[createdSessionIds.length - 1] || agent.id
+  const adaptAgent = { id: adaptAgentId, ctx: agentCtx }
+  const questions = [{
+    id: 'approval-1',
+    question: '身份标签变更：是否采纳？',
+    options: [{ label: '采纳' }, { label: '驳回' }, { label: '改' }],
+    card: { title: '身份标签变更单 · 曹伟轩（适配通道）', meta: [{ label: '单号', value: 'BG-2' }], categories: [{ text: '财经 L2 → L2', change: 'same' }] },
+  }]
+  const mark3 = sentCards.length
+  const r = emitCtx('user-questions/request', { questions, agent: adaptAgent, signal: undefined }, () => Promise.resolve('next'))
+  await drain()
+  const adaptCard = lastCardFrom(mark3)
+  ok(JSON.stringify((adaptCard && adaptCard.payload) || {}).includes('身份标签变更单 · 曹伟轩（适配通道）'),
+    '★ askUserQuestion 带 card 字段 ⇒ 走审批单卡（不是"文字 + 选它"简卡）')
+  const adaptBtns = allButtons(adaptCard)
+  ok(adaptBtns.length === 3, '适配通道的卡也是三个带色按钮（' + adaptBtns.length + ' 个）')
+  await tapValue(adaptBtns[1].value)
+  // 多个代际都挂在同一条水位线上（用例 50 重载过），`r[0]` 可能是"交回下一个"那条 ⇒
+  // 从**所有**返回值里挑出真正带 answers 的那个（这才是接管成功的那条）。
+  const allReturns = await Promise.all((r || []).map((x) => settle(x, 4000)))
+  const answered = allReturns.find((x) => x && x.answers) || allReturns[0]
+  ok(answered && answered.answers && answered.answers[0] && answered.answers[0].selected
+    && answered.answers[0].selected[0] === '驳回',
+    '★ 适配通道点「驳回」⇒ 按 question-answer 形状回传 selected=[驳回]（实际：' + JSON.stringify(answered) + '）')
+
+  // 护栏：非飞书会话 + 没给 chatId ⇒ 明确报错，绝不瞎发
+  const foreign = await formTool.execute({ title: '不该发出去的单' }, { agent: { id: 'agent-not-feishu' }, signal: undefined })
+  ok(foreign && foreign.ok === false && String(foreign.detail).includes('不是飞书会话'),
+    '★ 非飞书会话 ⇒ 明确报错（不瞎发到别人的会话）')
+}
+
 console.log('')
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')

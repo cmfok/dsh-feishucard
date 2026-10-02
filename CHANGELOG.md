@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-03
+
+### Added（新通道：**审批单卡** + 工具 `feishu_approval_form`；顺手给提问卡按钮上色）
+
+**背景（需求方原话）**：AI 要发「权限变更审批单」，需要**在飞书里可读、可点**；而它现在只能用
+`ask_user_question` 发简卡（一个问题 + 一排**无色**按钮），信息全堆成一坨，读不了。
+（需求提示词由另一个 AI 起草 —— 实现按本仓既有做法落地：命名空间、Promise 模式、跨代际卫生、
+冒烟守护、空闲落地。版本号/文档/测试/落地流程都走本仓这一套。）
+
+| # | 要加的 | 落地做法（函数名） |
+|:--|:--|:--|
+| 1 | 新 value 命名空间 `fs_form` + `fs_choice`，**只新增**、不动既有三类分派 | `handleCardAction()` 新增分支（排在 `fs_question` 之前）：按 token 查 `pendingForms` → 找不到**给可见提示**（照抄 stale 做法，绝不静默）→ 找到就 `resolve(选择)` → **原地把卡改成回执卡**（`formResultCardPayload`）并留痕 `approval form decided` |
+| 2 | 新卡版式 `approvalFormCardPayload(form, token)` | 头蓝 `📋 {title}` · `div + fields(is_short)` 双列字段区 · ①~⑥ 六段（每段之间 `hr`）· ⑥ 操作行＝`column_set flex_mode:'trisect'` 三个**带色**按钮：`✅ 采纳`(primary) / `❌ 驳回`(danger) / `✍️ 我要改`(default)，value 均为 `{ fs_form, fs_choice }` |
+| 3 | 提问卡按钮上色（原来没有 `type` ⇒ 全灰） | `optionButtonType(option, label, index)`：显式 `buttonType/type` > 词义（驳回/拒绝/取消… ⇒ danger）> 第一个 ⇒ primary > 其余 default；**向后兼容**（不传不报错，显式值只认飞书枚举） |
+| 4 | 让 AI 能触达这张卡 | **两条入口**：**(a)** 新工具 `feishu_approval_form`（结构化参数＝title/meta/categories/skills/evidence/impact/risk）→ 发卡 → **等点击** → 把选择当**工具结果**返回；目标会话自动解析（`findChatForAgent(exec.agent)` + 兜底链，与 `feishu_send` 同套），非飞书会话**明确报错不瞎发**；**(b)** `askUserQuestion` 适配：`questions[0].card` 存在时直接渲染审批单卡，回答按 `selected:[选择]` 回传（调用方零改动） |
+
+**硬要求逐条对照**：一张卡只装一个人/一件事（工具 description 写明 + 参数就是单份变更单）·
+30 分钟超时**可见**（卡改超时态 + 一条纯文本"已自动作废"，**绝不默认通过或驳回**）·
+点击后卡必须变（回执卡，重复点击走 `record not found` + 可见提示）· 既有三类分派一行未动 ·
+零硬编码 appId/secret（沿用 `readConfig()` / `bots` 解析）。
+
+**防回归（都会变红，写在冒烟里）**——新用例 51，**22 条断言**：
+工具已注册 · 卡头蓝+带人名 · 双列 `fields` 且 `is_short:true` · ①~⑥ 全在 · 🔹/🔸 与 ➕/➖ 图标 ·
+证据是引用块 · ≥5 条 `hr` · 操作行 `trisect` · 三个按钮**带色** primary/danger/default ·
+三个按钮都带 `{fs_form,fs_choice}` · 留痕 `approval form sent` · **点采纳 ⇒ 工具结果 choice=采纳** ·
+回执卡"已记录你的选择：采纳"且头变绿 · 留痕 `approval form decided` · **旧卡再点 ⇒ 可见提示**（非静默）·
+留痕 `record not found` · **超时 ⇒ timedOut=true + "自动作废"可见 + 卡变超时态** ·
+`askUserQuestion` 带 `card` ⇒ 走审批单卡且点驳回回传 `selected:[驳回]` · 非飞书会话 ⇒ 明确报错。
+
+**回归**：`node --check`=0；smoke **SMOKE PASS (sentCards=229, sessions=12)**，`❌` 0 条（用例 51 共 22 条断言全绿）。
+
 ## [0.5.7] - 2026-10-03
 
 ### Fixed（入站附件落盘：图片没有扩展名 / 时间戳是 UTC）
