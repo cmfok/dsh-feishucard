@@ -258,6 +258,8 @@ export function apply(ctx) {
     return 'bot 的回复卡片：' + String(best).replace(/\s+/g, ' ').slice(0, 60)
   }
 
+  // 未命中的哨兵文案：**惟一定义**（日志判定也用它，避免"改文案就静默把 miss 判成 hit"，审查 LOW#281）
+  const QUOTE_MISS_SENTINEL = '（内容未登记，可能是更早的消息）'
   function quoteHintFor(parentId) {
     if (!parentId) return ''
     const key = String(parentId)
@@ -268,7 +270,7 @@ export function apply(ctx) {
       loadMessageIndex()
       hit = recentMessages.get(key)
     }
-    const what = hit && hit.label ? '：' + hit.label : '（内容未登记，可能是更早的消息）'
+    const what = hit && hit.label ? '：' + hit.label : QUOTE_MISS_SENTINEL
     return '\n\n（你在引用这条消息' + what + '）'
   }
 
@@ -278,7 +280,7 @@ export function apply(ctx) {
   function logQuoteState(evt, hint) {
     const pid = String((evt && evt.parent_id) || '')
     const rid = String((evt && evt.root_id) || '')
-    const state = !hint ? 'none' : (hint.includes('内容未登记') ? 'miss' : 'hit')
+    const state = !hint ? 'none' : (hint.includes(QUOTE_MISS_SENTINEL) ? 'miss' : 'hit')
     console.log('[fs] inbound quote: parent_id=' + (pid || 'EMPTY') + ' root_id=' + (rid || 'EMPTY')
       + ' hint=' + state)
     if (state === 'miss') console.log('[fs] quote miss: ' + (pid || rid))
@@ -955,18 +957,13 @@ export function apply(ctx) {
   //   ⇒ 折叠阈值从"凭 50 猜的 40"改为 **180**（留 20 元素余量），并对载荷字节加同样含义的护栏。
   //   这条修正直接消除"正常长回合也被折进**默认收起**面板 ⇒ 过程文字看不见"（CM 报障的主症状）。
   const CARD_FOLD_THRESHOLD = 180
-  const CARD_FOLD_MAX_CHARS = 150000      // ≈150 KB，远低于实测 198.5 KB 的通过线
-  function elementTextChars(elements) {
-    let n = 0
-    for (const el of elements || []) {
-      if (!el || typeof el !== 'object') continue
-      if (typeof el.content === 'string') n += el.content.length
-      if (el.text && typeof el.text.content === 'string') n += el.text.content.length
-      if (Array.isArray(el.elements)) for (const inner of el.elements) {
-        if (inner && typeof inner.content === 'string') n += inner.content.length
-      }
-    }
-    return n
+  // 超限**换卡续写**的触发线（内容原样留在旧卡、新卡接续 ⇒ 永不隐藏、也不撞上限）：
+  const CARD_ROTATE_BLOCKS = 170
+  const CARD_ROTATE_BYTES = 120000        // 120 KB，低于实测通过线 198.5 KB
+  // ⚠️ 体积必须按**真字节**量（审查 MED#958）：中文 1 字 ≈ 3 UTF-8 字节，用 String.length
+  // 会低估到 ~1/3 —— 150000 "字符" 对 CJK 其实是 ~450 KB，早已越过实测 198.5 KB 的通过线。
+  function blocksBytes(blocks) {
+    try { return Buffer.byteLength(JSON.stringify(blocks || []), 'utf8') } catch { return 0 }
   }
 
   // 把长文本按段落边界切成 ≤ size 的块；单段本身超长则硬切。**不丢任何字符。**
@@ -1359,9 +1356,9 @@ export function apply(ctx) {
     // Window fold: keep the NEWEST content visible (live progress + conclusion
     // at the bottom), fold the ALREADY-SEEN history into panel(s) at the TOP.
     // The last KEEP_TAIL elements are never folded (2026-08-15 CM design).
-    const foldDue = elements.length > CARD_FOLD_THRESHOLD
-      || elementTextChars(elements) > CARD_FOLD_MAX_CHARS
-    if (foldDue) {
+    // 审查 MED#1362：折叠只是把文本搬进面板 —— **既不省字节也不省内容** ⇒ 体积超限不能靠它，
+    // 走 watcher 里的"换卡续写"（CARD_ROTATE_*）。折叠只负责**元素个数**这条硬限制。
+    if (elements.length > CARD_FOLD_THRESHOLD) {
       const KEEP_TAIL = 10
       const head = elements.slice(0, elements.length - KEEP_TAIL)
       const tail = elements.slice(elements.length - KEEP_TAIL)
@@ -1842,6 +1839,9 @@ export function apply(ctx) {
         + '原因：' + reason.slice(0, 220) + '\n'
         + words.tip
       void sendPlainText(bot, chatId, tip).catch(() => {})
+      // P2：同上 —— 失败提示也是另发的消息 ⇒ 换新卡续写，别让旧卡停在提示上方
+      rotateLiveCardForChat(chatId,
+        '⬇️ 上面那条是**另发的**失败提示；后续内容在这张新卡继续，旧卡原文原样保留。')
       console.log('[fs] card failure notice sent chat=' + chatId + ' kind=' + klass
         + (code ? ' code=' + code : ''))
       // ② 让 **Agent 也收到**（复用入站通道注入系统提示；下一次推理必然看到）
@@ -2098,10 +2098,18 @@ export function apply(ctx) {
         // 表格额度换卡（CM 2026-09-16 方案）：飞书单卡硬上限 5 张表（ErrCode 11310）。
         // 本卡已用满且**还有新事件待镜像**时，先换一张新卡 —— 旧卡的表格原样留在旧卡，
         // 新事件由新卡接续（新卡游标 = 旧卡游标，不丢不重）。这样永远不降级表格。
-        if (typeof onTableBudget === 'function' && cardTableCount(card) >= CARD_MAX_TABLES) {
+        if (typeof onTableBudget === 'function') {
           const pending = sessionEvents(agent.session)
           const from = Number.isFinite(card.cursor) ? card.cursor : 0
-          if (pending.length > from) { onTableBudget(); return }
+          if (pending.length > from) {
+            // ① 表格额度（飞书单卡硬上限 5 张表，ErrCode 11310）
+            if (cardTableCount(card) >= CARD_MAX_TABLES) { onTableBudget('tables'); return }
+            // ② 元素/体积额度（实测：200 元素、载荷 ~198.5 KB 通过）⇒ **换卡续写**：
+            //    旧卡正文原样保留＋一行说明，新卡从旧卡游标接续（不重放、不丢、不重）。
+            //    这样"过程文字默认可见"与"绝不撞上限"同时成立（CM 2026-10-03 口径）。
+            if (card.blocks.length > CARD_ROTATE_BLOCKS
+              || blocksBytes(card.blocks) > CARD_ROTATE_BYTES) { onTableBudget('size'); return }
+          }
         }
         if (scanCard(agent, card)) {
           card.lastEventAt = Date.now()
@@ -2145,6 +2153,9 @@ export function apply(ctx) {
                 + '也不是我在埋头干活）。你回我一句话就会强制重新发起这一轮。'
             void sendPlainText(bot, chatId, note).catch(() => { })
             console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
+            // P2：这条提示是另发的消息 ⇒ 把还在跑的那张卡换到下面新卡继续（旧卡原文保留）
+            rotateLiveCardForChat(chatId,
+              '⬇️ 上面那条是**另发的**提示；后续内容在这张新卡继续，旧卡原文原样保留。')
           }
         }
       } catch (error) {
@@ -2222,7 +2233,7 @@ export function apply(ctx) {
   })
 
   // 表格额度换卡（续卡通道专用）：旧卡保留表格，新卡接续游标，不丢不重。
-  function rotateAdoptedCard(agent) {
+  function rotateAdoptedCard(agent, reason) {
     const key = String(agent && agent.id)
     const entry = liveCardRegistry.get(key)
     if (!entry || !entry.card) return
@@ -2232,11 +2243,16 @@ export function apply(ctx) {
     fresh.footerMode = 'bare'
     old.sealing = true
     old.status = 'sealed'
-    old.blocks.push({ type: 'message', text: '📊 表格已达飞书单卡上限，后续内容见下方新卡。' })
+    old.blocks.push({
+      type: 'message',
+      text: reason === 'size'
+        ? '📄 本卡内容已达飞书单卡上限（约 200 元素 / 200 KB），后续内容见下方新卡；**本卡正文原样保留**。'
+        : '📊 表格已达飞书单卡上限，后续内容见下方新卡。',
+    })
     try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
     entry.card = fresh
     if (entry.stop) { try { entry.stop() } catch { } }
-    entry.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, () => rotateAdoptedCard(agent))
+    entry.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, (r) => rotateAdoptedCard(agent, r))
     console.log('[fs] 续卡通道：表格换卡 card=' + String(fresh.token || '-').slice(-8))
   }
 
@@ -2251,7 +2267,7 @@ export function apply(ctx) {
       }
       console.log('[fs] 热重载续卡：接管 agent=' + key + ' card=' + String(card.token || '-').slice(-8)
         + ' blocks=' + card.blocks.length)
-      entry.stop = startCardWatcher(entry.agent, card, entry.bot, entry.chatId, () => rotateAdoptedCard(entry.agent))
+      entry.stop = startCardWatcher(entry.agent, card, entry.bot, entry.chatId, (r) => rotateAdoptedCard(entry.agent, r))
     } catch (error) {
       console.log('[fs] 热重载续卡失败（不影响其它功能）: ' + String(error && error.message || error))
     }
@@ -3260,7 +3276,8 @@ export function apply(ctx) {
       // 而是把旧卡封住（表格留在旧卡），后续内容写到一张新卡上。
       // 与 split() 的唯一差别：新卡游标 = 旧卡**当前**游标 → 触发换卡的待处理事件落到新卡，
       // 既不丢也不重（split() 是答题专用，它把游标设到事件末尾，会跳过待处理事件）。
-      const rotateTables = () => {
+      // reason: 'tables'（5 表满额）| 'size'（元素/体积接近飞书单卡上限）—— 都是"换卡续写"。
+      const rotateTables = (reason) => {
         if (!stopCardWatcher) return
         if (!card || card.status === 'sealed' || card.status === 'error') return
         const carry = Number.isFinite(card.cursor) ? card.cursor : 0
@@ -3270,7 +3287,12 @@ export function apply(ctx) {
         const fresh = makeCardState(turnAgent)
         fresh.footerMode = 'bare'      // 换表新卡仍是"过程卡"
         fresh.cursor = carry
-        fresh.blocks.push({ type: 'message', text: '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。' })
+        fresh.blocks.push({
+          type: 'message',
+          text: reason === 'size'
+            ? '📄 上一张卡的内容已达飞书单卡上限（约 200 元素 / 200 KB），后续内容在这张新卡继续；**上一张的正文原样保留**。'
+            : '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。',
+        })
         card = fresh
         void syncCard(bot, chatId, fresh, true).catch(() => {})
         stopCardWatcher = startCardWatcher(turnAgent, fresh, bot, chatId, rotateTables)
@@ -6769,7 +6791,7 @@ export function apply(ctx) {
     // state.rotate：把"表格额度换卡"那条通道交出去（见 makeAutoCardEntry.split —— 评审 low#7）
     const state = { card: null, stop: null, rotate: null }
     // 表格额度换卡：与普通回合的 rotateTables 同机制（旧卡留表格，后续写新卡，游标接续不丢不重）
-    const rotate = () => {
+    const rotate = (reason) => {
       if (!state.stop || !state.card || state.card.status !== 'running') return
       const carry = Number.isFinite(state.card.cursor) ? state.card.cursor : 0
       state.stop()
@@ -6777,7 +6799,12 @@ export function apply(ctx) {
       void syncCard(bot, chatId, state.card, true).catch(() => {})
       const fresh = makeCardState(agent)
       fresh.cursor = carry
-      fresh.blocks.push({ type: 'message', text: '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。' })
+      fresh.blocks.push({
+        type: 'message',
+        text: reason === 'size'
+          ? '📄 上一张卡的内容已达飞书单卡上限（约 200 元素 / 200 KB），后续内容在这张新卡继续；**上一张的正文原样保留**。'
+          : '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。',
+      })
       state.card = fresh
       void syncCard(bot, chatId, fresh, true).catch(() => {})
       state.stop = startCardWatcher(agent, fresh, bot, chatId, rotate)
@@ -7028,6 +7055,27 @@ export function apply(ctx) {
 
   // 答题后统一找"当前该被冻结的那张卡"：入站轮优先，其次自动轮。
   // 两条路都找不到时**明确留痕**（不再静默跳过 —— 静默跳过正是这次回归的根因）。
+  // CM 2026-10-03：「这种卡片一直在最底部，有问题 —— 发了以后就自动换新卡，不能一直在最底。」
+  //   侧消息（看门狗/失败提示等**另发的**消息）会把"还在跑的那张卡"留在它上面，后续更新全写在上方，
+  //   用户看到的是最底下那条提示、以为我们停了。与"插话必须换卡"同源（CM 2026-10-02）⇒
+  //   发完侧消息就把该会话正在跑的卡**换到下面新卡继续**（旧卡就地封口＋一行说明、正文原样保留）。
+  //   复用答题/插话那套 `entry.split()`：新卡游标 = 当前事件位 ⇒ 不重放、不丢。
+  function rotateLiveCardForChat(chatId, label) {
+    try {
+      for (const entry of activeTurns.values()) {
+        if (!entry || String(entry.chatId || '') !== String(chatId || '')) continue
+        if (!entry.card || entry.card.status !== 'running') continue
+        if (typeof entry.split !== 'function') continue
+        const ok = entry.split({ old: { type: 'message', text: label } })
+        console.log('[fs] side notice -> live card rotated: chat=' + chatId + ' ok=' + (ok === true))
+        return ok === true
+      }
+    } catch (error) {
+      console.log('[fs] side notice rotate failed: ' + String(error && error.message || error))
+    }
+    return false
+  }
+
   function splitLiveCardAfterAnswer(agentId) {
     if (!agentId) return false
     const turn = activeTurns.get(agentId)

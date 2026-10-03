@@ -799,6 +799,42 @@ console.log('12) 表格额度换卡：单卡满 5 张表后，后续内容换新
   ok(beforeSecond.includes('| 列5 |'), '换卡前旧卡已承载 1~5 张表（内容留在旧卡）')
 }
 
+console.log('12b) 元素/体积超限 ⇒ **换卡续写**（旧卡正文原样保留、新卡接续；绝不折叠隐藏）')
+{
+  // 触发线：CARD_ROTATE_BLOCKS=170（块数 ≈ 元素数）。这里喂 175 段叙述 ⇒ 越过触发线；
+  // 再喂一波（watcher 判定要求"有事件待镜像"）⇒ 应换卡，旧卡保留全部叙述 + 一行说明。
+  const markR = sentCards.length
+  let releaseR
+  const gateR = new Promise((r) => { releaseR = r })
+  const prevIdleR = agent.whenIdle.bind(agent)
+  agent.whenIdle = () => gateR
+  agent.send = function (message) {
+    this.sent.push(message)
+    for (let i = 0; i < 175; i++) {
+      agentEvents.push({ type: 'assistant/message', seq: 9900 + i, data: { message: { content: [{ type: 'text', text: '长回合叙述 ' + i }] } } })
+    }
+  }
+  feedInbound('om_rotate_size', '超限换卡')
+  await drain()
+  agentEvents.push({ type: 'assistant/message', seq: 9990, data: { message: { content: [{ type: 'text', text: '换卡后的续写段' }] } } })
+  await drain()
+  releaseR()
+  agent.whenIdle = prevIdleR
+  await drain()
+
+  const createsR = cardsSince(markR).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  ok(createsR.length >= 2, '超限后新建了第二张卡（create 次数 ' + createsR.length + '）')
+  const allR = JSON.stringify(cardsSince(markR))
+  ok(allR.includes('已达飞书单卡上限'), '★ 旧卡带"换卡续写"说明（用户知道内容接在哪张卡）')
+  ok(allR.includes('本卡') || allR.includes('上一张'), '说明里点明"正文原样保留"')
+  // 零丢失：换卡前旧卡的载荷里必须还能看到第 0 段叙述（不被折叠隐藏）
+  const firstCreateIdx = cardsSince(markR).findIndex((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  const beforeRotate = firstCreateIdx >= 0 ? JSON.stringify(cardsSince(markR).slice(0, firstCreateIdx + 1)) : ''
+  ok(beforeRotate.includes('长回合叙述 0') || allR.includes('长回合叙述 0'),
+    '★ 第 0 段叙述**没有丢**（要么在旧卡可见区，要么整卡可检索）')
+  ok(allR.includes('换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
+}
+
 console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
 {
   // 背景（CM 反馈）：目标模式续轮由 @deepseek-ai/dsh-goal-round-driver 以**同会话**注入
@@ -1992,6 +2028,7 @@ console.log('31b) 🔴 P0 复现 CM 2026-10-03 报障：过程卡正文**不许*
   // 文字就"全跑到结论卡"、过程卡只剩一句指路。所以夹具必须是**叙述↔工具交替**。
   process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
   const markP0 = sentCards.length
+  const logMarkP0 = consoleLines.length   // 审查 LOW#2020：consoleLines 是全程缓冲，必须取本轮窗口
   agent.send = function (message) {
     this.sent.push(message)
     agentEvents.push({ type: 'assistant/message', seq: 9500, data: { message: { content: [{ type: 'text', text: '第一段过程叙述' }] } } })
@@ -2001,7 +2038,11 @@ console.log('31b) 🔴 P0 复现 CM 2026-10-03 报障：过程卡正文**不许*
     agentEvents.push({ type: 'tool/call', seq: 9504, data: { callId: 'p0_2', name: 'read', arguments: '{"file_path":"b.md"}' } })
     agentEvents.push({ type: 'tool/result', seq: 9505, data: { message: { source: { callId: 'p0_2' }, content: [{ type: 'text', text: 'ok' }] } } })
     agentEvents.push({ type: 'assistant/message', seq: 9506, data: { message: { content: [{ type: 'text', text: '第三段过程叙述' }] } } })
-    agentEvents.push({ type: 'assistant/message', seq: 9507, data: { message: { content: [{ type: 'text', text: '结论：三件事都做完了。' }] } } })
+    // 审查 MED#2016（我这条用例原本是**假绿**）：replySeqs 遇到"相邻叙述"会停 ⇒ 若结论**紧接**叙述，
+    // 它只覆盖结论那一句，旧实现也能通过。让结论**紧跟一次工具结果**，replySeqs 才会覆盖三段叙述。
+    agentEvents.push({ type: 'tool/call', seq: 9507, data: { callId: 'p0_3', name: 'read', arguments: '{"file_path":"c.md"}' } })
+    agentEvents.push({ type: 'tool/result', seq: 9508, data: { message: { source: { callId: 'p0_3' }, content: [{ type: 'text', text: 'ok' }] } } })
+    agentEvents.push({ type: 'assistant/message', seq: 9509, data: { message: { content: [{ type: 'text', text: '结论：三件事都做完了。' }] } } })
   }
   feedInbound('om_p0_keepblocks', 'P0 正文保全')
   await settle(4)
@@ -2017,7 +2058,7 @@ console.log('31b) 🔴 P0 复现 CM 2026-10-03 报障：过程卡正文**不许*
     '★ P0：过程卡**三段正文全部保留**（旧实现会把它们删掉搬进结论卡）')
   ok(procJson.includes('结论见下方卡片'), '过程卡末尾追加了一行指路（只追加，不删块）')
   ok(concJson.includes('结论：三件事都做完了'), '结论卡里有结论（自包含口径不变）')
-  ok(consoleLines.some((l) => l.includes('card fingerprint:') && l.includes('collapsed=')),
+  ok(consoleLines.slice(logMarkP0).some((l) => l.includes('card fingerprint:') && l.includes('collapsed=')),
     '★ 观测指纹已留痕（封口帧 elements/panels/collapsed/payload_md5）')
 }
 
@@ -2046,7 +2087,9 @@ console.log('31c) 折叠阈值修正：正常长回合（90 元素）不再把�
   }).join('\n')
   ok(visibleText.includes('叙述第 0 段'), '★ 第一段默认可见（阈值 180 之下不再折叠）')
   ok(visibleText.includes('叙述第 44 段'), '★ 最后一段默认可见')
-  ok(visibleText.includes('第一段过程叙述') || visibleText.length > 0, '（可见区非空）')
+  const hiddenNarration = procEls.filter((e) => e.tag === 'collapsible_panel' && e.expanded !== true
+    && String((e.elements && e.elements[0] && e.elements[0].content) || '').includes('叙述第 0 段'))
+  ok(hiddenNarration.length === 0, '★ 没有把叙述藏进收起面板（审查 LOW#2049：去掉恒真断言，改验真事实）')
 }
 
 console.log('32) /compact：压缩上下文必须透传到命令注册表（CM 2026-10-01 要求）')
