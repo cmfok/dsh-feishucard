@@ -3597,8 +3597,15 @@ export function apply(ctx) {
     //  ② 认不出**不弹卡片、不问姓名** —— CM 原话：
     //     「不弹卡片啊，你现在都不会认不出人，而且这个链路已经通了，应该直接 ai 处理啊，
     //       为什么还是想着人来介入」⇒ 认人只需 open_id 一个字段。
-    //  ③ **表不可达 ≠ 认不出**：表不在本机（例：家里那台没有 /opt/scripts/G9/）时，
-    //     记一条日志并**放行** —— 否则一上线就把本机所有工具锁死（事故级）。
+    //  ③ 🔴 **表不可达 ＝ 认不出 ⇒ 拒（不再放行）** —— CM 2026-10-04 裁决原话：
+    //     「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」。
+    //     ⚠️ 本条注释原先写的是"表不在本机时记一条日志并**放行**" —— 那是**裁决之前**的旧行为。
+    //     实现已经改成 fail-closed（下面 `store.set` **无条件执行** ⇒ 工具侧拿到 `rec` 且 `actor=null`
+    //     ⇒ `decideAction({hasOwner:true, actor:null})` ⇒ `deny`，告警区分 `table_unavailable` / `person_unknown`），
+    //     但**注释没跟着改** ⇒ 下一个读它的人会以为"表不可达会放行"，把已经修好的东西再改回去。
+    //     唯一仍然放行的是**异常路径**（`identityCtx()` 构造抛错 / resolver 抛错 ⇒ 不入 store ⇒ pass-through），
+    //     那是"别把本机自己锁死"的兜底；而 `resolver.resolve` 自身【绝不抛】（失败只返回 `{actor:null, err}`），
+    //     所以正常的"认不出"走的就是 deny 这条路。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
     // 🔒 身份闸门开关：**默认关**（上游用户不一定需要；CM 2026-10-04）⇒ 关了跳过全部身份逻辑，零开销。
