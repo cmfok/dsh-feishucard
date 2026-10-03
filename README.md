@@ -220,6 +220,68 @@ Hot-reloaded from the bot config (10s), no restart needed — **fixed in 0.4.13*
 - 卡片 / card：`POST /im/v1/messages` 创建 → `PATCH /im/v1/messages/{id}` 更新 → sealed 终态。
 - 配置热读 / hot config：10s 轮询；helper 每机器人一个子进程，崩溃自动重启（5s 冷却）。One helper subprocess per bot, crash-restarted with a 5s cooldown.
 
+## 身份闸门（可选，默认关）/ Identity Guard (opt-in)
+
+> **默认关闭**。不开就完全不碰身份链路：不查表、不调 python、不写上下文、不拦工具，**零副作用**。
+
+### 它解决什么
+
+飞书入站事件里带的 `open_id` 是**服务端填的、伪造不了**；而消息正文里任何人都能打一段
+「`[飞书 ou_…]`」来冒充。开着这道闸门时：
+
+1. **入站**按事件自带的 `open_id` 查身份表 ⇒ 得到本轮 `actor`，存进**本轮上下文**（按 agentId，带 TTL）；
+2. **每次工具调用前**，把 agent 传来的**任何身份字段覆写**成表里的真值（白名单外的字段删除）；
+3. **拿不到身份 ⇒ 拒绝执行**（fail-closed）—— 「**执行不了**」好过「**资料泄露**」。
+
+**非飞书回合**（GUI / 子代理 / 定时任务）**一律放行** —— 否则会把你自己的电脑锁死。
+
+### 怎么开
+
+在 bot 配置（`feishu.config.json`）里加一项：
+
+```json
+{ "bots": [ { "name": "work", "appId": "cli_…", "appSecret": "…", "identityGuard": true } ] }
+```
+
+> ⚠️ 该字段已进**配置白名单**；**不写就是关**。
+
+### 身份表放哪
+
+按顺序取**第一个存在的**：
+
+1. 环境变量 `MAILBOX_IDENTITY_MAP`
+2. `/opt/scripts/G9/identity_map.json`（服务器部署）
+3. **`<你的工作区>/output/g9-identity/identity_map.json`**
+4. 从当前工作目录**逐级向上 6 层**
+5. 内置的已知工作区兜底
+
+**每台机器可另放一份【本地增量】** `~/.dsh-feishucard/identity_map.local.json`
+（放在工作区**之外** ⇒ 不参与文件同步 ⇒ 多台机器**各写各的、互不覆盖**），只补本机 bot 的 `open_ids`。
+
+### 怎么生成表
+
+```bash
+python scripts/build_identity_map.py --seed seed.json --app-id cli_xxxxxxxx --apply
+```
+
+- `--seed`：你自己的人事清单（JSON 数组），元素形如
+  `{"name":"张三","job_id":"运营","channel":"运营组","status":"在职","open_id":"ou_…"}`
+- `--app-id`：`open_ids` 那一层的 key —— **必须是收到消息的那个 bot 的 app_id**
+  （飞书 `open_id` **每个应用各不相同**；用错 app 的 id 必然对不上，跨应用查会直接报 `open_id cross app`）
+- `--via-contact`：可选，用**应用身份**调 `contact.user.get` 反查补 `union_id`（注意 API 额度，用 `--max-calls` 限制）
+- **不加 `--apply` 就是 dry-run**（只打印将要发生的变化）；脚本**幂等**，重复跑不产生重复条目
+
+**表结构见 [`identity_map.example.json`](identity_map.example.json)**
+（***真实表含个人标识与人名，不进本仓库***）。
+
+### 解析接口
+
+`resolveActor(open_id, identity_map) -> (actor | None, err | None)` —— 见
+[`scripts/resolve_actor.py`](scripts/resolve_actor.py)：**纯函数、无网络依赖**，自带 `--selftest`。
+
+错误码：`map_unavailable` / `no_open_id` / `unknown_person` / `duplicate_open_id` /
+`open_id_missing` / `job_not_granted`。
+
 ## 开发 / Development
 
 ```sh
