@@ -6842,6 +6842,18 @@ export function apply(ctx) {
       if (!(owner && owner.bot && owner.bot.cfg && owner.bot.cfg.identityGuard)) return next()
       // ⚠️ 此处作用域里没有 `bot`（全局注册）⇒ 只能给 `workspaceRoot()`；内核有多级兜底，给 undefined 也不怕。
       const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
+      // 🔴 2026-10-04 复核发现的**口径偏差**（先只观测，**不改行为**）：
+      //    内核给 `decideAction` 的定义是「hasOwner=true ＋ 无 actor（**表在不在都一样**）⇒ deny」。
+      //    而代码走到这里时 **owner 必定存在**（上面那行已经 `return next()`）⇒ 按理应传 `hasOwner: true`。
+      //    现在的写法用 `!rec` 当"这不是飞书回合"的替身 ⇒ **有 owner、但 store 里没有这一轮的记录 ⇒ 放行**。
+      //    可达路径（**逻辑成立、真机尚未实证**）：`/switch` 把 handle 挂到新 session id、而 store 记的是旧 id；
+      //    卡片回调起的轮次也不经过入站注入。
+      //    ⇒ 先打点把"实际有多少这种轮次"量出来，**再决定是否收紧成 deny** ——
+      //      收紧会波及卡片交互与 `/switch` 之后的正常使用，不该拍脑袋改。
+      if (!rec) {
+        console.log('[fs] identity NOTE[no-record-allow]: tool=' + exec.name + ' agent=' + exec.agent.id
+          + ' ⇒ 飞书回合但无身份记录，按当前实现放行（口径偏差·待裁；见冒烟用例 70 的注释）')
+      }
       const action = !rec
         ? 'pass-through'                                  // 非飞书回合 ⇒ 不要求飞书身份
         : decideAction({ hasOwner: true, actor: rec.actor })
