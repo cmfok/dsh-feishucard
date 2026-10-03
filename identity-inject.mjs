@@ -13,8 +13,12 @@
  *   2. **认不出不弹卡片、不问姓名** —— AI 自己解决（CM 原话：
  *      「不弹卡片啊，你现在都不会认不出人，而且这个链路已经通了，应该直接 ai 处理啊，
  *        为什么还是想着人来介入」）
- *   3. **表不可达 ≠ 认不出** —— 前者是基础设施问题（例：本机没有 /opt/scripts/G9/），
- *      **必须降级放行**，否则一上线就把本机所有工具锁死（事故级）。
+ *   3. **表不可达 ＝ 认不出 ⇒ 拒**（fail-closed）。CM 原话：
+ *      「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」。
+ *      ⚠️ 本条原先写的是"表不可达**必须降级放行**" —— 那是**裁决之前**的旧口径；
+ *      它留在这里会与下文「§3 无 actor 怎么办」的 fail-closed 说明**直接矛盾**，故删。
+ *      **唯一仍然放行的**：这个回合**根本不是飞书来的**（GUI／子代理／定时轮）——
+ *      否则会把本机自己锁死（2026-10-04 实测过一次）。
  *
  * 自测：`node identity-inject.mjs --selftest`
  */
@@ -356,7 +360,7 @@ export function selftest () {
 
   console.log('── 5) resolver：失败必须返回错误、不抛 ──')
   const r = makeResolver({ mapPath: '/nonexistent/identity_map.json' })
-  ok(r.resolve('ou_x').err === 'map_unavailable', '表不存在 ⇒ map_unavailable（且 tableOk=false ⇒ 上层放行）')
+  ok(r.resolve('ou_x').err === 'map_unavailable', '表不存在 ⇒ map_unavailable（tableOk=false **仅供告警文案**；上层按 fail-closed 拒，不再据此放行）')
   ok(r.resolve('').err === 'no_open_id', '空 open_id ⇒ no_open_id')
 
   console.log('')
