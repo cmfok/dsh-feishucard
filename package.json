@@ -33,7 +33,9 @@
   "scripts": {
     "check": "node --check index.js && node --check helper.cjs",
     "smoke": "node scripts/smoke.mjs",
-    "sync": "node scripts/sync-to-profile.mjs"
+    "sync": "node scripts/sync-to-profile.mjs",
+    "release": "node scripts/release.mjs",
+    "backfill-tags": "node scripts/release.mjs --backfill-tags"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.73.0"
