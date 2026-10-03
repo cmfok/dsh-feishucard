@@ -3179,6 +3179,12 @@ console.log('55) ★ 同 agent 只允许一个 watcher：新卡注册时必须�
   const window55 = consoleLines.slice(logMark55)
   ok(window55.some((l) => l.includes('stale watcher stopped: agent=')),
     '★ 留痕 `stale watcher stopped`（不静默 —— 本文件口径）')
+  // 0.7.13（TODO-0710 #1）：留痕必须带 **born=<旧bornSeq>/<新bornSeq>** —— token 要首次 sync 成功才有，
+  //   真机 web.log L80023 打出 `old=- new=-` ＝ 查不到是哪两张卡。bornSeq 建卡即有、跨代单调。
+  const bornLine55 = window55.find((l) => l.includes('stale watcher stopped: agent=') && /born=[0-9]+\/[0-9]+/.test(l))
+  ok(Boolean(bornLine55),
+    '★ 留痕带 born=<旧bornSeq>/<新bornSeq>（建卡即有，不依赖 token 同步）实际：'
+    + (bornLine55 ? bornLine55.slice(-110) : '❌ 无 born 字段'))
   ok(stopped55 === true, '★ 同 agent 的旧 watcher 真的被停掉（它的 stop() 被调用 ⇒ clearInterval）')
   ok(zombie.status === 'sealed', '★ 旧卡被就地收口（status=sealed ⇒ 不再继续长）')
   ok(zombie.blocks.some((b) => b.text && b.text.includes('本卡已收口')),
@@ -3377,6 +3383,46 @@ console.log('57e) ★ 0.7.11 MED：clipNoteText 把被截掉的目的行【前�
   const hits57eP = (last57e.match(/🎯 目的行在末尾-壹/g) || []).length
   ok(hits57eP === 1,
     '★ 已在卡上的目的行恰好出现一次（实际 ' + hits57eP + ' 次）')
+}
+
+console.log('60) ★ 0.7.13 TODO#2：回合末尾恰好是工具调用 ⇒ 仍开结论卡（答复不退回过程卡）')
+{
+  // 形状：叙述 → 工具 → 答复 → 工具（**末尾是工具**）。0.7.12 的反向扫描在第一个工具处 break
+  //   ⇒ spokenBlocks 空 ⇒ narrationOnlyTurn ⇒ 不拆结论卡（0.7.13 修：先跳过末尾连续工具）。
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
+  let release60
+  const gate60 = new Promise((r) => { release60 = r })
+  const prevIdle60 = agent.whenIdle
+  agent.whenIdle = () => gate60
+  let seq60 = 15000
+  const mark60 = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq60, data: { message: { content: [{ type: 'text', text: '过程叙述-TAILTOOL-甲' }] } } },
+      { type: 'tool/call', seq: ++seq60, data: { callId: 'c60a', name: 'probe60a', arguments: '{}' } },
+      { type: 'tool/result', seq: ++seq60, data: { message: { source: { callId: 'c60a' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'assistant/message', seq: ++seq60, data: { message: { content: [{ type: 'text', text: '最终答复-TAILTOOL-乙' }] } } },
+      { type: 'tool/call', seq: ++seq60, data: { callId: 'c60b', name: 'probe60b', arguments: '{}' } },
+      { type: 'tool/result', seq: ++seq60, data: { message: { source: { callId: 'c60b' }, content: [{ type: 'text', text: 'done' }] } } },
+    )
+  }
+  feedInbound('om_p2_tailtool', 'P2 末尾工具回合')
+  await settle(4)
+  release60()
+  agent.whenIdle = prevIdle60
+  await settle(3)
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const groups60 = []
+  for (const c of cardsSince(mark60)) {
+    if (c.op === 'create' && c.payload && c.payload.schema === '2.0') groups60.push([])
+    if (groups60.length) groups60[groups60.length - 1].push(JSON.stringify(c.payload || {}))
+  }
+  const last60 = groups60.length ? groups60[groups60.length - 1].join('') : ''
+  ok(groups60.length >= 2,
+    '★ 末尾带工具的回合仍拆出结论卡（实际 ' + groups60.length + ' 张卡；0.7.12 会退回单卡）')
+  ok(last60.includes('最终答复-TAILTOOL-乙'), '★ 结论卡带最终答复')
+  ok(!last60.includes('过程叙述-TAILTOOL-甲'), '★ 结论卡不夹带过程叙述（只取最后一段连续叙述）')
 }
 
 console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢弃（CM：转发卡片没反应）')

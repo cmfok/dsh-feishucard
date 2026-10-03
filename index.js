@@ -2321,9 +2321,13 @@ export function apply(ctx) {
         oldCard.blocks.push({ type: 'message', text: '✅ 本卡已收口，后续内容见下方新卡。' })
         try { void syncCard(old.bot, old.chatId, oldCard, true).catch(() => { }) } catch { }
       }
+      // 0.7.13（TODO-0710 #1）：token 首次 sync 成功才有值 ⇒ 真机打出 old=- new=-（web.log L80023）。
+      //   bornSeq 建卡即有、跨代单调 ⇒ 留痕补 born=<旧>/<新>，两者都保留。
+      const bornOf = (c) => (c && c.bornSeq !== undefined && c.bornSeq !== null ? String(c.bornSeq) : '-')
       console.log('[fs] stale watcher stopped: agent=' + String(agent && agent.id)
         + ' old=' + String((oldCard && oldCard.token) || '-').slice(-8)
-        + ' new=' + String((card && card.token) || '-').slice(-8))
+        + ' new=' + String((card && card.token) || '-').slice(-8)
+        + ' born=' + bornOf(oldCard) + '/' + bornOf(card))
     }
     entry.stop = stop
     liveCardWatchers.add(entry)
@@ -3675,7 +3679,14 @@ export function apply(ctx) {
         if (!event) continue
         // 0.7.9（CM 2026-10-03 ②）：**跨过第一个工具调用就停** —— 结论只取"最后一段连续叙述"，
         // 不再把整轮过程话语 join 进 reply（否则结论卡会夹带过程卡的文字）。
-        if (event.type === 'tool/call' || event.type === 'tool/result') break
+        if (event.type === 'tool/call' || event.type === 'tool/result') {
+          // 0.7.13（TODO-0710 #2）：**末尾连续的工具事件先跳过**（还没收集到文本时 continue）——
+          //   "答复在前、工具在后"的回合旧判据在第一个工具处 break ⇒ spokenBlocks 空 ⇒
+          //   narrationOnlyTurn ⇒ 不拆结论卡（结论退到过程卡末尾）。
+          //   已有文本后再遇工具 ⇒ 维持 0.7.9 语义（只取"最后一段连续叙述"）。
+          if (spokenBlocks.length === 0) continue
+          break
+        }
         if (event.type !== 'assistant/message') continue
         const spoken = extractProcessText(event.data && event.data.message)
         if (!spoken) continue

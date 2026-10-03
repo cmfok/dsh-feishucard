@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.13] - 2026-10-03
+
+### 收尾：TODO-0710 遗留的插件侧两个已知问题（#0 闸门修在落地脚本里，不占版本号）
+
+**① TODO#1：`stale watcher stopped` 留痕打不出卡片标识（真机实证）**
+- 真机 `web.log` L80023：`old=- new=-` —— 卡片 `token` 要**首次 sync 成功之后**才有值，
+  该留痕点取的正是 token ⇒ 真机上查不到是哪两张卡。
+- 现在：追加 **`born=<旧bornSeq>/<新bornSeq>`**（bornSeq 建卡即有、跨代单调）。
+- 断言（case 55 扩展）：留痕行必须含 `born=<数字>/<数字>`（在未修复版上必红）。
+
+**② TODO#2：`spokenBlocks` 反向扫描——"回合末尾恰好是工具调用"的边界**
+- 旧判据跨过**第一个**工具调用就 `break` ⇒ 若答复在前、工具在后（如最后一步是落盘/上报），
+  反向扫到的第一个事件就是工具 ⇒ `spokenBlocks` 空 ⇒ `narrationOnlyTurn` ⇒ **不开结论卡**
+  （结论退到过程卡末尾）。
+- 现在：**末尾连续的工具事件先跳过**（还没收集到文本时 `continue`）；已有文本后再遇工具
+  ⇒ 维持 0.7.9 语义（只取"最后一段连续叙述"）。
+- 新用例 60（先红后绿）：叙述 → 工具 → 答复 → 工具（末尾）—— 0.7.12 上 1 张卡（红），
+  修复后 2 张卡、结论带答复、不夹带过程叙述。
+
+**风险自评（TODO 原文）**：该边界"极少见"（DSH 回合的结束事件通常是无工具的助手消息）——
+本轮把它修掉是为了消灭**已知问题清单**，不是应对活跃故障。
+
 ## [0.7.12] - 2026-10-03
 
 ### 加固：0.7.11 独立审查 5 条（**0 critical / 0 high / 2 medium / 3 low**，逐条核对 0 误报）
