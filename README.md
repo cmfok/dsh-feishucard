@@ -64,9 +64,9 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   When the session already runs at `danger-full-access`, the plugin adds no gate of its own.
 - **保活 / Keep-alive**：helper 崩溃自动重启（5s 冷却防重复）+ 凭据变更自动重连 + SDK 自带重连 + 状态可观测。Crash-restart with spawn cooldown, auto-reconnect, observable connection status.
 - **多机器人 / Multi-bot**：一个实例多个机器人，各自绑定工作区。One instance, many bots, one workspace each.
-- **目标模式进度卡 / Goal-round progress cards（2026-09-16，CM 拍板方案 A）**：目标模式（goal 模式）的续轮**不经过飞书入站**，过去在飞书完全看不到它在干什么。现在插件订阅 `agent/status`：某轮由目标轮驱动 → 自动建卡「🎯 目标模式 · 第 N 轮开始，正在工作…」，**复用与普通回合同一套**流式卡（过程话语 / 工具面板 / 表格换卡全部生效），轮结束封口写「✅ 本轮结束」。只报目标轮，其它自动回合不建卡（不刷屏）。Goal-round continuations never pass through Feishu inbound, so they used to be invisible; an `agent/status` hook now opens the same streaming card per goal round.
+- **目标模式进度卡 / Goal-round progress cards（2026-09-16，经评审确定方案 A）**：目标模式（goal 模式）的续轮**不经过飞书入站**，过去在飞书完全看不到它在干什么。现在插件订阅 `agent/status`：某轮由目标轮驱动 → 自动建卡「🎯 目标模式 · 第 N 轮开始，正在工作…」，**复用与普通回合同一套**流式卡（过程话语 / 工具面板 / 表格换卡全部生效），轮结束封口写「✅ 本轮结束」。只报目标轮，其它自动回合不建卡（不刷屏）。Goal-round continuations never pass through Feishu inbound, so they used to be invisible; an `agent/status` hook now opens the same streaming card per goal round.
 - **`/goal` 命令 / Goal command**：飞书里直接 ` /goal <目标> ` 即可让当前会话进入目标模式（透传到 harness 的 `command-goal`，`pause`/`resume`/`clear`/`edit <新目标>` 子命令同样可用；无参数 = 查看状态）。命令注册表不可用时兜底直连 `goals` 服务创建目标。`/goal <objective>` starts goal mode for that chat's session from Feishu; subcommands pass through to the harness command.
-- **`/switch` 两级：工作区 → 会话 / Two-level workspace & session picker（2026-10-02 重做，CM 定稿 A 方案）**：`/switch` 先发**工作区卡** —— 列出 DSH `workspaceRegistry` 里注册的工作区（**与 GUI 侧边栏同源**），每行显示路径、会话数、🟡 运行中数量、目录是否还在（⚠️ 不存在），并标出 ▶ 当前工作区，按钮「N 进入看会话」/「N 在这里新建」；点「进入」（或 `/switch <工作区序号>`）再发**该工作区的会话卡**，每行「接管 / 新建」，底部「← 返回工作区列表」。🟡 运行中的会话只给"新建"（同一会话被两处同时驱动会写坏历史）。文字兜底 `/switch <工作区序号> [<会话序号>|new]`；`/list` ＝ **当前工作区的会话**（当前工作区 ＝ 活跃会话的 cwd）。新建/接管时会话会**挂进工作区注册表**（best-effort）⇒ GUI 侧边栏也立刻看得到。`/switch` posts a workspace card first (from the DSH `workspaceRegistry`, the same source the GUI sidebar uses), then that workspace's session card; text fallbacks `/switch <ws> [<session>|new]`, and `/list` lists the current workspace's sessions.
+- **`/switch` 两级：工作区 → 会话 / Two-level workspace & session picker（2026-10-02 重做，维护者 定稿 A 方案）**：`/switch` 先发**工作区卡** —— 列出 DSH `workspaceRegistry` 里注册的工作区（**与 GUI 侧边栏同源**），每行显示路径、会话数、🟡 运行中数量、目录是否还在（⚠️ 不存在），并标出 ▶ 当前工作区，按钮「N 进入看会话」/「N 在这里新建」；点「进入」（或 `/switch <工作区序号>`）再发**该工作区的会话卡**，每行「接管 / 新建」，底部「← 返回工作区列表」。🟡 运行中的会话只给"新建"（同一会话被两处同时驱动会写坏历史）。文字兜底 `/switch <工作区序号> [<会话序号>|new]`；`/list` ＝ **当前工作区的会话**（当前工作区 ＝ 活跃会话的 cwd）。新建/接管时会话会**挂进工作区注册表**（best-effort）⇒ GUI 侧边栏也立刻看得到。`/switch` posts a workspace card first (from the DSH `workspaceRegistry`, the same source the GUI sidebar uses), then that workspace's session card; text fallbacks `/switch <ws> [<session>|new]`, and `/list` lists the current workspace's sessions.
 
 - **文件收件 / File inbox（2026-09-09）**：飞书文件/图片/语音消息不再被静默丢弃——自动下载到 fileInbox（配置项，缺省 <workspace>/downloaded_files；**2026-10-02 前实际从未生效**：下载链读 `evt.msg_type` 而 `normalizeEvent()` 只给 `message_type` ⇒ 文件消息被静默丢弃；现在两个键都给，**失败也会明说** HTTP 码；**2026-10-03 起**：文件名**没有扩展名时按文件头补**（jpg/png/gif/webp/bmp/pdf/zip，认不出补 `.bin`；已有扩展名的原样保留），时间戳用**本地时间** `YYYY-MM-DD-HHMMSS`），并向会话注入「收到文件+本地路径」，agent 可直接读取。Inbound Feishu file/image/audio messages are downloaded to fileInbox and surfaced to the agent with a local path.
 - **热重载打断提示 / Hot-reload interrupt notice（2026-10-02 复原并加固）**：保存插件源码即热重载（junction + HMR），而重载会拆掉插件作用域 ⇒ 正在跑的回合被 `aborted(disposed)` 中断。此时插件会在**该会话里**发一条纯文本说明（「♻️ 插件已热重载：上一轮被热重载打断（不是模型出错，也不是你的操作）…」），免得看起来像"说到一半莫名停了"。同一会话只提示一次（幂等）；重载时本来没有回合在跑 ⇒ **不发任何东西**（无噪声）。When a hot reload aborts an in-flight turn, the plugin posts an explanatory notice into that chat (once per session; silent when nothing was running).
@@ -90,7 +90,7 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   **`批准`＝整块可点击的深绿色块（`interactive_container` + `green-600`，白字居中）** / **`拒绝`＝红底白字按钮**（`danger_filled`）。
   也可以直接回文字（精确回「批准」/「同意」＝批准；带补充说明＝修改意见回给模型）。
   三条实现约束（都是真机踩出来的）：① 飞书 2.0 **按钮颜色枚举里没有绿色**；② 绿**不能**挂在
-  `column.background_style` 上 —— 官方注明该字段**需客户端 v7.9+**（CM 手机上根本没渲染），且会被
+  `column.background_style` 上 —— 官方注明该字段**需客户端 v7.9+**（维护者 手机上根本没渲染），且会被
   `width:'fill'` 的按钮整列盖住 ⇒ 绿必须用**整块可点击容器**做；③ markdown 文字要 `text_align:'center'` 居中，
   且加粗**不能**跨在 `<font>` 标签里外（`<font color='white'>**批准</font>**` 会把标签原文当文字漏出来）。
   **为什么以前收不到**：`exit_plan_mode` 走的是 `userQuestions` **服务**（不是 `ask_user_question` 工具），
@@ -171,7 +171,7 @@ dsh web   # 重启 / restart
 | 变量 / Variable | 缺省 / Default | 作用 / Effect |
 | --- | --- | --- |
 | `DSH_FEISHU_GOAL_CARDS` | `1`（开） | 设 `0` 全局关闭「目标模式进度卡」。Set `0` to disable goal-round progress cards. |
-| `DSH_FEISHU_APPROVAL` | `1`（开） | **默认开启**。CM 2026-10-02 改口径：「手机上得要能审批才行，**不可以关了**」（2026-09-16 的"默认关闭、不许改回"按 A20-⑤ 作废）。设 `0`／`false`／`off`／`no` 关闭。覆盖**沙箱越权升级**（`sandbox_permissions`）的审批。**会话已是 `danger-full-access`（用户已授全权）时一律不弹卡** —— 插件不再加一道（2026-10-02 修，见 CHANGELOG 0.4.18）。 |
+| `DSH_FEISHU_APPROVAL` | `1`（开） | **默认开启**。2026-10-02 改口径：「手机上得要能审批才行，**不可以关了**」（2026-09-16 的"默认关闭、不许改回"按  作废）。设 `0`／`false`／`off`／`no` 关闭。覆盖**沙箱越权升级**（`sandbox_permissions`）的审批。**会话已是 `danger-full-access`（用户已授全权）时一律不弹卡** —— 插件不再加一道（2026-10-02 修，见 CHANGELOG 0.4.18）。 |
 | `FS_CONFIG_DIR` | `~/.dsh-feishucard` | 配置文件目录（测试用）。 |
 
 per-bot 配置项 `notifyGoalRounds`（`false` 关闭该机器人的目标卡）写在 `feishu.config.json` 的对应 bot 里。Per-bot `notifyGoalRounds: false` disables goal cards for that bot only.
