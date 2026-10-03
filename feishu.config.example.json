@@ -6,11 +6,27 @@
       "appId": "cli_xxxxxxxxxxxxxxxx",
       "appSecret": "your_app_secret",
       "reactionEmoji": "OnIt",
-      "fileInbox": "<可选：收件目录绝对路径>"
+      "fileInbox": "<可选：收件目录绝对路径>",
+
+      "ownerOpenId": "",
+      "notifyGoalRounds": true,
+      "notifyAgentNotices": true,
+      "splitConclusionMinMs": 30000,
+      "approvalForm": false,
+      "identityGuard": false,
+      "mode": "full"
     }
   ],
   "_notes": {
     "workspace": "required: the absolute path of the workspace this bot serves — fill in your own machine's path; never commit a real one",
-    "fileInbox": "optional: directory where inbound Feishu file/media messages are saved; defaults to <workspace>/downloaded_files"
+    "fileInbox": "optional: directory where inbound Feishu file/media messages are saved; defaults to <workspace>/downloaded_files",
+    "_switches": "The 7 keys below are all OPTIONAL per-bot switches. Omit them entirely and the plugin still works on defaults. (JSON has no comments, so defaults are documented here.)",
+    "ownerOpenId": "optional, string, default \"\". Admin open_id — only needed when the bot must push proactively before any chat exists (no chat_id known yet).",
+    "notifyGoalRounds": "optional, boolean, default TRUE (write false to disable). Set false to turn off goal-round progress cards for this bot only. Process-wide kill switch: env DSH_FEISHU_GOAL_CARDS=0.",
+    "notifyAgentNotices": "optional, boolean, default TRUE (write false to disable). Set false to stop subagent-settled broadcast cards for this bot.",
+    "splitConclusionMinMs": "optional, number(ms), default 30000. A finished turn longer than this posts its conclusion as a NEW card (a new message, so Feishu notifies you); shorter turns stay on one card. 0 = always split. Env fallback: DSH_FEISHU_SPLIT_MIN_MS.",
+    "approvalForm": "optional, boolean, DEFAULT FALSE — you MUST write true explicitly to enable. Routes sandbox-escalation approvals as an in-chat button card. ⚠️ Do not confuse with the env var DSH_FEISHU_APPROVAL, which defaults to ON and governs the process; this per-bot key is what gates the card channel.",
+    "identityGuard": "optional, boolean, DEFAULT FALSE. Enables the identity gate (resolve the acting person from the inbound open_id, overwrite identity arguments on tool calls, fail-closed when it cannot be resolved). Off = all identity logic is skipped; most upstream users do not need it.",
+    "mode": "optional, string, default \"full\". Either \"full\" or \"stable\". \"stable\" is the reduced rendering mode used for group chats / limited environments."
   }
 }
