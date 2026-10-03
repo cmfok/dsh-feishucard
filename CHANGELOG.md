@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-10-03
+
+### 修复：**CI 一直是红的**（真因找到并根治）+ 第四轮独立审查
+
+> **CI 真因（本次才查清）**：`.github/workflows/ci.yml` 固定 `node-version: 20`，而 `index.js` **顶层**就
+> `import { zstdDecompressSync } from 'node:zlib'`（Node ≥ 22.15 才提供该导出）⇒ 在 Node 20 上加载插件直接
+> `SyntaxError: The requested module 'node:zlib' does not provide an export named 'zstdDecompressSync'`。
+> **从引入这一行起，每一次 push 的 CI 都是红的**（不是偶发，也不是这次才坏）。
+> 本机生产运行时是 **Node v24.15.0** ⇒ CI 升到 **24**，与生产对齐。
+> 另一处平台坑：冒烟夹具原先用 Windows 专有的 `TEMP`（G 用例在 ubuntu 上必红）—— 0.7.1 已改 `tmpdir()`。
+
+**第四轮审查（0 critical / 0 high / 1 medium / 7 low）修复：**
+- **MED 私钥识别泛化**：原先只认 `BEGIN (RSA|OPENSSH|EC|DSA|PGP)? PRIVATE KEY` ⇒
+  `-----BEGIN ENCRYPTED PRIVATE KEY-----`（`openssl pkcs8 -topk8` 的产物）等标准 PEM 标签**漏检**，
+  改名的密钥文件会绕过"内容疑似私钥一律不传"这道闸。现在按 `BEGIN(?: [A-Z0-9]+)* PRIVATE KEY` 拦。
+- **`exceed` 过宽**：任何含 `exceed` 的字样（`timeout exceeded` / `retries exceeded`）都会被判成"体积类"
+  并触发正文抢救 + 错误的体积文案 ⇒ 收紧为 `exceed\w*.{0,20}limit`。
+- **附件名安全闸自相矛盾**：`SENSITIVE_PATH_RE` 里还留着 `token|cookie|password|secret|credential` 这些**松词**，
+  与紧邻注释（"松词只在文件名主干完全相等时才敏感"）冲突 ⇒ 按注释把松词完全交给 `SENSITIVE_STEM` 精确判定：
+  `token-budget.md` / `password-reset-notes.md` / `cookie-notes.md` 不再被误拒，而 `token` / `.env` / `id_rsa` 仍然拦。
+- **死代码收尾**：上一版删掉 `card.stallNotified` 初值时漏了三处赋值（写进去没人读）⇒ 一并清掉。
+- **冒烟加固**：文件用例补"本地路径已从卡里抹掉"断言（与图片用例对齐）；
+  夹具改放**本次运行独有**的临时目录并在结束时整目录删除（不怕撞车、异常退出也不污染共享 temp）；
+  "工具未注册"的兜底返回值加 `missing` 标记，避免它把"两次都失败"那条负向断言**假绿**。
+
 ## [0.7.1] - 2026-10-03
 
 ### 修复：独立代码审查（`code-review-gate` / ocr）第一轮 findings
