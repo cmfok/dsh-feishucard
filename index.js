@@ -3063,12 +3063,17 @@ export function apply(ctx) {
         const t = r.title
         const idx = chatIndexById.has(String(r.sessionId)) ? chatIndexById.get(String(r.sessionId)) : -1
         if (idx >= 0 && t && chat.sessions[idx].title !== t) { chat.sessions[idx].title = t; titleChanged = true }
-        const name = t || r.summary || r.label || shortSessionId(r.sessionId)
+        // 2026-10-04（方案 B）：标题与摘要**都显示** —— 原先 `t || r.summary` 是二选一（有标题就看不到内容）。
+        const base = t || r.label || shortSessionId(r.sessionId)
         const flags = []
         if (r.current) flags.push('当前')
         else if (r.inChat) flags.push('本聊天')
         if (r.live) flags.push('🟡 运行中')
-        return (r.current ? '▶ ' : '  ') + (i + 1) + '. ' + name + (flags.length ? '（' + flags.join('·') + '）' : '')
+        // 摘要与主名不同才另起一行（没标题时会退化用 label/id，那种情况也不重复显示）
+        const extra = (r.summary && r.summary !== base)
+          ? '\n     <font color=\'grey\'>' + r.summary + '</font>' : ''
+        return (r.current ? '▶ ' : '  ') + (i + 1) + '. ' + base
+          + (flags.length ? '（' + flags.join('·') + '）' : '') + extra
       })
       if (titleChanged) { try { persistChats(bot, bot.chats) } catch { /* 落盘失败不影响展示 */ } }
       const head = '**工作区**：' + ws.title + '　`' + (ws.path || '?') + '`'
@@ -5066,7 +5071,11 @@ export function apply(ctx) {
       }
     })
     // 没标题的补"首条消息"当摘要（认得出是哪一个）；读盘有代价，最多 8 条
-    const need = rows.filter((r) => !r.title).slice(0, 8)
+    // 2026-10-04（CM 选定方案 B）：**改为"所有行都取摘要"** ——
+    //   原先是 `filter(r => !r.title)`，只有【没标题】的会话才去读；而 DSH 现在几乎每个会话都有标题
+    //   ⇒ need 恒为空 ⇒ 首条消息摘要**从来没被读过**（CM 实测：「显示的是标题，但是没有显示会话内容」）。
+    //   上限仍是 8 条（读盘开销由它兜住，未变）。
+    const need = rows.slice(0, 8)
     if (need.length) {
       const sp = ctx.get('sessionPersistence')
       const texts = await Promise.all(need.map((r) => firstUserText(sp, r.meta, r.size)))
@@ -5176,13 +5185,18 @@ export function apply(ctx) {
     rows.forEach((row, j) => {
       const n = j + 1
       const what = clipSessionName(row.title || row.summary || row.label || '（未命名会话）')
+      // 2026-10-04（CM 选定方案 B）：**标题在按钮上，首条消息摘要另起一行灰色小字**。
+      //   原实现是 `title || summary` 二选一 ⇒ 标题非空时永远看不到摘要（CM：「没有显示会话内容」）。
+      //   出卡前会经 sanitizeCardElements → sanitizeMarkdownForFeishu 统一清洗 ⇒ 这里不必手工转义。
+      const sub = row.summary ? '<font color=\'grey\'>' + clipSessionName(row.summary) + '</font>' : ''
       const blocked = row.live && !row.inChat && !row.current
       if (j > 0) elements.push({ tag: 'hr' })      // CM：会话之间要分隔线
       if (blocked) {
         // 不能切换的行**不给按钮**（给了只会点出一句"不能接管"），用一行文字写清
         elements.push({
           tag: 'markdown',
-          content: n + '. **' + what + '**　<font color=\'grey\'>🟡 正在别处运行，不能切换</font>',
+          content: n + '. **' + what + '**　<font color=\'grey\'>🟡 正在别处运行，不能切换</font>'
+            + (sub ? '\n' + sub : ''),
         })
         return
       }
@@ -5196,6 +5210,7 @@ export function apply(ctx) {
           value: { fs_switch: ws.token, fs_level: 'sess', fs_i: ws.index, fs_j: j, fs_mode: 'takeover' },
         }],
       })
+      if (sub) elements.push({ tag: 'markdown', content: sub })
     })
     elements.push({ tag: 'hr' })
     // 翻页（有第二页才出现）：一排两个等分；只有一侧可点时用 stretch 单个铺满
