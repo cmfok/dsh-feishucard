@@ -3799,30 +3799,92 @@ export function apply(ctx) {
         //    都走这里（conclusionEligible = !notSpoken && !narrationOnlyTurn && elapsed>=30s）。
         // 0.7.10（独立审查 MED#3799 修正）：**不能按"整段相等"判重** —— 镜像 note 走 appendNote 时会被
         //   `clipNoteText(…, MAX_NOTE_CHARS=500)` 处理，而它**不是纯截断**：它在 500 字附近**按换行切**、
-        //   去掉尾部表格行、**补一个 `…`**、还可能把被切掉的 🎯 目的行**补回末尾** ⇒ 剪过的 note
+        //   去掉尾部表格行、**补一个 `…`**、还可能把被切掉的 🎯 目的行**前置**到 note 开头 ⇒ 剪过的 note
         //   **不是 reply 的前缀**（我第一版用 startsWith 判，仍然失配 —— 自查时当场发现并改掉）。
         //   判据改为**最长公共前缀**：
         //     · 没被截断（整段已在卡上）⇒ 公共前缀 = 整段 ⇒ 尾部为空 ⇒ 一个字都不追加（零重复）
         //     · 被截断/换行切过 ⇒ 公共前缀 ≈ 500 ⇒ 只补 `…` 之后那半段（不丢字、也不重复前 500 字）
         const normText = (x) => String(x == null ? '' : x).replace(/\s+/g, ' ').trim()
         const replyRaw = String(reply)
-        const replyNorm = normText(replyRaw)
         const commonPrefixLen = (a, b) => {
           const n = Math.min(a.length, b.length)
           let i = 0
           while (i < n && a[i] === b[i]) i++
           return i
         }
-        let shownChars = 0
+        // 0.7.11（独立审查 0.7.10：HIGH#3823 / MED#3825 / MED#3819，逐条核对 0 误报）三处修正：
+        // ① 「整段已在卡上」（公共前缀 = 整段）必须**显式**判「无需追加」，不受 120 阈值闸限制 ——
+        //    否则 <120 字的短回复整段重追加（**最高频**路径，恰是本去重要消灭的重复，HIGH#3823）。
+        // ② 归一化会折叠空白（\n\n→空格、首尾 trim）⇒ 归一化长度 ≠ 原文长度；切原文必须用
+        //    「归一化下标 → 原文下标」映射（normWithMap 的 ends），不能拿归一化长度直接 slice（MED#3825）。
+        // ③ clipNoteText 会把被截掉的 🎯 目的行**前置**到镜像 note 开头（见上方 missing 分支：
+        //    `missing… + '\n' + clipped`，0.7.10 注释写"补回末尾"系笔误）⇒ 比较前两侧都要剥掉
+        //    前置 🎯 行，否则"🎯 在末尾"的长回复（smoke 28 形状）公共前缀 = 0，整段重追加（MED#3819）。
+        // 安全阀：凡这次"不再追加"的部分（前置行、已展示前缀）必须逐段确认真的在卡上；
+        // 任何一段查不到 ⇒ 放弃去重整段照发 —— 宁可重复，不可丢字（CM 红线）。
+        const LEADING_PURPOSE_RE = /^(?:[^\S\n]*(?:[-*][^\S\n]*)?🎯[^\n]*(?:\n|$))+/
+        const normWithMap = (s) => {
+          const raw = String(s == null ? '' : s)
+          const chars = []
+          const ends = []
+          let i = 0
+          while (i < raw.length) {
+            if (/\s/.test(raw[i])) {
+              let j = i
+              while (j < raw.length && /\s/.test(raw[j])) j++
+              chars.push(' '); ends.push(j)
+              i = j
+            } else {
+              chars.push(raw[i]); ends.push(i + 1)
+              i++
+            }
+          }
+          let a = 0, z = chars.length
+          while (a < z && chars[a] === ' ') a++
+          while (z > a && chars[z - 1] === ' ') z--
+          return { n: chars.slice(a, z).join(''), ends: ends.slice(a, z) }
+        }
+        const stripLeadingPurpose = (s) => {
+          const t = String(s || '')
+          const m = t.match(LEADING_PURPOSE_RE)
+          return m ? { text: t.slice(m[0].length), stripped: m[0] } : { text: t, stripped: '' }
+        }
+        const noteTexts = card.blocks.filter((b) => b && typeof b.text === 'string' && b.text).map((b) => b.text)
+        const onCard = (line) => {
+          const t = line.trim()
+          return Boolean(t) && noteTexts.some((tx) => tx.includes(t))
+        }
+        const replyStripped = stripLeadingPurpose(replyRaw)
+        const stripOffset = replyStripped.stripped.length
+        const rm = normWithMap(replyStripped.text)
+        const replyNorm = rm.n
+        let shownChars = -1
         for (const b of card.blocks) {
           if (!b || typeof b.text !== 'string' || !b.text) continue
-          const n = normText(b.text)
+          const nn = stripLeadingPurpose(b.text)
+          const n = normText(nn.text)
           if (!n) continue
           const c = commonPrefixLen(n, replyNorm)
-          // 阈值 120：避免把"一句短旁白恰好与开头相同"误判成"这段已经展示过了"
-          if (c >= 120) shownChars = Math.max(shownChars, Math.min(c, replyRaw.length))
+          const fullShown = c === replyNorm.length && replyNorm.length > 0
+          // 阈值 120：避免把"一句短旁白恰好与开头相同"误判成"这段已经展示过了"（整段命中不受此限）
+          if (!fullShown && c < 120) continue
+          const strippedLines = (replyStripped.stripped + '\n' + nn.stripped).split('\n').filter((x) => x.trim())
+          if (!strippedLines.every(onCard)) continue
+          const rawEnd = c > 0 ? rm.ends[c - 1] : 0
+          const abs = fullShown ? replyRaw.length : stripOffset + rawEnd
+          shownChars = Math.max(shownChars, abs)
+          if (fullShown) break
         }
-        const tail = shownChars > 0 ? replyRaw.slice(shownChars).trim() : replyRaw
+        let tail
+        if (shownChars < 0) {
+          tail = replyRaw
+        } else {
+          // 已在卡上的目的行不随尾部重复（clipNoteText 的 kept/missing 保证它们全部可见过）；
+          // 卡上查不到的目的行保留 —— 宁可重复，不可丢字。
+          tail = replyRaw.slice(shownChars).split('\n')
+            .filter((line) => (/^\s*(?:[-*][^\S\n]*)?🎯/.test(line) ? !onCard(line) : true))
+            .join('\n').trim()
+        }
         if (tail) card.blocks.push({ type: 'message', text: tail })
         replaced = true
       }

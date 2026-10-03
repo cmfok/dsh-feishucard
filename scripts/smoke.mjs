@@ -3290,7 +3290,93 @@ console.log('57) ★ 0.7.9 P2：过程卡不许丢字；结论卡不许夹带过
     const last57b = ops57b.length ? JSON.stringify(ops57b[ops57b.length - 1].payload) : ''
     const hits57b = (last57b.match(/LONGMARK-开头/g) || []).length
     ok(hits57b <= 1,
-      '★ 长回复（>500 字）不许在**同一张卡的最后形态**里出现两次（实际 ' + hits57b + ' 次；旧实现过程卡会重复）')  }
+      '★ 长回复（>500 字）不许在**同一张卡的最后形态**里出现两次（实际 ' + hits57b + ' 次；旧实现过程卡会重复）')
+  }
+}
+
+console.log('57c) ★ 0.7.11 HIGH：短回复（<120 字）整段已在卡上 ⇒ 收口不得整段重追加')
+{
+  let release57c
+  const gate57c = new Promise((r) => { release57c = r })
+  const prevIdle57c = agent.whenIdle
+  agent.whenIdle = () => gate57c
+  let seq57c = 14100
+  const mark57c = sentCards.length
+  const shortReply = 'SHORTMARK-短旁白整段已展示-收尾'
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: ++seq57c, data: { message: { content: [{ type: 'text', text: shortReply }] } } })
+  }
+  feedInbound('om_p2_short', 'P2 短回复不重复')
+  await settle(4)
+  release57c()
+  agent.whenIdle = prevIdle57c
+  await settle(3)
+  // 口径（§10.8）：**同一张卡的最后一次 payload** 里数出现次数 —— 跨窗口计数永不失败
+  const ops57c = cardsSince(mark57c).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last57c = ops57c.length ? JSON.stringify(ops57c[ops57c.length - 1].payload) : ''
+  const hits57c = (last57c.match(/SHORTMARK-短旁白整段已展示-收尾/g) || []).length
+  ok(hits57c <= 1,
+    '★ 短回复（<120 字）整段已在卡上不许重复出现（实际 ' + hits57c + ' 次；0.7.10 的 120 阈值把「整段已在」判死）')
+}
+
+console.log('57d) ★ 0.7.11 MED：空白折叠后归一化长度≠原文长度 ⇒ 不得按归一化长度切原文')
+{
+  let release57d
+  const gate57d = new Promise((r) => { release57d = r })
+  const prevIdle57d = agent.whenIdle
+  agent.whenIdle = () => gate57d
+  let seq57d = 14200
+  const mark57d = sentCards.length
+  // 甲段 99 字符 + 45 个换行 + 乙段 39 字符 = 原文 183；归一化 139（45 换行折叠成 1 空格，省 44）
+  // 0.7.10 的 bug：shownChars=139（归一化长度）直接切原文 ⇒ slice(139) 把乙段整段重吐一遍。
+  const paraA = 'BLANKTAIL-MARKER-甲-' + 'P'.repeat(80)
+  const paraB = 'BLANKTAIL-MARKER-乙-' + 'Q'.repeat(20)
+  const blankReply = paraA + '\n'.repeat(45) + paraB
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: ++seq57d, data: { message: { content: [{ type: 'text', text: blankReply }] } } })
+  }
+  feedInbound('om_p2_blank', 'P2 空行回复不重复')
+  await settle(4)
+  release57d()
+  agent.whenIdle = prevIdle57d
+  await settle(3)
+  const ops57d = cardsSince(mark57d).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last57d = ops57d.length ? JSON.stringify(ops57d[ops57d.length - 1].payload) : ''
+  const hits57d = (last57d.match(/BLANKTAIL-MARKER-乙/g) || []).length
+  ok(hits57d <= 1,
+    '★ 含空行的已展示回复不得按归一化长度切片重吐尾部（实际 ' + hits57d + ' 次）')
+}
+
+console.log('57e) ★ 0.7.11 MED：clipNoteText 把被截掉的目的行【前置】到 note 开头 ⇒ 必须剥掉再算公共前缀')
+{
+  let release57e
+  const gate57e = new Promise((r) => { release57e = r })
+  const prevIdle57e = agent.whenIdle
+  agent.whenIdle = () => gate57e
+  let seq57e = 14300
+  const mark57e = sentCards.length
+  // smoke 28 同款形状作为**回复**：正文 600+ 字（必被 500 截断）、🎯 目的行在末尾（被切掉 ⇒ 前置到 note 开头）
+  // 0.7.10 的 bug：note 以 🎯 开头 ⇒ 公共前缀=0 ⇒ 整段重追加；修后还须保证目的行不随尾部二次出现。
+  const longReply = 'PURPMARK-正文开头-' + 'X'.repeat(600) + '\n🎯 目的行在末尾-壹'
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: ++seq57e, data: { message: { content: [{ type: 'text', text: longReply }] } } })
+  }
+  feedInbound('om_p2_purpose', 'P2 目的行前置不重复')
+  await settle(4)
+  release57e()
+  agent.whenIdle = prevIdle57e
+  await settle(3)
+  const ops57e = cardsSince(mark57e).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last57e = ops57e.length ? JSON.stringify(ops57e[ops57e.length - 1].payload) : ''
+  const hits57e = (last57e.match(/PURPMARK-正文开头-/g) || []).length
+  ok(hits57e <= 1,
+    '★ 目的行前置形状不得整段重追加（实际 ' + hits57e + ' 次）')
+  const hits57eP = (last57e.match(/🎯 目的行在末尾-壹/g) || []).length
+  ok(hits57eP <= 1,
+    '★ 已在卡上的目的行不得随尾部二次出现（实际 ' + hits57eP + ' 次）')
 }
 
 console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢弃（CM：转发卡片没反应）')
