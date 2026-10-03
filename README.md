@@ -250,7 +250,7 @@ Hot-reloaded from the bot config (10s), no restart needed — **fixed in 0.4.13*
 按顺序取**第一个存在的**：
 
 1. 环境变量 `MAILBOX_IDENTITY_MAP`
-2. `/opt/scripts/G9/identity_map.json`（服务器部署）
+2. **部署目录下的 `identity_map.json`**（服务器上的固定位置；想换路径就设 `MAILBOX_IDENTITY_MAP`）
 3. **`<你的工作区>/output/g9-identity/identity_map.json`**
 4. 从当前工作目录**逐级向上 6 层**
 5. 内置的已知工作区兜底
