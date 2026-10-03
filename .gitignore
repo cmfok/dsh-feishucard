@@ -12,6 +12,10 @@ identity_map.json
 identity_map.local.json
 *.local.json
 
+# python（scripts/*.py 的编译产物）
+__pycache__/
+*.pyc
+
 # logs
 *.log
 npm-debug.log*
