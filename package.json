@@ -35,7 +35,8 @@
     "smoke": "node scripts/smoke.mjs",
     "sync": "node scripts/sync-to-profile.mjs",
     "release": "node scripts/release.mjs",
-    "backfill-tags": "node scripts/release.mjs --backfill-tags"
+    "backfill-tags": "node scripts/release.mjs --backfill-tags",
+    "backfill-releases": "node scripts/release.mjs --backfill-releases"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.73.0"

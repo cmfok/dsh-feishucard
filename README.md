@@ -298,6 +298,37 @@ npm run sync                   # 同步到 profile 副本（含体检 + 校验�
 
 冒烟测试覆盖 / covered by the smoke suite：helper 注册、入站消息管线（会话创建/消息投递）、流式卡片（create/PATCH/schema/工具面板/状态符号/note/seal）、命令处理、链路稳定性。Helper registration, inbound pipeline, streaming card lifecycle, commands, end-to-end stability.
 
+### 发布 / Releasing
+
+**一条命令（防漏）** —— 目的是让「漏写 CHANGELOG / 忘打 tag / 忘建 Release」在**机制上**不可能发生：
+
+```sh
+# ① 先在 CHANGELOG.md 顶部写一段：## [0.7.19] - YYYY-MM-DD
+# ② 然后：
+npm run release 0.7.19
+```
+
+`npm run release <version>` 依次做：**校验** → 改 `package.json` 版本 → commit → 打 annotated tag
+→ push master → push tag → `gh release create`（**说明从 CHANGELOG 的该版本段自动切出**）。
+
+**四条硬闸门，任何一条不过就拒绝执行**（绝不静默跳过）：
+
+1. 必须在 git 仓库里，且分支是 `master`
+2. **工作区干净**（不把半成品发出去）
+3. 🔑 **`CHANGELOG.md` 必须已有 `## [<version>]` 段** —— 这是防「漏写 CHANGELOG」的关键
+4. 该 tag 未存在
+
+其他子命令：
+
+```sh
+npm run release 0.7.19 -- --dry-run   # 只体检，不改任何东西
+npm run backfill-tags                 # 按 package.json 的 version 变更历史补历史 tag（对不上的会列出、不硬猜）
+npm run backfill-releases             # 为已有 tag 补 GitHub Release（notes 取自 CHANGELOG）
+```
+
+> **为什么要有这个脚本**：发版要做五件事，**全靠人记就必漏**。实测后果是 CHANGELOG 缺了一版、
+> tag 从 `v0.3.0` 之后再没打过 ⇒ 仓库首页的 Release 停在两个月前 ⇒ **看起来像停更**。
+
 ## 独立审查门槛 / Review gate
 
 推送前过一道**独立**的 AI 代码审查（`code-review-gate` skill，底座 [alibaba/open-code-review](https://github.com/alibaba/open-code-review)，模型 `deepseek-flash`）。
