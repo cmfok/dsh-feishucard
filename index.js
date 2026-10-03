@@ -1409,10 +1409,13 @@ export function apply(ctx) {
   const SAFE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
   const SAFE_FILE_EXT = new Set(['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
     '.mp4', '.opus', '.txt', '.csv', '.md', '.zip'])
-  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|apikey|api[_-]?key|keychain|private[_-]?key|\.ssh|\.aws|\.dsh)([\\/_.-]|$)/i
+  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|apikey|api[_-]?key|keychain|private[_-]?key|\.ssh|\.aws|\.dsh|secrets|tokens|cookies|passwords|credentials)([\\/_.-]|$)/i
   // 最松的几个词（key/env/pwd…）只在**文件名主干完全等于它**时才算敏感 ——
   // 否则 `key-notes.pdf` / `env-diff.md` 这类正常文件会被误当成凭证（独立审查 LOW#1412）。
-  const SENSITIVE_STEM = new Set(['key', 'keys', 'env', 'pwd', 'secret', 'token', 'password', 'passwd', 'credential', 'credentials', 'cookie'])
+  // ⚠️ 单复数都要在（审查 MED#1412：把松词从正则里挪走后，只剩单数会造成
+  // `secrets.txt` / `tokens.txt` / `cookies.txt` **两道闸都过**、真的会被上传）。
+  const SENSITIVE_STEM = new Set(['key', 'keys', 'env', 'pwd', 'secret', 'secrets', 'token', 'tokens',
+    'password', 'passwords', 'passwd', 'credential', 'credentials', 'cookie', 'cookies'])
   function extOf(p) {
     const m = baseNameOf(p).match(/\.[A-Za-z0-9]+$/)
     return m ? m[0].toLowerCase() : ''

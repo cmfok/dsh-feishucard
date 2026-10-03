@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-10-03
+
+### 修复：第五轮审查（含一条**本版自己引入的安全回归**）
+
+> 第五轮：0 critical / 0 high / 1 medium / 2 low（门槛 **WARN**）。medium 是我在 0.7.2 里"收紧"时**自己捅出来的**：
+> 把 `secret/token/cookie` 这类松词从 `SENSITIVE_PATH_RE` 挪到精确主干判定（`SENSITIVE_STEM`）时
+> **只写了单数** ⇒ 主干恰好是**复数**的文件（`secrets.txt` / `tokens.txt` / `cookies.txt`）
+> **两道闸都过**、真的会被上传（`.txt/.md/.csv/.zip` 都在文件白名单里）。已复核为真并修：
+> - `SENSITIVE_PATH_RE` 显式补回复数（`secrets|tokens|cookies|passwords|credentials`）；
+> - `SENSITIVE_STEM` 补齐单复数两份，避免下次再"改一处漏一处"。
+
+**低危（顺手做掉）**
+- `.github/workflows/ci.yml` 增加 `permissions: contents: read`（该 job 只做 checkout + 测试，最小权限）。
+- `package.json` 增加 `"engines": { "node": ">=22.15.0" }`：`index.js` 顶层就用 `zlib.zstdDecompressSync`
+  （Node ≥22.15），原先 Node 18/20 上 `npm install` 静默成功、加载插件才炸出难懂的 SyntaxError；
+  现在安装期就能看到要求（也解释了 CI 为什么必须 ≥22）。
+
 ## [0.7.2] - 2026-10-03
 
 ### 修复：**CI 一直是红的**（真因找到并根治）+ 第四轮独立审查
