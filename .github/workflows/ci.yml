@@ -27,6 +27,12 @@ jobs:
       - name: Install deps
         run: npm i --no-save
 
+      # 发布物 ≠ 本地：`files` 漏掉一个被相对 import 的文件时，**本地冒烟照样全绿**，
+      # 而别人 `npm i` 装上去会直接 `failed to import`（现场实证过一次）。
+      # 这一步把它挡在 push / PR 阶段，而不是等发版时才拦。
+      - name: Packaging integrity
+        run: node scripts/check-packaging.mjs --repo .
+
       - name: Smoke test
         run: npm run smoke
 
