@@ -4785,21 +4785,32 @@ export function apply(ctx) {
   }
 
   // 首条用户消息（摘要）：只对**体积可控**的日志读，绝不为列个表去解析几百 MB 的历史。
-  async function firstUserText(sp, meta, size) {
-    // 2026-10-02 A 方案：调用方现在会传"只有活会话、没有持久化快照"的行（meta === undefined），
-    // 以及注册表/持久化服务缺失的情况 ⇒ 这里必须先挡住，否则整张会话卡会崩在 `meta.id` 上。
-    // 2026-10-04 放宽：**不再要求 `sp` 非空** —— 0.2.0 起 `sessionPersistence` 可能已不存在，
-    // 而新接口 `sessionQuery.readSession` 并不需要它；原先的 `!sp` 判断会让摘要恒空（见上）。
-    if (!meta || !meta.id) return ''
-    if (Number.isFinite(size) && size > SWITCH_SUMMARY_MAX_BYTES) return ''
+  // ⚠️ 2026-10-04（**第四层**，也是真正一直在静默返回的那层）：**改为接收 `sessionId` 而不是 `meta`** ——
+  //   调用方在"只有活会话、没有持久化快照"的行上 `meta` 为 undefined（见 buildSessionRows 里的注释），
+  //   而本函数开头 `if (!meta || !meta.id) return ''` ⇒ **立刻返回、连一条日志都没有**（纯静默）。
+  //   新接口 `sessionQuery.readSession(sessionId)` 只需要会话 id ⇒ **根本不需要 meta**，
+  //   所以这里的 meta 依赖纯属历史包袱。三处静默返回也都补上了可见诊断。
+  async function firstUserText(sp, sessionId, size) {
+    if (!sessionId) {
+      console.log('[fs] switch: summary skipped (no sessionId)')
+      return ''
+    }
+    if (Number.isFinite(size) && size > SWITCH_SUMMARY_MAX_BYTES) {
+      console.log('[fs] switch: summary skipped for ' + sessionId + ' size=' + size + ' > ' + SWITCH_SUMMARY_MAX_BYTES)
+      return ''
+    }
     try {
-      const pending = Promise.resolve(readSessionLog(sp, meta.id))
+      const pending = Promise.resolve(readSessionLog(sp, sessionId))
       pending.catch(() => {})                       // 超时后仍会 reject：先挂上处理器
       const raced = await Promise.race([
         pending,
         new Promise((resolve) => { setTimeout(() => resolve(undefined), SWITCH_SUMMARY_TIMEOUT_MS) }),
       ])
-      if (!raced || !Array.isArray(raced.events)) return ''
+      if (!raced || !Array.isArray(raced.events)) {
+        console.log('[fs] switch: no snapshot for ' + sessionId
+          + ' raced=' + (raced === undefined ? 'undefined(timeout?)' : typeof raced))
+        return ''
+      }
       for (const ev of raced.events) {
         if (!ev || ev.type !== 'user/message') continue
         // ⚠️ 两种事件结构都要兼容（2026-10-04 实测差异）：
@@ -4821,10 +4832,10 @@ export function apply(ctx) {
       // （避免再次出现"摘要为空但日志全绿"的静默失败）
       const kinds = {}
       for (const ev of raced.events) { const t = (ev && ev.type) || '?'; kinds[t] = (kinds[t] || 0) + 1 }
-      console.log('[fs] switch: no user text for ' + meta.id
+      console.log('[fs] switch: no user text for ' + sessionId
         + ' events=' + raced.events.length + ' types=' + JSON.stringify(kinds).slice(0, 220))
     } catch (error) {
-      console.log('[fs] switch: summary read failed for ' + meta.id + ': ' + String(error && error.message || error))
+      console.log('[fs] switch: summary read failed for ' + sessionId + ': ' + String(error && error.message || error))
     }
     return ''
   }
@@ -5092,7 +5103,12 @@ export function apply(ctx) {
     const need = rows.slice(0, 8)
     if (need.length) {
       const sp = ctx.get('sessionPersistence')
-      const texts = await Promise.all(need.map((r) => firstUserText(sp, r.meta, r.size)))
+      // ⚠️ 传 `r.sessionId`（**不是 `r.meta`**）—— meta 在"只有活会话"的行上是 undefined，
+      //   而 firstUserText 原先第一行就 `if (!meta …) return ''` ⇒ **摘要从不产生、且连日志都没有**
+      //   （2026-10-04 找到的第四层，也是这次"改了三刀仍无摘要"的真正原因）。
+      const texts = await Promise.all(need.map((r) => firstUserText(sp, r.sessionId, r.size)))
+      console.log('[fs] switch: summary fill need=' + need.length
+        + ' lens=[' + texts.map((t) => (t ? String(t).length : 0)).join(',') + ']')
       need.forEach((r, i) => { r.summary = texts[i] || '' })
     }
     return rows
