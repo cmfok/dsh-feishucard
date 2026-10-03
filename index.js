@@ -138,9 +138,6 @@ export function apply(ctx) {
   // ⇒ 可能是上一代在应答。这里留住 disposer，随本代卸载一起注销（见 ctx.effect）。
   const agentScopeDisposers = []
 
-  // 审批单工具（方案 B）**始终注册** —— 这个声明只是为了让"注册 disposer"有个统一名字，
-  // 真正的注册在下面的 `ctx.effect` 里（声明放最前面是为了避开 TDZ：ensureHelpers 也会用到它）。
-  let approvalFormDisposer = null
 
   // 载荷/正文指纹（只为留痕：飞书对 2.0 卡片只回占位符，正文读不回来；
   // 有了指纹就能在日志里直接比对"两张卡是不是同一段内容"）。djb2，无依赖。
@@ -492,13 +489,17 @@ export function apply(ctx) {
   // ⇒ 所以把清洗放在**这一个唯一收口点**上：任何纯文本兜底都自动免疫。
   // ⚠️ 只剥"飞书真不支持/会整卡被拒"的东西；**`<font>` 是要保留的**（卡片 markdown 支持颜色），
   //    之前那个坑是**跨标签嵌套**（`<font>**X**</font>`），那个在 P1-5 的发卡链里按"已知好形态"修正。
+  // 卡片 markdown **不支持**的 HTML 标签（会整卡被拒 / 把标签原文漏给用户）——
+  // **一处定义**：stripUnsendable（纯文本兜底）与 sanitizeMarkdownForFeishu（发卡前清洗）共用，
+  // 免得两份黑名单各改各的（独立审查 LOW#1576）。
+  const UNSUPPORTED_HTML_TAG_RE = /<\/?(?:div|span|table|thead|tbody|tr|td|th|html|body|script|style|iframe)\b[^>]*>/gi
   function stripUnsendable(text) {
     let out = String(text == null ? '' : text)
     // ① 本地图片路径（Windows 盘符 / file:// / POSIX 绝对路径）⇒ 换成看得懂的说明
     out = out.replace(/!\[([^\]]*)\]\(\s*(?:[A-Za-z]:[\\/]|file:\/\/|(?:\/|\\)[^)]*)[^)]*\)/g,
       (m, alt) => '（图片未发送：飞书只接受**已上传**的 image_key' + (alt ? '，原图说明：' + alt : '') + '）')
     // ② 卡片 markdown **不支持**的 HTML 标签（会整卡被拒，或把标签原文漏给用户）
-    out = out.replace(/<\/?(?:div|span|table|thead|tbody|tr|td|th|html|body|script|style|iframe)\b[^>]*>/gi, '')
+    out = out.replace(UNSUPPORTED_HTML_TAG_RE, '')
     return out
   }
 
@@ -523,6 +524,14 @@ export function apply(ctx) {
       body = res.text
     } catch (error) {
       console.log('[fs] inline images (plain) failed: ' + String(error && error.message || error))
+    }
+    // G-文件：纯文本通道**也**要能发文件（纯文本/卡片都带不了文件 ⇒ 作为独立文件消息发出）。
+    // 冒烟抓出：只接在卡路径上 ⇒ `feishu_send` 里的本地文件链接永远发不出去。
+    try {
+      const files = await sendLocalFiles(bot, target, body)
+      body = files.text
+    } catch (error) {
+      console.log('[fs] local files (plain) failed: ' + String(error && error.message || error))
     }
     body = stripUnsendable(body)
     const card = {
@@ -605,6 +614,21 @@ export function apply(ctx) {
   // 2026-10-01（改造③）：卡片必须知道自己是**哪个 agent** 的 —— 底部「目标条」
   // （目标全文/状态/上下文/缓存命中）要从该 agent 的会话里现读。
   // 不传 agent 时保持 null：buildCardPayload 见到 null 就整块跳过（优雅降级）。
+  // 建卡那一刻的**计划模式真值**：回扫会话事件里最后一条 `plan/mode`（一条都没有 ⇒ false）。
+  // 计划模式是**会话级**、跨回合存活，而 `plan/mode` 只在"开关那一刻"落一条 ⇒
+  // 只按新事件更新会让"开关之后才建的卡"一直显示普通模式（独立审查 MED#645）。
+  function lastPlanModeActive(agent) {
+    try {
+      const events = agent && agent.session ? sessionEvents(agent.session) : []
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i]
+        if (e && e.type === 'plan/mode' && e.data) return Boolean(e.data.active)
+      }
+    } catch (error) {
+      console.log('[fs] plan mode probe failed: ' + String(error && error.message || error))
+    }
+    return false
+  }
   function makeCardState(agent) {
     return {
       agent: agent || null,
@@ -638,11 +662,11 @@ export function apply(ctx) {
       idleKind: '',
       idleToolName: '',
       pendingTools: 0,
-      stallNotified: false,
       // 2026-10-03：上次"长静默播报"的时刻（同一种静默最多每 10 分钟播一条，防刷屏）
       stallNotifiedAt: 0,
       // 2026-10-03 H：计划模式开关（读会话 `plan/mode` 事件）—— 状态栏据此显示「📋 计划模式」
-      planActive: false,
+      // 初值必须**回扫会话**（见 lastPlanModeActive），不能硬编码 false：否则开关之后建的卡全错。
+      planActive: lastPlanModeActive(agent),
       // 2026-10-03 F：这张卡是否已经做过"正文抢救"（内容被拒 ⇒ 摘片段重发纯文本，只做一次）
       rescued: false,
     }
@@ -1374,8 +1398,76 @@ export function apply(ctx) {
   // 权限：上传走 `im:resource`（本机 work bot 已实测具备）。
   const IMAGE_MAX_BYTES = 10 * 1024 * 1024            // 官方限制：图片 ≤10MB
   const LOCAL_IMAGE_RE = /!\[([^\]]*)\]\(\s*((?:[A-Za-z]:[\\/]|file:\/\/|\/|\\)[^)]*)\)/g
+  // G-文件（2026-10-03 独立审查 MED#1410 后补线）：正文里的**本地文件链接** `[报告](D:\x.pdf)`
+  //   —— 卡片发不了文件，改走"先上传换 `file_key`，再作为**文件消息**发出"。
+  //   `(?<!!)` 排除图片写法（图片走 LOCAL_IMAGE_RE，别重复处理）。
+  const LOCAL_FILE_RE = /(?<!!)\[([^\]\n]*)\]\(\s*((?:file:\/\/|[A-Za-z]:[\\/]|\/|\\)[^)\n]*)\)/g
+  const FILE_MAX_BYTES = 30 * 1024 * 1024            // 飞书文件（消息）上限 30MB
+  // ---- 附件安全闸（独立审查 HIGH#2 的修复）-------------------------------------
+  // 卡面正文是 **agent 生成**的 ⇒ 可被提示注入 ⇒ 不设闸就变成"任意本地文件读取 + 外传"通道。
+  // 三道：① 扩展名白名单 ② 图片按**文件头**验真 ③ 凭证/密钥类**名字与内容**一律不传。
+  const SAFE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
+  const SAFE_FILE_EXT = new Set(['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.mp4', '.opus', '.txt', '.csv', '.md', '.zip'])
+  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|secret|secrets|credential|credentials|password|passwd|token|tokens|apikey|api[_-]?key|cookie|cookies|keychain|private[_-]?key|\.ssh|\.aws|\.dsh)([\\/_.-]|$)/i
+  // 最松的几个词（key/env/pwd…）只在**文件名主干完全等于它**时才算敏感 ——
+  // 否则 `key-notes.pdf` / `env-diff.md` 这类正常文件会被误当成凭证（独立审查 LOW#1412）。
+  const SENSITIVE_STEM = new Set(['key', 'keys', 'env', 'pwd', 'secret', 'token', 'password', 'passwd', 'credential', 'credentials', 'cookie'])
+  function extOf(p) {
+    const m = baseNameOf(p).match(/\.[A-Za-z0-9]+$/)
+    return m ? m[0].toLowerCase() : ''
+  }
+  function sniffImage(buf) {
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png'
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg'
+    if (buf.length >= 6 && buf.slice(0, 6).toString('latin1') === 'GIF87a') return 'gif'
+    if (buf.length >= 6 && buf.slice(0, 6).toString('latin1') === 'GIF89a') return 'gif'
+    if (buf.length >= 12 && buf.slice(0, 4).toString('latin1') === 'RIFF'
+      && buf.slice(8, 12).toString('latin1') === 'WEBP') return 'webp'
+    if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp'
+    return ''
+  }
+  function looksLikePrivateKey(buf) {
+    return /BEGIN (RSA|OPENSSH|EC|DSA|PGP)? ?PRIVATE KEY/.test(buf.slice(0, 4096).toString('latin1'))
+  }
+  function assertSafeAttachment(filePath, kind) {
+    const p = String(filePath || '')
+    if (!p) throw new Error('空路径，拒绝上传')
+    const stem = baseNameOf(p).replace(/\.[A-Za-z0-9]+$/, '').toLowerCase()
+    if (SENSITIVE_STEM.has(stem) || SENSITIVE_PATH_RE.test(p)) {
+      throw new Error('疑似凭证/密钥类文件（' + baseNameOf(p) + '），按 A13 规矩不上传')
+    }
+    // ⚠️ A29 是**图片**规矩（授权二维码不发图、改发链接）；普通文档叫 `login-notes.md` 不该被拒
+    //（独立审查 MED#1436：原来对文件也套这条，理由文案还是错的）。
+    if (kind === 'image' && looksLikeAuthArtifact(p)) {
+      throw new Error('授权类的图（疑似二维码）按规矩不发图，请改发可点击的授权链接')
+    }
+    const ext = extOf(p)
+    const allow = kind === 'image' ? SAFE_IMAGE_EXT : SAFE_FILE_EXT
+    if (!allow.has(ext)) {
+      throw new Error((kind === 'image' ? '图片' : '文件') + '扩展名不在允许清单内：'
+        + (ext || '(无后缀)') + '，只允许 ' + [...allow].join('/'))
+    }
+    return ext
+  }
+  // 同一张图重复同步时别再上传一次（省额度、避免限流）：appId|path -> img_key。
+  // ⚠️ 必须带 appId：`img_key` 是**按应用**作用域的，A 应用换来的 key 给 B 应用用 ⇒ invalid image keys ⇒ 整卡被拒。
+  const localImageKeyCache = new Map()
+  const IMAGE_KEY_CACHE_MAX = 200
+  // 同一个文件只发一次（建卡/多次同步会反复走到同一段正文）：chatId|path
+  const sentLocalFiles = new Set()
+  const SENT_FILES_MAX = 500
   function baseNameOf(p) {
     return String(p || '').replace(/^file:\/\//i, '').split(/[\\/]/).filter(Boolean).pop() || ''
+  }
+  // `file://` 形式在 existsSync/readFileSync 里**永远失败**（独立审查 LOW#1614）⇒ 统一先归一化成真实路径。
+  function localPathOf(p) {
+    let s = String(p || '')
+    if (/^file:\/\//i.test(s)) {
+      s = s.replace(/^file:\/\//i, '')
+      if (/^\/[A-Za-z]:[\\/]/.test(s)) s = s.slice(1)     // file:///C:/x ⇒ C:/x
+    }
+    return s
   }
   function looksLikeAuthArtifact(filePath) {
     // A29 防呆（CM 2026-10-03 明确规矩）：授权类（二维码等）**不自动上传成图片**，
@@ -1383,12 +1475,13 @@ export function apply(ctx) {
     return /(^|[\\/_.-])(qr|qrcode|auth|login|oauth|scan)([\\/_.-]|$)/i.test(String(filePath || ''))
   }
   async function uploadImage(bot, filePath) {
-    const buf = readFileSync(filePath)
+    assertSafeAttachment(filePath, 'image')
+    const buf = readFileSync(localPathOf(filePath))
     if (buf.length > IMAGE_MAX_BYTES) {
       throw new Error('图片 ' + (buf.length / 1048576).toFixed(1) + 'MB 超过飞书上限 10MB')
     }
-    if (looksLikeAuthArtifact(filePath)) {
-      throw new Error('授权类的图（疑似二维码）按规矩不发图，请改发可点击的授权链接')
+    if (!sniffImage(buf)) {
+      throw new Error('按文件头判断不是有效图片，拒绝上传（防"改名成 .png 的其他文件"）')
     }
     const form = new FormData()
     form.append('image_type', 'message')
@@ -1408,9 +1501,20 @@ export function apply(ctx) {
     return key
   }
   async function uploadFile(bot, filePath, displayName) {
-    const buf = readFileSync(filePath)
-    const name = String(displayName || baseNameOf(filePath) || 'file')
-    const ext = (name.split('.').pop() || '').toLowerCase()
+    const safeExt = assertSafeAttachment(filePath, 'file')
+    const buf = readFileSync(localPathOf(filePath))
+    if (buf.length > FILE_MAX_BYTES) {
+      throw new Error('文件 ' + (buf.length / 1048576).toFixed(1) + 'MB 超过飞书上限 30MB')
+    }
+    if (looksLikePrivateKey(buf)) {
+      throw new Error('内容疑似私钥（BEGIN … PRIVATE KEY），按 A13 规矩不上传')
+    }
+    // ⚠️ 类型必须跟随**真实文件**的后缀（审查 LOW#1513：agent 写 `[报告.exe](D:\a.pdf)` 时，
+    // 用显示名判类型会把 pdf 发成 stream，与真实文件不符）；显示名只影响用户看到的文件名。
+    const realName = baseNameOf(filePath) || ('file' + safeExt)
+    const rawName = String(displayName || '').trim()
+    const name = extOf(rawName) ? rawName : realName
+    const ext = safeExt.replace(/^\./, '').toLowerCase()
     const FILE_TYPES = {
       pdf: 'pdf', doc: 'doc', docx: 'doc', xls: 'xls', xlsx: 'xls',
       ppt: 'ppt', pptx: 'ppt', mp4: 'mp4', opus: 'opus',
@@ -1451,53 +1555,140 @@ export function apply(ctx) {
   async function inlineLocalImages(bot, text) {
     const src = String(text == null ? '' : text)
     const matches = [...src.matchAll(LOCAL_IMAGE_RE)]
-    if (!matches.length) return { text: src, uploaded: 0, failures: [] }
+    if (!matches.length) return { text: src, uploaded: 0, reused: 0, failures: [] }
     let out = src
     const failures = []
     let uploaded = 0
+    let reused = 0
+    const cachePrefix = String((bot && bot.cfg && bot.cfg.appId) || '') + '|'
     for (const m of matches) {
       try {
-        const key = await uploadImage(bot, m[2])
+        // 键里带**内容身份**（大小+修改时间）：同一路径的图被重画后必须重新上传，
+        // 否则卡上会一直显示**旧图**（审查 LOW#1564）。
+        let cacheKey = cachePrefix + m[2]
+        try {
+          const st = statSync(m[2])
+          cacheKey += '|' + st.size + '|' + Math.round(st.mtimeMs)
+        } catch { /* 读不到 stat 就退化成裸路径（照旧缓存） */ }
+        let key = localImageKeyCache.get(cacheKey)
+        if (key) {
+          reused += 1
+        } else {
+          key = await uploadImage(bot, m[2])
+          localImageKeyCache.set(cacheKey, key)
+          if (localImageKeyCache.size > IMAGE_KEY_CACHE_MAX) {
+            localImageKeyCache.delete(localImageKeyCache.keys().next().value)
+          }
+          uploaded += 1
+        }
         out = out.replace(m[0], '![' + m[1] + '](' + key + ')')
-        uploaded += 1
       } catch (error) {
         const why = String(error && error.message || error)
         failures.push(why)
         out = out.replace(m[0], '（图片未发送：' + why + '）')
       }
     }
-    return { text: out, uploaded, failures }
+    return { text: out, uploaded, reused, failures }
   }
-  // 发卡**前**的异步加工：递归找出所有含本地图片引用的 `content` 字段并换成 img_key
-  //（**必须递归**：笔记/字段可能被包在 column_set / div.fields / 折叠面板里，浅层遍历会漏）
-  function collectImageHolders(node, out) {
-    if (!node || typeof node !== 'object') return out
-    if (typeof node.content === 'string' && node.content.includes('![')) out.push(node)
+  // **通用递归遍历**：对每个含字符串 `content` 的节点调用 `fn`（对象只访问一次，防环）。
+  // 为什么必须递归：笔记/字段/工具面板可能被包在 column_set / collapsible_panel / div.fields 里，
+  // 浅层遍历会漏（A29 真机事故 + 独立审查 MED#1582 两次栽在同一处）。
+  function walkContentHolders(node, fn, seen) {
+    if (!node || typeof node !== 'object') return seen
+    const memo = seen || new Set()
+    if (memo.has(node)) return memo
+    memo.add(node)
+    if (typeof node.content === 'string') fn(node)
     for (const key of Object.keys(node)) {
       const v = node[key]
       if (Array.isArray(v)) {
-        for (const item of v) collectImageHolders(item, out)
+        for (const item of v) walkContentHolders(item, fn, memo)
       } else if (v && typeof v === 'object') {
-        collectImageHolders(v, out)
+        walkContentHolders(v, fn, memo)
       }
     }
-    return out
+    return memo
   }
-  async function inlinePayloadImages(bot, payload) {
-    const holders = collectImageHolders(payload, [])
+  function hasLocalAttachment(text) {
+    const s = String(text || '')
+    // ⚠️ 带 g 的正则 `.test()` 会**把 lastIndex 推到匹配末尾**，而 `matchAll` 会**继承当前 lastIndex**
+    // ⇒ 若不复位，后面 inlineLocalImages 会从中间开始扫、**漏掉前面的图片引用**（原样进卡 ⇒ 整卡被拒）。
+    // 独立审查 HIGH：这是一条"平时看不出来、排序一变就炸"的潜伏 bug。
+    LOCAL_IMAGE_RE.lastIndex = 0
+    const imageHit = LOCAL_IMAGE_RE.test(s)
+    LOCAL_IMAGE_RE.lastIndex = 0
+    if (imageHit) return true
+    LOCAL_FILE_RE.lastIndex = 0
+    const fileHit = LOCAL_FILE_RE.test(s)
+    LOCAL_FILE_RE.lastIndex = 0
+    return fileHit
+  }
+  // 本地**文件**链接 ⇒ 上传换 `file_key` ⇒ 作为**文件消息**发出（卡面只留一句"已发送"）。
+  // 路径不存在 ⇒ **原样不动**（正常超链接 `[文档](/docs/x.md)` 不能被误改成"发送失败"）。
+  // 同一 (chat,path) 只发一次：卡会反复同步，否则会重复发同一份文件。
+  async function sendLocalFiles(bot, chatId, text) {
+    const src = String(text == null ? '' : text)
+    LOCAL_FILE_RE.lastIndex = 0
+    const matches = [...src.matchAll(LOCAL_FILE_RE)]
+    if (!matches.length) return { text: src, sent: 0, failures: [], skipped: 0 }
+    let out = src
+    const failures = []
+    let sent = 0
+    let skipped = 0
+    for (const m of matches) {
+      const target = localPathOf(m[2])
+      const label = String(m[1] || '').trim() || baseNameOf(target)
+      if (!existsSync(target)) { skipped += 1; continue }
+      // ⚠️ 键里要带**文件身份**（大小+修改时间）：否则同一路径的文件**内容更新后**会被永久
+      // 当成"已发过"而不再送达（审查 MED#1634）。同一份文件在多次卡同步中仍只发一次。
+      let dedupeKey = String(chatId || '') + '|' + target
+      try {
+        const st = statSync(target)
+        dedupeKey += '|' + st.size + '|' + Math.round(st.mtimeMs)
+      } catch { /* 读不到 stat 就退化成裸路径 */ }
+      if (sentLocalFiles.has(dedupeKey)) {
+        out = out.replace(m[0], '（文件已发送：' + label + '）')
+        continue
+      }
+      try {
+        const key = await uploadFile(bot, target, label)
+        const okSent = await sendFileMessage(bot, chatId, key, '')
+        if (!okSent) throw new Error('文件消息发送失败')
+        sentLocalFiles.add(dedupeKey)
+        if (sentLocalFiles.size > SENT_FILES_MAX) {
+          sentLocalFiles.delete(sentLocalFiles.values().next().value)
+        }
+        out = out.replace(m[0], '（文件已发送：' + label + '）')
+        sent += 1
+      } catch (error) {
+        const why = String(error && error.message || error)
+        failures.push(why)
+        out = out.replace(m[0], '（文件未发送：' + why + '）')
+      }
+    }
+    return { text: out, sent, failures, skipped }
+  }
+  async function inlinePayloadImages(bot, payload, chatId) {
+    const holders = []
+    walkContentHolders(payload, (h) => { if (hasLocalAttachment(h.content)) holders.push(h) })
     const failures = []
     let uploaded = 0
+    let reused = 0
+    let filesSent = 0
     for (const holder of holders) {
-      LOCAL_IMAGE_RE.lastIndex = 0                       // 全局正则：先复位再 test（否则会漏）
-      if (!LOCAL_IMAGE_RE.test(holder.content)) continue
-      LOCAL_IMAGE_RE.lastIndex = 0
       const res = await inlineLocalImages(bot, holder.content)
       holder.content = res.text
       uploaded += res.uploaded
+      reused += res.reused
       failures.push(...res.failures)
+      const files = await sendLocalFiles(bot, chatId, holder.content)
+      holder.content = files.text
+      filesSent += files.sent
+      failures.push(...files.failures)
     }
-    if (uploaded || failures.length) {
-      console.log('[fs] inline images: uploaded=' + uploaded + ' failed=' + failures.length
+    if (uploaded || reused || filesSent || failures.length) {
+      console.log('[fs] inline attachments: images=' + uploaded + ' reused=' + reused
+        + ' files=' + filesSent + ' failed=' + failures.length
         + (failures.length ? ' first=' + failures[0].slice(0, 120) : ''))
     }
     return { payload, failures }
@@ -1511,8 +1702,16 @@ export function apply(ctx) {
     return globalThis.__fsFailureNotices || (globalThis.__fsFailureNotices = new Map())
   }
   function classifyCardFailure(text) {
-    return /230099|invalid image|200570|200861|11310|too large|frequency/i.test(String(text || ''))
-      ? 'rejected' : 'transport'
+    const s = String(text || '')
+    // ① 内容类（写了卡片不支持的写法 / 无效 image key）⇒ 才走"摘掉片段抢救正文"那条路
+    if (/230099|invalid image|200570|200861/i.test(s)) return 'rejected'
+    // ② **体积类**：内容本身没毛病，但"整卡太长/元素太多" ⇒ 纯文本只有 1 个元素、通常发得出去，
+    //    所以照样要**抢救正文**（审查 MED#1676：并进限流类会让用户一直看不到东西）。
+    // 11310 = card table number over limit（见本文件 ~934 行的真机记录）⇒ 属**数量/体积**类，不是写法错。
+    if (/too large|exceed|element.*limit|content.*limit|11310/i.test(s)) return 'toolarge'
+    // ③ **限流类**：重发也会被限 ⇒ 走退避/熔断，别谎报"摘掉片段就好了"（审查 MED#1513）
+    if (/frequency|rate limit|rate_limit|99991400/i.test(s)) return 'limited'
+    return 'transport'
   }
   function payloadPlainText(payload) {
     try {
@@ -1526,6 +1725,34 @@ export function apply(ctx) {
       return parts.join('\n\n')
     } catch { return '' }
   }
+  // 四类失败的文案**集中在这一张表**（审查 MED#1733/#1745：嵌套三元会随类别增多越写越乱，
+  // 而且"给用户看的"与"给 Agent 看的"两处必须同步 ⇒ 一张表解决，两处都从这里取）。
+  function failureWordings(klass) {
+    if (klass === 'rejected') {
+      return {
+        tip: '已把**发不出去的片段**（如本地图片路径）摘掉后重发，**正文没有丢**。'
+          + '要让图片真的显示，需要先上传到飞书换 `image_key`。',
+        note: '常见原因：写了**本地图片路径**（飞书只认已上传的 image_key），或用了卡片不支持的写法。'
+          + '请改用可发送的形式；**正文已用纯文本兜底发给用户了**，别重复整段。',
+      }
+    }
+    if (klass === 'toolarge') {
+      return {
+        tip: '卡片太长/元素太多被拒：**已把正文用纯文本重发**（纯文本只有 1 个元素，通常发得出去）。',
+        note: '内容是**太长/元素太多**被拒（不是写法错）；正文已用纯文本兜底发给用户，下次拆短一点。',
+      }
+    }
+    if (klass === 'limited') {
+      return {
+        tip: '被飞书**限流**了（不是内容问题）：已按退避重试若干次，**不会无限重试**，这张卡之后不再更新。',
+        note: '偏**限流**（不是内容问题），稍后重发即可，别去改正文。',
+      }
+    }
+    return {
+      tip: '网络/传输类失败：已按退避重试若干次，**不会无限重试**，这张卡之后不再更新。',
+      note: '偏网络/传输，稍后重发即可。',
+    }
+  }
   function notifyCardFailure(bot, chatId, info) {
     try {
       const reason = String((info && info.reason) || '卡片发送失败')
@@ -1534,28 +1761,29 @@ export function apply(ctx) {
       const code = String((info && info.code) || (codeMatch ? codeMatch[1] : ''))
       const key = String(chatId || '-') + '|' + klass
       const seen = failureNotices()
-      if (Date.now() - Number(seen.get(key) || 0) < FAILURE_NOTICE_WINDOW_MS) return
+      const nowMs = Date.now()
+      // 审查 LOW#1510：这个 Map 从不清理 ⇒ 进程活久了会随会话数无界增长；顺手淘汰过期项。
+      for (const [k, t] of seen) {
+        if (nowMs - Number(t || 0) > FAILURE_NOTICE_WINDOW_MS) seen.delete(k)
+      }
+      if (nowMs - Number(seen.get(key) || 0) < FAILURE_NOTICE_WINDOW_MS) return
       seen.set(key, Date.now())
+      const words = failureWordings(klass)
       const tip = '⚠️ **卡片发送失败**（' + klass + '）' + (code ? '｜飞书 code=' + code : '') + '\n'
         + '原因：' + reason.slice(0, 220) + '\n'
-        + (klass === 'rejected'
-          ? '已把**发不出去的片段**（如本地图片路径）摘掉后重发，**正文没有丢**。'
-            + '要让图片真的显示，需要先上传到飞书换 `image_key`。'
-          : '网络/限流类失败：已按退避重试若干次，**不会无限重试**，这张卡之后不再更新。')
+        + words.tip
       void sendPlainText(bot, chatId, tip).catch(() => {})
       console.log('[fs] card failure notice sent chat=' + chatId + ' kind=' + klass
         + (code ? ' code=' + code : ''))
       // ② 让 **Agent 也收到**（复用入站通道注入系统提示；下一次推理必然看到）
       const note = '（系统提示：你上一步的**输出没有送达用户** —— 卡片被飞书拒了（' + klass
         + (code ? '，code ' + code : '') + '）。'
-        + (klass === 'rejected'
-          ? '常见原因：写了**本地图片路径**（飞书只认已上传的 image_key），或用了卡片不支持的写法。'
-            + '请改用可发送的形式；**正文已用纯文本兜底发给用户了**，别重复整段。'
-          : '偏网络/限流，稍后重发即可。') + '）'
+        + words.note + '）'
       void handleInbound(bot, {
         message_id: 'cardfail-' + Date.now().toString(36),
         message_type: 'text',
         chat_id: chatId,
+        _internal: true,   // 审查 LOW#1555：内部系统提示**不是**用户在回答提问卡
         content: JSON.stringify({ text: note }),
       }).catch(() => {})
     } catch (error) {
@@ -1574,25 +1802,20 @@ export function apply(ctx) {
     //    ⇒ 规范成已知好形态：**加粗在外、颜色在内**
     out = out.replace(/<font([^>]*)>\s*(\*\*|__)([\s\S]*?)\2\s*<\/font>/gi, '$2<font$1>$3</font>$2')
     // ② 卡片 markdown **不支持**的 HTML 标签（与 stripUnsendable 共用同一张黑名单）
-    out = out.replace(/<\/?(?:div|span|table|thead|tbody|tr|td|th|html|body|script|style|iframe)\b[^>]*>/gi, '')
+    out = out.replace(UNSUPPORTED_HTML_TAG_RE, '')
     return out
   }
   function sanitizeCardElements(elements) {
     let touched = 0
+    // **递归**（复用 walkContentHolders）：旧实现只看顶层 + el.text/el.fields，
+    // 而 agent 正文常常在 collapsible_panel / column_set 里 ⇒ 恰好漏掉要治的内容，
+    // 非法标签照样进飞书、照样**整张卡被拒**（独立审查 MED#1582）。
     for (const el of elements || []) {
       if (!el || typeof el !== 'object') continue
-      const holders = []
-      if (typeof el.content === 'string') holders.push(el)
-      if (el.text && typeof el.text.content === 'string') holders.push(el.text)
-      if (Array.isArray(el.fields)) {
-        for (const f of el.fields) {
-          if (f && f.text && typeof f.text.content === 'string') holders.push(f.text)
-        }
-      }
-      for (const h of holders) {
+      walkContentHolders(el, (h) => {
         const after = sanitizeMarkdownForFeishu(h.content)
         if (after !== h.content) { h.content = after; touched += 1 }
-      }
+      })
     }
     if (touched) console.log('[fs] sanitized for feishu: ' + touched + ' field(s)')
     return elements
@@ -1621,7 +1844,7 @@ export function apply(ctx) {
       const payload = buildCardPayload(card)
       // G：把 markdown 里的**本地图片引用**换成真 `img_key`（飞书只认 key，本地路径会**整卡被拒**）
       try {
-        await inlinePayloadImages(bot, payload)
+        await inlinePayloadImages(bot, payload, chatId)
       } catch (error) {
         console.log('[fs] inline images failed: ' + String(error && error.message || error))
       }
@@ -1682,14 +1905,14 @@ export function apply(ctx) {
         // ---- F（2026-10-03）：失败**不再静默** --------------------------------------
         // ① 内容被拒（230099 类）：**先把正文救回来** —— 摘掉发不出去的片段后重发纯文本。
         //    这一步是"用户那边突然什么都不动了"的直接解药（旧实现让兜底也带着非法片段再挂一次）。
-        if (klass === 'rejected' && rescueText && !card.rescued) {
+        if ((klass === 'rejected' || klass === 'toolarge') && rescueText && !card.rescued) {
           card.rescued = true
           void sendPlainText(bot, chatId, rescueText)
             .then(() => { console.log('[fs] card body rescued chat=' + chatId) })
             .catch(() => { })
         }
         // ② 统一出口：用户看得见的说明 + **Agent 收得到的回执**（判重窗口内只发一次）。
-        if (klass === 'rejected' || card.failCount >= CARD_MAX_FAILURES) {
+        if (klass === 'rejected' || klass === 'toolarge' || card.failCount >= CARD_MAX_FAILURES) {
           notifyCardFailure(bot, chatId, { reason: message })
         }
       } finally {
@@ -2020,6 +2243,8 @@ export function apply(ctx) {
             message_id: 'reload-resume-' + Date.now().toString(36),
             message_type: 'text',
             chat_id: chatId,
+            _internal: true,   // 同上：别把"续跑"提示吃成提问卡的回答
+
             content: JSON.stringify({
               text: '（系统提示：插件刚热重载，上一轮被打断。请**从断点继续**，'
                 + '已经做完的部分不要重做；若其实已经做完，就一句话说明结论即可。）',
@@ -2836,7 +3061,9 @@ export function apply(ctx) {
 
     // A pending user-question (ask_user_question / plan review) is answered
     // by the next plain message in this chat (F-04).
-    const pendingQ = pendingQuestions.get(chatId)
+    // 审查 LOW#1555：插件**自己注入**的系统提示（卡片失败回执 / 热重载续跑）不是用户回答 ——
+    // 否则"有提问卡挂着"时它会被当成回答吃掉，Agent 永远收不到那份回执。
+    const pendingQ = (evt && evt._internal) ? undefined : pendingQuestions.get(chatId)
     if (pendingQ) {
       pendingQuestions.delete(chatId)
       if (pendingQ.timer) clearTimeout(pendingQ.timer)
@@ -3721,7 +3948,13 @@ export function apply(ctx) {
       console.log('[fs] approval card updated in place: '
         + String((record.request && record.request.toolName) || '') + ' -> ' + String(label))
     } catch (error) {
+      // 审查 MED#3724：就地更新失败时卡上**按钮还在**、但 token 已被 settle 清掉 ⇒ 再点就是
+      // "点了没反应"。补一条纯文本回执（与提问卡/审批单卡两条路一致）：总要有人告诉用户"记下了"。
       console.log('[fs] approval card update failed: ' + String(error && error.message || error))
+      const chatId = record.chatId || bot.lastChatId || ''
+      if (chatId) {
+        void sendPlainText(bot, chatId, '✅ 已记录你的审批：' + String(label || '')).catch(() => { })
+      }
     }
   }
 

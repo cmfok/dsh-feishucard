@@ -5,6 +5,70 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-10-03
+
+### 修复：独立代码审查（`code-review-gate` / ocr）第一轮 findings
+
+> 0.7.0 落地后按项目门槛跑了一道**独立**审查（deepseek-flash，用时 5 分 3 秒，535 万 tokens），
+> 初判 **BLOCK**：0 critical / **2 high** / 8 medium / 7 low。逐条打开代码核对后**全部属实**，
+> 本版全部修掉并补了回归断言。审查报告：`output/code-review/dsh-feishucard-20261003-104926/REPORT.md`。
+>
+> **第二轮**（对 0.7.1 自身再审，同样是独立 OCR 跑）：**1 high / 4 medium / 5 low**，逐条核对后同样全部属实并已修：
+> ① **HIGH 全局正则 `lastIndex` 泄漏** —— `hasLocalAttachment()` 里 `.test()` 会把 `lastIndex` 推走且未复位，
+> 而 `matchAll` 会**继承**该位置 ⇒ 图片引用可能被从中间开始扫、前面的引用被漏掉 ⇒ 本地路径原样进卡 ⇒ **整张卡被拒**
+>（典型"排序一变就炸"的潜伏 bug，两轮冒烟都没抓到，是审查抓出来的）；
+> ② 图片 key 缓存键改为 **`appId|path`**：`img_key` 是**按应用**作用域的，多 bot 共用同一路径会拿错 key ⇒ invalid image keys；
+> ③ `too large` 单列成 `toolarge` 类 —— **照样抢救正文**（纯文本只有 1 个元素、通常发得出去），
+> 不再因为并进"限流类"而让用户一直看不到东西；
+> ④ A29 授权/二维码规矩**只管图片**：`login-notes.md` / `scan-report.pdf` 这类正常文档不再被误拒，拒绝文案也不再张冠李戴；
+> ⑤ 安全闸里最松的几个词（`key`/`env`/`pwd`）改为**只在文件名主干完全相等时**命中（`key-notes.pdf` 不再误伤）；
+> ⑥ `file://` 路径先归一化成真实路径（原先 `existsSync`/`readFileSync` 必然失败 ⇒ 那条分支等于死代码）；
+> ⑦ 清掉改造后已无调用方的 `collectImageHolders`；冒烟"凭证拒绝"用例改用**真实存在**的 `id_rsa.png` 夹具
+>（原夹具指向不存在的 Windows 路径 ⇒ ENOENT 也会让它变绿），并保证该断言**不会静默跳过**。
+> 第二轮报告：`output/code-review/dsh-feishucard-071-20261003-110826/REPORT.md`。
+>
+> **第三轮**（再审）：**0 critical / 0 high / 6 medium / 6 low**（门槛判定 **WARN**，放行门槛已过），仍逐条核对并修掉：
+> ① `11310` 归类修正 —— 本文件 ~934 行记的就是 `card table number over limit`，属**数量/体积**类，
+> 原先混进"内容类"会让用户与 Agent 都被告知"是图片路径/写法问题"，诊断指错方向；
+> ② 失败文案收成**一张表** `failureWordings(klass)`（四类：rejected / toolarge / limited / transport）——
+> 原先"给用户看的提示"与"给 Agent 看的回执"两处各写一遍嵌套三元，既难读又必须手动同步；
+> ③ 图片缓存键与文件去重键都补上**内容身份**（大小 + mtime）：路径没变但内容更新过的图/文件，
+> 原先会被永久当成"已处理"⇒ 卡上一直显示旧图、新文件永不送达（两处都是"省了一次上传、丢了一次更新"的错）；
+> ④ 文件类型跟随**真实文件**后缀（`[报告.exe](D:\a.pdf)` 不再把 pdf 发成 stream）；显示名只影响用户看到的文件名；
+> ⑤ 私钥正则里被首支完全覆盖的死分支删掉；
+> ⑥ 冒烟：F 用例那两处 `imgTool.execute` 也设防（工具没注册时**干净判红**、不抛 TypeError 打断整块）、
+> 文件断言改成"工具缺失就说工具缺失"、凭证拒绝断言改用自己那段的窗口、
+> 热开启用例第二处解引用也设防、`id_rsa.png` 等夹具跑完清理（不留垃圾在 %TEMP%）。
+> 第三轮报告：`output/code-review/dsh-feishucard-071r2-20261003-112147/REPORT.md`。
+
+**HIGH**
+- **附件安全闸**（`assertSafeAttachment`）：卡面正文是 **agent 生成**的 ⇒ 可被提示注入 ⇒ 原先 `uploadImage` 会把
+  正文里出现的**任意绝对路径**读出来传到飞书，等于"任意本地文件读取 + 外传"通道。现在三道闸：
+  ① 扩展名白名单（图片 png/jpg/jpeg/gif/webp/bmp；文件 pdf/doc/xls/ppt/mp4/opus/txt/csv/md/zip）
+  ② 图片**按文件头验真**（改名成 `.png` 的其他文件一律拒）
+  ③ 凭证/密钥类**名字**（`id_rsa`/`.env`/`key`/`token`/`cookie`/`.ssh`/`.aws`/`.dsh` …）与**内容**（`BEGIN … PRIVATE KEY`）一律不传。
+- 冒烟夹具路径改用 `tmpdir()`：原先用 Windows 专有的 `TEMP` ⇒ 在 CI（`ubuntu-latest`）上退化成**相对路径**、
+  `LOCAL_IMAGE_RE` 认不出 ⇒ G 用例必红（推上去 CI 就挂）。
+
+**MEDIUM**
+- **本地文件真送达（G 的另一半接线）**：`uploadFile`/`sendFileMessage` 原是**死代码**（从未被调用）。
+  现在正文里的 `[季度报告.pdf](D:\…\x.pdf)` ⇒ 先上传换 `file_key` ⇒ 作为**文件消息**发出，卡面只留「（文件已发送：…）」；
+  同一 `(chat, path)` 只发一次；**路径不存在则原样不动**（普通超链接 `[文档](/docs/x.md)` 不被误改）。
+- `classifyCardFailure` 拆开**内容类**（230099/invalid image…）与**体积/限流类**（too large / frequency / 99991400）：
+  限流不再被当成"内容被拒"——不会去重发注定失败的长文，也不会甩锅给本地图片路径。
+- `sanitizeCardElements` 改为**递归**（复用统一的 `walkContentHolders`）：旧实现只看顶层 + `el.text`/`el.fields`，
+  而正文常被包在 `collapsible_panel` / `column_set` 里 ⇒ 恰好漏掉要治的内容，非法标签照样进飞书、**整张卡被拒**。
+- **状态栏模式建卡即回扫**（`lastPlanModeActive`）：计划模式是**会话级**、跨回合存活，而 `plan/mode` 只在"开关那一刻"落一条
+  ⇒ 旧实现让"开关之后才建的卡"一直显示 `🧭 普通模式`。
+- **审批卡就地更新失败补纯文本回执**：旧实现只写日志，而卡上按钮还在、token 已被 `settle` 清掉 ⇒ 再点就是"点了没反应"。
+- **图片 key 缓存**：同一张图不再每次卡同步都重传一次（省额度、避免限流）。
+- 死代码清理（`approvalFormDisposer`、`card.stallNotified`）；冒烟里两处"断言失败后仍解引用"改成**干净判红**（不再抛 TypeError 打断整轮）。
+
+**LOW**
+- 插件**自己注入**的系统提示打 `_internal` 标记（卡片失败回执 / 热重载续跑）：不再会被"挂着的提问卡"当成**用户回答**吃掉。
+- `failureNotices` 过期项淘汰（原先无界增长）；不支持 HTML 标签黑名单提成**唯一常量**（纯文本兜底与发卡清洗共用）；
+  降级重试用例断言改成"新增条数 == 2"（原断言恒真，回归抓不到）。
+
 ## [0.7.0] - 2026-10-03
 
 ### 大版本：**失败必须可见** + **图片/文件真送达** + **计划→目标承接** + **审批卡保留正文** + **通道开关定稿**
