@@ -16,6 +16,12 @@ duplicate_open_id / open_id_missing / job_not_granted / not_active /
 2026-10-04 追加 `not_active`：原先「人已离职」与「完全不认识这个 open_id」共用
 `unknown_person` ⇒ 上层若按它做兜底（例如弹卡片问姓名），**离职的人会被当成陌生人来处理**。
 离职是**正常拒绝**（他不该被认），与「不认识」是两件事 ⇒ 分开报。
+
+🔴 2026-10-04 在职校验改为**反向排除**（裁决链：`0150` 偏差④ ⇒ `0225` §四）：
+原先正向枚举 `("在职","active")`，把「兼职」11 人 ＋「待入职」2 人 也拒了 ——
+而这两种人在 HRM（实测 69 行）里都是**在册的正常人**。
+现在只拒 `离职 / 终止办理 / 兼职终止` 三种状态，**其余一律正常**。
+自测里已把「兼职」「待入职」两条**放行断言固化**，防回归。
 """
 import json
 
@@ -76,9 +82,16 @@ def resolveActor(open_id, identity_map):
 
     person = hits[0]
 
-    # ④ 在职校验 —— 离职 / 终止办理 **≠「不认识」**（2026-10-04 分开报，见文件头说明）
-    #    ⇒ 上层看到 `not_active` 应当「正常拒绝」；**不要**走"问姓名"之类的兜底。
-    if str(person.get("status", "")) not in ("在职", "active"):
+    # ④ 在职校验 —— 🔴 **反向排除**（2026-10-04 裁决：`0150` 偏差④ ⇒ `0225` §四）
+    #
+    #    原先正向枚举 `("在职","active")` ⇒ 把**「兼职」11 人 ＋「待入职」2 人**也拒了。
+    #    词表来自 HRM「全部员工管理」实测 69 行：
+    #      在职 17 · 兼职 11 · 待入职 2 · 离职 30 · 终止办理 8 · 兼职终止 1
+    #    ⇒ **只有这三种状态判「不该被认」；其余一律正常**（含 兼职 / 待入职 / 在职 / 未填）。
+    #    🔴 离职三态仍报 `not_active`（＝**正常拒绝**，≠「不认识」）；
+    #       上层**不要**对 `not_active` 走"问姓名"之类兜底（那是给 `unknown_person` 的）。
+    _INACTIVE_STATUS = ("离职", "终止办理", "兼职终止")
+    if str(person.get("status", "") or "").strip() in _INACTIVE_STATUS:
         return None, E_NOT_ACTIVE
 
     # ⑤ 岗位授权：job_id 必须已批（未批 = job_not_granted）
@@ -111,21 +124,29 @@ if __name__ == "__main__":
             #    （2026-10-04 实测：改了 not_active 后自测仍打印 ✅ unknown_person，就是栽在这里）。
             {"union_id": "on_gone", "open_ids": {"cli_main": "ou_gone_main"},
              "name": "离职者", "status": "离职"},
+            # 🔴 反向排除必须**放行**下面两种 —— 正向枚举 ("在职","active") 会把它们误拒：
+            #    实测 HRM「全部员工管理」69 行里，「兼职」11 人 ＋「待入职」2 人 就是这么被打回的。
+            {"union_id": "on_pt", "open_ids": {"cli_main": "ou_pt_main"},
+             "name": "兼职者", "job_id": "J-PT", "status": "兼职"},
+            {"union_id": "on_pre", "open_ids": {"cli_main": "ou_pre_main"},
+             "name": "待入职者", "job_id": "J-PRE", "status": "待入职"},
         ],
         "pending": [{"name": "李四", "open_id": "ou_lisi_unk", "reason": "union_id 未取到"}],
     }
     cases = [
-        ("ou_cm_main", None),          # 命中
-        ("ou_cm_hr",   None),          # 跨 app 命中同一 union_id
-        ("ou_unk",     E_UNKNOWN_PERSON),
-        ("ou_lisi_unk", E_MISSING),    # pending 显式列出
+        ("ou_cm_main",  "OK:陈明"),      # 命中
+        ("ou_cm_hr",    "OK:陈明"),      # 跨 app 命中同一 union_id
+        ("ou_pt_main",  "OK:兼职者"),    # 🔴 兼职 ⇒ 放行（反向排除；正向枚举会误拒）
+        ("ou_pre_main", "OK:待入职者"),  # 🔴 待入职 ⇒ 放行
+        ("ou_unk",      E_UNKNOWN_PERSON),
+        ("ou_lisi_unk", E_MISSING),      # pending 显式列出
         ("",            E_NO_OPEN_ID),
     ]
     bad = 0
     for ou, want in cases:
         actor, err = resolveActor(ou, MAP)
         got = err if err else "OK:" + actor["name"]
-        want_s = want or "OK:陈明"
+        want_s = want
         flag = "✅" if got == want_s else "❌"
         if got != want_s:
             bad += 1
