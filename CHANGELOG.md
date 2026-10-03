@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.19] - 2026-10-04
+
+### 修复：0.7.17 独立审查 **BLOCK** —— 群判定（chatKinds）三条失效路径 ＋ 4 条 low，「群 ⇒ 恒 stable」补完
+
+> 来源：独立代码审查报告（VERDICT **BLOCK**：1 medium 必修 + 4 low），与仓库审查门槛管线（3 medium）
+> **交叉印证同一组缺陷**。全量冒烟 **先红后绿**：RED-3 `518✅/5❌`（四条新用例全红、前提全绿）
+> → 修复后 **GREEN `523✅/0❌`，`SMOKE PASS (sentCards=321, sessions=20)`**。
+
+**① MED-A：内部合成事件把群记录覆盖成 p2p**
+- 卡片失败通知与热重载自动续跑注入的事件**不带 `chat_type`**，旧写法 `String(evt.chat_type || 'p2p')`
+  **无条件覆盖** ⇒ 已判定的群被改写成 p2p ⇒ 群降级 full、过程叙述暴露给群（**用例 66 锚定**）。
+- 现在：**带字段才写**（存在性守卫）；无记录时行为与旧写 p2p 等价（`resolveCardMode` 只认 `group`）。
+
+**② MED-C：命令通道绕过记录 ⇒ `/switch` 门禁 fail-open**
+- `/switch` 等命令在 `handleInbound` **之前**分流（不起 turn 即 return）⇒ 永远走不到记录处
+  ⇒ 热重载后群的第一条命令按 cfg 缺省 full 放行（**用例 67 RED 实测：群里照常出切换卡**）。
+- 现在：`handleHelperMessage` 的 `normalizeEvent` 之后**早记**（同款守卫，命令/提问/普通消息全覆盖）。
+
+**③ MED-B：chatKinds 不落盘 ⇒ 重启/热重载后群判定归零**
+- 无入站的主动推卡（goal 轮/自动轮卡）在恢复前按 cfg 缺省 full 渲染 ⇒ 过程叙述泄露（**用例 69 行为锚**）。
+  ⚠️「重启后下一条真群消息」那条路**判别不了本缺陷**：真事件自带 `chat_type`、入站当场写对（自愈）——
+  RED 首跑由此产生假绿，教训记入用例注释（**用例 68 白盒锚落盘字段**）。
+- 现在：`persistChats` 写 `kind`（undefined 时由 JSON 丢弃）＋ `loadChats` 恢复（旧 state 无字段 ⇒ 同旧行为）。
+
+**④ LOW×3**
+- **封口同源**：封口处**当场 `resolveCardMode`** —— `card.mode` 是上一帧的值，与紧跟的渲染错位
+  会出现「同段答复显示两次 / 答复消失」（窗口＝两帧之间 cfg/群判定变化）。
+- **按钮门禁**：`handleSwitchAction`（切换卡**按钮回调**）入口补 stable 判定 —— F6 原来只拦文字命令。
+- **无效等待**：删冒烟 3×10.5s 等待 —— cfg 实为 **≤500ms 热读**（`ensureHelpers` 每个 drain tick
+  无条件 `bot.cfg = cfg`，`CONFIG_REFRESH_MS` 只 gate helper 拉起）；同步纠正源码「热读 10s」注释。
+
+**未修（留 0.7.20）**：LOW-3 stable 跳过集复用 `CARD_LABEL_SKIP`，与真实指路行集合不对齐
+（漏过滤 `✅ 本轮已完成…上方` 等 / 误伤 `✅ 已收到你的选择…`）—— 独立显示层主题，单独一版做。
+
 ## [0.7.18] - 2026-10-04
 
 ### 新功能：**身份闸门（P1.5「按人判」）— 默认关**

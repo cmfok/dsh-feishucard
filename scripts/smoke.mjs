@@ -4069,7 +4069,8 @@ console.log('63) ★ 0.7.17 stable 显示层：员工只看 状态+工具面板+
       reactionEmoji: 'GLANCE', approvalForm: true, mode: 'stable',
     }],
   }, null, 2))
-  await new Promise((r) => setTimeout(r, 10500))   // 等 cfg 热读节拍（CONFIG_REFRESH_MS=10s，12b 同款）
+  // 0.7.19（审查 LOW#5）：原地等 10.5s 是**无效等待**——mock 的 interval 不自跑，cfg 真正
+  // 生效靠下面 settle→drain 驱动的 ensureHelpers（每 tick 无条件 bot.cfg=cfg，≤500ms）。
   await settle(2)
   let release63
   const gate63 = new Promise((r) => { release63 = r })
@@ -4112,7 +4113,6 @@ console.log('64) ★ 0.7.17 stable 门禁：/switch 被拒（CM：员工一个�
       reactionEmoji: 'GLANCE', approvalForm: true, mode: 'stable',
     }],
   }, null, 2))
-  await new Promise((r) => setTimeout(r, 10500))
   await settle(2)
   const mark64 = sentCards.length
   feedInbound('om_stable_switch', '/switch')
@@ -4137,7 +4137,6 @@ console.log('65) ★ 0.7.17 群一律 stable＋三开关全关（C）：mode 配
       reactionEmoji: 'GLANCE', approvalForm: true,
     }],
   }, null, 2))
-  await new Promise((r) => setTimeout(r, 10500))
   await settle(2)
   const mark65 = sentCards.length
   let seq65 = 19000
