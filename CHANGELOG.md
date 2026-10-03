@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.15] - 2026-10-03
+
+### 修复：0.7.14 独立审查 4 条（**0 critical / 1 high / 1 medium / 2 low**，逐条核对 0 误报）
+
+> 来源：`output\code-review\dsh-feishucard-0714-retry-20261003-203205\REPORT.md`（VERDICT **BLOCK**，fail-on: high ⇒ 未推送，按设计 HOLD）。
+
+**① HIGH#1979：`__fsInterruptedCards` 用 globalThis Set 按卡片对象记 —— 会拦死新实例的续卡**
+- 卡片对象**跨代共享**（`activeTurns`/`liveCardRegistry` 都是 globalThis Map）⇒ 新代接管的**就是同一个对象**，
+  它的 syncCard 同样命中守卫 ⇒ 卡片永远冻结在「正在工作中…」；且 Set 永不清 ⇒ 无界增长（连带解掉 LOW#2361）。
+- 现在：守卫改为 **apply 作用域内的 per-generation `WeakSet`**（`interruptedCards`）—— dispose 登记进**本代**的
+  WeakSet，旧代只拦自己；新代 apply 是新闭包、自己的 WeakSet 是空的 ⇒ 接管照常；WeakSet 不阻止 GC ⇒ 随代回收。
+
+**② MED#3942：用例 61 夹具与注释不符（191 字 < 500 ⇒ 截断分支从未被踩）**
+- 注释说"长答复含截断点前后标记"，实际 ~191 字 ⇒ clipNoteText 根本不截断 ⇒ 注释声称测的"被截断的 note"没测到。
+- 现在：头/尾各 400 字 ⇒ 全文 >500 ⇒ 镜像 note 被截成前 500 + `…` ⇒ "搬走"必须在**被截断的 note**上按 seq 命中（真实覆盖该分支）。
+
+**③ LOW#2359：dispose 的空 `catch {}` 吞错** —— 登记失败时守卫静默失效、半截卡回归无诊断 ⇒ 补留痕日志。
+**④ LOW#2361：Set 无界增长** —— 由 ① 的 WeakSet per-generation 根治（不再有全局累积）。
+
+**配套（可证伪）**：用例 62 第三条断言重写 —— 原断言查 `globalThis.__fsInterruptedCards`（实现细节，改守卫即失效），
+改为**代际区分行为断言**：dispose 后重新 apply 新代 ⇒ 新代对同一张卡的推送**不许**被拦（在 0.7.14 的 global Set 上必红）。
 ## [0.7.14] - 2026-10-03
 
 ### 修复：一条回复发两张卡（过程卡与结论卡内容重复）—— CM 指定 TASK v3（执行：HOME）

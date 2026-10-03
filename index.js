@@ -98,6 +98,12 @@ export function apply(ctx) {
   // agent / card / bot / chatId / split 都跨代可用），于是照旧走插话那条路。
   const activeTurns = globalThis.__fsActiveTurns
     || (globalThis.__fsActiveTurns = new Map())   // agentId -> { card, bot, chatId, split }
+  // 0.7.15（审查 HIGH#1979）：**按代**记被 dispose 中断的卡 —— 0.7.14 曾用 globalThis Set 按对象记，
+  // 而卡片对象跨代共享（activeTurns/liveCardRegistry 都是 globalThis Map）⇒ 新代接管同一对象也被拦死
+  // （冻结在「正在工作中…」）且全局 Set 永不清（无界增长，LOW#2361）。WeakSet 在 apply 作用域：
+  // 只拦**本代**（旧代 dispose 时登记进自己的闭包），新代 apply 是新闭包、自己的 WeakSet 为空 ⇒ 接管照常；
+  // WeakSet 不阻止 GC ⇒ 卡与 agent 图随代回收。
+  const interruptedCards = new WeakSet()
 
   // 刚封口的普通回合卡：agentId -> { card, bot, chatId, sealedAt }
   // 2026-09-27（CM 实证："每次发东西，大部分都会一个内容发两次"）：
@@ -1973,10 +1979,11 @@ export function apply(ctx) {
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
   function syncCard(bot, chatId, card, force) {
-    // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 被中断回合的卡不许再由旧实例推送**。
-    //   dispose 把活跃回合的卡登记进 __fsInterruptedCards（跨代共享，见 dispose 处）；
-    //   新实例续卡/接管走它自己的 syncCard（新一代没有这个标记）⇒ 这里只拦旧代，留痕不抛错。
-    if (card && globalThis.__fsInterruptedCards && globalThis.__fsInterruptedCards.has(card)) {
+    // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 被中断回合的卡不许再由本代（旧实例）推送**。
+    // 0.7.15（审查 HIGH#1979）：查**本代闭包**的 `interruptedCards`（WeakSet）——
+    //   卡片对象跨代共享，0.7.14 的 globalThis Set 会把新代接管的同一张卡一起拦死（冻结）；
+    //   本代登记只作用于本代 ⇒ 新代 apply 是新闭包、集合为空 ⇒ 接管/续卡照常推送。留痕不抛错。
+    if (card && interruptedCards.has(card)) {
       console.log('[fs] card sync skipped: generation disposed (interrupted card left for new instance)')
       return card.queue
     }
@@ -2353,13 +2360,15 @@ export function apply(ctx) {
       const interrupted = []
       for (const [agentId, entry] of Array.from(activeTurns)) {
         if (!entry || !entry.bot || !entry.chatId) continue
-        // 0.7.14（TASK v3 §4 / H3）：把活跃回合的**卡对象**登记进跨代 Set ⇒ 旧代后续的封口推送
-        //   在 syncCard 处被拦下 —— "半截卡"根因：dispose 停 watcher 后，旧代 runTurn 收尾仍 seal+push
-        //   （web.log 18:39:32 实录：dispose 两行之后跟着 turn sealed + blocks=37 的推送）。
+        // 0.7.14（TASK v3 §4 / H3）：把活跃回合的**卡对象**登记 ⇒ 本代后续的封口推送在 syncCard 处被拦下
+        //   —— "半截卡"根因：dispose 停 watcher 后，本代 runTurn 收尾仍 seal+push（web.log 18:39:32 实录）。
+        // 0.7.15（审查 HIGH#1979 / LOW#2359）：登记进**本代闭包的 WeakSet**（不再用 globalThis Set ——
+        //   会连新代一起拦死）；空 catch 补留痕（登记失败 = 守卫静默失效 = 半截卡回归无诊断）。
         try {
-          if (!globalThis.__fsInterruptedCards) globalThis.__fsInterruptedCards = new Set()
-          if (entry.card) globalThis.__fsInterruptedCards.add(entry.card)
-        } catch { }
+          if (entry.card) interruptedCards.add(entry.card)
+        } catch (error) {
+          console.log('[fs] dispose(热重载): 登记被中断卡片失败 ' + String(error && error.message || error))
+        }
         interrupted.push({
           sessionId: String(agentId),
           chatId: String(entry.chatId),
