@@ -1089,30 +1089,26 @@ export function apply(ctx) {
     return out.join('\n')
   }
 
-  // 卡片级表格配额：按元素顺序，第 6 张起的表格降级成可读清单（不再用代码块）
-  // 0.7.9（CM 2026-10-03 P4，BA 回合 11310 实证 web.log 79604）：**必须递归**。
-  //   旧实现只走两层（顶层 markdown + `collapsible_panel.elements`）⇒ 面板里再嵌
-  //   `column_set`/嵌套面板的表格**既不被计数也不被降级** ⇒ 载荷在飞书眼里 >5 张表 ⇒ ErrCode 11310。
-  const NESTED_KEYS = ['elements', 'columns', 'items', 'fields', 'children', 'lines']
-  function walkMarkdownContent(node, fn, depth) {
-    if (!node || typeof node !== 'object' || (depth || 0) > 8) return
-    if (Array.isArray(node)) { for (const it of node) walkMarkdownContent(it, fn, (depth || 0) + 1); return }
-    if (node.tag === 'markdown' && typeof node.content === 'string') { fn(node); return }
-    for (const k of NESTED_KEYS) {
-      if (node[k] && typeof node[k] === 'object') walkMarkdownContent(node[k], fn, (depth || 0) + 1)
-    }
-  }
+  // 卡片级表格配额：按遍历顺序，第 6 张起的表格降级成可读清单（不再用代码块）。
+  // 0.7.9（CM 2026-10-03 P4，BA 回合 11310 实证 web.log 79604）先改成"递归"；
+  // 0.7.10（独立审查 LOW#1096 修正）：**不再手维护键白名单** —— 改为复用本文件既有的通用遍历器
+  //   `walkContentHolders`（它对**所有**键递归、且有环保护，见其定义处的真机事故注释）。
+  //   旧白名单只覆盖"今天用到的键"：任何没列上的容器（1.0 风格 `div.text`、未来新增的包裹层）
+  //   都会让 countPayloadTables **静默返回 0** ⇒ 护栏看着"通过"、而飞书那边照样 11310。
   function countPayloadTables(elements) {
     let n = 0
-    walkMarkdownContent(elements, (el) => { n += countMarkdownTables(el.content) }, 0)
+    walkContentHolders(elements, (h) => {
+      if (h && h.tag === 'markdown' && typeof h.content === 'string') n += countMarkdownTables(h.content)
+    })
     return n
   }
   function demoteOverflowTables(elements, max) {
     let used = 0
-    walkMarkdownContent(elements, (el) => {
-      if (countMarkdownTables(el.content) === 0) return
-      el.content = demoteTablesInText(el.content, () => (++used > max))
-    }, 0)
+    walkContentHolders(elements, (h) => {
+      if (!h || h.tag !== 'markdown' || typeof h.content !== 'string') return
+      if (countMarkdownTables(h.content) === 0) return
+      h.content = demoteTablesInText(h.content, () => (++used > max))
+    })
     return elements
   }
 
@@ -1406,17 +1402,17 @@ export function apply(ctx) {
     // 表格配额：飞书单卡最多 5 张表，超出的改成代码块（**不删内容**）。
     // 必须在折叠之前做 —— 折叠把文本挪进面板并不会减少表格数。
     demoteOverflowTables(elements, CARD_MAX_TABLES)
-    // 0.7.9 P4：递归护栏 —— 上面的降级是"按 markdown 元素顺序"，这里是**兜底复检**：
-    // 任何路径漏掉的嵌套表格都在这里被降级，且留痕可判定（旧实现静默超限 ⇒ 11310）。
+    // 0.7.10（独立审查 MED#1413 修正）：这里原先是"再降一次"的第二遍 —— 但两遍用**同一遍历、
+    // 同一上限**，第二遍不可能再降（第一遍之后剩下的表要么在前 5 张之内、要么 demoteTablesInText
+    // 根本转不了，例如单行/只有分隔线的"伪表"），等于**空转**，还打印了误导性的 `demoted=` 计数。
+    // 现在改成**诚实复检**：只报告"降级之后还剩几张表"；若仍超上限 ⇒ 说明有转不了的表格
+    // （= 仍有 11310 风险），交给 watcher 的换卡兜底，并留下**可判定**的日志。
     {
-      const tables = countPayloadTables(elements)
-      if (tables > CARD_MAX_TABLES) {
-        let used2 = 0
-        walkMarkdownContent(elements, (el) => {
-          el.content = demoteTablesInText(el.content, () => (++used2 > CARD_MAX_TABLES))
-        }, 0)
-        console.log('[fs] payload tables=' + tables + ' demoted=' + (tables - CARD_MAX_TABLES)
-          + ' (hard guard, card=' + String(card && card.token || '-').slice(-8) + ')')
+      const left = countPayloadTables(elements)
+      if (left > CARD_MAX_TABLES) {
+        console.log('[fs] payload tables still=' + left + ' (limit ' + CARD_MAX_TABLES
+          + ') after demote: unconvertible tables remain, rotation will handle; card='
+          + String(card && card.token || '-').slice(-8))
       }
     }
 
@@ -2412,7 +2408,8 @@ export function apply(ctx) {
       text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
     })
     try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
-    fresh.rotatedThisTurn = true
+    // 0.7.10（独立审查 LOW#7044）：**不设** rotatedThisTurn —— 该标志只在 runTurn 收尾时读，
+    // 而这条（热重载续卡）路径不经过那个判定 ⇒ 设了也是**死存**，反而让人以为"这里会抑制结论卡"。
     try { void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => { }) } catch { }
     entry.card = fresh
     if (entry.stop) { try { entry.stop() } catch { } }
@@ -3147,7 +3144,10 @@ export function apply(ctx) {
       for (const k of ['content', 'text', 'title', 'name', 'user_name', 'file_name', 'tag_name', 'label']) {
         if (typeof node[k] === 'string') push(node[k])
       }
-      for (const k of ['elements', 'fields', 'columns', 'items', 'message_list', 'content', 'title', 'children', 'elements_list']) {
+      // 0.7.10（独立审查 MED#3150 修正）：**必须含 body/header** —— schema 2.0 卡片把元素放在
+      // `body.elements`（本插件自己发出去的卡就是这个形状）⇒ 少了这两个键，**转发我们自己的卡**
+      // 仍然什么都抠不到、只能回"读不到正文"，等于 P6 没修好 CM 报的那条。
+      for (const k of ['body', 'header', 'elements', 'fields', 'columns', 'items', 'message_list', 'content', 'title', 'children', 'elements_list']) {
         if (node[k] && typeof node[k] === 'object') walk(node[k], depth + 1)
       }
     }
@@ -3668,7 +3668,8 @@ export function apply(ctx) {
       // （smoke 7 重复文本、smoke 12 六张表并成一张卡，两次都是这么踩到的）。
       const spokenBlocks = []
       const spokenSeqs = new Set()
-      let crossedTool = false
+      // 0.7.10（独立审查 MED#3677）：删掉 `crossedTool` —— 0.7.9 把"跨过工具调用继续收"改成
+      // **跨过第一个工具调用就 break**，该变量再也不会被赋成 true（死代码 + 与注释自相矛盾）。
       for (let i = events.length - 1; i >= seqBefore; i--) {
         const event = events[i]
         if (!event) continue
@@ -3679,11 +3680,11 @@ export function apply(ctx) {
         const spoken = extractProcessText(event.data && event.data.message)
         if (!spoken) continue
         if (isNarrationOnly(spoken)) break
-        if (spokenBlocks.length > 0 && !crossedTool) break
+        // 只收"最后一段连续叙述"：一旦已经收到过一段、又碰到没被工具隔开的第二段 ⇒ 停
+        if (spokenBlocks.length > 0) break
         if (event.seq !== undefined && spokenSeqs.has(event.seq)) continue
         if (event.seq !== undefined) spokenSeqs.add(event.seq)
         spokenBlocks.unshift({ seq: event.seq, text: spoken })
-        crossedTool = false
       }
       // 整轮只有旁白（没有真正答复）时退回旧口径：取最后一条文本，但**不拆结论卡**。
       const narrationOnlyTurn = spokenBlocks.length === 0
@@ -3796,9 +3797,33 @@ export function apply(ctx) {
         //    一轮里它能覆盖**整轮**叙述 ⇒ 过程卡的分步叙述被吞成一段（就是"文字消失"的观感）。
         //    这一分支的触发面比 0.7.5 修的分卡路径更宽：**所有 <30s 回合、纯旁白回合、notSpoken 回合**
         //    都走这里（conclusionEligible = !notSpoken && !narrationOnlyTurn && elapsed>=30s）。
-        const already = card.blocks.some((b) => b && b.text && typeof b.text === 'string'
-          && b.text.replace(/\s+/g, ' ').trim() === String(reply).replace(/\s+/g, ' ').trim())
-        if (!already) card.blocks.push({ type: 'message', text: reply })
+        // 0.7.10（独立审查 MED#3799 修正）：**不能按"整段相等"判重** —— 镜像 note 走 appendNote 时会被
+        //   `clipNoteText(…, MAX_NOTE_CHARS=500)` 处理，而它**不是纯截断**：它在 500 字附近**按换行切**、
+        //   去掉尾部表格行、**补一个 `…`**、还可能把被切掉的 🎯 目的行**补回末尾** ⇒ 剪过的 note
+        //   **不是 reply 的前缀**（我第一版用 startsWith 判，仍然失配 —— 自查时当场发现并改掉）。
+        //   判据改为**最长公共前缀**：
+        //     · 没被截断（整段已在卡上）⇒ 公共前缀 = 整段 ⇒ 尾部为空 ⇒ 一个字都不追加（零重复）
+        //     · 被截断/换行切过 ⇒ 公共前缀 ≈ 500 ⇒ 只补 `…` 之后那半段（不丢字、也不重复前 500 字）
+        const normText = (x) => String(x == null ? '' : x).replace(/\s+/g, ' ').trim()
+        const replyRaw = String(reply)
+        const replyNorm = normText(replyRaw)
+        const commonPrefixLen = (a, b) => {
+          const n = Math.min(a.length, b.length)
+          let i = 0
+          while (i < n && a[i] === b[i]) i++
+          return i
+        }
+        let shownChars = 0
+        for (const b of card.blocks) {
+          if (!b || typeof b.text !== 'string' || !b.text) continue
+          const n = normText(b.text)
+          if (!n) continue
+          const c = commonPrefixLen(n, replyNorm)
+          // 阈值 120：避免把"一句短旁白恰好与开头相同"误判成"这段已经展示过了"
+          if (c >= 120) shownChars = Math.max(shownChars, Math.min(c, replyRaw.length))
+        }
+        const tail = shownChars > 0 ? replyRaw.slice(shownChars).trim() : replyRaw
+        if (tail) card.blocks.push({ type: 'message', text: tail })
         replaced = true
       }
       if (!replaced) card.blocks.push({ type: 'message', text: reply })
@@ -7043,7 +7068,7 @@ export function apply(ctx) {
       void syncCard(bot, chatId, state.card, true).catch(() => {})
       const fresh = makeCardState(agent)
       fresh.cursor = carry
-      fresh.rotatedThisTurn = true
+      // 0.7.10（独立审查 LOW#7044）：**不设** rotatedThisTurn —— 自动卡换卡不经过 runTurn 的收尾判定（死存）。
       state.card = fresh
       void syncCard(bot, chatId, fresh, true).catch(() => {})
       state.stop = startCardWatcher(agent, fresh, bot, chatId, rotate)

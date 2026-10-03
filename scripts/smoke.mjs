@@ -970,8 +970,11 @@ console.log('13b) 目标卡照样享受表格换卡（新功能 × 既有换卡�
   ok(JSON.stringify(all).includes('本轮结束'), '封口落在换卡后的新卡上（游标已接续，不断链）')
   // 0.7.9（CM 2026-10-03 ③）：换卡说明现在写在**旧卡**上（走 PATCH，不再是新卡的 create）
   // ⇒ 先按"任意 op 里含换卡说明"定位，再把**其后第一张 create** 当作新卡。
+  // 0.7.10（独立审查 MED#973 修正）：**必须同时断言 op 类型** —— 只查"短语存在"的话，
+  // 把说明写回"新卡的 create"（= 0.7.8 的旧行为）也照样满足 ⇒ 这条断言钉不住它名字里的回归。
   const hintAt = all.findIndex((c) => JSON.stringify(c.payload).includes('表格已满'))
-  ok(hintAt >= 0, '换卡说明写在旧卡上（P3）')
+  ok(hintAt >= 0 && all[hintAt].op === 'update',
+    '换卡说明写在**旧卡**上（P3：走 PATCH，不是新卡的 create）实际 op=' + (hintAt >= 0 ? all[hintAt].op : 'none'))
   const newStart = all.findIndex((c, i) => i > hintAt && c.op === 'create')
   const onNewCard = newStart >= 0 ? JSON.stringify(all.slice(newStart)) : ''
   ok(onNewCard.includes('| 列6 |') && !onNewCard.includes('**列6**：'),
@@ -3195,15 +3198,32 @@ console.log('56) ★ 0.7.9 P1：状态栏一行只有一个模式位（CM ①）
   const mark56 = sentCards.length
   feedInbound('om_mode_slot', '状态栏模式位测试')
   await settle(3)
+  // 0.7.10（独立审查 MED#3201 修正）：**必须先放行闸门让回合收口** —— 运行中的过程卡是
+  // `footerMode='bare'`，页脚只渲染 statusTextFor(card)（本来就只有**一个**模式位），
+  // 而"两个模式位"只出现在**完整页脚**（收口后才渲染）⇒ 旧写法在**未修复版上也会通过**（空断言）。
+  release56()
+  agent.whenIdle = prevIdle56
+  await settle(4)
   const body56 = JSON.stringify(cardsSince(mark56))
   ok(!body56.includes('目标模式 · 未启用'),
     '★ 无目标时不再出现「🎯 目标模式 · 未启用」（CM ①：普通模式与目标模式共存）')
-  const hits56 = (body56.match(/目标模式/g) || []).length
-  ok(hits56 <= 1, '★ 同一张卡里「目标模式」最多出现 1 次（实际 ' + hits56 + '）')
+  // ⚠️ 口径必须精确（0.7.10 自查修正）：**不能**在整张卡上数「目标模式」的次数 —— 目标轮的过程卡
+  //   **标题**本来就是 `🎯 目标模式 · 第 N 轮…`，与状态栏的模式位是**设计内的两处**（两张卡就 4 次）
+  //   ⇒ 旧写法会把"正常"判成"回归"（**假红**：上一轮 GREEN 就是这么被我自己的断言判红的）。
+  //   CM ① 的真正形状是：**同一个文本元素里**出现两个模式词
+  //   （例：`🧭 普通模式 · 运行中  ｜  🎯 目标模式 · 未启用` 或 `🎯 目标模式 · 运行中  ｜  🎯 目标模式 · 已激活…`）。
+  const badElems56 = []
+  const walk56 = (n) => {
+    if (!n || typeof n !== 'object') return
+    if (typeof n.content === 'string' && (n.content.match(/目标模式/g) || []).length > 1) badElems56.push(n.content.slice(0, 90))
+    for (const k of Object.keys(n)) { const v = n[k]; if (v && typeof v === 'object') walk56(v) }
+  }
+  for (const c of cardsSince(mark56)) walk56(c.payload)
+  ok(badElems56.length === 0,
+    '★ 没有任何**单个文本元素**里出现两个「目标模式」（CM ① 的真正形状）实际 ' + badElems56.length + ' 处'
+    + (badElems56.length ? '：' + badElems56[0] : ''))
   ok(!body56.includes('目标模式 · 已暂停') && !body56.includes('目标模式 · 已阻塞'),
     '★ 目标短语不再自带「目标模式」前缀（否则与模式位重复）')
-  release56()
-  agent.whenIdle = prevIdle56
   await settle(2)
 }
 
@@ -3241,8 +3261,36 @@ console.log('57) ★ 0.7.9 P2：过程卡不许丢字；结论卡不许夹带过
   const last57 = groups57.length ? groups57[groups57.length - 1].join('') : ''
   ok(groups57.length <= 1 || !last57.includes('过程叙述-ALPHA-过程'),
     '★ 结论卡（本轮最后一张）**不夹带**过程叙述（实际 ' + groups57.length + ' 张卡）')
-  ok(body57.includes('过程叙述-ALPHA-过程') && body57.includes('最终答复-BETA-结论'),
-    '过程叙述与最终答复**同时**在（没有把前者吞进后者）')
+  // 0.7.10（独立审查 LOW#3244 修正）：原句只是上面两条的**合取**（永不独立失败）⇒ 换成新增覆盖：
+  ok(groups57.length <= 2,
+    '★ 本轮**真卡片 ≤2**（过程卡 + 结论卡；不再多出第 3 张）实际 ' + groups57.length)
+
+  // 0.7.10（审查 MED#3799 的回归钉）：长回复（>500 字）**不许在过程卡上重复出现** ——
+  // 镜像 note 会被 clipNoteText 处理（截断 + 补 … + 可能补回目的行），旧实现按"整段相等"判重必然失配。
+  {
+    let release57b
+    const gate57b = new Promise((r) => { release57b = r })
+    const prevIdle57b = agent.whenIdle
+    agent.whenIdle = () => gate57b
+    const mark57b = sentCards.length
+    const longText = 'LONGMARK-开头-' + 'X'.repeat(700) + '-LONGMARK-结尾'
+    agent.send = function (message) {
+      this.sent.push(message)
+      agentEvents.push({ type: 'assistant/message', seq: ++seq57, data: { message: { content: [{ type: 'text', text: longText }] } } })
+    }
+    feedInbound('om_p2_long', 'P2 长回复不重复')
+    await settle(4)
+    release57b()
+    agent.whenIdle = prevIdle57b
+    await settle(3)
+    // ⚠️ 口径必须精确（0.7.10 自查修正）：**不能跨窗口计数** —— 旧实现是"**同一张卡上**出现两次"，
+    //   而"两张卡各一次"在窗口计数里同样是 2 ⇒ 断言会**永不失败**（我第一版就是这么写的，自查时改掉）。
+    //   正确判据：取**这张卡的最后一次 payload**（每次 PATCH 都发全量元素列表），在其中数出现次数。
+    const ops57b = cardsSince(mark57b).filter((c) => c.payload && c.payload.schema === '2.0')
+    const last57b = ops57b.length ? JSON.stringify(ops57b[ops57b.length - 1].payload) : ''
+    const hits57b = (last57b.match(/LONGMARK-开头/g) || []).length
+    ok(hits57b <= 1,
+      '★ 长回复（>500 字）不许在**同一张卡的最后形态**里出现两次（实际 ' + hits57b + ' 次；旧实现过程卡会重复）')  }
 }
 
 console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢弃（CM：转发卡片没反应）')
@@ -3256,6 +3304,8 @@ console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢
   const fedRich = JSON.stringify(agent.sent)
   ok(fedRich.includes('卡片正文-GAMMA') || fedRich.includes('卡片标题-Z'),
     '★ 卡片里的文字被抠出来喂给了模型（不再零反应）')
+  // 0.7.10（独立审查 LOW#3250 修正）：markRich 原本声明后**从未使用**（死变量）⇒ 接一条真断言：
+  ok(cardsSince(markRich).length > 0, '★ 卡片消息也走卡片通道（有可见产出），不是零反应')
   ok(consoleLines.some((l) => l.includes('inbound rich message salvaged') && l.includes('chat=')),
     '★ 留痕 inbound rich message salvaged 且带 chat/message_id')
 
