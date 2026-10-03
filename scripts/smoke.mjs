@@ -3939,8 +3939,10 @@ console.log('61) ★ 0.7.14 B3 总纲：过程卡与结论卡之间不许重复�
   process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
   const mark61 = sentCards.length
   let seq61 = 16000
-  const head61 = 'REPLY61-头-' + 'H'.repeat(80)
-  const tail61 = 'REPLY61-尾-' + 'T'.repeat(80)
+  // 0.7.15（审查 MED#3942）：必须**真 >500 字** —— 头/尾各 400 ⇒ 镜像 note 被 clipNoteText
+  // 截成前 500 + …（被截断的 note 不是原文前缀 ⇒ "搬走"仍须按 seq 命中 —— 原 191 字从未踩到该分支）。
+  const head61 = 'REPLY61-头-' + 'H'.repeat(400)
+  const tail61 = 'REPLY61-尾-' + 'T'.repeat(400)
   const longReply61 = head61 + '\n\n中段说明一句。\n\n' + tail61
   agent.send = function (message) {
     this.sent.push(message)
@@ -3990,24 +3992,42 @@ console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡�
   feedInbound('om_h3_half', 'H3 半截卡')
   await settle(3)
   // 模拟 HMR dispose：逐个调 ctx.effect cleanup，直到看到"登记 … 个可能被中断的回合"
-  let disposed62 = false
+  // 0.7.15：**逐个跑完全部 cleanup**（不 break）—— 登记代可能 ≠ 封口代，只登记第一个代会漏拦；
+  // dispose 可重复执行（已 splice 的列表再跑是空操作），对每一代都跑一遍才覆盖"谁在封口"。
+  const markAdopt = sentCards.length
+  const logAdopt = consoleLines.length
   for (const cleanup of effectCleanups) {
-    const before = consoleLines.length
     try { cleanup() } catch { }
-    if (consoleLines.slice(before).some((l) => l.includes('dispose(热重载): 登记'))) { disposed62 = true; break }
   }
+  let disposed62 = consoleLines.slice(logMark62).some((l) => l.includes('dispose(热重载): 登记'))
   ok(disposed62, '（前提）dispose 已执行且登记了被中断的回合')
+  // 0.7.15（审查 HIGH#1979）：新代（重新 apply）接管**同一张卡对象**后，它的 syncCard **不许**被拦
+  // —— 0.7.14 的 globalThis Set 按对象记 ⇒ 新代也被拦、卡片冻结在「正在工作中…」（本断言在 0.7.14 必红）。
+  // 0.7.15 fix (S10.8 observation surface): slice consoleLines with a consoleLines index (logMark62);
+  // takeover log prints the internal id card=card_294 (create log has feishu token msg=om_card_294, strip om_ prefix).
+  const tokM = consoleLines.slice(logMark62, logAdopt).join('\n').match(/card created[^\n]*msg=(\S+)/)
+  const tok62 = tokM ? tokM[1] : ''
+  const cid62 = tok62.replace(/^om_/, '')
+  const modA = await import('../index.js')
+  modA.apply(ctx)
+  await drain()
+  await settle(2)
+  const adoptLines = consoleLines.slice(logAdopt)
+  ok(Boolean(tok62) && adoptLines.some((l) => l.includes('热重载续卡：接管') && l.includes('card=' + cid62)),
+    '（前提）新代接管了同一张卡（热重载续卡：接管 + ' + (cid62 || 'id未取到') + '）')
+  const skipAfterAdopt = adoptLines.filter((l) => l.includes('card sync skipped: generation disposed')).length
+  ok(skipAfterAdopt === 0,
+    '★ HIGH：新代接管的推送**不许**被拦（0.7.14 的 global Set 会拦 ⇒ skip=' + skipAfterAdopt + ' ⇒ 红）')
+  ok(sentCards.slice(markAdopt).some((c) => c.op === 'update'),
+    '★ HIGH：新代接管后对该卡产生了推送（update；0.7.14 被拦 ⇒ 无 ⇒ 红）')
   const markAfterDispose = sentCards.length
   release62()
   agent.whenIdle = prevIdle62
   await settle(3)
-  const pushedAfterDispose = sentCards.slice(markAfterDispose)
   ok(consoleLines.slice(logMark62).some((l) => l.includes('card sync skipped: generation disposed')),
     '★ H3：旧实例的封口推送被拦下（card sync skipped: generation disposed；0.7.13 无此拦截 ⇒ 红）')
-  ok(pushedAfterDispose.length === 0,
-    '★ H3：dispose 之后旧实例**一张卡都不许再发**（实际 ' + pushedAfterDispose.length + ' 条；0.7.13 会多发半截卡 ⇒ 红）')
-  ok(globalThis.__fsInterruptedCards && globalThis.__fsInterruptedCards.size >= 1,
-    '★ 被中断回合的卡已登记进跨代 Set（新实例接管/续卡时可据此识别）')
+  ok(sentCards.slice(markAfterDispose).filter((c) => c.op === 'create').length === 0,
+    '★ H3：dispose 之后不许再新建卡（实际 ' + sentCards.slice(markAfterDispose).filter((c) => c.op === 'create').length + ' 张；0.7.13 的半截卡/0.7.14 的拦截失效都会出）')
   await settle(2)
 }
 
