@@ -20,6 +20,9 @@ __pycache__/
 *.log
 npm-debug.log*
 
+# 审查/冒烟产物目录（如 HOME#ZCode 的 review-0717/：日志与 .exit 标记）—— 属产物，不入库
+review-*/
+
 # local backups written by scripts/sync-to-profile.mjs and hand edits
 *.bak
 *.bak-*
