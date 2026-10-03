@@ -4802,13 +4802,27 @@ export function apply(ctx) {
       if (!raced || !Array.isArray(raced.events)) return ''
       for (const ev of raced.events) {
         if (!ev || ev.type !== 'user/message') continue
-        const src = (ev.data && ev.data.source) || {}
+        // ⚠️ 两种事件结构都要兼容（2026-10-04 实测差异）：
+        //   · 旧 `sessionPersistence.readFrom`：{ type, data: { source, content: [{ text }] } }
+        //   · 新 `sessionQuery.readSession`：payload 就是 UserMessage 本体（**不一定有 `data` 包装**）
+        //   原实现只读 `ev.data.content` ⇒ 若新结构没有 `data`，则取到空数组 ⇒
+        //   **摘要永远为空且不报错**（静默）—— 这正是 CM 反馈"只有标题、没有内容"的一层原因。
+        const d = (ev.data && typeof ev.data === 'object') ? ev.data : ev
+        const src = (d && d.source) || {}
         if (src.kind && src.kind !== 'user') continue
-        const text = (ev.data && ev.data.content || [])
-          .map((c) => (c && typeof c.text === 'string' ? c.text : '')).join(' ')
+        const raw = (d && d.content) || (d && d.message && d.message.content) || []
+        const text = (Array.isArray(raw) ? raw : [])
+          .map((c) => (c && typeof c.text === 'string' ? c.text : ''))
+          .join(' ')
           .replace(/\s+/g, ' ').trim()
         if (text) return text.length > 60 ? text.slice(0, 60) + '…' : text
       }
+      // 一条**可见诊断**：本会话里一个 user/message 的正文都没取到时，把实际见到的事件类型打出来。
+      // （避免再次出现"摘要为空但日志全绿"的静默失败）
+      const kinds = {}
+      for (const ev of raced.events) { const t = (ev && ev.type) || '?'; kinds[t] = (kinds[t] || 0) + 1 }
+      console.log('[fs] switch: no user text for ' + meta.id
+        + ' events=' + raced.events.length + ' types=' + JSON.stringify(kinds).slice(0, 220))
     } catch (error) {
       console.log('[fs] switch: summary read failed for ' + meta.id + ': ' + String(error && error.message || error))
     }
