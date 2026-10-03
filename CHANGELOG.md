@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.14] - 2026-10-03
+
+### 修复：一条回复发两张卡（过程卡与结论卡内容重复）—— CM 指定 TASK v3（执行：HOME）
+
+> 来源：`信箱\inbox-CM-OFFICE\20261003-1905-HOME-TASK-一条回复发两张卡的根因与修复方案.md`（v3）。
+> **受影响条目清单（规矩 1）**：主域 **B**（B1/B2/B3/B4/B5/B6/B7）＋ 相邻 **H3**、**A2**；
+> 逐条对账见提交说明与 `deploy/ship17` 日志。
+
+**① 根因**：原设计（L3649 注释"promote the last note … so the reply is not duplicated"）是
+封口时把**结论段**从过程卡搬走；0.7.5 P0 的「过程卡只追加、绝不删块」把这一刀**连带砍掉** ⇒
+结论段留在过程卡（镜像 note）+ 结论卡再放一份 ⇒ **两卡重复**。
+**前提已变**：0.7.9 收紧后 `replySeqs` 只含最后那段连续答复、碰不到过程叙述 ⇒ 搬走它安全。
+
+**② 改动 1（代码，split 分支 1 处）**：先把 `replySeqs` 命中的 note 从过程卡移除，再追加指路行。
+**只动 replySeqs 命中的 note；🎯 行/进度旁白一条不动**（B1 不受影响）。
+
+**③ 改动 2（断言反转 2 处）**：
+- 用例 31：`过程卡保留正文（与结论卡重复是有意代价）` → **`过程卡不含结论段`**（旧断言把 bug 写成期望，规矩 3 活案例）。
+- 用例 31b：`三段正文全部保留` → **`过程叙述一段不少` ＋ `结论段不在过程卡上`**（B1 与 B3 分别钉住）。
+
+**④ 改动 3（守护用例 2 条）**：
+- **用例 61（B3 总纲）**：叙述→工具→长答复（>500 字，含截断点前后标记）⇒ 结论卡完整、过程卡连截断前缀都不留、🎯 行不少。
+- **用例 62（H3）**：热重载 dispose 后旧实例**一张卡都不许再发**（"半截卡"根因 = dispose 停 watcher 后旧代 runTurn 收尾仍 seal+push）。
+  修法 = dispose 把活跃回合的**卡对象**登记进跨代 `__fsInterruptedCards`，`syncCard` 头部命中即拦截留痕；新实例续卡走自己的通道不受影响。
+
+**⑤ 先红后绿**：31/31b 反转断言 + 61 + 62 在未修复版（0.7.13）上**全部报红**，修复后转绿。
 ## [0.7.13] - 2026-10-03
 
 ### 收尾：TODO-0710 遗留的插件侧两个已知问题（#0 闸门修在落地脚本里，不占版本号）

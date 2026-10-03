@@ -2038,10 +2038,10 @@ console.log('31) 结论独立成卡（CM 2026-10-01 B 方案，17:3x 修正：**
   const conclusionIdx = events.findIndex((c, i) => i > 0 && c.op === 'create' && JSON.stringify(c.payload).includes('一切正常'))
   ok(conclusionIdx > 0, '结论出现在**新开的**那张卡里')
   const beforeConclusion = JSON.stringify(events.slice(0, conclusionIdx))
-  // 🔴 2026-10-03 P0 口径反转（CM 报障 + 计划口径 (ii)）：过程卡**只追加、不删块** ⇒
-  //    结论那一段会同时留在过程卡里（与自包含的结论卡重复），这是**有意为之**的代价：
-  //    "过程卡的文字和步骤不动"优先于"两卡不重复"（旧口径为了不重复而把过程卡清空）。
-  ok(beforeConclusion.includes('一切正常'), '★ P0：过程卡**保留**正文（只追加、不删块；与结论卡重复是有意代价）')
+  // 🔴 0.7.14 反转（CM 指定 TASK v3）：旧断言把 bug 写成了期望（规矩 3 活案例）——
+  //    【旧断言】2026-10-03 P0：过程卡保留正文（与结论卡重复是有意代价）。
+    //【反转条件】replySeqs 收紧到只含最后一段答复后，搬走结论段已不会误删过程叙述 ⇒ 两卡不许再重复。
+  ok(!beforeConclusion.includes('一切正常'), '★ 0.7.14 B3：过程卡**不含**结论段（结论只出现在结论卡）')
   ok(beforeConclusion.includes('结论见下方卡片'), '过程卡末尾追加一句指路')
   ok(JSON.stringify(creates[creates.length - 1].payload).includes('已完成'), '结论卡的状态栏写「已完成」')
   // CM 2026-10-01 A 方案：**过程卡不摆状态栏**（无目标/无上下文/无缓存），只留一行裸状态
@@ -2105,7 +2105,10 @@ console.log('31b) 🔴 P0 复现 CM 2026-10-03 报障：过程卡正文**不许*
   const procJson = JSON.stringify(procPayload)
   const concJson = JSON.stringify(concPayload)
   ok(procJson.includes('第一段过程叙述') && procJson.includes('第二段过程叙述') && procJson.includes('第三段过程叙述'),
-    '★ P0：过程卡**三段正文全部保留**（旧实现会把它们删掉搬进结论卡）')
+    '★ B1：过程叙述三段**一段不少**（0.7.14 "搬走结论段"不许碰到它们）')
+  // 🔴 0.7.14 反转（CM 指定 TASK v3）：结论段不许再留在过程卡上（与结论卡重复 = 本次事故）。
+  ok(!procJson.includes('结论：三件事都做完了'),
+    '★ 0.7.14 B3：结论段不在过程卡上（0.7.13 及以前会留一份 ⇒ 两卡重复）')
   ok(procJson.includes('结论见下方卡片'), '过程卡末尾追加了一行指路（只追加，不删块）')
   ok(concJson.includes('结论：三件事都做完了'), '结论卡里有结论（自包含口径不变）')
   ok(consoleLines.slice(logMarkP0).some((l) => l.includes('card fingerprint:') && l.includes('collapsed=')),
@@ -3919,6 +3922,93 @@ console.log('53) ★ 热重载"续卡"不得接管已经过期的卡（僵尸卡
     '（反例）更早的那张绝不出现在"接管"日志里')
   reg.delete('fs-main-zold')
   reg.delete('fs-main-znew')
+}
+
+console.log('61) ★ 0.7.14 B3 总纲：过程卡与结论卡之间不许重复同一段文字（CM 指定 TASK v3）')
+{
+  // ① 先清场：case 52 的适配子段会留下**未回答的挂起问题**（user-questions/request）——
+  //   纯文本入站会被 pendingQuestions 当成回答吃掉（第一次跑实测：61 的入站根本没到回合路径）。
+  //   修法 = 先发一条一次性文本，把挂起问题按插件的**文本回答主路径**答掉（与卡上点击同效），
+  //   settle 等那一轮收口，再开始本用例。无挂起时这条就是一条普通 Junk 回合，无害。
+  feedInbound('om_b3_drain', '（清场：回答遗留问题）')
+  await settle(4)
+  // 形状：🎯 叙述 → 工具 → **长答复（>500 字，含截断点前后的标记）**。
+  // 镜像 note 会被 clipNoteText 截成前 500 字 + … ⇒ 断言分两层：
+  //   头标记（截断点之前）在未修复版会随 note 留在过程卡 ⇒ 红；
+  //   尾标记（截断点之后）从未上过过程卡 ⇒ 只钉"结论卡完整性"。
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
+  const mark61 = sentCards.length
+  let seq61 = 16000
+  const head61 = 'REPLY61-头-' + 'H'.repeat(80)
+  const tail61 = 'REPLY61-尾-' + 'T'.repeat(80)
+  const longReply61 = head61 + '\n\n中段说明一句。\n\n' + tail61
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq61, data: { message: { content: [{ type: 'text', text: '🎯 先去核对基线库，确认口径。' }] } } },
+      { type: 'tool/call', seq: ++seq61, data: { callId: 'c61', name: 'probe61', arguments: '{}' } },
+      { type: 'tool/result', seq: ++seq61, data: { message: { source: { callId: 'c61' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'assistant/message', seq: ++seq61, data: { message: { content: [{ type: 'text', text: longReply61 }] } } },
+    )
+  }
+  feedInbound('om_b3_dup', 'B3 两卡不重复')
+  await settle(4)
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const groups61 = []
+  for (const c of cardsSince(mark61)) {
+    if (c.op === 'create' && c.payload && c.payload.schema === '2.0') groups61.push([])
+    if (groups61.length) groups61[groups61.length - 1].push(JSON.stringify(c.payload || {}))
+  }
+  const proc61 = groups61.length ? groups61[0].join('') : ''
+  const conc61 = groups61.length > 1 ? groups61[groups61.length - 1].join('') : ''
+  ok(groups61.length >= 2, '（前提）拆出过程卡 + 结论卡（实际 ' + groups61.length + ' 张）')
+  ok(conc61.includes('REPLY61-头-') && conc61.includes('REPLY61-尾-'),
+    '★ 结论卡有**完整**结论（含 500 字截断点之后的尾段）')
+  ok(!proc61.includes('REPLY61-头-'),
+    '★ B3：过程卡**不含**结论段（连被截断的前缀都不许留 —— 0.7.13 会留 ⇒ 红）')
+  ok(proc61.includes('🎯 先去核对基线库'),
+    '★ B1：过程叙述（🎯 行）一条不少（"搬走结论段"不许碰到它）')
+  await settle(2)
+}
+
+console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡（"半截卡"根因）')
+{
+  // 复现（对应真机 web.log 18:39:32）：回合在跑 → HMR dispose（停 watcher、登记 interrupted）→
+  // 回合收尾 ⇒ 0.7.13 的旧实例仍会 seal+push（用户多看到一张半截卡）。
+  // 0.7.14：dispose 把活跃回合的卡登记进 __fsInterruptedCards，syncCard 头部命中即拦。
+  let release62
+  const gate62 = new Promise((r) => { release62 = r })
+  const prevIdle62 = agent.whenIdle
+  agent.whenIdle = () => gate62
+  const mark62 = sentCards.length
+  const logMark62 = consoleLines.length
+  let seq62 = 17000
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: ++seq62, data: { message: { content: [{ type: 'text', text: '被重载打断的答复-62' }] } } })
+  }
+  feedInbound('om_h3_half', 'H3 半截卡')
+  await settle(3)
+  // 模拟 HMR dispose：逐个调 ctx.effect cleanup，直到看到"登记 … 个可能被中断的回合"
+  let disposed62 = false
+  for (const cleanup of effectCleanups) {
+    const before = consoleLines.length
+    try { cleanup() } catch { }
+    if (consoleLines.slice(before).some((l) => l.includes('dispose(热重载): 登记'))) { disposed62 = true; break }
+  }
+  ok(disposed62, '（前提）dispose 已执行且登记了被中断的回合')
+  const markAfterDispose = sentCards.length
+  release62()
+  agent.whenIdle = prevIdle62
+  await settle(3)
+  const pushedAfterDispose = sentCards.slice(markAfterDispose)
+  ok(consoleLines.slice(logMark62).some((l) => l.includes('card sync skipped: generation disposed')),
+    '★ H3：旧实例的封口推送被拦下（card sync skipped: generation disposed；0.7.13 无此拦截 ⇒ 红）')
+  ok(pushedAfterDispose.length === 0,
+    '★ H3：dispose 之后旧实例**一张卡都不许再发**（实际 ' + pushedAfterDispose.length + ' 条；0.7.13 会多发半截卡 ⇒ 红）')
+  ok(globalThis.__fsInterruptedCards && globalThis.__fsInterruptedCards.size >= 1,
+    '★ 被中断回合的卡已登记进跨代 Set（新实例接管/续卡时可据此识别）')
+  await settle(2)
 }
 
 if (failures === 0) {

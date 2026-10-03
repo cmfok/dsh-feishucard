@@ -1973,6 +1973,13 @@ export function apply(ctx) {
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
   function syncCard(bot, chatId, card, force) {
+    // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 被中断回合的卡不许再由旧实例推送**。
+    //   dispose 把活跃回合的卡登记进 __fsInterruptedCards（跨代共享，见 dispose 处）；
+    //   新实例续卡/接管走它自己的 syncCard（新一代没有这个标记）⇒ 这里只拦旧代，留痕不抛错。
+    if (card && globalThis.__fsInterruptedCards && globalThis.__fsInterruptedCards.has(card)) {
+      console.log('[fs] card sync skipped: generation disposed (interrupted card left for new instance)')
+      return card.queue
+    }
     if (!card || !bot || card.circuitOpen) {
       if (card && card.circuitOpen) console.log('[fs] card sync skipped: circuitOpen (failCount=' + card.failCount + ')')
       return card.queue
@@ -2346,6 +2353,13 @@ export function apply(ctx) {
       const interrupted = []
       for (const [agentId, entry] of Array.from(activeTurns)) {
         if (!entry || !entry.bot || !entry.chatId) continue
+        // 0.7.14（TASK v3 §4 / H3）：把活跃回合的**卡对象**登记进跨代 Set ⇒ 旧代后续的封口推送
+        //   在 syncCard 处被拦下 —— "半截卡"根因：dispose 停 watcher 后，旧代 runTurn 收尾仍 seal+push
+        //   （web.log 18:39:32 实录：dispose 两行之后跟着 turn sealed + blocks=37 的推送）。
+        try {
+          if (!globalThis.__fsInterruptedCards) globalThis.__fsInterruptedCards = new Set()
+          if (entry.card) globalThis.__fsInterruptedCards.add(entry.card)
+        } catch { }
         interrupted.push({
           sessionId: String(agentId),
           chatId: String(entry.chatId),
@@ -3798,7 +3812,14 @@ export function apply(ctx) {
         card.blocks.push({ type: 'message', text: '✅ 本轮已完成，结论见上方卡片。' })
         replaced = true
       } else if (splitConclusion) {
-        // 结论进下面的新卡；过程卡**正文一个字都不动**，只在末尾追加一行指路。
+        // 0.7.14（CM 指定 TASK v3「一条回复发两张卡」· B3 总纲）：**把结论段从过程卡搬走** ——
+        //   恢复本函数上方英文注释的原设计（promote the last note … so the reply is not duplicated）。
+        //   0.7.5 P0 的「绝不删块」防的是**过程叙述被清空**；0.7.9 收紧后 replySeqs 只含最后那段
+        //   连续答复、碰不到过程叙述 ⇒ 搬走它不再有副作用。只移 replySeqs 命中的 note，
+        //   其余 note（🎯 行/进度旁白）一条不动（B1）。
+        const moveSeqs = new Set(replySeqs)
+        card.blocks = card.blocks.filter(
+          (b) => !(b && b.type === 'note' && b.seq !== undefined && moveSeqs.has(b.seq)))
         card.blocks.push({ type: 'message', text: '✅ 本轮完成，结论见下方卡片。' })
         replaced = true
       } else if (replySeqs.length > 0) {
