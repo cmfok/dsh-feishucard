@@ -31,8 +31,42 @@ export const IDENTITY_KEYS = Object.freeze([
 
 /** 默认表路径（服务器）；可用环境变量 MAILBOX_IDENTITY_MAP 覆盖 */
 export const DEFAULT_MAP_PATH = '/opt/scripts/G9/identity_map.json'
-/** 默认 resolver 路径（服务器）；可用 node --experimental 无关，纯 python 脚本调用 */
+/** 默认 resolver 路径（服务器）；可用环境变量 MAILBOX_RESOLVER 覆盖 */
 export const DEFAULT_RESOLVER_PATH = '/opt/scripts/G9/resolve_actor.py'
+
+/** resolver 路径候选 —— 同 MAP_CANDIDATES 的道理（一份代码跑两种机器） */
+export const RESOLVER_CANDIDATES = [
+  process.env.MAILBOX_RESOLVER,
+  DEFAULT_RESOLVER_PATH,
+  'P:/Qoder/work/output/g9-identity/resolve_actor.py',
+].filter(Boolean)
+
+export function pickResolverPath (candidates = RESOLVER_CANDIDATES) {
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isFile()) return c } catch { /* 试下一个 */ }
+  }
+  return candidates[0] || DEFAULT_RESOLVER_PATH
+}
+
+/**
+ * 表路径候选 —— **按顺序取第一个存在的**。
+ * 解决"同一份代码跑在两种机器上"：
+ *   · 服务器（8 个员工 bot）：`/opt/scripts/G9/identity_map.json`
+ *   · HOME（我的工作台）：`P:/Qoder/work/output/g9-identity/identity_map.json`
+ * ⇒ **动态探测**（每次调用都判），所以表随时放进来 / 移走都能立刻反映，不必等热重载。
+ */
+export const MAP_CANDIDATES = [
+  process.env.MAILBOX_IDENTITY_MAP,
+  DEFAULT_MAP_PATH,
+  'P:/Qoder/work/output/g9-identity/identity_map.json',
+].filter(Boolean)
+
+export function pickMapPath (candidates = MAP_CANDIDATES) {
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isFile()) return c } catch { /* 试下一个 */ }
+  }
+  return candidates[0] || DEFAULT_MAP_PATH
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // 1) 本轮上下文：索引 agentId；`(chat_id, message_id)` 作溯源字段
@@ -96,14 +130,19 @@ export function applyActorToArguments (args, actor, keys = IDENTITY_KEYS) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 3) 🔴「无 actor 怎么办」—— 把规格没写清的边界做成纯函数
+// 3) 🔴「无 actor 怎么办」—— CM 2026-10-04 亲自裁决：**一律拒绝（fail-closed）**
 //
-//    hasOwner=false（GUI／子代理／定时轮）        ⇒ pass-through（**不许锁死 GUI**）
-//    hasOwner=true ＋ actor                      ⇒ overwrite
-//    hasOwner=true ＋ 无 actor ＋ 表可达          ⇒ deny（**这才是要拦的**）
-//    hasOwner=true ＋ 无 actor ＋ **表不可达**    ⇒ pass-through ＋ 记警告
-//        ↑ 这一条是安全阀：表不在本机（例：家里的 dsh 没有 /opt/scripts/G9/）时，
-//          "拿不到 actor" 是**基础设施问题**，不是我方身份问题 ⇒ 拒绝会锁死整机。
+//    **CM 原话**：「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」
+//    救急手段（CM 同日给出）：①「主 A 准」这个不公开的身份可临时救急
+//                            ② 我可以 SSH 上服务器直接修表
+//    ⇒ **所以「表不可达」不再是放行理由** —— 它只是"确认不了身份"的一种情形。
+//
+//    只有一种放行：**这个回合根本不是飞书来的**（GUI／子代理／定时轮）——
+//    那时**不要求飞书身份**（否则你本人在自己电脑上会被锁死，2026-10-04 已实测过一次）。
+//
+//    hasOwner=false（非飞书回合：GUI／子代理／定时轮）      ⇒ pass-through
+//    hasOwner=true  ＋ actor                              ⇒ overwrite
+//    hasOwner=true  ＋ 无 actor（**无论表在不在**）          ⇒ deny  ← CM 裁决
 // ───────────────────────────────────────────────────────────────────────────
 export function decideAction ({ hasOwner, actor, tableOk = true }) {
   if (!hasOwner) return 'pass-through'
@@ -117,26 +156,51 @@ export function decideAction ({ hasOwner, actor, tableOk = true }) {
 //    只在【入站】调一次（不是每次工具调用）＋ 进程内缓存（按 open_id）
 //    失败一律返回 { actor:null, err }，**绝不抛**（一条消息失败不该影响整机）
 // ───────────────────────────────────────────────────────────────────────────
-export function makeResolver ({ mapPath = process.env.MAILBOX_IDENTITY_MAP || DEFAULT_MAP_PATH,
-                              resolverPath = process.env.MAILBOX_RESOLVER || DEFAULT_RESOLVER_PATH,
-                              python = 'python3', timeoutMs = 8000 } = {}) {
+export function makeResolver ({ mapPath = null,
+                              resolverPath = process.env.MAILBOX_RESOLVER || pickResolverPath(),
+                              python = null, timeoutMs = 8000 } = {}) {
   const cache = new Map()
   let cachedTableMtime = null
 
+  // python 解释器也要探测：服务器叫 `python3`，Windows 上通常只有 `python` / `py`
+  //（2026-10-04 实测：写死 `python3` ⇒ 本机 `resolver_no_json`）
+  let cachedPython = null
+  function currentPython () {
+    if (python) return python
+    if (process.env.MAILBOX_PYTHON) return process.env.MAILBOX_PYTHON
+    if (cachedPython) return cachedPython
+    for (const c of ['python3', 'python', 'py']) {
+      try {
+        const r = spawnSync(c, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 5000 })
+        if (String(r.stdout || '').trim() === '1') { cachedPython = c; return c }
+      } catch { /* 试下一个 */ }
+    }
+    return (cachedPython = 'python3')
+  }
+
+  // **动态取表路径**：显式入参 ＞ 环境变量 ＞ 多候选探测（服务器 / HOME）
+  // ⇒ 每次调用都重新判 ⇒ 表放进来 / 移走立刻生效，不必等热重载。
+  function currentMapPath () {
+    if (mapPath) return mapPath
+    if (process.env.MAILBOX_IDENTITY_MAP) return process.env.MAILBOX_IDENTITY_MAP
+    return pickMapPath()
+  }
+
   function tableOk () {
-    try { return fs.statSync(mapPath).isFile() } catch { return false }
+    try { return fs.statSync(currentMapPath()).isFile() } catch { return false }
   }
 
   return {
-    mapPath,
+    get mapPath () { return currentMapPath() },
     tableOk,
     resolve (openId) {
+      const mp = currentMapPath()
       if (!openId) return { actor: null, err: 'no_open_id', tableOk: tableOk() }
       if (!tableOk()) return { actor: null, err: 'map_unavailable', tableOk: false }
       if (!fs.existsSync(resolverPath)) return { actor: null, err: 'resolver_missing', tableOk: true }
       // 表换了（mtime 变）⇒ 清缓存，避免"旧身份"
       try {
-        const mt = fs.statSync(mapPath).mtimeMs
+        const mt = fs.statSync(mp).mtimeMs
         if (cachedTableMtime !== null && mt !== cachedTableMtime) cache.clear()
         cachedTableMtime = mt
       } catch { /* 读不到 mtime 就用旧缓存 */ }
@@ -147,17 +211,21 @@ export function makeResolver ({ mapPath = process.env.MAILBOX_IDENTITY_MAP || DE
         'from resolve_actor import resolveActor',
         'm = json.load(open(sys.argv[2], encoding="utf-8-sig"))',
         'a, e = resolveActor(sys.argv[3], m)',
-        'print(json.dumps({"actor": a, "err": e}, ensure_ascii=False))',
+        'print(json.dumps({"actor": a, "err": e}, ensure_ascii=True))',
       ].join('\n')
       let out
       try {
-        const r = spawnSync(python, ['-c', code, path.dirname(resolverPath), mapPath, openId],
-          { encoding: 'utf8', timeout: timeoutMs })
+        const r = spawnSync(currentPython(), ['-c', code, path.dirname(resolverPath), mp, openId],
+          { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, PYTHONIOENCODING: 'utf-8' } })
         out = String(r.stdout || '').trim()
       } catch (e) {
         return { actor: null, err: 'resolver_failed:' + String(e && e.message || e).slice(0, 60), tableOk: true }
       }
-      const i = out.lastIndexOf('{')
+      // ⚠️ 必须取【第一个】`{` —— 2026-10-04 实测：actor 里含 `grants: {}` / `extra_grants: {}`
+      //    这类**嵌套空对象**，用 lastIndexOf('{') 会从那个空对象开始切 ⇒ JSON.parse 必失败
+      //    （表现为 resolver_bad_json，且**只在"认得人"时出现** —— 认不出的人 payload 里没有 `{}`，
+      //     所以症状看起来时好时坏，极易误判成"编码问题"）。
+      const i = out.indexOf('{')
       if (i < 0) return { actor: null, err: 'resolver_no_json', tableOk: true }
       let d
       try { d = JSON.parse(out.slice(i)) } catch { return { actor: null, err: 'resolver_bad_json', tableOk: true } }
