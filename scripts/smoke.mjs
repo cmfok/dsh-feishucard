@@ -834,6 +834,25 @@ console.log('12b) 元素/体积超限 ⇒ **换卡续写**（旧卡正文原样�
   ok(beforeRotate.includes('长回合叙述 0') || allR.includes('长回合叙述 0'),
     '★ 第 0 段叙述**没有丢**（要么在旧卡可见区，要么整卡可检索）')
   ok(allR.includes('换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
+
+  // 12c/12d（0.7.8：审查 MED#7095 + MED#2272/MED#967 复核）
+  //   ① 换卡时旧卡**不许停在「正在工作中…」**（封口后的卡留着占位符 = 用户看到一张永远"在工作"的死卡）；
+  //   ② 换卡说明是**新卡视角**（"上一张卡…这张新卡"）⇒ 只许出现在新卡载荷里，写在旧卡上句句自指。
+  const opsR = cardsSince(markR)
+  const groupR = []
+  for (const c of opsR) {
+    if (c.op === 'create' && c.payload && c.payload.schema === '2.0') groupR.push([])
+    if (groupR.length) groupR[groupR.length - 1].push(JSON.stringify(c.payload || {}))
+  }
+  const oldCardBody = groupR.length ? groupR[0].join('') : ''
+  const newCardBody = groupR.length > 1 ? groupR.slice(1).join('') : ''
+  // ⚠️ 12c 只看旧卡的**最后形态**：建卡那一帧**本来就带**占位符（设计如此），拿整段历史判会假红
+  //    （第一版就是这么写的，GREEN 也红 —— 夹具的错，不是代码的错）。
+  const oldLastBody = groupR.length ? groupR[0][groupR[0].length - 1] : ''
+  ok(!oldLastBody.includes('正在工作中…'),
+    '★ 12c 换卡后旧卡**最后形态**不再停在「正在工作中…」（MED#7095：换卡前先摘占位符）')
+  ok(newCardBody.includes('已达飞书单卡上限') && !oldCardBody.includes('已达飞书单卡上限'),
+    '★ 12d 换卡说明只出现在**新卡**上（MED#2272/MED#967：文案是新卡视角，写在旧卡上会自指）')
 }
 
 console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
@@ -3091,6 +3110,54 @@ console.log('50) 静默看门狗：提示必须**有诊断含义**（CM 2026-10-
   await drain()
 }
 
+console.log('55) ★ 同 agent 只允许一个 watcher：新卡注册时必须停掉同 agent 的旧 watcher 并把旧卡收口')
+{
+  // 真机症状（本机 web.log L78520-78548，CM 2026-10-03 报障「换了新卡，旧卡也一直在更新」）：
+  //   热重载"续卡"之后旧卡的 watcher 还在跑，再来一条入站又会开一张新卡 ⇒ 两个 watcher 扫**同一条**
+  //   事件流 ⇒ 两张卡内容同步长（0c26bbb3 与 09c6d978 游标 5405→5406→…→5445）。
+  // ⚠️ 为什么**不**用"回合进行中插一条文件消息"来复现：入站挂在 `bot.chain` 上**串行**执行
+  //   （index.js L3985 `bot.chain = bot.chain.then(() => handleInbound(...))`），首轮被 gate 住时
+  //   第二条入站**根本轮不到** ⇒ 永远建不出第二张卡（cycle2/3/4 三次实测都是 `create 次数 1`）⇒ 那种夹具必假红。
+  //   所以改用**确定性构造**：直接把"同 agent 的旧卡 + 旧 watcher"放进**跨代接管登记表**
+  //   （真机里它就是热重载接管的那张卡），再让一条普通入站建新卡 ⇒ 新 watcher 注册时必须处理掉它。
+  const reg = globalThis.__fsLiveCards
+  ok(reg && typeof reg.set === 'function' && Boolean(agent && agent.id),
+    '（前提）跨代接管登记表挂在 globalThis、且 harness agent 有 id')
+  const zombie = {
+    token: 'om_zombie55',
+    blocks: [{ type: 'message', text: '旧卡正文' }, { type: 'message', text: '正在工作中…' }],
+    tools: new Map(),
+    seenSeqs: new Set(),
+    status: 'running',
+    bornSeq: 1,          // 故意比新卡小 ⇒ "更晚创建的是新卡"成立
+    cursor: 0,
+  }
+  let stopped55 = false
+  reg.set(String(agent.id), {
+    agent,
+    card: zombie,
+    bot: { cfg: { appId: APP_ID }, chats: new Map() },
+    chatId: CHAT_ID,
+    stop: () => { stopped55 = true },
+  })
+  const logMark55 = consoleLines.length
+  const mark55 = sentCards.length
+  agent.send = function (message) { this.sent.push(message) }
+  feedInbound('om_two_watcher_b', '新入站（应把同 agent 的旧卡顶掉）')
+  await settle(3)
+  ok(createsSince(mark55).length >= 1, '（前提）新入站建出了新卡（create 次数 ' + createsSince(mark55).length + '）')
+  const window55 = consoleLines.slice(logMark55)
+  ok(window55.some((l) => l.includes('stale watcher stopped: agent=')),
+    '★ 留痕 `stale watcher stopped`（不静默 —— 本文件口径）')
+  ok(stopped55 === true, '★ 同 agent 的旧 watcher 真的被停掉（它的 stop() 被调用 ⇒ clearInterval）')
+  ok(zombie.status === 'sealed', '★ 旧卡被就地收口（status=sealed ⇒ 不再继续长）')
+  ok(zombie.blocks.some((b) => b.text && b.text.includes('本卡已收口')),
+    '★ 旧卡留了一行「本卡已收口，后续内容见下方新卡」')
+  ok(!zombie.blocks.some((b) => b.text === '正在工作中…'),
+    '★ 旧卡上的「正在工作中…」占位符被摘掉（与 MED#7095 同源要求）')
+  reg.delete(String(agent.id))
+}
+
 console.log('51) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10-02：0.4.22 之后这条提示没了）')
 {
   const activeTurns = globalThis.__fsActiveTurns
@@ -3492,6 +3559,45 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
   try { rmSync(fixtureDir, { recursive: true, force: true }) } catch { /* 清不掉不影响结论 */ }
 }
 console.log('')
+console.log('53) ★ 热重载"续卡"不得接管已经过期的卡（僵尸卡源头：协作信箱 CM-OFFICE 任务）')
+{
+  // 真机症状（协作信箱）：热重载接管了一张**早已不是该会话当前卡**的旧卡 ⇒ 它扫不到新事件、
+  //   静默分钟数只涨不落 ⇒ 每 10 分钟往会话发一条"上游已经 N 分钟没有回包"（实际对话很活跃）。
+  // 判据：同会话里**更早**的那张卡必须"封口而不接管"；**更新**的那张照常接管（不搞一刀切）。
+  const reg = globalThis.__fsLiveCards
+  ok(reg && typeof reg.set === 'function', '（前提）跨代接管登记表挂在 globalThis')
+  const mkEntry = (agentId, token, bornSeq) => ({
+    agent: { id: agentId },
+    card: {
+      token,
+      blocks: [{ type: 'message', text: '旧卡正文 ' + token }],
+      tools: new Map(),
+      seenSeqs: new Set(),
+      status: 'running',
+      bornSeq,
+      cursor: 0,
+    },
+    bot: { cfg: { appId: APP_ID }, chats: new Map() },
+    chatId: CHAT_ID,
+    stop: () => {},
+  })
+  reg.set('fs-main-zold', mkEntry('fs-main-zold', 'zzz-old1', 10))
+  reg.set('fs-main-znew', mkEntry('fs-main-znew', 'zzz-new2', 20))
+  const markZ = consoleLines.length
+  const modZ = await import('../index.js')
+  modZ.apply(ctx)
+  await drain()
+  const zLines = consoleLines.slice(markZ)
+  ok(zLines.some((l) => l.includes('热重载续卡：跳过') && l.includes('zzz-old1')),
+    '★ 更早的那张卡**不被接管**（封口而不是继续养着 ⇒ 从源头不产生会误报"没有回包"的僵尸卡）')
+  ok(zLines.some((l) => l.includes('热重载续卡：接管') && l.includes('zzz-new2')),
+    '（对照）同会话里**更新**的那张卡照常被接管（没有一刀切停掉接管）')
+  ok(!zLines.some((l) => l.includes('热重载续卡：接管') && l.includes('zzz-old1')),
+    '（反例）更早的那张绝不出现在"接管"日志里')
+  reg.delete('fs-main-zold')
+  reg.delete('fs-main-znew')
+}
+
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
   process.exit(0)

@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.8] - 2026-10-03
+
+### 修复：0.7.7 独立审查遗留 4 条 ＋ 协作信箱报障（stall 误报）＋ CM 报障（换卡后旧卡还在更新）
+
+> 三条来源：① 0.7.7 推送前的独立审查报告（WARN：3 medium / 1 low，**逐条打开代码核对，0 条误报**）；
+> ② 协作信箱 `收件箱\20261003-1430-CM-OFFICE--飞书卡片stall误报修复.md`（公司那台报的"上游 35 分钟没有回包"误报）；
+> ③ CM 2026-10-03 真机报障「换了新卡，新卡在更新、**旧卡也一直在更新**」。
+
+**CM 报障（最高优先）：同一个 agent 只允许一个 watcher**
+- 真机证据（本机 `web.log` L78520-78548）：同一会话两张卡 `status=running`、游标**同步**前进
+  （`0c26bbb3` 与 `09c6d978`：5405→5406→5412→…→5445）。判据先定好：同会话两卡同步长 ⇒ 是 bug。
+- 根因链：插话 `split()` 之后**又来一条不能 steer 的入站**（文件消息正文为空 ⇒ `steerActiveTurn` 的
+  `!text` 早退）⇒ `handleInbound` 又开一张卡；而 `startCardWatcher` 只做
+  `liveCardRegistry.set(agent.id, entry)`（**覆盖登记**），**从不先停同 agent 的旧 watcher**。
+- 修法：`startCardWatcher` 注册前加**不变式** —— 同 agent 已有在册 watcher 且指向**另一张卡** ⇒
+  就地停掉它、把旧卡收口（摘占位符 + 一行"✅ 本卡已收口，后续内容见下方新卡"），并留痕
+  `stale watcher stopped: agent=… old=… new=…`（不静默）。
+  ⚠️ 候选集合**同时包含**本代 `liveCardWatchers` 与**跨代** `liveCardRegistry`（热重载后旧卡的 watcher
+  可能属于上一代，只扫本代 Set 会漏掉"旧卡继续长"这种跨代情况 —— 自查时发现的盲区）。
+
+**协作信箱：stall 误报（僵尸卡）**
+- 机理（复核对方诊断，成立）：热重载"续卡"接管了一张**已不是该会话当前卡**的旧卡 ⇒ 它扫不到新事件 ⇒
+  `lastEventAt` 不刷新 ⇒ 静默分钟数只涨不落 ⇒ 每 10 分钟一条"上游没有回包"误报。
+- **对对方诊断的修正**：真缺口**不是**"漏了 `clearInterval`"（0.7.7 的换卡/封口路径都调了 `stop()`），
+  而是**发提示前没有"我还是不是这张会话的活跃卡"这一层校验**。
+- 修法：新增 `isLiveCardForChat(chatId, card)`（同会话存在**序号更大且仍 running** 的卡 ⇒ 本卡已过期）；
+  ① 静默分支发提示前过闸门：不过 ⇒ **不播报** ＋ 就地收口 ＋ 停自己的定时器 ＋ 留痕
+  `stall notice suppressed: stale card …`；② 热重载"续卡"接管前过同一判据：不过 ⇒ **封口而不接管**
+  （从源头不产生僵尸卡）。措辞／必须另发纯文本／`stall notice sent` 日志／真静默仍发 —— 全部保持。
+- 新增 `nextCardStamp()`：卡片**创建序号**挂 `globalThis`（跨代单调）。不用时间戳的原因：热重载后计数器
+  会从头来、同毫秒还会打平，而僵尸卡判据要求"后建的序号一定更大"。
+
+**审查遗留（逐条核对，0 条误报）**
+- **MED#2272**：`rotateAdoptedCard` 把换卡说明推到 `old.blocks`，而文案（`rotateNoticeSize()` /
+  `ROTATE_NOTICE_TABLES`）是**新卡视角** ⇒ 读者在旧卡上看到"上一张卡…在这张新卡继续"，句句自指。
+  改为推 `fresh.blocks`（与另两条换卡通道同构）。
+- **MED#967**：`SIDE_NOTICE_OLD` 写成"下面那条／本卡原文"（**旧卡视角**），但侧消息是**先发纯文本、
+  再换卡** ⇒ 这句话落在**新卡**上 ⇒ 自指。改名 `SIDE_NOTICE_FRESH` 并改成
+  `⬆️ 上面那条是**另发的**提示；后续内容在这张新卡继续，上一张卡正文原样保留。`
+- **MED#7095**：换卡路径（`rotateTables` / `openGoalCard.rotate` / `rotateAdoptedCard`）封旧卡时**没摘**
+  「正在工作中…」占位符（`split()` 有摘）⇒ 旧卡永久停在"工作中"。抽 `dropWorkingPlaceholder(card)`
+  在这三处封卡前调用。
+- **LOW#2128**：体积护栏的粗筛 `60` 是硬编码魔数 ⇒ 抽 `CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK = 60`
+  并注明"必须 ≤ `CARD_ROTATE_BLOCKS`"。
+
+**口径（CM 2026-10-03 拍板）**
+- 短回合（<30s）**维持** 30s 阈值才分结论卡 —— 不搞"一律分卡"（避免短问答也变两张卡）。
+
+**有意未做的两处（与初版计划的偏差，如实记录）**
+- `steerActiveTurn` **不**改成异步去 steer"只有文件、没有正文"的入站：改动面（异步化 + 调用点）大于收益，
+  且"同 agent 单 watcher"不变式已经**从根上**消除双卡（新回合开卡时旧卡被就地收口）。
+- `handleInbound` **不**单独再加"本会话已有在跑卡"的闸门：闸门统一放在 `startCardWatcher` 注册点
+  （所有建卡路径都必经此处），避免同一条规则在两处实现、日后漂移。
+
+**验证**：`node --check` 通过；新增冒烟用例 12c/12d/53/55（**先在未修复版上跑红**，证明夹具真能钉住 bug）；
+主冒烟 `SMOKE PASS` ＋ 冷启动 `COLD PASS(form-off)`；推送前跑 `code-review-gate` ＋ 大文件体检；CI 必须绿。
+
 ## [0.7.7] - 2026-10-03
 
 ### 修复：0.7.6 独立审查的 8 条（2 条正中 P2 要害）

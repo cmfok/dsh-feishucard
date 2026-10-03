@@ -648,6 +648,23 @@ export function apply(ctx) {
     }
     return false
   }
+  // 0.7.8：卡片的**创建序号**（跨代单调，挂 globalThis）—— 用来判"同会话里哪张卡更新"。
+  //   为什么不用时间戳：热重载后新实例的计数器会从头开始，同毫秒还会打平；
+  //   僵尸卡判据要求"后建的卡序号一定更大"。
+  function nextCardStamp() {
+    const g = globalThis
+    g.__fsCardSeq = Number(g.__fsCardSeq || 0) + 1
+    return g.__fsCardSeq
+  }
+  const WORKING_PLACEHOLDER = '正在工作中…'
+  // 封口/换卡前必须摘掉"正在工作中…"占位符（本文件多处已明令：封口后的卡不许留着它）。
+  // 审查 MED#7095：换卡路径（rotateTables / openGoalCard.rotate / rotateAdoptedCard）漏了这一步。
+  function dropWorkingPlaceholder(card) {
+    if (!card || !Array.isArray(card.blocks)) return 0
+    const before = card.blocks.length
+    card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === WORKING_PLACEHOLDER))
+    return before - card.blocks.length
+  }
   function makeCardState(agent) {
     return {
       agent: agent || null,
@@ -688,6 +705,8 @@ export function apply(ctx) {
       planActive: lastPlanModeActive(agent),
       // 2026-10-03 F：这张卡是否已经做过"正文抢救"（内容被拒 ⇒ 摘片段重发纯文本，只做一次）
       rescued: false,
+      // 0.7.8：创建序号（跨代单调）—— 判"同会话哪张卡更新"用（僵尸卡闸门 / 单 watcher 不变式）。
+      bornSeq: nextCardStamp(),
     }
   }
 
@@ -959,12 +978,16 @@ export function apply(ctx) {
   const CARD_FOLD_THRESHOLD = 180
   // 超限**换卡续写**的触发线（内容原样留在旧卡、新卡接续 ⇒ 永不隐藏、也不撞上限）：
   const CARD_ROTATE_BLOCKS = 170
+  // 体积护栏的**块数粗筛下限**（审查 LOW#2128）：块数不到这里就**不做** JSON.stringify 体积检查（性能）。
+  // 必须 <= CARD_ROTATE_BLOCKS —— 否则体积检查会在"真超限"的卡上被跳过、护栏静默失效。
+  const CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK = 60
   // 换卡/侧消息的**共享文案**（审查 MED#2246：三处近乎逐字重复、且硬编码 "约 200 元素 / 200 KB"
   // 与真实阈值 170 块 / 120 KB 矛盾 ⇒ 抽常量并把数字**从阈值派生**）。
   const ROTATE_NOTICE_TABLES = '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。'
-  // 侧消息（看门狗/失败提示）是**另发的一条消息**，它排在旧卡**下面** ⇒ 文案写在旧卡上时必须说"下面那条"，
-  // 否则方向反了（审查 LOW#2157：原稿写成"上面那条"，用户看到的却是下面那条）。
-  const SIDE_NOTICE_OLD = '⬇️ 下面那条是**另发的**提示；后续内容见下方新卡，本卡原文原样保留。'
+  // 侧消息（看门狗/失败提示）是**另发的一条消息**：先发纯文本、**再**换卡 ⇒ 它排在**新卡的上面**。
+  // 0.7.8（审查 MED#967 复核）：这句话落在**新卡**上（rotateTables / openGoalCard.rotate 都推
+  //   fresh.blocks）⇒ 必须写成"上面那条"。旧稿写成"下面那条／本卡原文"，在新卡上**自指**（方向反了）。
+  const SIDE_NOTICE_FRESH = '⬆️ 上面那条是**另发的**提示；后续内容在这张新卡继续，上一张卡正文原样保留。'
   function rotateNoticeSize() {
     return '📄 上一张卡的内容已达飞书单卡上限（约 ' + CARD_ROTATE_BLOCKS + ' 块 / '
       + Math.round(CARD_ROTATE_BYTES / 1000) + ' KB），后续内容在这张新卡继续；**上一张的正文原样保留**。'
@@ -1855,7 +1878,7 @@ export function apply(ctx) {
       // P2（审查 MED#1841）：同样**等提示发出去之后**再换卡（顺序不保证 = 新卡落到提示上方）
       void sendPlainText(bot, chatId, tip)
         .catch(() => {})
-        .then(() => rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD))
+        .then(() => rotateLiveCardForChat(chatId, SIDE_NOTICE_FRESH))
       console.log('[fs] card failure notice sent chat=' + chatId + ' kind=' + klass
         + (code ? ' code=' + code : ''))
       // ② 让 **Agent 也收到**（复用入站通道注入系统提示；下一次推理必然看到）
@@ -2105,6 +2128,25 @@ export function apply(ctx) {
   // 不接管的话两代各自开卡 ⇒ 就是 CM 报的"两张卡并行长"。
   const liveCardRegistry = globalThis.__fsLiveCards || (globalThis.__fsLiveCards = new Map())
 
+  // 0.7.8：本卡还是不是"这张会话当前最新的在跑卡"。
+  //   判据：同会话里存在**序号更大（＝更晚创建）且仍 running** 的卡 ⇒ 本卡已被顶掉（僵尸卡）。
+  //   为什么需要它：热重载"续卡"会接管上一代的卡；若那张卡早已不是会话当前的卡，它就再也扫不到
+  //   新事件、却仍按"当前这一轮"的口吻播报（协作信箱报障的"上游 35 分钟没回包"误报源）。
+  function isLiveCardForChat(chatId, card) {
+    if (!card) return false
+    const seen = new Set()
+    const stale = (entry) => {
+      const oc = entry && entry.card
+      if (!oc || oc === card || seen.has(oc)) return false
+      seen.add(oc)
+      return String(entry.chatId || '') === String(chatId || '')
+        && oc.status === 'running'
+        && Number(oc.bornSeq || 0) > Number(card.bornSeq || 0)
+    }
+    for (const entry of liveCardWatchers) { if (stale(entry)) return false }
+    for (const entry of liveCardRegistry.values()) { if (stale(entry)) return false }
+    return true
+  }
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
     const entry = { agent, card, bot, chatId, stop: null }
     const timer = setInterval(() => {
@@ -2126,7 +2168,8 @@ export function apply(ctx) {
             //    旧卡正文原样保留＋一行说明，新卡从旧卡游标接续（不重放、不丢、不重）。
             //    这样"过程文字默认可见"与"绝不撞上限"同时成立（CM 2026-10-03 口径）。
             if (card.blocks.length > CARD_ROTATE_BLOCKS
-              || (card.blocks.length > 60 && blocksBytes(card.blocks) > CARD_ROTATE_BYTES)) {
+              || (card.blocks.length > CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK
+                && blocksBytes(card.blocks) > CARD_ROTATE_BYTES)) {
               onTableBudget('size'); return
             }
           }
@@ -2163,6 +2206,19 @@ export function apply(ctx) {
           const threshold = kind === 'tools' ? DSH_TOOL_NOTICE_MIN : DSH_STALL_NOTICE_MIN
           if (mins >= threshold
             && Date.now() - Number(card.stallNotifiedAt || 0) >= DSH_NOTICE_REPEAT_MS) {
+            // 0.7.8 活跃性闸门（协作信箱任务：CM-OFFICE 报的"上游 35 分钟没回包"误报）：
+            //   本卡**已不是**该会话当前最新的在跑卡 ⇒ 它是僵尸卡：它扫不到新事件 ⇒ 静默分钟数只涨不落
+            //   ⇒ 会一直误报（真机证据：同一 chat 连续 kind=tools mins=3，而同时刻别的卡游标在推进）。
+            //   处理：不播报 + 就地收口 + 停掉自己的定时器（留痕，不静默）。
+            if (!isLiveCardForChat(chatId, card)) {
+              console.log('[fs] stall notice suppressed: stale card chat=' + chatId
+                + ' card=' + String((card.token || '-')).slice(-8) + ' kind=' + kind + ' mins=' + mins)
+              card.status = 'sealed'
+              dropWorkingPlaceholder(card)
+              try { void syncCard(bot, chatId, card, true).catch(() => { }) } catch { }
+              try { stop() } catch { }
+              return
+            }
             card.stallNotifiedAt = Date.now()
             const running = [...card.tools.values()].filter((t) => t && t.status === 'running')
             const toolName = card.idleToolName || (running.length ? String(running[running.length - 1].name || '') : '')
@@ -2178,7 +2234,7 @@ export function apply(ctx) {
               .catch(() => { })
               .then(() => {
                 console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
-                rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
+                rotateLiveCardForChat(chatId, SIDE_NOTICE_FRESH)
               })
           }
         }
@@ -2190,6 +2246,40 @@ export function apply(ctx) {
       clearInterval(timer)
       liveCardWatchers.delete(entry)
       if (liveCardRegistry.get(String(agent.id)) === entry) liveCardRegistry.delete(String(agent.id))
+    }
+    // 0.7.8 不变式（CM 2026-10-03 报障「换了新卡，旧卡也一直在更新」）：
+    //   同一个 agent（＝同一条会话）同一时刻**只允许一个 watcher**。旧实现只做
+    //   liveCardRegistry.set(agent.id, entry) —— 那是**覆盖登记**，旧 watcher 仍在跑，
+    //   两张卡各自扫**同一条**事件流 ⇒ 两张卡同步长。
+    //   真机证据（本机 web.log L78520-78548）：0c26bbb3 与 09c6d978 游标同步 5405→5445…。
+    //   成因：插话 split 之后**又来一条"不能 steer"的入站**（文件消息正文为空，见 steerActiveTurn
+    //   的 !text 早退）⇒ handleInbound 又开了一张卡。这里把旧卡就地收口，保证"一张卡一人一事"。
+    //   ⚠️ 候选必须**同时**包含本代 liveCardWatchers 与跨代 liveCardRegistry：
+    //     热重载后旧卡的 watcher 可能属于**上一代**（本代 Set 看不到它），只扫 Set 会漏掉
+    //     "旧卡继续长"这种跨代情况（2026-10-03 自查发现的盲区）。
+    const staleCandidates = []
+    const staleSeen = new Set()
+    for (const e of liveCardWatchers) {
+      if (e && e.card && !staleSeen.has(e.card)) { staleSeen.add(e.card); staleCandidates.push(e) }
+    }
+    for (const e of liveCardRegistry.values()) {
+      if (e && e.card && !staleSeen.has(e.card)) { staleSeen.add(e.card); staleCandidates.push(e) }
+    }
+    for (const old of staleCandidates) {
+      const oldCard = old && old.card
+      if (!old || old === entry || oldCard === card) continue
+      if (String(old.agent && old.agent.id) !== String(agent && agent.id)) continue
+      try { old.stop() } catch { }
+      if (oldCard && oldCard.status === 'running') {
+        oldCard.sealing = true
+        oldCard.status = 'sealed'
+        dropWorkingPlaceholder(oldCard)
+        oldCard.blocks.push({ type: 'message', text: '✅ 本卡已收口，后续内容见下方新卡。' })
+        try { void syncCard(old.bot, old.chatId, oldCard, true).catch(() => { }) } catch { }
+      }
+      console.log('[fs] stale watcher stopped: agent=' + String(agent && agent.id)
+        + ' old=' + String((oldCard && oldCard.token) || '-').slice(-8)
+        + ' new=' + String((card && card.token) || '-').slice(-8))
     }
     entry.stop = stop
     liveCardWatchers.add(entry)
@@ -2267,11 +2357,16 @@ export function apply(ctx) {
     fresh.footerMode = 'bare'
     old.sealing = true
     old.status = 'sealed'
-    old.blocks.push({
+    dropWorkingPlaceholder(old)
+    try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
+    // 0.7.8（审查 MED#2272 复核）：换卡说明属于**新卡** —— 另两条换卡通道（rotateTables /
+    //   openGoalCard.rotate）都推 fresh.blocks。旧实现推到 old.blocks ⇒ 读者在旧卡上看到
+    //   "上一张卡…在这张新卡继续"，句句自指。
+    fresh.blocks.push({
       type: 'message',
       text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
     })
-    try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
+    try { void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => { }) } catch { }
     entry.card = fresh
     if (entry.stop) { try { entry.stop() } catch { } }
     entry.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, (r) => rotateAdoptedCard(agent, r))
@@ -2287,6 +2382,19 @@ export function apply(ctx) {
         liveCardRegistry.delete(key)
         continue
       }
+      // 0.7.8：接管前先判"它还是不是这张会话当前最新的在跑卡"（协作信箱任务③：从源头不产生僵尸卡）。
+      //   不是 ⇒ **封口而不接管**（否则新实例会养出一张永远扫不到新事件、却还按"当前这一轮"口吻播报的卡）。
+      if (!isLiveCardForChat(entry.chatId, card)) {
+        card.sealing = true
+        card.status = 'sealed'
+        dropWorkingPlaceholder(card)
+        card.blocks.push({ type: 'message', text: '♻️ 插件热重载：本卡已不是当前这张，停止更新（后续内容见下方卡片）。' })
+        try { void syncCard(entry.bot, entry.chatId, card, true).catch(() => { }) } catch { }
+        console.log('[fs] 热重载续卡：跳过（已不是当前卡）agent=' + key
+          + ' card=' + String(card.token || '-').slice(-8))
+        continue
+      }
+      card.bornSeq = nextCardStamp()   // 接管 ⇒ 它现在才是"当前卡"（跨代序号必须重打，见 isLiveCardForChat）
       console.log('[fs] 热重载续卡：接管 agent=' + key + ' card=' + String(card.token || '-').slice(-8)
         + ' blocks=' + card.blocks.length)
       entry.stop = startCardWatcher(entry.agent, card, entry.bot, entry.chatId, (r) => rotateAdoptedCard(entry.agent, r))
@@ -3305,6 +3413,7 @@ export function apply(ctx) {
         const carry = Number.isFinite(card.cursor) ? card.cursor : 0
         stopCardWatcher()
         card.status = 'sealed'
+        dropWorkingPlaceholder(card)
         void syncCard(bot, chatId, card, true).catch(() => {})
         const fresh = makeCardState(turnAgent)
         fresh.footerMode = 'bare'      // 换表新卡仍是"过程卡"
@@ -6818,6 +6927,7 @@ export function apply(ctx) {
       const carry = Number.isFinite(state.card.cursor) ? state.card.cursor : 0
       state.stop()
       state.card.status = 'sealed'
+      dropWorkingPlaceholder(state.card)
       void syncCard(bot, chatId, state.card, true).catch(() => {})
       const fresh = makeCardState(agent)
       fresh.cursor = carry
@@ -7083,7 +7193,7 @@ export function apply(ctx) {
   //   发完侧消息就把该会话正在跑的卡**换到下面新卡继续**（旧卡就地封口＋一行说明、正文原样保留）。
   //   复用答题/插话那套 `entry.split()`：新卡游标 = 当前事件位 ⇒ 不重放、不丢。
   function rotateLiveCardForChat(chatId, label) {
-    const text = label || SIDE_NOTICE_OLD
+    const text = label || SIDE_NOTICE_FRESH
     try {
       // ⚠️ 审查 MED#7069：**不能**用 `entry.split()` —— 那是"答题路径"语义（新卡游标 = 事件末尾），
       //    会**跳过还没镜像的事件**；换卡路径（rotateTables/rotate）用的是 carry = 旧卡当前游标，
