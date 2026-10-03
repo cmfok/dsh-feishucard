@@ -816,7 +816,8 @@ console.log('12b) 元素/体积超限 ⇒ **换卡续写**（旧卡正文原样�
   }
   feedInbound('om_rotate_size', '超限换卡')
   await drain()
-  agentEvents.push({ type: 'assistant/message', seq: 9990, data: { message: { content: [{ type: 'text', text: '换卡后的续写段' }] } } })
+  // 审查 LOW#819：9900+i（i=0..174）已经用到 9990 ⇒ 撞号会被 seenSeqs 去重、把失败归错因
+  agentEvents.push({ type: 'assistant/message', seq: 10100, data: { message: { content: [{ type: 'text', text: '换卡后的续写段' }] } } })
   await drain()
   releaseR()
   agent.whenIdle = prevIdleR
