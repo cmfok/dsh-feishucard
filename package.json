@@ -22,9 +22,11 @@
   },
   "files": [
     "index.js",
+    "identity-inject.mjs",
     "helper.cjs",
     "cordis.patch.yml",
     "feishu.config.example.json",
+    "identity_map.example.json",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
