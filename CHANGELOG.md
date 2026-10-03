@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.18] - 2026-10-04
+
+### 新功能：**身份闸门（P1.5「按人判」）— 默认关**
+
+> CM 2026-10-04 定：做成开关（本仓库会发布给外部，**别人不一定需要这个功能**），**不写就是关**。
+
+- 配置项 **`identityGuard`**（布尔，已进 `normalizeBot` 白名单 —— 漏加则配置写了也被丢）。
+  开启后：入站按事件自带的 **`open_id`**（服务端填的、伪造不了）查身份表 ⇒ 得到本轮 `actor`，
+  存进**本轮上下文**；此后**每次工具调用前**，把 agent 传来的**任何身份字段覆写成表里的真值**；
+  **拿不到身份 ⇒ 拒绝执行**（fail-closed，「执行不了」好过「资料泄露」）。
+- **非飞书回合**（GUI／子代理／定时任务）**一律放行** —— 不要求飞书身份。
+- 内核 `identity-inject.mjs`（ESM，自带 `--selftest`，20/20 通过）。
+- 表 / resolver 路径**跟随工作区**（环境变量 ＞ 部署目录 ＞ `<工作区>/output/g9-identity/` ＞ cwd 逐级向上 ＞ 已知工作区兜底）；
+  支持**本地增量** `~/.dsh-feishucard/identity_map.local.json`（工作区之外 ⇒ 不参与同步 ⇒ 多机各写各的）。
+- 生成器 `scripts/build_identity_map.py` 与解析器 `scripts/resolve_actor.py` 入库（**入库前已脱敏**）；
+  `identity_map.example.json` 为**结构示例**，**真实表（含人名与个人标识）不入库**（`.gitignore` 拦住）。
+
+### 修复：`/switch` 会话摘要 —— **四层叠加**，此前一直静默为空
+
+> 现象（CM 2026-10-04 实测）：卡片能列出会话**标题**，但**看不到会话内容**；补诊断后逐层定位。
+
+1. **读取接口**：`sessionPersistence.readFrom` 在 dsh 0.2.0 已**移除** ⇒ 改走
+   `sessionQuery.readSession(sessionId)`（失败仍退回旧接口，兼容旧宿主）。
+2. **数据层**：`rows.filter((r) => !r.title)` 只读"**没标题**"的会话 ⇒ 而几乎每个会话都有标题
+   ⇒ **取摘要的代码从未执行**。改为全部（仍限 **8 条**，读盘开销不变）。
+3. **渲染层**：`row.title || row.summary || row.label` 是**二选一**短路 ⇒ 改了**标题与摘要同时显示**
+   （按钮上放标题，按钮下另起一行灰色小字放摘要）；`/list` 文字列表同样两者都显示。
+4. **入参**：`firstUserText(sp, r.meta, …)` 的 `meta` 在「只有活会话、无持久化快照」的行上为
+   `undefined` ⇒ 函数第一行即返回 ⇒ **纯静默**（无摘要、无日志、无报错）。改为传 **`sessionId`**。
+
+- 摘要内容改为**最近一句**（不再取第一句：会话标题已覆盖"主题"，最近一句才是"我刚在聊什么"）。
+- **去掉插件自己加的投递前缀** `[飞书 ou_…] `（约 40 字符，原先挤占了 60 字上限的大半）。
+- 摘要上限 **60 → 120 字**（抽成常量 `SWITCH_SUMMARY_CHARS`）。
+- 读取超时 **1.5s → 5s**（大日志读不完曾导致 8 条里 5 条为空）。
+- 三处**静默返回点**全部补上**可见诊断**（无 id ／ 体积超限 ／ 拿不到 snapshot ／ 一个用户正文都没取到）。
+
+### 修复：`resolve_actor` 新增错误码 `not_active`
+
+- 原先「人已离职」与「完全不认识这个 `open_id`」**共用 `unknown_person`** ⇒
+  上层若按它做兜底（如弹卡片问姓名），**离职的人会被当成陌生人来处理**。
+  离职是**正常拒绝** ⇒ 现独立报 `not_active`（错误码 7 → **8** 种）。
+- 顺带修掉一条**假绿灯**自测：用例里"离职者"的 `open_ids` 为空 ⇒ 他在匹配阶段就落到
+  `unknown_person`，**根本走不到在职校验** ⇒ 改代码后自测仍显示旧结果。已补 `open_ids`
+  并加**反面断言**（陌生人是 `unknown_person`）钉住两者。
+
+### 其他
+
+- `.gitignore`：`identity_map.json` / `*.local.json` / `__pycache__` / `*.pyc`。
+- README 新增「身份闸门（可选，默认关）」一节（怎么开 ／ 表放哪 ／ 怎么生成 ／ 解析接口）。
+
 ## [0.7.17] - 2026-10-04
 
 ### 新功能：**两模式（full/stable）＋ 三开关**（CM 拍板 10 问后实施；knowledge 试点）
