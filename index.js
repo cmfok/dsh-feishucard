@@ -272,6 +272,23 @@ export function apply(ctx) {
     return '\n\n（你在引用这条消息' + what + '）'
   }
 
+  // CM 2026-10-03（P1）：引用透传必须**可判定** —— 命中 / 未命中 / **字段为空** 三种都留痕。
+  // 背景：helper 原样转发整包 data（helper.cjs），所以字段有就一定到得了这里；"什么都没有"
+  // 只可能是飞书没带 parent_id/root_id ⇒ 必须有日志，否则只能靠猜（A24 禁无出处断言）。
+  function logQuoteState(evt, hint) {
+    const pid = String((evt && evt.parent_id) || '')
+    const rid = String((evt && evt.root_id) || '')
+    const state = !hint ? 'none' : (hint.includes('内容未登记') ? 'miss' : 'hit')
+    console.log('[fs] inbound quote: parent_id=' + (pid || 'EMPTY') + ' root_id=' + (rid || 'EMPTY')
+      + ' hint=' + state)
+    if (state === 'miss') console.log('[fs] quote miss: ' + (pid || rid))
+    if (state === 'none' && evt && typeof evt.content === 'string'
+      && /(quote|parent_id|root_id)/i.test(evt.content)) {
+      // 字段为空、但事件正文里出现引用痕迹 ⇒ 把原始 content 记下来（下次就知道飞书是怎么给的）
+      console.log('[fs] quote fields EMPTY but content mentions quoting: ' + evt.content.slice(0, 200))
+    }
+  }
+
   // ---- config -------------------------------------------------------------
   // Config/state live under ~/.dsh-feishucard by default; FS_CONFIG_DIR
   // overrides the base directory (used by tests, and for multi-profile
@@ -878,11 +895,9 @@ export function apply(ctx) {
   }
 
   // Card payload: notes as markdown blocks, tool panels collapsed by default,
-  // a bottom status line until sealed. Elements capped (Feishu limit 50,
-  // keep headroom at 40), overflow folded into one "更多过程" panel.
-  // Card payload: notes as markdown blocks, tool panels collapsed by default,
-  // a bottom status line until sealed. Elements capped (Feishu limit 50,
-  // keep headroom at 40), overflow folded into one "更多过程" panel.
+  // a bottom status line until sealed. Overflow is folded into "更早过程" panel(s).
+  // ⚠️ 2026-10-03 更正：这里原写 "Feishu limit 50, keep headroom at 40" —— **错的**。
+  //    实测上限是 **200 元素**（见 CARD_FOLD_THRESHOLD 处证据），阈值已改为 180。
 
   // 正文 → 元素列表：**长代码块折成默认收起的面板**，短代码块保持原样渲染。
   // 阈值与 Hermes 侧一致（>8 行 或 >600 字符），行为可预期；未闭合围栏自动补全。
@@ -934,6 +949,25 @@ export function apply(ctx) {
   //    `ErrCode 11310 / card table number over limit`。Hermes 侧 2026-09-15 实测
   //    单日 22 次 11310 **全部**来自这一条 —— 而 DSH 此前**完全没有表格防护**。
   const CARD_MAX_TABLES = 5
+  // 🧪 2026-10-03 实测（官方文档 + cardkit 建卡接口，未发任何消息）：
+  //   · 卡片 JSON 2.0 单卡上限 = **200 个元素**（200 → code=0；201 → code=300305 element exceeds the limit）
+  //   · 载荷**另有字节上限**（198.5 KB 通过；983 KB → code=200860 card over max size）
+  //   ⇒ 折叠阈值从"凭 50 猜的 40"改为 **180**（留 20 元素余量），并对载荷字节加同样含义的护栏。
+  //   这条修正直接消除"正常长回合也被折进**默认收起**面板 ⇒ 过程文字看不见"（CM 报障的主症状）。
+  const CARD_FOLD_THRESHOLD = 180
+  const CARD_FOLD_MAX_CHARS = 150000      // ≈150 KB，远低于实测 198.5 KB 的通过线
+  function elementTextChars(elements) {
+    let n = 0
+    for (const el of elements || []) {
+      if (!el || typeof el !== 'object') continue
+      if (typeof el.content === 'string') n += el.content.length
+      if (el.text && typeof el.text.content === 'string') n += el.text.content.length
+      if (Array.isArray(el.elements)) for (const inner of el.elements) {
+        if (inner && typeof inner.content === 'string') n += inner.content.length
+      }
+    }
+    return n
+  }
 
   // 把长文本按段落边界切成 ≤ size 的块；单段本身超长则硬切。**不丢任何字符。**
   function chunkText(text, size) {
@@ -1325,7 +1359,9 @@ export function apply(ctx) {
     // Window fold: keep the NEWEST content visible (live progress + conclusion
     // at the bottom), fold the ALREADY-SEEN history into panel(s) at the TOP.
     // The last KEEP_TAIL elements are never folded (2026-08-15 CM design).
-    if (elements.length > 40) {
+    const foldDue = elements.length > CARD_FOLD_THRESHOLD
+      || elementTextChars(elements) > CARD_FOLD_MAX_CHARS
+    if (foldDue) {
       const KEEP_TAIL = 10
       const head = elements.slice(0, elements.length - KEEP_TAIL)
       const tail = elements.slice(elements.length - KEEP_TAIL)
@@ -1373,6 +1409,29 @@ export function apply(ctx) {
       }
       elements.length = 0
       for (const el of tail) elements.push(el)
+    }
+    // 观测指纹（CM 2026-10-03 §3 指出"看不到日志就没法判定"）：
+    //   封口那一帧打印 elements/panels/collapsed/可见字数/payload 指纹 ——
+    //   下次任何"文字不见了"都能**一条日志**判定是折叠、换卡还是回退路径。
+    if (card && card.status === 'sealed') {
+      try {
+        const panels = elements.filter((e) => e && e.tag === 'collapsible_panel')
+        const visible = elements.map((e) => {
+          if (!e) return ''
+          if (e.tag === 'markdown') return String(e.content || '')
+          if (e.tag === 'collapsible_panel' && e.expanded === true) {
+            return String((e.elements && e.elements[0] && e.elements[0].content) || '')
+          }
+          return ''
+        }).join('\n')
+        console.log('[fs] card fingerprint: card=' + (card.token || '-')
+          + ' status=' + String(card.status)
+          + ' elements=' + elements.length
+          + ' panels=' + panels.length
+          + ' collapsed=' + panels.filter((p) => p.expanded !== true).length
+          + ' visible_chars=' + visible.length
+          + ' payload_md5=' + createHash('md5').update(JSON.stringify({ elements })).digest('hex').slice(0, 8))
+      } catch { /* 指纹只用于留痕，绝不影响发卡 */ }
     }
     if (elements.length === 0) elements.push({ tag: 'markdown', content: ' ' })
     // 底部状态栏：上下文占比/缓存命中/目标状态 + **运行状态**都收在这一块里（改造③ + CM 2026-10-01）
@@ -2994,6 +3053,7 @@ export function apply(ctx) {
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     const label = openId ? '[飞书 ' + openId + '] ' : '[飞书消息] '
     const quote = quoteHintFor(evt.parent_id || evt.root_id)
+    logQuoteState(evt, quote)
     try {
       entry.agent.steer({
         id: 'fs-' + evt.message_id,
@@ -3183,6 +3243,7 @@ export function apply(ctx) {
       // 改造⑤：CM 长按引用某条消息/某张卡片时，把被引内容的摘要随正文一起送进会话
       // （旧实现只送正文 ⇒ agent 无法判断"他回的是哪一条"）。
       const quote = quoteHintFor(evt.parent_id || evt.root_id)
+      logQuoteState(evt, quote)
       const message = {
         id: 'fs-' + messageId,
         role: 'user',
@@ -3452,14 +3513,17 @@ export function apply(ctx) {
       // 分卡时它只是过程卡 ⇒ 保持 bare（状态栏由下面新开的结论卡承担）。
       if (!splitConclusion) card.footerMode = 'full'
       let replaced = false
+      // 🔴 CM 2026-10-03 P0（真机理，代码实证）：这里原先把 `replySeqs` 覆盖的 note **从过程卡删掉**
+      //    （`card.blocks.filter(...)`），而 `replySeqs` 是"从末尾往前扫、**跨过工具调用继续收**"
+      //    得来的 ⇒ 一轮里被收进去的叙述可能覆盖**整轮** ⇒ 过程卡被清空成一句指路、
+      //    那些文字全部出现在结论卡里。CM 的验收①是"过程卡的文字和步骤**不动**" ⇒
+      //    **过程卡只允许追加，绝不允许删块**（正文保住；结论卡仍自包含，代价是两卡重复同一段）。
       if (duplicateConclusion) {
-        // 重复链条：**不再重复发送结论**，本卡只留一行指路（正文不重复、也不新开卡）。
-        card.blocks = card.blocks.filter((b) => !(b.type === 'note' && replySeqs.includes(b.seq)))
+        // 重复链条：**不再重复发送结论**（也不新开卡），只在末尾追加一行指路。
         card.blocks.push({ type: 'message', text: '✅ 本轮已完成，结论见上方卡片。' })
         replaced = true
       } else if (splitConclusion) {
-        // 摘掉镜像进来的结论 note，改一行指路（正文一个字不丢：整段进下面的结论卡）
-        card.blocks = card.blocks.filter((b) => !(b.type === 'note' && replySeqs.includes(b.seq)))
+        // 结论进下面的新卡；过程卡**正文一个字都不动**，只在末尾追加一行指路。
         card.blocks.push({ type: 'message', text: '✅ 本轮完成，结论见下方卡片。' })
         replaced = true
       } else if (replySeqs.length > 0) {

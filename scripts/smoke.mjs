@@ -1952,8 +1952,11 @@ console.log('31) 结论独立成卡（CM 2026-10-01 B 方案，17:3x 修正：**
   const conclusionIdx = events.findIndex((c, i) => i > 0 && c.op === 'create' && JSON.stringify(c.payload).includes('一切正常'))
   ok(conclusionIdx > 0, '结论出现在**新开的**那张卡里')
   const beforeConclusion = JSON.stringify(events.slice(0, conclusionIdx))
-  ok(!beforeConclusion.includes('一切正常'), '过程卡里**没有**重复结论')
-  ok(beforeConclusion.includes('结论见下方卡片'), '过程卡留一句指路')
+  // 🔴 2026-10-03 P0 口径反转（CM 报障 + 计划口径 (ii)）：过程卡**只追加、不删块** ⇒
+  //    结论那一段会同时留在过程卡里（与自包含的结论卡重复），这是**有意为之**的代价：
+  //    "过程卡的文字和步骤不动"优先于"两卡不重复"（旧口径为了不重复而把过程卡清空）。
+  ok(beforeConclusion.includes('一切正常'), '★ P0：过程卡**保留**正文（只追加、不删块；与结论卡重复是有意代价）')
+  ok(beforeConclusion.includes('结论见下方卡片'), '过程卡末尾追加一句指路')
   ok(JSON.stringify(creates[creates.length - 1].payload).includes('已完成'), '结论卡的状态栏写「已完成」')
   // CM 2026-10-01 A 方案：**过程卡不摆状态栏**（无目标/无上下文/无缓存），只留一行裸状态
   // 判据换成「缓存命中」（= 完整状态栏的指标段）。
@@ -1980,6 +1983,70 @@ console.log('31) 结论独立成卡（CM 2026-10-01 B 方案，17:3x 修正：**
   await settle(3)
   ok(createsSince(mark2).length === 1,
     '**短任务（即使调了工具）也维持单卡**（实际 ' + createsSince(mark2).length + ' 张）')
+}
+
+console.log('31b) 🔴 P0 复现 CM 2026-10-03 报障：过程卡正文**不许**被搬到结论卡')
+{
+  // 复现要点（我第一版探针没抓到的原因）：回复集合 replySeqs 是"从末尾往前扫、**跨过工具调用
+  // 继续收**"得来的 ⇒ 叙述与工具交替时它会覆盖**整轮** ⇒ 旧实现把过程卡里这些 note 全删掉，
+  // 文字就"全跑到结论卡"、过程卡只剩一句指路。所以夹具必须是**叙述↔工具交替**。
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
+  const markP0 = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: 9500, data: { message: { content: [{ type: 'text', text: '第一段过程叙述' }] } } })
+    agentEvents.push({ type: 'tool/call', seq: 9501, data: { callId: 'p0_1', name: 'read', arguments: '{"file_path":"a.md"}' } })
+    agentEvents.push({ type: 'tool/result', seq: 9502, data: { message: { source: { callId: 'p0_1' }, content: [{ type: 'text', text: 'ok' }] } } })
+    agentEvents.push({ type: 'assistant/message', seq: 9503, data: { message: { content: [{ type: 'text', text: '第二段过程叙述' }] } } })
+    agentEvents.push({ type: 'tool/call', seq: 9504, data: { callId: 'p0_2', name: 'read', arguments: '{"file_path":"b.md"}' } })
+    agentEvents.push({ type: 'tool/result', seq: 9505, data: { message: { source: { callId: 'p0_2' }, content: [{ type: 'text', text: 'ok' }] } } })
+    agentEvents.push({ type: 'assistant/message', seq: 9506, data: { message: { content: [{ type: 'text', text: '第三段过程叙述' }] } } })
+    agentEvents.push({ type: 'assistant/message', seq: 9507, data: { message: { content: [{ type: 'text', text: '结论：三件事都做完了。' }] } } })
+  }
+  feedInbound('om_p0_keepblocks', 'P0 正文保全')
+  await settle(4)
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const p0Creates = sentCards.slice(markP0)
+    .filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  ok(p0Creates.length === 2, '前提：走了「结论独立成卡」那条路（实际 ' + p0Creates.length + ' 张）')
+  const procPayload = p0Creates.length > 0 ? p0Creates[0].payload : {}
+  const concPayload = p0Creates.length > 1 ? p0Creates[p0Creates.length - 1].payload : {}
+  const procJson = JSON.stringify(procPayload)
+  const concJson = JSON.stringify(concPayload)
+  ok(procJson.includes('第一段过程叙述') && procJson.includes('第二段过程叙述') && procJson.includes('第三段过程叙述'),
+    '★ P0：过程卡**三段正文全部保留**（旧实现会把它们删掉搬进结论卡）')
+  ok(procJson.includes('结论见下方卡片'), '过程卡末尾追加了一行指路（只追加，不删块）')
+  ok(concJson.includes('结论：三件事都做完了'), '结论卡里有结论（自包含口径不变）')
+  ok(consoleLines.some((l) => l.includes('card fingerprint:') && l.includes('collapsed=')),
+    '★ 观测指纹已留痕（封口帧 elements/panels/collapsed/payload_md5）')
+}
+
+console.log('31c) 折叠阈值修正：正常长回合（90 元素）不再把过程文字藏进收起面板')
+{
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
+  const markFold = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    for (let i = 0; i < 45; i++) {
+      agentEvents.push({ type: 'tool/call', seq: 9600 + i * 2, data: { callId: 'fv_' + i, name: 'read', arguments: '{"file_path":"g' + i + '.md"}' } })
+      agentEvents.push({ type: 'assistant/message', seq: 9601 + i * 2, data: { message: { content: [{ type: 'text', text: '叙述第 ' + i + ' 段 ' + 'y'.repeat(20) }] } } })
+    }
+    agentEvents.push({ type: 'assistant/message', seq: 9800, data: { message: { content: [{ type: 'text', text: '结论：完毕。' }] } } })
+  }
+  feedInbound('om_fold_threshold', '阈值修正')
+  await settle(4)
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const foldCreates = sentCards.slice(markFold)
+    .filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  const procEls = (foldCreates[0] && foldCreates[0].payload.body.elements) || []
+  const visibleText = procEls.map((e) => {
+    if (e.tag === 'markdown') return String(e.content || '')
+    if (e.tag === 'collapsible_panel' && e.expanded === true) return String((e.elements && e.elements[0] && e.elements[0].content) || '')
+    return ''
+  }).join('\n')
+  ok(visibleText.includes('叙述第 0 段'), '★ 第一段默认可见（阈值 180 之下不再折叠）')
+  ok(visibleText.includes('叙述第 44 段'), '★ 最后一段默认可见')
+  ok(visibleText.includes('第一段过程叙述') || visibleText.length > 0, '（可见区非空）')
 }
 
 console.log('32) /compact：压缩上下文必须透传到命令注册表（CM 2026-10-01 要求）')
