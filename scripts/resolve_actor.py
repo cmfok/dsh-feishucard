@@ -98,14 +98,29 @@ def resolveActor(open_id, identity_map):
     if not person.get("job_id"):
         return None, E_NOT_GRANTED
 
-    # ⑥ 组装 actor（六字段 + channels + source，字段与 policy_axis.User 对齐）
+    # ⑥ 组装 actor —— 🔴 **两层字段都要带**（`0225` §三 裁决）
+    #
+    #    引擎层（门禁直接吃，`policy_axis.User`）：name / scopes / grants / extra_grants /
+    #      grants_until / channels
+    #    画像层（审计 / 审批单 / 追溯）：open_id / person_id / source
+    #
+    #    ⚠️ 实测身份表 `people` 条目**没有 `level` / `category` 两列**（只有 union_id / open_ids /
+    #       person_id / name / job_id / channel / status / aliases / scopes / grants /
+    #       extra_grants / grants_until / confirmed_at）⇒ 这两键**暂不输出**，
+    #       且**绝不编造兜底值**（编一个默认档位 = 假身份）。补齐的前提是 D1 先有数据源。
+    #    ⇒ `open_id` 必须回带：它同时是内核 `IDENTITY_KEYS` 的成员，**不带就会被【删除】而非覆写**。
+    #    带上多余键无害 —— 调用侧 `User(name=…, scopes=…, grants=…)` 是显式传参，不会吸进 dataclass。
     return ({
+        # 引擎层
         "name": person.get("name", ""),
         "scopes": list(person.get("scopes", [])),
         "grants": dict(person.get("grants", {})),
         "extra_grants": dict(person.get("extra_grants", {})),
         "grants_until": dict(person.get("grants_until", {})),
         "channels": list(person.get("channels", [])),
+        # 画像层
+        "open_id": str(open_id),
+        "person_id": str(person.get("person_id") or ""),
         "source": f"identity_map@v{m.get('v', '?')}",
     }), None
 
@@ -164,4 +179,9 @@ if __name__ == "__main__":
     # 反面断言：**完全不认识**的人仍然是 unknown_person —— 两者不可混
     _, err = resolveActor("ou_nobody_main", MAP)
     print(("✅" if err == E_UNKNOWN_PERSON else "❌") + " 陌生人 → " + str(err))
+    # 画像层：`open_id` 必须**回带** —— 它是内核 `IDENTITY_KEYS` 的成员，
+    # 不带就会被【删除】而非覆写（2026-10-04 实测过这个坑：agent 传了反而被抹掉）。
+    _a, _e = resolveActor("ou_cm_main", MAP)
+    _got = (_a or {}).get("open_id")
+    print(("✅" if _got == "ou_cm_main" else "❌") + " 画像层 open_id → " + str(_got))
     print("自测失败数:", bad)
