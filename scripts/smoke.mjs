@@ -3316,8 +3316,8 @@ console.log('57c) ★ 0.7.11 HIGH：短回复（<120 字）整段已在卡上 �
   const ops57c = cardsSince(mark57c).filter((c) => c.payload && c.payload.schema === '2.0')
   const last57c = ops57c.length ? JSON.stringify(ops57c[ops57c.length - 1].payload) : ''
   const hits57c = (last57c.match(/SHORTMARK-短旁白整段已展示-收尾/g) || []).length
-  ok(hits57c <= 1,
-    '★ 短回复（<120 字）整段已在卡上不许重复出现（实际 ' + hits57c + ' 次；0.7.10 的 120 阈值把「整段已在」判死）')
+  ok(hits57c === 1,
+    '★ 短回复（<120 字）整段已在卡上恰好出现一次（实际 ' + hits57c + ' 次；0.7.10 的 120 阈值把「整段已在」判死）')
 }
 
 console.log('57d) ★ 0.7.11 MED：空白折叠后归一化长度≠原文长度 ⇒ 不得按归一化长度切原文')
@@ -3345,8 +3345,8 @@ console.log('57d) ★ 0.7.11 MED：空白折叠后归一化长度≠原文长度
   const ops57d = cardsSince(mark57d).filter((c) => c.payload && c.payload.schema === '2.0')
   const last57d = ops57d.length ? JSON.stringify(ops57d[ops57d.length - 1].payload) : ''
   const hits57d = (last57d.match(/BLANKTAIL-MARKER-乙/g) || []).length
-  ok(hits57d <= 1,
-    '★ 含空行的已展示回复不得按归一化长度切片重吐尾部（实际 ' + hits57d + ' 次）')
+  ok(hits57d === 1,
+    '★ 含空行的已展示回复恰好出现一次、不重吐尾部（实际 ' + hits57d + ' 次）')
 }
 
 console.log('57e) ★ 0.7.11 MED：clipNoteText 把被截掉的目的行【前置】到 note 开头 ⇒ 必须剥掉再算公共前缀')
@@ -3372,11 +3372,11 @@ console.log('57e) ★ 0.7.11 MED：clipNoteText 把被截掉的目的行【前�
   const ops57e = cardsSince(mark57e).filter((c) => c.payload && c.payload.schema === '2.0')
   const last57e = ops57e.length ? JSON.stringify(ops57e[ops57e.length - 1].payload) : ''
   const hits57e = (last57e.match(/PURPMARK-正文开头-/g) || []).length
-  ok(hits57e <= 1,
-    '★ 目的行前置形状不得整段重追加（实际 ' + hits57e + ' 次）')
+  ok(hits57e === 1,
+    '★ 目的行前置形状恰好出现一次、不整段重追加（实际 ' + hits57e + ' 次）')
   const hits57eP = (last57e.match(/🎯 目的行在末尾-壹/g) || []).length
-  ok(hits57eP <= 1,
-    '★ 已在卡上的目的行不得随尾部二次出现（实际 ' + hits57eP + ' 次）')
+  ok(hits57eP === 1,
+    '★ 已在卡上的目的行恰好出现一次（实际 ' + hits57eP + ' 次）')
 }
 
 console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢弃（CM：转发卡片没反应）')

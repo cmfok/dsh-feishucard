@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.12] - 2026-10-03
+
+### 加固：0.7.11 独立审查 5 条（**0 critical / 0 high / 2 medium / 3 low**，逐条核对 0 误报）
+
+> 来源：`output\code-review\dsh-feishucard-0711-20261003-180621\REPORT.md`（VERDICT **WARN**，放行推送；按 0.7.9 先例逐条核对后全收）。
+> ⚠️ 本轮性质 = **加固/重构**，无新增红用例：MED#3826 是维护性（双归一化器并存）、MED#3853 在镜像不变式下不触发
+> （只在"非镜像块巧合命中"路径丢字）；既有断言的可证伪性已由 0.7.10 上的 RED 轮证明（当时 4 红）。
+
+**① MED#3826：归一化双实现并存（漂移风险）** —— `normText` 与 `normWithMap` 是同一规则的两次实现、
+分居比较两侧，将来改一漏一 ⇒ 前缀长度静默漂移（重追加/丢尾）且无测试可查。
+现在：**单一信源** —— note 侧也走 `normWithMap(…).n`，删除 `normText`。
+
+**② MED#3853：`onCard` 子串匹配 → 整行比较** —— 目的行互为前后缀时（`🎯 读取 a.txt` ⊂ `🎯 读取 a.txt 并展示`），
+子串命中会把"卡上有更长的行"误当"这条短行已展示"，在非镜像巧合路径上**从尾部丢字**（违反"宁可重复，不可丢字"）。
+现在：逐行 `trim` 后**整行相等**比较（更保守：宁可整段照发）。
+
+**③ LOW（风格）：`== null` → `=== null || === undefined`**（项目规则禁松等）。
+**④ LOW（性能）：`/\s/` 正则提升为 `WS_RE` 常量**（此前每字符求值一次字面量）。
+**⑤ LOW（测试）：57c/57d/57e 四条断言 `<= 1` → `=== 1`** —— `<= 1` 在"文本被整段丢掉"（count=0）时也会过，
+`=== 1` 双向钉住（重复=红、丢字=红）；可证伪性不变（0.7.10 上 count=2 照样红）。
+
 ## [0.7.11] - 2026-10-03
 
 ### 修复：0.7.10 独立审查 4 条（**0 critical / 1 high / 2 medium / 1 low**，逐条核对 0 误报）

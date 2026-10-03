@@ -3804,7 +3804,6 @@ export function apply(ctx) {
         //   判据改为**最长公共前缀**：
         //     · 没被截断（整段已在卡上）⇒ 公共前缀 = 整段 ⇒ 尾部为空 ⇒ 一个字都不追加（零重复）
         //     · 被截断/换行切过 ⇒ 公共前缀 ≈ 500 ⇒ 只补 `…` 之后那半段（不丢字、也不重复前 500 字）
-        const normText = (x) => String(x == null ? '' : x).replace(/\s+/g, ' ').trim()
         const replyRaw = String(reply)
         const commonPrefixLen = (a, b) => {
           const n = Math.min(a.length, b.length)
@@ -3822,16 +3821,19 @@ export function apply(ctx) {
         //    前置 🎯 行，否则"🎯 在末尾"的长回复（smoke 28 形状）公共前缀 = 0，整段重追加（MED#3819）。
         // 安全阀：凡这次"不再追加"的部分（前置行、已展示前缀）必须逐段确认真的在卡上；
         // 任何一段查不到 ⇒ 放弃去重整段照发 —— 宁可重复，不可丢字（CM 红线）。
+        // 0.7.12（审查 2m+3low 全收）：归一化单一信源（normWithMap 兼供 note 侧）/ onCard 整行比较 /
+        //   严格判空 / WS_RE 提升。
         const LEADING_PURPOSE_RE = /^(?:[^\S\n]*(?:[-*][^\S\n]*)?🎯[^\n]*(?:\n|$))+/
+        const WS_RE = /\s/
         const normWithMap = (s) => {
-          const raw = String(s == null ? '' : s)
+          const raw = String(s === null || s === undefined ? '' : s)
           const chars = []
           const ends = []
           let i = 0
           while (i < raw.length) {
-            if (/\s/.test(raw[i])) {
+            if (WS_RE.test(raw[i])) {
               let j = i
-              while (j < raw.length && /\s/.test(raw[j])) j++
+              while (j < raw.length && WS_RE.test(raw[j])) j++
               chars.push(' '); ends.push(j)
               i = j
             } else {
@@ -3852,7 +3854,9 @@ export function apply(ctx) {
         const noteTexts = card.blocks.filter((b) => b && typeof b.text === 'string' && b.text).map((b) => b.text)
         const onCard = (line) => {
           const t = line.trim()
-          return Boolean(t) && noteTexts.some((tx) => tx.includes(t))
+          // 0.7.12（审查 MED#3853）：**整行**比较 —— 子串命中会把"卡上有更长的行"误当"这条短目的行已展示"，
+          // 在非镜像巧合路径上从尾部丢字（违反"宁可重复，不可丢字"）。
+          return Boolean(t) && noteTexts.some((tx) => tx.split('\n').some((l) => l.trim() === t))
         }
         const replyStripped = stripLeadingPurpose(replyRaw)
         const stripOffset = replyStripped.stripped.length
@@ -3862,7 +3866,7 @@ export function apply(ctx) {
         for (const b of card.blocks) {
           if (!b || typeof b.text !== 'string' || !b.text) continue
           const nn = stripLeadingPurpose(b.text)
-          const n = normText(nn.text)
+          const n = normWithMap(nn.text).n
           if (!n) continue
           const c = commonPrefixLen(n, replyNorm)
           const fullShown = c === replyNorm.length && replyNorm.length > 0
