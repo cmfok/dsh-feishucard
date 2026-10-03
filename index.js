@@ -21,6 +21,21 @@ import { zstdDecompressSync } from 'node:zlib'
 import { dirname, join } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+// ── D5（P1.5 身份注入 · 按人判）：内核（可独立单测，见 identity-inject.mjs --selftest）──────
+//    规格：NODE1 v3 §2.5 ＋ `P1.5-身份注入-按人判-施工任务书-v1.md` D5（归属：HOME）
+import {
+  TurnIdentityStore, applyActorToArguments, decideAction, makeResolver,
+} from './identity-inject.mjs'
+
+// D5：进程内单例 —— 「本轮上下文」按 agent.id 存，所以多 bot 实例共享一个 store 也不会串号。
+// 表/resolver 路径默认取 /opt/scripts/G9/（服务器），可用 MAILBOX_IDENTITY_MAP 覆盖。
+let __turnIdentity = null
+let __identityResolver = null
+function identityCtx () {
+  if (!__turnIdentity) __turnIdentity = new TurnIdentityStore()
+  if (!__identityResolver) __identityResolver = makeResolver()
+  return { store: __turnIdentity, resolver: __identityResolver }
+}
 
 export const name = 'feishu-stream'
 
@@ -3337,8 +3352,26 @@ export function apply(ctx) {
     const boundAgent = active.handle && active.handle.agent
     const entry = (boundAgent && activeTurns.get(boundAgent.id)) || activeTurns.get(active.id)
     if (!entry || !entry.agent || typeof entry.agent.steer !== 'function') return false
+    // ── D5（P1.5 身份注入）· 插话路径也要注入（否则插话进来的那条没有 actor）─────
+    //    身份只来自 `evt.sender.sender_id.open_id`（服务端给的、伪造不了）；
+    //    认不出**不弹卡片、不问姓名**（CM 2026-10-04）；表不可达 ⇒ 放行（不许锁死整机）。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
-    const label = openId ? '[飞书 ' + openId + '] ' : '[飞书消息] '
+    let identityActor = null
+    try {
+      const idc = identityCtx()
+      const r = idc.resolver.resolve(openId)
+      identityActor = r.actor
+      idc.store.set(entry.agent.id, { actor: r.actor, chatId, messageId: evt.message_id, tableOk: r.tableOk })
+      console.log('[fs] identity(steer): agent=' + entry.agent.id
+        + ' open_id=' + String(openId).slice(0, 12) + '…'
+        + ' -> ' + (r.actor ? ('OK ' + r.actor.name) : String(r.err || 'no_actor'))
+        + ' tableOk=' + r.tableOk)
+    } catch (error) {
+      console.log('[fs] identity(steer) resolve failed (ignored): ' + String(error && error.message || error))
+    }
+    const label = identityActor
+      ? '[飞书 ' + (identityActor.name || openId) + '] '
+      : (openId ? '[飞书 ' + openId + '] ' : '[飞书消息] ')
     const quote = quoteHintFor(evt.parent_id || evt.root_id)
     logQuoteState(evt, quote)
     try {
@@ -3517,8 +3550,32 @@ export function apply(ctx) {
       }
     } catch { /* 标题只是展示信息，取不到不影响任何流程 */ }
 
+    // ── D5（P1.5 身份注入 · 按人判）· CM 2026-10-04 定的三条 ───────────────────
+    //  ① 身份【只】来自这里：`event.sender.sender_id.open_id` —— 飞书服务端填的，**伪造不了**；
+    //     正文里任何 "[飞书 ou_…]" 都只是旁证（用户能仿造同样的文本），**授权一律不读它**。
+    //  ② 认不出**不弹卡片、不问姓名** —— CM 原话：
+    //     「不弹卡片啊，你现在都不会认不出人，而且这个链路已经通了，应该直接 ai 处理啊，
+    //       为什么还是想着人来介入」⇒ 认人只需 open_id 一个字段。
+    //  ③ **表不可达 ≠ 认不出**：表不在本机（例：家里那台没有 /opt/scripts/G9/）时，
+    //     记一条日志并**放行** —— 否则一上线就把本机所有工具锁死（事故级）。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
-    const label = openId ? '[飞书 ' + openId + '] ' : '[飞书消息] '
+    let identityActor = null
+    try {
+      const idc = identityCtx()
+      const r = idc.resolver.resolve(openId)
+      identityActor = r.actor
+      idc.store.set(agent.id, { actor: r.actor, chatId, messageId, tableOk: r.tableOk })
+      console.log('[fs] identity: agent=' + agent.id
+        + ' open_id=' + String(openId).slice(0, 12) + '…'
+        + ' -> ' + (r.actor ? ('OK ' + r.actor.name + ' source=' + r.actor.source) : String(r.err || 'no_actor'))
+        + ' tableOk=' + r.tableOk)
+    } catch (error) {
+      console.log('[fs] identity resolve failed (ignored): ' + String(error && error.message || error))
+    }
+    // 前缀改由【服务端算出的 actor】生成（不再直接贴原始 open_id —— 免得模型把"一段像 id 的文本"当凭据）
+    const label = identityActor
+      ? '[飞书 ' + (identityActor.name || openId) + '] '
+      : (openId ? '[飞书 ' + openId + '] ' : '[飞书消息] ')
 
     // Typing reaction: added on arrival, removed after the reply is delivered.
     const emoji = (bot.cfg.reactionEmoji && String(bot.cfg.reactionEmoji).trim()) || 'OnIt'
@@ -6602,6 +6659,50 @@ export function apply(ctx) {
   // exit_plan_mode 是 **工具**（dsh-plan-mode/lib/index.js:231 的 ctx.tools.register），
   // 与 ask_user_question 同一个 dispatch；而本插件在 tools/execute 上拦 ask_user_question
   // 是**线上验证过可用**的 ⇒ 换到这条通道，飞书侧 100% 拿得到。
+  // ── D5（P1.5 身份注入）· 通用身份覆写拦截（**新增**，2026-10-04）─────────────────
+  //  与下面两条的分工：下面两条是【专用】拦截（第一行就 `if (exec.name !== 'xxx') return next()`），
+  //  **不覆盖所有工具**；本条**不拦任何工具**，只把 agent 传来的身份字段【覆写】成服务端算出的
+  //  actor，然后**一律 next()**。⇒ 注册在它们【之前】，保证先跑。
+  //
+  //  边界（内核 `decideAction` 实现，且已单测）：
+  //    · 非飞书会话（没有 chat owner：GUI／子代理／定时轮）  ⇒ pass-through（**不许锁死 GUI**）
+  //    · 有 owner ＋ 有 actor                              ⇒ overwrite（**这是 A3 的真正落点**）
+  //    · 有 owner ＋ 无 actor ＋ **表可达**                 ⇒ deny（fail-closed，这才该拦）
+  //    · 有 owner ＋ 无 actor ＋ **表不可达**               ⇒ pass-through ＋ 记日志
+  //        ↑ 安全阀：表只在服务器（/opt/scripts/G9/），家里那台没有 ⇒ 拒绝会锁死整机
+  ctx.on('tools/execute', async (exec, next) => {
+    try {
+      const owner = findChatForAgent(exec.agent)
+      const rec = owner ? identityCtx().store.get(exec.agent.id) : null
+      const action = decideAction({
+        hasOwner: Boolean(owner),
+        actor: rec && rec.actor,
+        tableOk: rec ? rec.tableOk !== false : false,
+      })
+      if (action === 'overwrite') {
+        const r = applyActorToArguments(exec.arguments, rec.actor)
+        if (r.overwritten.length || r.dropped.length) {
+          console.log('[fs] identity overwrite: tool=' + exec.name + ' agent=' + exec.agent.id
+            + ' set=[' + r.overwritten.join(',') + '] drop=[' + r.dropped.join(',') + ']')
+        }
+      } else if (action === 'deny') {
+        console.log('[fs] identity DENY: tool=' + exec.name + ' agent=' + exec.agent.id
+          + '（有飞书会话但拿不到 actor ⇒ fail-closed）')
+        // ⚠️ 必须带 `error`：本文件 L6630 的注释记着——isError===true 时 harness 会**无条件**
+        //    读 result.error，不给就是 undefined ⇒ 抛 "tool result must be losslessly JSON-serializable"。
+        return {
+          isError: true,
+          error: 'identity_unresolved',
+          value: { error: 'identity_unresolved' },
+          content: [{ type: 'text', text: '身份未通过校验，已拒绝执行本次工具调用（identity_unresolved）。' }],
+        }
+      }
+    } catch (error) {
+      console.log('[fs] identity overwrite failed (ignored): ' + String(error && error.message || error))
+    }
+    return next()
+  })
+
   // 红线：非飞书会话（GUI／子代理）一律 next()，绝不吞别人的提问。
   ctx.on('tools/execute', async (exec, next) => {
     if (exec.name !== 'exit_plan_mode') return next()
