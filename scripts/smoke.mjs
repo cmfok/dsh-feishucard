@@ -88,6 +88,7 @@ const globalFetch = globalThis.fetch
 const imageUploads = []
 const fileUploads = []
 let rejectPatches = 0
+let rejectPatchesBody = null   // 0.7.9：可注入具体错误体（P5 用 11310）
 globalThis.fetch = async (url, init) => {
   const u = String(url)
   if (u.includes('/auth/v3/tenant_access_token/internal')) {
@@ -124,10 +125,11 @@ globalThis.fetch = async (url, init) => {
     if (rejectPatches > 0) {
       // F 用例：模拟"内容被拒"（真机原话 code 230099 / ErrCode 200570 / invalid image keys）
       // ⚠️ 这一支在 PATCH 提前返回**之后** ⇒ 只对 **create** 生效（审查 LOW#124 指出原注释与实现不符）。
+      // 0.7.9：新增 rejectPatchesBody —— P5 用例用它注入 **11310 表格超限**（真机 web.log 79604）。
       rejectPatches -= 1
       return {
         status: 200,
-        text: () => Promise.resolve(JSON.stringify({
+        text: () => Promise.resolve(JSON.stringify(rejectPatchesBody || {
           code: 230099,
           msg: 'Failed to create card content, ext=ErrCode: 200570; ErrMsg: card contains invalid image keys',
         })),
@@ -617,6 +619,23 @@ function feedInboundFile(msgId, file) {
     },
   }) + '\n'
 }
+// 0.7.9 P6：任意 message_type 的入站（interactive = 转发/卡片消息）。
+function feedInboundRaw(msgId, msgType, contentObj) {
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: msgId,
+        message_type: msgType,
+        chat_id: CHAT_ID,
+        chat_type: 'p2p',
+        content: JSON.stringify(contentObj),
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+}
 function cardsSince(n) {
   return sentCards.slice(n)
 }
@@ -851,8 +870,10 @@ console.log('12b) 元素/体积超限 ⇒ **换卡续写**（旧卡正文原样�
   const oldLastBody = groupR.length ? groupR[0][groupR[0].length - 1] : ''
   ok(!oldLastBody.includes('正在工作中…'),
     '★ 12c 换卡后旧卡**最后形态**不再停在「正在工作中…」（MED#7095：换卡前先摘占位符）')
-  ok(newCardBody.includes('已达飞书单卡上限') && !oldCardBody.includes('已达飞书单卡上限'),
-    '★ 12d 换卡说明只出现在**新卡**上（MED#2272/MED#967：文案是新卡视角，写在旧卡上会自指）')
+  // 0.7.9（CM 2026-10-03 ③ 拍板）：指路语写在**旧卡**（读者就在这张卡上），**新卡干净起步**。
+  // ⚠️ 这作废了 0.7.8 按审查 MED#967/MED#2272 改成"新卡视角"的方向 —— 以 CM 最新口径为准。
+  ok(oldCardBody.includes('本卡内容已达飞书单卡上限') && !newCardBody.includes('本卡内容已达飞书单卡上限'),
+    '★ 12d 换卡指路语写在**旧卡**上、新卡干净起步（CM 2026-10-03 ③）')
 }
 
 console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
@@ -939,7 +960,7 @@ console.log('13b) 目标卡照样享受表格换卡（新功能 × 既有换卡�
 
   const creates = createsSince(mark)
   ok(creates.length >= 2, '目标卡满额后换新卡（create 次数 ' + creates.length + '）')
-  ok(JSON.stringify(cardsSince(mark)).includes('表格已满'), '新卡带换卡说明')
+  ok(JSON.stringify(cardsSince(mark)).includes('表格已满'), '换卡说明出现（0.7.9：写在**旧卡**上）')
 
   // 第 6 张表在**新卡**上的落地形态：轮结束的强制同步会把待写内容一次刷出去
   //（换卡后头 400ms 内的普通同步会被 CARD_MIN_INTERVAL 限流跳过，属既有行为，不是目标卡缺陷）。
@@ -947,11 +968,15 @@ console.log('13b) 目标卡照样享受表格换卡（新功能 × 既有换卡�
   await settle()
   const all = cardsSince(mark)
   ok(JSON.stringify(all).includes('本轮结束'), '封口落在换卡后的新卡上（游标已接续，不断链）')
-  const hintAt = all.findIndex((c) => c.op === 'create' && JSON.stringify(c.payload).includes('表格已满'))
-  const onNewCard = hintAt >= 0 ? JSON.stringify(all.slice(hintAt)) : ''
+  // 0.7.9（CM 2026-10-03 ③）：换卡说明现在写在**旧卡**上（走 PATCH，不再是新卡的 create）
+  // ⇒ 先按"任意 op 里含换卡说明"定位，再把**其后第一张 create** 当作新卡。
+  const hintAt = all.findIndex((c) => JSON.stringify(c.payload).includes('表格已满'))
+  ok(hintAt >= 0, '换卡说明写在旧卡上（P3）')
+  const newStart = all.findIndex((c, i) => i > hintAt && c.op === 'create')
+  const onNewCard = newStart >= 0 ? JSON.stringify(all.slice(newStart)) : ''
   ok(onNewCard.includes('| 列6 |') && !onNewCard.includes('**列6**：'),
     '第 6 张表落在新卡且保持 markdown 原样（未被降级）')
-  ok(!JSON.stringify(all.slice(0, hintAt < 0 ? 0 : hintAt)).includes('| 列6 |'),
+  ok(!JSON.stringify(all.slice(0, newStart < 0 ? 0 : newStart)).includes('| 列6 |'),
     '第 6 张表没有跑到旧卡（游标接续不重不漏）')
 }
 
@@ -1819,7 +1844,9 @@ console.log('25) 卡片底部「目标条」：目标全文 + 状态 + 上下文
   feedInbound('om_goal_disabled', '未启用目标条测试')
   await settle(3)
   const body3 = JSON.stringify(cardsSince(mark3))
-  ok(body3.includes('未启用'), '无目标时目标条写「未启用」')
+  // 0.7.9（CM 2026-10-03 ①）：删掉「🎯 目标模式 · 未启用」那句 —— 模式位已由 statusTextFor 独占，
+  // 再写一句"未启用"就是"普通模式与目标模式共存"的第二种形态。
+  ok(!body3.includes('未启用'), '★ 无目标时目标条**不再**写「未启用」（一行只有一个模式位）')
   ok(body3.includes('grey-50'), '未启用形态也有灰色底（grey-50）')
   ok(body3.includes('"tag":"hr"'), '未启用形态同样带灰色分隔线')
   fakeGoalEnabled = true
@@ -2197,10 +2224,10 @@ console.log('33) 目标状态三分支（paused/blocked/complete）＋ 状态变
     ok(JSON.stringify(cardsSince(mark)).includes(expect), label + '：卡面出现「' + expect + '」')
   }
   fakeGoalPhase = 'paused'
-  await phaseCase('暂停态目标条', '目标模式 · 已暂停')
+  await phaseCase('暂停态目标条', '已暂停（发 /goal resume 恢复）')
   fakeGoalPhase = 'blocked'
   fakeGoalBlockedReason = '已达轮次上限'
-  await phaseCase('阻塞态目标条（状态栏只写已阻塞）', '目标模式 · 已阻塞')
+  await phaseCase('阻塞态目标条（状态栏只写已阻塞）', '🚫 已阻塞 · ')
   // CM 2026-10-01：**状态栏只写「已阻塞」**，长原因挪到展开面板 ⇒ 上面断"短状态栏"，
   // 下面断"原因仍完整在卡里（面板内容里）"。
   await phaseCase('阻塞态目标条（原因在面板里）', '已达轮次上限')
@@ -2223,7 +2250,7 @@ console.log('33) 目标状态三分支（paused/blocked/complete）＋ 状态变
   }
   fakeGoalPhase = 'complete'
   fakeGoalBlockedReason = ''
-  await phaseCase('完成态目标条', '目标模式 · 已完成 · 共 3 轮')
+  await phaseCase('完成态目标条', '已完成 · 共 3 轮')
   fakeGoalPhase = 'active'
 
   // (b) `goal/changed` / `goal/activation-changed` → **已经在飞书上的活跃卡**必须跟着刷新。
@@ -3156,6 +3183,120 @@ console.log('55) ★ 同 agent 只允许一个 watcher：新卡注册时必须�
   ok(!zombie.blocks.some((b) => b.text === '正在工作中…'),
     '★ 旧卡上的「正在工作中…」占位符被摘掉（与 MED#7095 同源要求）')
   reg.delete(String(agent.id))
+}
+
+console.log('56) ★ 0.7.9 P1：状态栏一行只有一个模式位（CM ①）')
+{
+  let release56
+  const gate56 = new Promise((r) => { release56 = r })
+  const prevIdle56 = agent.whenIdle
+  agent.whenIdle = () => gate56
+  agent.send = function (message) { this.sent.push(message) }
+  const mark56 = sentCards.length
+  feedInbound('om_mode_slot', '状态栏模式位测试')
+  await settle(3)
+  const body56 = JSON.stringify(cardsSince(mark56))
+  ok(!body56.includes('目标模式 · 未启用'),
+    '★ 无目标时不再出现「🎯 目标模式 · 未启用」（CM ①：普通模式与目标模式共存）')
+  const hits56 = (body56.match(/目标模式/g) || []).length
+  ok(hits56 <= 1, '★ 同一张卡里「目标模式」最多出现 1 次（实际 ' + hits56 + '）')
+  ok(!body56.includes('目标模式 · 已暂停') && !body56.includes('目标模式 · 已阻塞'),
+    '★ 目标短语不再自带「目标模式」前缀（否则与模式位重复）')
+  release56()
+  agent.whenIdle = prevIdle56
+  await settle(2)
+}
+
+console.log('57) ★ 0.7.9 P2：过程卡不许丢字；结论卡不许夹带过程叙述（CM ②）')
+{
+  let release57
+  const gate57 = new Promise((r) => { release57 = r })
+  const prevIdle57 = agent.whenIdle
+  agent.whenIdle = () => gate57
+  let seq57 = 13000
+  const mark57 = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: ++seq57, data: { message: { content: [{ type: 'text', text: '过程叙述-ALPHA-过程' }] } } })
+    agentEvents.push({ type: 'tool/call', seq: ++seq57, data: { callId: 'c57', name: 'probe57', arguments: '{}' } })
+    agentEvents.push({ type: 'tool/result', seq: ++seq57, data: { message: { source: { callId: 'c57' }, content: [{ type: 'text', text: 'ok' }] } } })
+    agentEvents.push({ type: 'assistant/message', seq: ++seq57, data: { message: { content: [{ type: 'text', text: '最终答复-BETA-结论' }] } } })
+  }
+  feedInbound('om_p2_keep', 'P2 过程卡不丢字')
+  await settle(4)
+  release57()
+  agent.whenIdle = prevIdle57
+  await settle(3)
+
+  const ops57 = cardsSince(mark57)
+  const body57 = JSON.stringify(ops57)
+  ok(body57.includes('过程叙述-ALPHA-过程'),
+    '★ 过程卡仍能看到**工具调用之前**的叙述（CM ②「过程卡全部文字突然消失」）')
+  ok(body57.includes('最终答复-BETA-结论'), '最终答复也在卡上（内容没丢）')
+  const groups57 = []
+  for (const c of ops57) {
+    if (c.op === 'create' && c.payload && c.payload.schema === '2.0') groups57.push([])
+    if (groups57.length) groups57[groups57.length - 1].push(JSON.stringify(c.payload || {}))
+  }
+  const last57 = groups57.length ? groups57[groups57.length - 1].join('') : ''
+  ok(groups57.length <= 1 || !last57.includes('过程叙述-ALPHA-过程'),
+    '★ 结论卡（本轮最后一张）**不夹带**过程叙述（实际 ' + groups57.length + ' 张卡）')
+  ok(body57.includes('过程叙述-ALPHA-过程') && body57.includes('最终答复-BETA-结论'),
+    '过程叙述与最终答复**同时**在（没有把前者吞进后者）')
+}
+
+console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢弃（CM：转发卡片没反应）')
+{
+  const markRich = sentCards.length
+  feedInboundRaw('om_card_rich', 'interactive', {
+    header: { title: { content: '卡片标题-Z' } },
+    elements: [{ tag: 'markdown', content: '卡片正文-GAMMA' }],
+  })
+  await settle(3)
+  const fedRich = JSON.stringify(agent.sent)
+  ok(fedRich.includes('卡片正文-GAMMA') || fedRich.includes('卡片标题-Z'),
+    '★ 卡片里的文字被抠出来喂给了模型（不再零反应）')
+  ok(consoleLines.some((l) => l.includes('inbound rich message salvaged') && l.includes('chat=')),
+    '★ 留痕 inbound rich message salvaged 且带 chat/message_id')
+
+  const markEmpty = sentCards.length
+  feedInboundRaw('om_card_empty', 'interactive', {})
+  await settle(3)
+  const bodyEmpty = JSON.stringify(cardsSince(markEmpty))
+  ok(bodyEmpty.includes('非文本') || bodyEmpty.includes('读不到') || bodyEmpty.includes('没有我能读'),
+    '★ 抠不到文字时**回一条可见提示**（绝不静默）')
+  ok(consoleLines.some((l) => l.includes('inbound dropped visible') && l.includes('message_id=')),
+    '★ 留痕 inbound dropped visible 且带 chat/message_id（可事后对上是谁发的）')
+}
+
+console.log('59) ★ 0.7.9 P5：11310（表格/元素超限）不再"通知+抢救+换卡"三连（CM：卡片乱发）')
+{
+  rejectPatches = 1
+  rejectPatchesBody = { code: 230099, msg: 'Failed to create card content, ext=ErrCode: 11310; ErrMsg: card table number over limit' }
+  const mark59 = sentCards.length
+  let seq59 = 14000
+  agent.send = function (message) {
+    this.sent.push(message)
+    // 必须让本轮**有输出**：否则会走"会话自愈重试"（heal）路径，重试各自建卡 ⇒ create 计数不可判定
+    // （0.7.9 实测：不加这一句时本轮 create=6，其中多张来自 heal 重试，与卡片路径无关）。
+    agentEvents.push({ type: 'assistant/message', seq: ++seq59, data: { message: { content: [{ type: 'text', text: 'P5 超限回合的答复' }] } } })
+  }
+  feedInbound('om_11310', 'P5 表格超限')
+  await settle(4)
+  const body59 = JSON.stringify(cardsSince(mark59))
+  ok(!body59.includes('卡片发送失败'),
+    '★ 11310 不再发用户可见的「卡片发送失败」提示（正文已由抢救纯文本送达）')
+  // ⚠️ 判据修正（0.7.9 实测）：smoke 的 mock 把**纯文本消息**也记成 op='create'（payload 不是卡片 schema）
+  //   ⇒ 必须只数**真卡片**（payload.schema === '2.0'），否则会把"抢救纯文本 / 兜底纯文本"当成卡片，断言失真。
+  const creates59 = cardsSince(mark59).filter((c) => c.op === 'create')
+  const cards59 = creates59.filter((c) => c.payload && c.payload.schema === '2.0')
+  const texts59 = creates59.filter((c) => !(c.payload && c.payload.schema === '2.0'))
+  ok(cards59.length <= 2, '★ 本轮**真卡片** ≤2（实际 ' + cards59.length + ' 张 —— 旧实现是"通知+抢救+换卡"三连）')
+  ok(texts59.length <= 2, '★ 纯文本 ≤2 条（抢救正文 + 兜底；不再多一条"卡片发送失败"）实际 ' + texts59.length)
+  ok(consoleLines.some((l) => l.includes('card failure notice skipped')),
+    '★ 留痕 card failure notice skipped（11310 被正确归成 toolarge）')
+  rejectPatches = 0
+  rejectPatchesBody = null
 }
 
 console.log('51) 热重载打断会话 ⇒ 必须在会话里说清（CM 2026-10-02：0.4.22 之后这条提示没了）')

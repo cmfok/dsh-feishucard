@@ -983,14 +983,15 @@ export function apply(ctx) {
   const CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK = 60
   // 换卡/侧消息的**共享文案**（审查 MED#2246：三处近乎逐字重复、且硬编码 "约 200 元素 / 200 KB"
   // 与真实阈值 170 块 / 120 KB 矛盾 ⇒ 抽常量并把数字**从阈值派生**）。
-  const ROTATE_NOTICE_TABLES = '📊 上一张卡的表格已满（飞书单卡最多 5 张），后续内容在这张新卡继续。'
-  // 侧消息（看门狗/失败提示）是**另发的一条消息**：先发纯文本、**再**换卡 ⇒ 它排在**新卡的上面**。
-  // 0.7.8（审查 MED#967 复核）：这句话落在**新卡**上（rotateTables / openGoalCard.rotate 都推
-  //   fresh.blocks）⇒ 必须写成"上面那条"。旧稿写成"下面那条／本卡原文"，在新卡上**自指**（方向反了）。
-  const SIDE_NOTICE_FRESH = '⬆️ 上面那条是**另发的**提示；后续内容在这张新卡继续，上一张卡正文原样保留。'
+  // 0.7.9（CM 2026-10-03 ③ 拍板）：**指路语写在旧卡**（读者就在这张卡上）⇒ 文案用旧卡视角。
+  // ⚠️ 这**作废**了 0.7.8 按审查 MED#967/MED#2272 改成"新卡视角"的方向 —— 以 CM 最新口径为准。
+  const ROTATE_NOTICE_TABLES = '📊 本卡表格已满（飞书单卡最多 5 张），后续内容见下方新卡；**本卡正文原样保留**。'
+  // 侧消息（看门狗/失败提示）是**另发的一条消息**，它排在旧卡**下面**、新卡**上面**。
+  // 0.7.9（CM 2026-10-03 ③ 拍板）：**指路语写在旧卡**（读者正看着旧卡）⇒ 必须说"下面那条"。
+  const SIDE_NOTICE_OLD = '⬇️ 下面那条是**另发的**提示；后续内容见下方新卡，**本卡正文原样保留**。'
   function rotateNoticeSize() {
-    return '📄 上一张卡的内容已达飞书单卡上限（约 ' + CARD_ROTATE_BLOCKS + ' 块 / '
-      + Math.round(CARD_ROTATE_BYTES / 1000) + ' KB），后续内容在这张新卡继续；**上一张的正文原样保留**。'
+    return '📄 本卡内容已达飞书单卡上限（约 ' + CARD_ROTATE_BLOCKS + ' 块 / '
+      + Math.round(CARD_ROTATE_BYTES / 1000) + ' KB），后续内容见下方新卡；**本卡正文原样保留**。'
   }
   const CARD_ROTATE_BYTES = 120000        // 120 KB，低于实测通过线 198.5 KB
   // ⚠️ 体积必须按**真字节**量（审查 MED#958）：中文 1 字 ≈ 3 UTF-8 字节，用 String.length
@@ -1089,17 +1090,29 @@ export function apply(ctx) {
   }
 
   // 卡片级表格配额：按元素顺序，第 6 张起的表格降级成可读清单（不再用代码块）
+  // 0.7.9（CM 2026-10-03 P4，BA 回合 11310 实证 web.log 79604）：**必须递归**。
+  //   旧实现只走两层（顶层 markdown + `collapsible_panel.elements`）⇒ 面板里再嵌
+  //   `column_set`/嵌套面板的表格**既不被计数也不被降级** ⇒ 载荷在飞书眼里 >5 张表 ⇒ ErrCode 11310。
+  const NESTED_KEYS = ['elements', 'columns', 'items', 'fields', 'children', 'lines']
+  function walkMarkdownContent(node, fn, depth) {
+    if (!node || typeof node !== 'object' || (depth || 0) > 8) return
+    if (Array.isArray(node)) { for (const it of node) walkMarkdownContent(it, fn, (depth || 0) + 1); return }
+    if (node.tag === 'markdown' && typeof node.content === 'string') { fn(node); return }
+    for (const k of NESTED_KEYS) {
+      if (node[k] && typeof node[k] === 'object') walkMarkdownContent(node[k], fn, (depth || 0) + 1)
+    }
+  }
+  function countPayloadTables(elements) {
+    let n = 0
+    walkMarkdownContent(elements, (el) => { n += countMarkdownTables(el.content) }, 0)
+    return n
+  }
   function demoteOverflowTables(elements, max) {
     let used = 0
-    for (const el of elements) {
-      const targets = el && el.tag === 'markdown' ? [el]
-        : (el && el.tag === 'collapsible_panel' ? (el.elements || []) : [])
-      for (const t of targets) {
-        if (!t || t.tag !== 'markdown' || !t.content) continue
-        if (countMarkdownTables(t.content) === 0) continue
-        t.content = demoteTablesInText(t.content, () => (++used > max))
-      }
-    }
+    walkMarkdownContent(elements, (el) => {
+      if (countMarkdownTables(el.content) === 0) return
+      el.content = demoteTablesInText(el.content, () => (++used > max))
+    }, 0)
     return elements
   }
 
@@ -1226,15 +1239,15 @@ export function apply(ctx) {
   function goalStateText(view) {
     const rounds = '第 ' + (Number(view.roundsStarted) || 0) + '/' + (Number(view.maxGoalRounds) || 0) + ' 轮'
     const phase = String(view.phase || '')
-    if (phase === 'complete') return '✅ 目标模式 · 已完成 · 共 ' + (Number(view.roundsStarted) || 0) + ' 轮'
-    if (phase === 'paused') return '⏸️ 目标模式 · 已暂停（发 /goal resume 恢复）· ' + rounds
+    if (phase === 'complete') return '✅ 已完成 · 共 ' + (Number(view.roundsStarted) || 0) + ' 轮'
+    if (phase === 'paused') return '⏸️ 已暂停（发 /goal resume 恢复）· ' + rounds
     // CM 2026-10-01：**状态栏只写「已阻塞」** —— 长原因会把 `🧠 上下文/占比`、`💾 缓存命中`
     // 两栏挤断；原因一律放到**展开面板**的「阻塞原因」一行（见 goalFooterElements 的 detail）。
-    if (phase === 'blocked') return '🚫 目标模式 · 已阻塞 · ' + rounds
+    if (phase === 'blocked') return '🚫 已阻塞 · ' + rounds
     if (phase === 'active' && String(view.activation || '') !== 'armed') {
-      return '⚠️ 目标模式 · 已创建但续行已停（发 /goal resume 恢复）· ' + rounds
+      return '⚠️ 已创建但续行已停（发 /goal resume 恢复）· ' + rounds
     }
-    return '🎯 目标模式 · 已激活（续行已开）· ' + rounds
+    return '已激活（续行已开）· ' + rounds
   }
 
   function goalFooterElements(card) {
@@ -1273,12 +1286,16 @@ export function apply(ctx) {
           elements: [{
             tag: 'markdown',
             // CM 2026-10-01 选定 **V3**（三张预览卡里挑的）：灰底 + 斜体一行 —— 与正文区分、又不抢眼
-            content: '_' + status + '  ｜  🎯 目标模式 · 未启用' + (metric ? '  ｜  ' + metric : '') + '_',
+            content: '_' + status + (metric ? '  ｜  ' + metric : '') + '_',
           }],
         }],
       }]
     }
-    const header = (status + '  ｜  ' + goalStateText(view) + (metric ? '  ｜  ' + metric : '')).replace(/\*\*/g, '')
+    // 0.7.9（CM 2026-10-03 ①）：**一行只允许一个模式位**。statusTextFor 已经写了模式，
+    // 所以这里只补"目标状态短语"；且**计划模式优先**时不再显示目标短语（否则又出现两个模式）。
+    const planActive = Boolean(card && card.planActive)
+    const goalPart = planActive ? '' : goalStateText(view)
+    const header = (status + (goalPart ? '  ｜  ' + goalPart : '') + (metric ? '  ｜  ' + metric : '')).replace(/\*\*/g, '')
     const created = Number(view.createdAt)
     const detail = [
       '**状态**：`' + String(view.phase || '?') + '` ｜ **续行**：`' + String(view.activation || '?')
@@ -1389,6 +1406,19 @@ export function apply(ctx) {
     // 表格配额：飞书单卡最多 5 张表，超出的改成代码块（**不删内容**）。
     // 必须在折叠之前做 —— 折叠把文本挪进面板并不会减少表格数。
     demoteOverflowTables(elements, CARD_MAX_TABLES)
+    // 0.7.9 P4：递归护栏 —— 上面的降级是"按 markdown 元素顺序"，这里是**兜底复检**：
+    // 任何路径漏掉的嵌套表格都在这里被降级，且留痕可判定（旧实现静默超限 ⇒ 11310）。
+    {
+      const tables = countPayloadTables(elements)
+      if (tables > CARD_MAX_TABLES) {
+        let used2 = 0
+        walkMarkdownContent(elements, (el) => {
+          el.content = demoteTablesInText(el.content, () => (++used2 > CARD_MAX_TABLES))
+        }, 0)
+        console.log('[fs] payload tables=' + tables + ' demoted=' + (tables - CARD_MAX_TABLES)
+          + ' (hard guard, card=' + String(card && card.token || '-').slice(-8) + ')')
+      }
+    }
 
     // Window fold: keep the NEWEST content visible (live progress + conclusion
     // at the bottom), fold the ALREADY-SEEN history into panel(s) at the TOP.
@@ -1420,7 +1450,9 @@ export function apply(ctx) {
         for (let i = count - 1; i >= 0; i--) {
           tail.unshift({
             tag: 'collapsible_panel',
-            expanded: false,
+            // 0.7.9（CM 2026-10-03 ②）：**默认展开** —— 折叠只用来省"元素个数"，
+            // 而 expanded:false 会让读者以为"过程文字突然消失了"（要手动点开才看得到）。
+            expanded: true,
             background_color: 'grey-50',
             border: { color: 'grey', corner_radius: '8px' },
             padding: '8px 8px 8px 8px',
@@ -1804,6 +1836,11 @@ export function apply(ctx) {
   }
   function classifyCardFailure(text) {
     const s = String(text || '')
+    // 0.7.9（CM P5，真机实证 web.log 79604）：**11310 必须先判** ——
+    //   飞书的 11310 报文外面裹着 `code:230099`（"表格数超上限"是 230099 的一个 ext 分支），
+    //   按旧顺序会先命中 ① 的 `230099` ⇒ 归成 `rejected` ⇒ "表格/元素超限"专路
+    //   （不再发用户可见的失败提示）**永远不会触发**。冒烟 59 号用例当场钉住过这个误分类。
+    if (/11310|table number over limit|tables?\s+over\s+limit/i.test(s)) return 'toolarge'
     // ① 内容类（写了卡片不支持的写法 / 无效 image key）⇒ 才走"摘掉片段抢救正文"那条路
     if (/230099|invalid image|200570|200861/i.test(s)) return 'rejected'
     // ② **体积类**：内容本身没毛病，但"整卡太长/元素太多" ⇒ 纯文本只有 1 个元素、通常发得出去，
@@ -1872,15 +1909,26 @@ export function apply(ctx) {
       if (nowMs - Number(seen.get(key) || 0) < FAILURE_NOTICE_WINDOW_MS) return
       seen.set(key, Date.now())
       const words = failureWordings(klass)
-      const tip = '⚠️ **卡片发送失败**（' + klass + '）' + (code ? '｜飞书 code=' + code : '') + '\n'
-        + '原因：' + reason.slice(0, 220) + '\n'
-        + words.tip
-      // P2（审查 MED#1841）：同样**等提示发出去之后**再换卡（顺序不保证 = 新卡落到提示上方）
-      void sendPlainText(bot, chatId, tip)
-        .catch(() => {})
-        .then(() => rotateLiveCardForChat(chatId, SIDE_NOTICE_FRESH))
-      console.log('[fs] card failure notice sent chat=' + chatId + ' kind=' + klass
-        + (code ? ' code=' + code : ''))
+      // 0.7.9（CM 2026-10-03 P5）：**toolarge（11310 表格/元素超限）不再发用户可见的失败提示** ——
+      //   正文已经在 syncCard 的 rescue 路径里用纯文本送达（那条是必要的），再叠一条"卡片发送失败"
+      //   就变成"通知 + 抢救 + 换卡"三连 ⇒ 用户看到的就是"卡片乱发"（BA 回合实证 web.log 79605-79619）。
+      //   Agent 侧的系统回执（下面 note）保留 —— 它不占用户版面，但能让模型知道输出没送达。
+      if (klass === 'toolarge') {
+        console.log('[fs] card failure notice skipped (toolarge, body already rescued) chat=' + chatId)
+        void rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
+      } else {
+        const tip = '⚠️ **卡片发送失败**（' + klass + '）' + (code ? '｜飞书 code=' + code : '') + '\n'
+          + '原因：' + reason.slice(0, 220) + '\n'
+          + words.tip
+        // P2（审查 MED#1841）：同样**等提示发出去之后**再换卡（顺序不保证 = 新卡落到提示上方）
+        void sendPlainText(bot, chatId, tip)
+          .catch(() => {})
+          .then(() => rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD))
+        // 0.7.9 P5d：这条日志**只在真的发了提示时**打印 —— 否则日志与事实相反
+        //（跳过分支持续打印 sent，会让日后审计误判"提示已发"，也让"留痕可判定"失效）。
+        console.log('[fs] card failure notice sent chat=' + chatId + ' kind=' + klass
+          + (code ? ' code=' + code : ''))
+      }
       // ② 让 **Agent 也收到**（复用入站通道注入系统提示；下一次推理必然看到）
       const note = '（系统提示：你上一步的**输出没有送达用户** —— 卡片被飞书拒了（' + klass
         + (code ? '，code ' + code : '') + '）。'
@@ -2234,7 +2282,7 @@ export function apply(ctx) {
               .catch(() => { })
               .then(() => {
                 console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
-                rotateLiveCardForChat(chatId, SIDE_NOTICE_FRESH)
+                rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
               })
           }
         }
@@ -2358,14 +2406,13 @@ export function apply(ctx) {
     old.sealing = true
     old.status = 'sealed'
     dropWorkingPlaceholder(old)
-    try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
-    // 0.7.8（审查 MED#2272 复核）：换卡说明属于**新卡** —— 另两条换卡通道（rotateTables /
-    //   openGoalCard.rotate）都推 fresh.blocks。旧实现推到 old.blocks ⇒ 读者在旧卡上看到
-    //   "上一张卡…在这张新卡继续"，句句自指。
-    fresh.blocks.push({
+    // 0.7.9（CM 2026-10-03 ③）：指路语写在**旧卡**（读者就在这张卡上）；新卡干净起步。
+    old.blocks.push({
       type: 'message',
       text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
     })
+    try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
+    fresh.rotatedThisTurn = true
     try { void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => { }) } catch { }
     entry.card = fresh
     if (entry.stop) { try { entry.stop() } catch { } }
@@ -3069,6 +3116,45 @@ export function apply(ctx) {
     }
   }
 
+  // 0.7.9 P6（CM 2026-10-03：转发卡片给 bot "没反应"；协作信箱 15:20 TASK 同）：
+  //   转发进来的卡片是 msg_type='interactive'，extractText() 拿不到正文 ⇒ 旧实现走到
+  //   handleInbound 的 `if (!text.trim()) return` **静默丢弃**（只留一个表情）。
+  //   这个函数把卡片 JSON 里的可读文字**递归抠出来**当正文（去重、限长），抠不到则由调用方回可见提示。
+  function salvageTextFromRich(evt) {
+    let parsed = null
+    try {
+      const raw = evt && evt.content
+      parsed = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw
+    } catch { return '' }
+    if (!parsed || typeof parsed !== 'object') return ''
+    const out = []
+    const push = (s) => {
+      const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+      if (t && !out.includes(t)) out.push(t)
+    }
+    const walk = (node, depth) => {
+      if (!node || depth > 6 || out.length >= 80) return
+      if (typeof node === 'string') {
+        const s = node.trim()
+        if ((s.startsWith('{') || s.startsWith('[')) && s.length < 20000) {
+          try { walk(JSON.parse(s), depth + 1); return } catch { /* 不是 JSON ⇒ 当普通文字 */ }
+        }
+        push(s)
+        return
+      }
+      if (Array.isArray(node)) { for (const it of node) walk(it, depth + 1); return }
+      if (typeof node !== 'object') return
+      for (const k of ['content', 'text', 'title', 'name', 'user_name', 'file_name', 'tag_name', 'label']) {
+        if (typeof node[k] === 'string') push(node[k])
+      }
+      for (const k of ['elements', 'fields', 'columns', 'items', 'message_list', 'content', 'title', 'children', 'elements_list']) {
+        if (node[k] && typeof node[k] === 'object') walk(node[k], depth + 1)
+      }
+    }
+    walk(parsed, 0)
+    return out.join('\n').slice(0, 4000)
+  }
+
   // ---- inbound file inbox (2026-09-09, CM): Feishu file/media messages carry
   // no text, so extractText() returns '' and the old code dropped them
   // silently. Download the resource via the message-resources API and inject a
@@ -3252,7 +3338,25 @@ export function apply(ctx) {
       const note = await downloadInboundFile(bot, evt)
       if (note) text = note
     }
-    if (!text.trim()) return
+    if (!text.trim()) {
+      // 0.7.9 P6：非文本、非文件的入站（转发卡片 interactive / 合并转发 / 分享名片 / 语音 / 表情…）
+      //   旧实现**静默丢弃** ⇒ CM「转发卡片到 dsh，没反应」。
+      const kind = String((evt && (evt.msg_type || evt.message_type)) || 'unknown')
+      const salvaged = salvageTextFromRich(evt)
+      if (salvaged) {
+        text = '（飞书**非文本**消息，类型 ' + kind + '；以下是从消息里抽出的正文）\n' + salvaged
+        console.log('[fs] inbound rich message salvaged: type=' + kind + ' chat=' + chatId
+          + ' message_id=' + String(messageId || '') + ' chars=' + salvaged.length)
+      } else {
+        // 读不了 ⇒ **必须有可见反馈**（本文件口径：任何"我读不了"都不许静默）
+        console.log('[fs] inbound dropped visible: type=' + kind + ' chat=' + chatId
+          + ' message_id=' + String(messageId || ''))
+        await sendPlainText(bot, chatId, '📎 我收到了一条**非文本**消息（类型 `' + kind + '`），'
+          + '但里面没有我能读的正文。\n你可以：① 把要点复制成**文字**发我；'
+          + '② 把**文件/图片**直接发我（我能自己下载并读）。')
+        return
+      }
+    }
 
     // Commands are handled without touching an agent session.
     const cmd = splitCommand(text)
@@ -3414,14 +3518,16 @@ export function apply(ctx) {
         stopCardWatcher()
         card.status = 'sealed'
         dropWorkingPlaceholder(card)
+        // 0.7.9（CM 2026-10-03 ③）：指路语写在**旧卡**（读者就在这张卡上）；**新卡不带任何指路语**。
+        card.blocks.push({
+          type: 'message',
+          text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
+        })
         void syncCard(bot, chatId, card, true).catch(() => {})
         const fresh = makeCardState(turnAgent)
         fresh.footerMode = 'bare'      // 换表新卡仍是"过程卡"
         fresh.cursor = carry
-        fresh.blocks.push({
-          type: 'message',
-          text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
-        })
+        fresh.rotatedThisTurn = true   // P5③：本轮已换过卡 ⇒ 收尾不再另开结论卡
         card = fresh
         void syncCard(bot, chatId, fresh, true).catch(() => {})
         stopCardWatcher = startCardWatcher(turnAgent, fresh, bot, chatId, rotateTables)
@@ -3566,7 +3672,9 @@ export function apply(ctx) {
       for (let i = events.length - 1; i >= seqBefore; i--) {
         const event = events[i]
         if (!event) continue
-        if (event.type === 'tool/call' || event.type === 'tool/result') { crossedTool = true; continue }
+        // 0.7.9（CM 2026-10-03 ②）：**跨过第一个工具调用就停** —— 结论只取"最后一段连续叙述"，
+        // 不再把整轮过程话语 join 进 reply（否则结论卡会夹带过程卡的文字）。
+        if (event.type === 'tool/call' || event.type === 'tool/result') break
         if (event.type !== 'assistant/message') continue
         const spoken = extractProcessText(event.data && event.data.message)
         if (!spoken) continue
@@ -3661,7 +3769,9 @@ export function apply(ctx) {
         }
       }
       // 纯旁白的一轮不开结论卡：卡面上只有一行 🎯 目的行 = 无信息卡片。
-      const splitConclusion = conclusionEligible && !duplicateConclusion
+      // 0.7.9 P5③：本轮已经换过卡（表格/体积换卡或热重载续卡）⇒ **结论留在当前卡**，
+      // 不再另开一张 —— 否则一轮里会出现"过程卡 + 换卡 + 结论卡"三张（CM 说的"卡片乱发"）。
+      const splitConclusion = conclusionEligible && !duplicateConclusion && !card.rotatedThisTurn
       // A 方案：**不分卡**时这张卡本身就是结论卡 ⇒ 升级成完整状态栏；
       // 分卡时它只是过程卡 ⇒ 保持 bare（状态栏由下面新开的结论卡承担）。
       if (!splitConclusion) card.footerMode = 'full'
@@ -3680,19 +3790,16 @@ export function apply(ctx) {
         card.blocks.push({ type: 'message', text: '✅ 本轮完成，结论见下方卡片。' })
         replaced = true
       } else if (replySeqs.length > 0) {
-        // 把**第一条**被镜像的 note 就地换成完整答复（保持时间顺序），其余同批 note 删掉
-        // （否则同一段话会既在过程区各出现一次、又在结论处出现一次）。
-        for (let i = 0; i < card.blocks.length; i++) {
-          const b = card.blocks[i]
-          if (b.type === 'note' && replySeqs.includes(b.seq)) {
-            card.blocks[i] = { type: 'message', text: reply }
-            replaced = true
-            break
-          }
-        }
-        if (replaced) {
-          card.blocks = card.blocks.filter((b) => !(b.type === 'note' && replySeqs.includes(b.seq)))
-        }
+        // 🔴 0.7.9（CM 2026-10-03 ②「过程卡文字突然消失」）：**只追加，绝不覆盖 note、绝不删块**。
+        //    旧实现在这里把 replySeqs 命中的 note 覆盖成整段 reply、其余同批 note 全删 ——
+        //    而 replySeqs 是"从末尾往前扫、跨过工具调用继续收"得来的（见上方 L3563-3579），
+        //    一轮里它能覆盖**整轮**叙述 ⇒ 过程卡的分步叙述被吞成一段（就是"文字消失"的观感）。
+        //    这一分支的触发面比 0.7.5 修的分卡路径更宽：**所有 <30s 回合、纯旁白回合、notSpoken 回合**
+        //    都走这里（conclusionEligible = !notSpoken && !narrationOnlyTurn && elapsed>=30s）。
+        const already = card.blocks.some((b) => b && b.text && typeof b.text === 'string'
+          && b.text.replace(/\s+/g, ' ').trim() === String(reply).replace(/\s+/g, ' ').trim())
+        if (!already) card.blocks.push({ type: 'message', text: reply })
+        replaced = true
       }
       if (!replaced) card.blocks.push({ type: 'message', text: reply })
       // 2026-09-27：记下这张刚封口的回合卡 —— 同一轮里紧接着起的 goal/notice 自动轮
@@ -6928,13 +7035,15 @@ export function apply(ctx) {
       state.stop()
       state.card.status = 'sealed'
       dropWorkingPlaceholder(state.card)
-      void syncCard(bot, chatId, state.card, true).catch(() => {})
-      const fresh = makeCardState(agent)
-      fresh.cursor = carry
-      fresh.blocks.push({
+      // 0.7.9（CM 2026-10-03 ③）：指路语写在旧卡；新卡干净起步。
+      state.card.blocks.push({
         type: 'message',
         text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
       })
+      void syncCard(bot, chatId, state.card, true).catch(() => {})
+      const fresh = makeCardState(agent)
+      fresh.cursor = carry
+      fresh.rotatedThisTurn = true
       state.card = fresh
       void syncCard(bot, chatId, fresh, true).catch(() => {})
       state.stop = startCardWatcher(agent, fresh, bot, chatId, rotate)
@@ -7193,7 +7302,7 @@ export function apply(ctx) {
   //   发完侧消息就把该会话正在跑的卡**换到下面新卡继续**（旧卡就地封口＋一行说明、正文原样保留）。
   //   复用答题/插话那套 `entry.split()`：新卡游标 = 当前事件位 ⇒ 不重放、不丢。
   function rotateLiveCardForChat(chatId, label) {
-    const text = label || SIDE_NOTICE_FRESH
+    const text = label || SIDE_NOTICE_OLD
     try {
       // ⚠️ 审查 MED#7069：**不能**用 `entry.split()` —— 那是"答题路径"语义（新卡游标 = 事件末尾），
       //    会**跳过还没镜像的事件**；换卡路径（rotateTables/rotate）用的是 carry = 旧卡当前游标，
