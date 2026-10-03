@@ -1,0 +1,43 @@
+{
+  "_comment": "身份表【结构示例】—— 只有 schema，没有任何真实数据。",
+  "_why": [
+    "真实表含个人标识（open_id / union_id）与人名，属隐私数据，**不进本仓库**（CM 2026-10-04 要求：上传时把凭证和人名去掉）。",
+    "需要时用仓库随附的脚本自己生成：build_identity_map.py（你的 HR 系统 + 飞书通讯录反查）。",
+    "默认落盘位置（按顺序探测，取第一个存在的）：",
+    "  1. 环境变量 MAILBOX_IDENTITY_MAP",
+    "  2. /opt/scripts/G9/identity_map.json            （服务器部署）",
+    "  3. <你的工作区>/output/g9-identity/identity_map.json   （各开发机；已在 .gitignore 里）",
+    "  4. cwd 逐级向上 6 层；5. 已知工作区兜底",
+    "每台机器可另放一份【本地增量】~/.dsh-feishucard/identity_map.local.json（放工作区之外 ⇒ 不参与同步 ⇒ 各机互不覆盖），",
+    "只补本机 bot 的 open_ids，其余字段一律以主表为准。",
+    "⚠️ 功能【默认关闭】：配置里写 \"identityGuard\": true 才会启用（见 feishu.config.example.json）。"
+  ],
+  "v": 1,
+  "updated": "1970-01-01T00:00:00+08:00",
+  "primary_key": "union_id",
+  "people": [
+    {
+      "union_id": "on_00000000000000000000000000000000",
+      "open_ids": {
+        "cli_xxxxxxxxxxxxxxxx": "ou_00000000000000000000000000000000"
+      },
+      "person_id": "",
+      "name": "示例姓名",
+      "job_id": "示例岗位",
+      "channel": "示例部门",
+      "status": "在职",
+      "aliases": ["示例别名"],
+      "scopes": [],
+      "grants": {},
+      "extra_grants": {},
+      "grants_until": {},
+      "confirmed_at": "1970-01-01T00:00:00+08:00"
+    }
+  ],
+  "pending": [
+    {
+      "name": "示例（资料未齐的人）",
+      "reason": "open_id 未取到（HRM 该行 Openid 为空）"
+    }
+  ]
+}

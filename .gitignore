@@ -6,6 +6,12 @@ node_modules/
 .env.*
 *.local
 
+# 身份表：真实表含【个人标识（open_id / union_id）与人名】—— **不进仓库**，只放 identity_map.example.json
+#（CM 2026-10-04：这个仓库会推送到 git，上传时把凭证和人名去掉）
+identity_map.json
+identity_map.local.json
+*.local.json
+
 # logs
 *.log
 npm-debug.log*
