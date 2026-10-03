@@ -280,7 +280,12 @@ python scripts/build_identity_map.py --seed seed.json --app-id cli_xxxxxxxx --ap
 [`scripts/resolve_actor.py`](scripts/resolve_actor.py)：**纯函数、无网络依赖**，自带 `--selftest`。
 
 错误码：`map_unavailable` / `no_open_id` / `unknown_person` / `duplicate_open_id` /
-`open_id_missing` / `job_not_granted`。
+`open_id_missing` / `job_not_granted` / **`not_active`**
+（人已离职 / 终止办理 ⇒ **正常拒绝**；**与「不认识」分开报**）。
+
+> **`not_active` 是 2026-10-04 追加的**：原先「离职」与「完全不认识这个 `open_id`」共用
+> `unknown_person`，上层若按它做兜底（例如问姓名），**离职的人会被当成陌生人来处理** ——
+> 而离职是正常拒绝，不该被兜底。
 
 ## 开发 / Development
 
