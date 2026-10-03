@@ -4398,6 +4398,107 @@ console.log('69) ★ 0.7.19 RED-B2 重启后【无入站的主动推卡】仍 st
   await settle(2)
 }
 
+console.log('70) ★ 身份认证 fail-closed：identityGuard 开 + 飞书回合身份未解析 ⇒ 拒绝执行（CM 2026-10-04 裁决）')
+{
+  // 被守护的行为（**已有实现，本用例不碰实现**）：
+  //   `identity-inject.mjs` 的 decideAction —— hasOwner=false ⇒ pass-through；有 actor ⇒ overwrite；
+  //   **无 actor ⇒ deny**。CM 原话：「无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧」
+  //   拦截器实体 = index.js:6830（`ctx.on('tools/execute')` 里**第一个**监听器，通用身份拦截；
+  //   6872 / 6949 是专用拦截，本用例不碰）。开关 = 每个 bot 的配置项 `identityGuard`（**默认关**）。
+  //
+  // ⚠️ 口径澄清（2026-10-04 施工时逐行读 index.js:6835-6840 得出，别写错）：
+  //   if (!(owner && owner.bot && owner.bot.cfg && owner.bot.cfg.identityGuard)) return next()
+  //   const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
+  //   const action = !rec ? 'pass-through' : decideAction({ hasOwner: true, actor: rec.actor })
+  //   ⇒ **deny 的触发条件是「store 里有这一轮的记录、但 rec.actor 为空」**（＝这个飞书回合确实
+  //     去解析了身份、却没解析出来）；而「store 里**根本没有**这条记录」走 `!rec` ⇒ pass-through（放行）。
+  //   ⇒ 所以本用例的 deny 场景走**端到端真实路径**：开着开关喂一条飞书入站 ⇒ 入站侧 resolve 失败
+  //     （本机表里没有 ou_test 这个人）⇒ store 记 { actor: null } ⇒ 工具调用被拦。
+  //     用例刻意**不**断言"store 里没记录也拒" —— 与当前实现不符，属另一条口径（会另案上报）。
+  const CFG_PATH = join(process.env.FS_CONFIG_DIR, 'feishu.config.json')
+  const cfgTextBefore = readFileSync(CFG_PATH, 'utf8')
+  const patchCfg = (patch) => {
+    const cfg = JSON.parse(readFileSync(CFG_PATH, 'utf8'))
+    Object.assign(cfg.bots[0], patch)
+    writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2))
+  }
+  const nextSpy = () => Promise.resolve('next')
+  const capture = (runs) => runs.map((r) => Promise.resolve(r).then(
+    (value) => ({ value }), (error) => ({ error })))
+  // 断言消息里要能看出"到底返回了什么"，否则红了只能靠猜
+  const summarize = (os) => os.map((o) => (o.error
+    ? ('throw:' + String((o.error && o.error.message) || o.error))
+    : (o.value === 'next' ? 'next' : JSON.stringify(o.value).slice(0, 100))))
+  const isDeny = (o) => Boolean(o && o.value && typeof o.value === 'object' && o.value.isError === true)
+
+  // (0) 前提：开关默认关（配置里本来没有这个键）—— 守住"默认关"这条口径
+  ok(JSON.parse(cfgTextBefore).bots[0].identityGuard === undefined,
+    '（前提）identityGuard 默认**关**：配置里本来就没有这个键')
+
+  // (1) 开闸 ＋ 喂一条**真实飞书入站**（唯一能写进 store 的生产路径：handleInbound 的身份解析）
+  patchCfg({ identityGuard: true })
+  await settle(2)
+  ok(JSON.parse(readFileSync(CFG_PATH, 'utf8')).bots[0].identityGuard === true,
+    '（前提）开关已写进配置（实现是**热读**：ensureHelpers 每 tick 无条件 bot.cfg=cfg，靠 drain 驱动）')
+  agent.send = function (message) { this.sent.push(message) }
+  liveAgents.length = 0   // 让入站的 resolveAgent 走 resume 分支 ⇒ handle.agent 就是下面这个 mock agent
+  const idLogFrom = consoleLines.length
+  feedInbound('om_identity_guard_70', '身份闸门用例：这条走真实入站路径')
+  await settle(4)
+  const idLines = consoleLines.slice(idLogFrom).filter((l) => l.includes('[fs] identity:'))
+  ok(idLines.length >= 1,
+    '（前提）入站侧真的做了身份解析（留痕 `[fs] identity: agent=…`；实际 ' + idLines.length + ' 行）')
+  ok(idLines.length >= 1 && !idLines.some((l) => l.includes('-> OK ')),
+    '（前提）这个 open_id **没解析出 actor**（留痕：' + JSON.stringify(idLines) + '）')
+  // 谁被记进了 store 就用谁：findChatForAgent 认两种归属 —— 会话表里的 id（String(s.id) === key）
+  // 或活 handle 的 agent 对象（index.js:4452-4453）⇒ 按插件自己日志里的 agent id 取对应对象。
+  const recId = (idLines.map((l) => (l.match(/\[fs\] identity: agent=(\S+)/) || [])[1]).find(Boolean)) || agent.id
+  const fsAgent = recId === agent.id ? agent : { id: recId, ctx: agentCtx, session: agent.session }
+  const execPayload = (a) => ({ name: 'read', agent: a, arguments: { file_path: 'a.md' }, signal: undefined })
+
+  // (2) 🔴 断言二：开关开 ＋ 飞书回合身份未解析 ⇒ 工具结果 isError:true（**不是** next()）
+  const onRun = await Promise.all(capture(emitCtx('tools/execute', execPayload(fsAgent), nextSpy)))
+  ok(onRun.length >= 3,
+    '（前提）tools/execute 上至少 3 个监听器（通用身份 + exit_plan_mode + ask_user_question；实际 '
+      + onRun.length + '）')
+  const denyHits = onRun.filter(isDeny)
+  ok(denyHits.length >= 1,
+    '★ 开关开 + 飞书回合身份未解析 ⇒ 拦下（工具结果 isError:true，不是 next()）：'
+      + JSON.stringify(summarize(onRun)))
+  ok(denyHits.length >= 1
+      && denyHits.every((o) => String(JSON.stringify(o.value)).includes('identity_unresolved')),
+    '★ 拒绝理由看得出是「身份未解析」（identity_unresolved）')
+
+  // (3) 🔴 断言三：开关开 ＋ **非飞书** agent（无 owner 的回合）⇒ 仍然 next()（放行）
+  //     （2026-10-04 实测踩过一次：锁死本机 GUI／子代理就是事故级）
+  const foreignRun = await Promise.all(capture(emitCtx('tools/execute',
+    execPayload({ id: 'agent-not-feishu-70' }), nextSpy)))
+  ok(foreignRun.length >= 3 && foreignRun.every((o) => o.value === 'next'),
+    '★ 开关开着也不许锁死非飞书 agent（本机 GUI／子代理／定时轮）⇒ 全部 next()（listeners='
+      + foreignRun.length + '）')
+
+  // (4) 🔴 断言一：开关**关** ⇒ 工具调用不被拦（监听器 next()）
+  //     放在最后做，且此时 store 里那条 { actor: null } 记录**还在** ⇒ 证明"放行"是**开关**造成的，
+  //     而不是"没记录/记录过期"造成的假绿。
+  patchCfg({ identityGuard: false })
+  await settle(2)
+  const offRun = await Promise.all(capture(emitCtx('tools/execute', execPayload(fsAgent), nextSpy)))
+  ok(offRun.length >= 3 && offRun.every((o) => o.value === 'next'),
+    '★ 开关关 ⇒ 同一条调用**一个监听器都不拦**（全 next()；listeners=' + offRun.length + '）')
+  // 反证：再打开 ⇒ 同一条调用又被拦（说明身份记录仍在、没被 TTL 清掉）
+  patchCfg({ identityGuard: true })
+  await settle(2)
+  const onAgain = await Promise.all(capture(emitCtx('tools/execute', execPayload(fsAgent), nextSpy)))
+  ok(onAgain.some(isDeny),
+    '★ 再把开关打开 ⇒ 同一条调用又被拦（证明上一步的放行是**开关**造成的，不是记录消失）')
+
+  // 收尾：配置还原成本用例之前的样子（本用例在最后，但别给以后加用例的人埋雷）
+  writeFileSync(CFG_PATH, cfgTextBefore)
+  await settle(2)
+  ok(JSON.parse(readFileSync(CFG_PATH, 'utf8')).bots[0].identityGuard === undefined,
+    '（收尾）配置已还原：identityGuard 键移除（回到默认关）')
+}
+
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
   process.exit(0)
