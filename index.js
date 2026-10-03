@@ -371,6 +371,9 @@ export function apply(ctx) {
         // ⚠️ 必须进白名单：本函数是**白名单归一化**，漏在这里 ⇒ 配置里写了也被丢掉
         //（本仓在 splitConclusionMinMs 上踩过一模一样的坑，见上面那条注释）。
         approvalForm: typeof bot.approvalForm === 'boolean' ? bot.approvalForm : undefined,
+        // 0.7.17（两模式）：full（缺省＝现状行为）| stable（员工显示层收起）。热读，10 秒生效。
+        // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
+        mode: (typeof bot.mode === 'string' && bot.mode.toLowerCase() === 'stable') ? 'stable' : undefined,
       })
     }
     return cleaned
@@ -1344,6 +1347,14 @@ export function apply(ctx) {
       + ' notes=' + card.blocks.filter((b) => b.type === 'note').length
       + ' tools=' + card.tools.size)
     for (const block of card.blocks) {
+      // 0.7.17（stable 显示层）：员工只看 状态行＋工具折叠面板（结果在内）＋结论；
+      // 过程叙述（note）/指路行 message **不渲染**。blocks 本身一字不动（B7/追加纪律）——
+      // 过滤只发生在 payload 渲染层；mode 在 syncCard 入口已解析（card.mode）。
+      if (card.mode === 'stable' && block.type === 'note') continue
+      if (card.mode === 'stable' && block.type === 'message') {
+        const stableText = (block.text || '').trim()
+        if (CARD_LABEL_SKIP.has(stableText) || stableText.indexOf('✅ 本卡已收口') === 0) continue
+      }
       if (block.type === 'message' || block.type === 'note') {
         const text = (block.text || '').trim()
         // 2026-09-15：正文里的长代码块也折起来（移植 Hermes 的 message_elements 思路）。
@@ -1977,6 +1988,15 @@ export function apply(ctx) {
   }
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
+  // 0.7.17（两模式）：mode 判定 —— **群一律 stable**（2030：共享的屏不按人变）；
+  // 私聊按 bot 配置（cfg.mode 热读 10s，缺省 full ＝ 与 0.7.16 逐字一致）。
+  // 一期按 bot；NODE1 身份表就绪后升二期按人（open_id → 人，跨 bot 统一）。
+  function resolveCardMode(bot, chatId) {
+    const kinds = bot && bot.chatKinds
+    if (kinds && kinds.get(chatId) === 'group') return 'stable'
+    const m = bot && bot.cfg ? String(bot.cfg.mode || '').toLowerCase() : ''
+    return m === 'stable' ? 'stable' : 'full'
+  }
   function syncCard(bot, chatId, card, force) {
     // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 本代（旧实例）不许再推任何卡**。
     // 0.7.16（审查 MED#2）：判据改**代际旗** —— 按对象登记拦不住 dispose 后本代新建的卡；
@@ -1995,6 +2015,8 @@ export function apply(ctx) {
       console.log('[fs] card sync skipped: createFailed (no token)')
       return card.queue
     }
+    // 0.7.17（两模式）：每次推送前重解析一次（cfg 热读 ⇒ 改模式 10 秒内对新推送生效）。
+    card.mode = resolveCardMode(bot, chatId)
     const now = Date.now()
     if (now < card.retryUntil) return card.queue
     if (card.token && !force && now - card.lastSyncAt < CARD_MIN_INTERVAL) return card.queue
@@ -3029,6 +3051,11 @@ export function apply(ctx) {
       return true
     }
     if (resolved === 'switch') {
+      // 0.7.17（stable 门禁）：稳定版不支持切换会话（CM：员工一个会话就够）。
+      if (resolveCardMode(bot, chatId) === 'stable') {
+        await sendPlainText(bot, chatId, '🔒 稳定版不支持切换会话（该功能未对当前模式开放）。')
+        return true
+      }
       // 两级：无参数 = 工作区卡；<工作区序号> = 该工作区的会话卡；
       //        <工作区序号> new = 在该工作区新建；<工作区序号> <会话序号> = 接管。
       const arg = String(cmd.arg || '').trim()
@@ -3359,6 +3386,10 @@ export function apply(ctx) {
       return
     }
     bot.lastChatId = chatId
+    // 0.7.17（两模式）：记录 chat 类型（入站事件自带的 chat_type，p2p|group）——
+    // 群判据**不信 oc_ 前缀**（2030：飞书单聊与群聊都用 oc_）⇒ 群一律 stable（见 resolveCardMode）。
+    if (!bot.chatKinds) bot.chatKinds = new Map()
+    bot.chatKinds.set(chatId, String((evt && evt.chat_type) || 'p2p'))
 
     const messageId = evt.message_id
     let text = extractText(evt.content)
@@ -3833,6 +3864,12 @@ export function apply(ctx) {
         card.blocks.push({ type: 'message', text: '✅ 本轮完成，结论见下方卡片。' })
         replaced = true
       } else if (replySeqs.length > 0) {
+        // 0.7.17（stable seal）：渲染层隐藏镜像 note ⇒ 去重失去意义；整条答复直接作为 message 上卡
+        //（结论可见 = V2）。full 模式走原去重逻辑，一字不改（下方 else 全体原样保留）。
+        if (card.mode === 'stable') {
+          card.blocks.push({ type: 'message', text: reply })
+          replaced = true
+        } else {
         // 🔴 0.7.9（CM 2026-10-03 ②「过程卡文字突然消失」）：**只追加，绝不覆盖 note、绝不删块**。
         //    旧实现在这里把 replySeqs 命中的 note 覆盖成整段 reply、其余同批 note 全删 ——
         //    而 replySeqs 是"从末尾往前扫、跨过工具调用继续收"得来的（见上方 L3563-3579），
@@ -3933,6 +3970,7 @@ export function apply(ctx) {
         }
         if (tail) card.blocks.push({ type: 'message', text: tail })
         replaced = true
+        } // 0.7.17 stable else-end
       }
       if (!replaced) card.blocks.push({ type: 'message', text: reply })
       // 2026-09-27：记下这张刚封口的回合卡 —— 同一轮里紧接着起的 goal/notice 自动轮

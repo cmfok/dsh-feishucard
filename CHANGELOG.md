@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.17] - 2026-10-04
+
+### 新功能：**两模式（full/stable）＋ 三开关**（CM 拍板 10 问后实施；knowledge 试点）
+
+> 需求：`AIAD/0-必读文件/开发文件/飞书卡片两模式-开发需求-v1.md`（§3 七项稳定性机制一个不砍）。
+> CM 拍板：分期（一期按 bot / NODE1 后按人）· 审批向他、批 1 次长期有效 · stable 折叠程度＝「工作中状态＋工具折叠面板（结果在内）」，其他不渲染 · 切会话关、通知播报开 · full 默认三开关全开、CM 免审批。
+
+**① mode 判定（建卡前，2030「不许先渲染再遮」）**
+- 入站事件自带 `chat_type`（p2p|group）⇒ 记入 `bot.chatKinds`（**群判据不信 oc_ 前缀**）。
+- `resolveCardMode(bot, chatId)`：**群 ⇒ 一律 `stable`**；私聊 ⇒ `bot.cfg.mode`（热读 10s，缺省 `full`）。
+
+**② stable 显示层（渲染层过滤，**blocks 一字不动** —— B7/追加纪律不破）**
+- `buildCardPayload` 在 `card.mode === 'stable'` 时：**跳过全部 `note` 块**（过程叙述/🎯 行）与指路行 message 块（`CARD_LABEL_SKIP`＋收口前缀）；**保留** 状态行、工具折叠面板（`expanded:false`，结果在内）、插话醒目块、最后答复。
+- `full`（缺省）路径**一行不改** ⇒ V3（既有冒烟全绿＝逐字一致）。
+
+**③ /switch 门禁**：stable bot 上 `/switch` 直接拒绝并提示「稳定版不支持切换会话」（CM：员工一个会话就够）。
+
+**④ cfg 白名单**：`mode` 进入 bot 配置归一化白名单（漏加＝配置写了也被丢，splitConclusionMinMs 同坑）。
+
+**先红后绿**：用例 63（过程叙述不渲染）/64（/switch 被拒）/65（群强制 stable）在 0.7.16 上**全部报红**，0.7.17 转绿；既有全量用例（full 路径）逐字一致。
+
+**三开关的平台层落点（服务器侧，随 0.7.17 试点 knowledge）**：
+- `plan-mode`/`goal` 关 = `preset-employee` 声明里 `planning` 组与 `command-goal`/`tool-goal` 行 `disabled: true`（agent 无 plan/goal 工具与命令 ⇒ 进不去、不卡死）；
+- `approval` 关 = 员工 bot `feishu.config.json` 不开 `approvalForm`（既有通道拒绝机制）。
 ## [0.7.16] - 2026-10-03
 
 ### 修复：0.7.15 独立审查 4 条（**0 critical / 0 high / 2 medium / 2 low**，逐条核对 0 误报）

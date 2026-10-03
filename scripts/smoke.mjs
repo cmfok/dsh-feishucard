@@ -4052,6 +4052,116 @@ console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡�
   await settle(2)
 }
 
+console.log('63) ★ 0.7.17 stable 显示层：员工只看 状态+工具面板+结论（过程叙述/指路不渲染）')
+{
+  // CM 2026-10-03 拍板（10 问）：stable＝员工只看到「工作中」状态＋工具调用折叠面板（结果在内）＋结论卡；
+  // 过程叙述/🎯 行/指路行一律不渲染。cfg.mode 走白名单归一化（漏加就被丢——splitConclusionMinMs 同坑）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: true, mode: 'stable',
+    }],
+  }, null, 2))
+  await new Promise((r) => setTimeout(r, 10500))   // 等 cfg 热读节拍（CONFIG_REFRESH_MS=10s，12b 同款）
+  await settle(2)
+  let release63
+  const gate63 = new Promise((r) => { release63 = r })
+  const prevIdle63 = agent.whenIdle
+  agent.whenIdle = () => gate63
+  let seq63 = 18000
+  const mark63 = sentCards.length
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq63, data: { message: { content: [{ type: 'text', text: '过程叙述-STABLE-甲' }] } } },
+      { type: 'tool/call', seq: ++seq63, data: { callId: 'c63', name: 'probe63', arguments: '{}' } },
+      { type: 'tool/result', seq: ++seq63, data: { message: { source: { callId: 'c63' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'assistant/message', seq: ++seq63, data: { message: { content: [{ type: 'text', text: '最终答复-STABLE-乙' }] } } },
+    )
+  }
+  feedInbound('om_stable_display', 'stable 显示层测试')
+  await settle(4)
+  release63()
+  agent.whenIdle = prevIdle63
+  await settle(3)
+  const ops63 = cardsSince(mark63).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last63 = ops63.length ? JSON.stringify(ops63[ops63.length - 1].payload) : ''
+  ok(ops63.length >= 1, '（前提）建了卡（实际 ' + ops63.length + ' 张）')
+  ok(last63.includes('最终答复-STABLE-乙'), '★ stable：结论照常显示（V2 结论卡一定出现）')
+  ok(last63.includes('工具调用'), '★ stable：工具调用折叠面板保留（结果在内）')
+  ok(!last63.includes('过程叙述-STABLE-甲'), '★ stable：过程叙述**不渲染**（0.7.16 无过滤 ⇒ 红）')
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  await settle(2)
+}
+
+console.log('64) ★ 0.7.17 stable 门禁：/switch 被拒（CM：员工一个会话就够）')
+{
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: true, mode: 'stable',
+    }],
+  }, null, 2))
+  await new Promise((r) => setTimeout(r, 10500))
+  await settle(2)
+  const mark64 = sentCards.length
+  feedInbound('om_stable_switch', '/switch')
+  await settle(4)
+  const touched64 = sentCards.slice(mark64)
+  ok(touched64.some((c) => JSON.stringify(c.payload || {}).includes('稳定版不支持')),
+    '★ stable：/switch 被明确拒绝并提示（0.7.16 会照常出切换卡 ⇒ 红）')
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  await settle(2)
+}
+
+console.log('65) ★ 0.7.17 群一律 stable＋三开关全关（C）：mode 配置即使缺省，群也降级')
+{
+  // 群判据 = 入站事件自带的 chat_type（不信 oc_ 前缀，2030）。cfg.mode 不写（=full），
+  // 但 chat_type=group ⇒ 建卡必须判 stable ⇒ 过程叙述同样不渲染（RED 于 0.7.16）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: true,
+    }],
+  }, null, 2))
+  await new Promise((r) => setTimeout(r, 10500))
+  await settle(2)
+  const mark65 = sentCards.length
+  let seq65 = 19000
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq65, data: { message: { content: [{ type: 'text', text: '群叙述-GROUP65-甲' }] } } },
+      { type: 'assistant/message', seq: ++seq65, data: { message: { content: [{ type: 'text', text: '群答复-GROUP65-乙' }] } } },
+    )
+  }
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: 'om_group65', message_type: 'text', chat_type: 'group',
+        chat_id: 'oc_group65_test01', content: JSON.stringify({ text: '群里的验收消息' }),
+      },
+      sender: { sender_id: { open_id: 'ou_test' } },
+    },
+  }) + '\n'
+  await settle(5)
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
+  const ops65 = cardsSince(mark65).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last65 = ops65.length ? JSON.stringify(ops65[ops65.length - 1].payload) : ''
+  ok(ops65.length >= 1, '（前提）群消息建了卡（实际 ' + ops65.length + ' 张）')
+  ok(last65.includes('群答复-GROUP65-乙'), '★ 群：答复照常显示')
+  ok(!last65.includes('群叙述-GROUP65-甲'), '★ 群：过程叙述**不渲染**（群里一律 stable；0.7.16 无过滤 ⇒ 红）')
+  await settle(2)
+}
+
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
   process.exit(0)
