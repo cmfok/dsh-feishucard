@@ -31,13 +31,18 @@ import {
 // 表/resolver 路径默认取 /opt/scripts/G9/（服务器），可用 MAILBOX_IDENTITY_MAP 覆盖。
 let __turnIdentity = null
 let __identityResolver = null
-function identityCtx () {
+// ⚠️ `workspaceRoot` 是 `apply()` 内的局部（index.js:356），**模块级的本函数访问不到** ——
+//    2026-10-04 实测踩过：这里写成 `workspaceRoot()` ⇒ 每次抛 `workspaceRoot is not defined`，
+//    而调用处的 try/catch 把它**静默吞掉** ⇒ **身份注入悄悄失效**（`rec` 始终为 null，
+//    看起来"没被锁死"很安全，其实**根本没在认人**）。
+//    ⇒ **必须由调用方把工作区传进来**（三个调用点都在 `apply()` 作用域内，拿得到）。
+function identityCtx (ws) {
   if (!__turnIdentity) __turnIdentity = new TurnIdentityStore()
   // 🔑 表/resolver 的路径**跟着工作区走**（CM 2026-10-04 要求）：
   //    服务器 `/opt/scripts/G9/` 优先，其次 `<工作区>/output/g9-identity/`。
   //    ⇒ 表放在工作区里 ⇒ **Syncthing 会把它同步到各开发机** ⇒ HOME(`P:\Qoder\work`) 与
   //      CM-OFFICE(`D:\Work`) 都找得到，**两台都不会被锁死**。不写死任何盘符。
-  if (!__identityResolver) __identityResolver = makeResolver({ workspaceRoot: workspaceRoot() })
+  if (!__identityResolver) __identityResolver = makeResolver({ workspaceRoot: ws || process.cwd() })
   return { store: __turnIdentity, resolver: __identityResolver }
 }
 
@@ -3362,7 +3367,7 @@ export function apply(ctx) {
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
     try {
-      const idc = identityCtx()
+      const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
       const r = idc.resolver.resolve(openId)
       identityActor = r.actor
       idc.store.set(entry.agent.id, { actor: r.actor, chatId, messageId: evt.message_id, tableOk: r.tableOk })
@@ -3565,7 +3570,7 @@ export function apply(ctx) {
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
     try {
-      const idc = identityCtx()
+      const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
       const r = idc.resolver.resolve(openId)
       identityActor = r.actor
       idc.store.set(agent.id, { actor: r.actor, chatId, messageId, tableOk: r.tableOk })
@@ -6663,26 +6668,31 @@ export function apply(ctx) {
   // exit_plan_mode 是 **工具**（dsh-plan-mode/lib/index.js:231 的 ctx.tools.register），
   // 与 ask_user_question 同一个 dispatch；而本插件在 tools/execute 上拦 ask_user_question
   // 是**线上验证过可用**的 ⇒ 换到这条通道，飞书侧 100% 拿得到。
-  // ── D5（P1.5 身份注入）· 通用身份覆写拦截（**新增**，2026-10-04）─────────────────
-  //  与下面两条的分工：下面两条是【专用】拦截（第一行就 `if (exec.name !== 'xxx') return next()`），
+  // ── D5（P1.5 身份注入）· 通用身份覆写拦截（2026-10-04）──────────────────────
+  //  与下面两条的分工：那两条是【专用】拦截（第一行就 `if (exec.name !== 'xxx') return next()`），
   //  **不覆盖所有工具**；本条**不拦任何工具**，只把 agent 传来的身份字段【覆写】成服务端算出的
   //  actor，然后**一律 next()**。⇒ 注册在它们【之前】，保证先跑。
   //
-  //  边界（内核 `decideAction` 实现，且已单测）：
-  //    · 非飞书会话（没有 chat owner：GUI／子代理／定时轮）  ⇒ pass-through（**不许锁死 GUI**）
-  //    · 有 owner ＋ 有 actor                              ⇒ overwrite（**这是 A3 的真正落点**）
-  //    · 有 owner ＋ 无 actor ＋ **表可达**                 ⇒ deny（fail-closed，这才该拦）
-  //    · 有 owner ＋ 无 actor ＋ **表不可达**               ⇒ pass-through ＋ 记日志
-  //        ↑ 安全阀：表只在服务器（/opt/scripts/G9/），家里那台没有 ⇒ 拒绝会锁死整机
+  //  边界（内核 `decideAction`，已单测）：
+  //    · 非飞书回合（没有 chat owner：GUI／子代理／定时轮）  ⇒ pass-through（**不许锁死 CM 自己的电脑**）
+  //    · 飞书回合 ＋ 有 actor                              ⇒ overwrite（**这才是 A3 的真正落点**）
+  //    · 飞书回合 ＋ 无 actor（**表在不在都一样**）          ⇒ deny ＋ ALERT
+  //        ↑ **CM 2026-10-04 裁决：「无表就拒…执行不了总比资料泄露好」**；救急走主 A 准 / SSH 修表
+  //
+  //  ⚠️ 两个【已踩过】的坑，别再犯：
+  //  ① `identityCtx()` 必须能拿到工作区 —— 它在 `apply()` 外，拿不到里面的 `workspaceRoot`；
+  //     早先写成 `identityCtx()` ⇒ 构造器抛错被 catch 吞掉 ⇒ **注入静默失效**（日志里全是
+  //     `workspaceRoot is not defined`，但外面看起来"没锁死"，很安全 —— 其实根本没认人）。
+  //  ② 表路径**不许依赖运行时那个值**（`workspaceRoot()` 取 `ctx.get('sandboxPolicy')`，常为 undefined）
+  //     ⇒ 内核已加"cwd 逐级向上 6 层 ＋ 已知工作区兜底（P:/Qoder/work、D:/Work）"。
   ctx.on('tools/execute', async (exec, next) => {
     try {
       const owner = findChatForAgent(exec.agent)
-      const rec = owner ? identityCtx().store.get(exec.agent.id) : null
-      const action = decideAction({
-        hasOwner: Boolean(owner),
-        actor: rec && rec.actor,
-        tableOk: rec ? rec.tableOk !== false : false,
-      })
+      // ⚠️ 此处作用域里没有 `bot`（全局注册）⇒ 只能给 `workspaceRoot()`；内核有多级兜底，给 undefined 也不怕。
+      const rec = owner ? identityCtx(workspaceRoot()).store.get(exec.agent.id) : null
+      const action = !rec
+        ? 'pass-through'                                  // 非飞书回合 ⇒ 不要求飞书身份
+        : decideAction({ hasOwner: true, actor: rec.actor })
       if (action === 'overwrite') {
         const r = applyActorToArguments(exec.arguments, rec.actor)
         if (r.overwritten.length || r.dropped.length) {
@@ -6690,10 +6700,14 @@ export function apply(ctx) {
             + ' set=[' + r.overwritten.join(',') + '] drop=[' + r.dropped.join(',') + ']')
         }
       } else if (action === 'deny') {
-        console.log('[fs] identity DENY: tool=' + exec.name + ' agent=' + exec.agent.id
-          + '（有飞书会话但拿不到 actor ⇒ fail-closed）')
-        // ⚠️ 必须带 `error`：本文件 L6630 的注释记着——isError===true 时 harness 会**无条件**
-        //    读 result.error，不给就是 undefined ⇒ 抛 "tool result must be losslessly JSON-serializable"。
+        // 🔴 告警要【显眼】且区分原因（CM 2026-10-04 关心"留痕"）：
+        //    table_unavailable ＝ 表丢了/读不到（**运维事件** ⇒ 去修表，不许静默降级）
+        //    person_unknown    ＝ 表在、但这个人不在册（**业务事件** ⇒ 去补人）
+        const why = rec.tableOk === false ? 'table_unavailable' : 'person_unknown'
+        console.log('[fs] identity ALERT[' + why + '] DENY: tool=' + exec.name
+          + ' agent=' + exec.agent.id + ' tableOk=' + rec.tableOk)
+        // ⚠️ 必须带 `error`：isError===true 时 harness 会**无条件**读 result.error，
+        //    不给就是 undefined ⇒ 抛 "tool result must be losslessly JSON-serializable"。
         return {
           isError: true,
           error: 'identity_unresolved',
@@ -6702,11 +6716,13 @@ export function apply(ctx) {
         }
       }
     } catch (error) {
-      console.log('[fs] identity overwrite failed (ignored): ' + String(error && error.message || error))
+      // ⚠️ 这里**不许静默**：注入/覆写自身出错必须留痕 ——
+      //    否则就会像 2026-10-04 那次一样"悄悄失效"，外面完全看不出来。
+      console.log('[fs] identity ALERT[internal_error] ' + String(error && error.message || error))
     }
     return next()
   })
-
+ 
   // 红线：非飞书会话（GUI／子代理）一律 next()，绝不吞别人的提问。
   ctx.on('tools/execute', async (exec, next) => {
     if (exec.name !== 'exit_plan_mode') return next()

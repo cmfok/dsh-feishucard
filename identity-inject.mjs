@@ -55,7 +55,23 @@ export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
   const env = process.env[envName]
   if (env) out.push(env)
   out.push(serverPath)
+  // ① 调用方给的工作区（最准）
   if (workspaceRoot) out.push(path.join(workspaceRoot, relPath))
+  // ② 🔴 **从 cwd 逐级向上找** —— 不能只信调用方：
+  //    2026-10-04 实测，`index.js` 的 `workspaceRoot()` 依赖 `ctx.get('sandboxPolicy')`，
+  //    取不到就返回 `undefined` ⇒ 回退 `process.cwd()` ⇒ **那不是工作区** ⇒ 找不到表。
+  //    逐级向上找（最多 6 层）能覆盖"cwd 在工作区子目录里"的各种情形。
+  try {
+    let d = process.cwd()
+    for (let i = 0; i < 6 && d; i++) {
+      out.push(path.join(d, relPath))
+      const up = path.dirname(d)
+      if (!up || up === d) break
+      d = up
+    }
+  } catch { /* 取不到 cwd 就跳过这一级 */ }
+  // ③ **已知工作区兜底**（两台开发机的实际位置；不写死单台 ⇒ 两台都能命中）
+  for (const ws of ['P:/Qoder/work', 'D:/Work']) out.push(path.join(ws, relPath))
   return out
 }
 
@@ -159,10 +175,25 @@ export function applyActorToArguments (args, actor, keys = IDENTITY_KEYS) {
 //    hasOwner=true  ＋ actor                              ⇒ overwrite
 //    hasOwner=true  ＋ 无 actor（**无论表在不在**）          ⇒ deny  ← CM 裁决
 // ───────────────────────────────────────────────────────────────────────────
-export function decideAction ({ hasOwner, actor, tableOk = true }) {
+/**
+ * 🔴 CM 2026-10-04 裁决：**无表就拒**（fail-closed）。
+ *    CM 原话：「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」
+ *    救急手段（CM 同日给出）：①「主 A 准」这个不公开的身份可临时救急；
+ *                            ② 可以 SSH 上服务器直接修表。
+ *
+ * 只有一种放行：**这个回合根本不是飞书来的**（GUI／子代理／定时轮）——
+ * 那时**不要求飞书身份**（否则你本人在自己电脑上会被锁死，2026-10-04 已实测过一次）。
+ *
+ *   hasOwner=false（非飞书回合：GUI／子代理／定时轮）  ⇒ pass-through
+ *   hasOwner=true  ＋ actor                        ⇒ overwrite
+ *   hasOwner=true  ＋ 无 actor（**表在不在都一样**）  ⇒ deny
+ *
+ * ⚠️ `tableOk` **不再参与放行判断** —— 它只用于**告警文案**（区分"表丢了"与"这人不认识"）；
+ *    留痕在调用侧（`index.js` 的 `tools/execute` 拦截）做。
+ */
+export function decideAction ({ hasOwner, actor }) {
   if (!hasOwner) return 'pass-through'
   if (actor) return 'overwrite'
-  if (!tableOk) return 'pass-through'
   return 'deny'
 }
 
@@ -284,12 +315,15 @@ export function selftest () {
   let pass = 0; let fail = 0
   const ok = (c, label) => { if (c) { pass++; console.log('  ✅ ' + label) } else { fail++; console.log('  ❌ ' + label) } }
 
-  console.log('── 1) decideAction：无 actor 的边界 ──')
-  ok(decideAction({ hasOwner: false, actor: null }) === 'pass-through', '非飞书会话（无 owner）⇒ 放行（不许把 GUI/子代理锁死）')
-  ok(decideAction({ hasOwner: true, actor: { name: 'x' } }) === 'overwrite', '有 owner ＋ 有 actor ⇒ 覆写')
-  ok(decideAction({ hasOwner: true, actor: null }) === 'deny', '有 owner ＋ 无 actor ＋ 表可达 ⇒ 拒绝（fail-closed 的真正作用域）')
-  ok(decideAction({ hasOwner: true, actor: null, tableOk: false }) === 'pass-through',
-    '🔴 有 owner ＋ 无 actor ＋ **表不可达** ⇒ 放行（安全阀：表不在本机时不许锁死整机）')
+  console.log('── 1) decideAction：CM 2026-10-04 裁决「无表就拒」──')
+  ok(decideAction({ hasOwner: false, actor: null }) === 'pass-through',
+    '非飞书回合（GUI/子代理）⇒ 放行（**不许把 CM 自己的电脑锁死** —— 2026-10-04 实测过一次）')
+  ok(decideAction({ hasOwner: true, actor: { name: 'x' } }) === 'overwrite', '飞书回合 ＋ 有 actor ⇒ 覆写')
+  ok(decideAction({ hasOwner: true, actor: null }) === 'deny', '🔴 飞书回合 ＋ 无 actor ⇒ 拒绝')
+  ok(decideAction({ hasOwner: true, actor: null, tableOk: false }) === 'deny',
+    '🔴 **表不可达也照样拒**（CM：执行不了总比泄露好；救急走主 A 准 / SSH 修表）')
+  ok(decideAction({ hasOwner: true, actor: null, tableOk: true }) === 'deny',
+    '🔴 表可达但认不出这个人 ⇒ 同样拒（两者本质一样：拿不到身份）')
 
   console.log('── 2) applyActorToArguments：核心自证「塞别人身份必被覆写」──')
   const actor = { name: '陈明', open_id: 'ou_cm', union_id: 'on_cm', scopes: ['公司'] }
