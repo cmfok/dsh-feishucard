@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-10-03
+
+### 修复：0.7.6 独立审查的 8 条（2 条正中 P2 要害）
+
+> 0.7.6（P2"侧消息后换新卡"）落地后补跑审查：**0 critical / 0 high / 4 medium / 4 low**，逐条核对**全部属实**。
+
+**MEDIUM**
+- **换卡必须等提示真的发出去（MED#1841）**：`sendPlainText` 是"先取 token / 传图/文件、再 POST"的异步链，
+  而换卡紧跟其后同步执行 ⇒ 两条请求顺序**不保证**，新卡可能落在提示**上方**＝正是要修的症状。
+  现在改为 `sendPlainText(...).catch(()=>{}).then(() => rotateLiveCardForChat(...))`（看门狗与失败提示两处）。
+- **不能借"答题路径"的 split 换卡（MED#7069）**：`entry.split()` 把新卡游标设到**事件末尾**，
+  会**跳过还没镜像的事件**；换卡路径（`rotateTables`/`rotate`）用的是 `carry = 旧卡当前游标`，才"不重放、不丢"。
+  现在 turn entry 与自动卡 entry 都暴露 `rotate()` 通道，侧消息一律走它。
+- **侧消息换卡要覆盖自动轮（MED#7063）**：看门狗/失败提示**也会**从自动卡（目标轮/回执轮）的 watcher 发出，
+  原先只扫 `activeTurns` ⇒ 那些轮症状照旧。现在两条路都扫（`activeTurns` → `autoCards`），
+  且"该会话没有正在跑的卡"会**明确留痕**（本文件口径：不许静默跳过）。
+- **文案去重 + 数字派生（MED#2246）**：三处换卡文案近乎逐字重复，且硬编码"约 200 元素 / 200 KB"
+  与真实阈值（`CARD_ROTATE_BLOCKS=170` 块 / `CARD_ROTATE_BYTES=120000`≈120 KB）**矛盾** ⇒
+  抽成共享常量（`ROTATE_NOTICE_TABLES` / `rotateNoticeSize()`），数字由阈值派生。
+
+**LOW**
+- **文案方向反了（LOW#2157）**：侧消息是**另发**的一条、排在旧卡**下面**，而原文案写成"上面那条"；
+  改为 `SIDE_NOTICE_OLD = '⬇️ 下面那条是**另发的**提示；后续内容见下方新卡，本卡原文原样保留。'`
+- **字节护栏静默失效（LOW#965）**：`blocksBytes` 出错时静默返回 0 会让体积护栏悄悄失效 ⇒ 必须留痕。
+- **轮询热路径（LOW#2110）**：该判定现在每次 300ms 轮询都会走到 ⇒ 会话快照**一轮只取一次**并复用给 `scanCard()`，
+  且体积检查先按块数粗筛（小卡不做 120 KB 的 `JSON.stringify`）。
+- **冒烟 seq 撞号（LOW#819）**：9900+i 已用到 9990 ⇒ 续写段改用 10100（撞号会被 `seenSeqs` 去重、把失败归错因）。
+
+**验证**：`node --check` 通过；主冒烟 `SMOKE PASS (sentCards=263)`；冷启动 `COLD PASS(form-off)`；
+推送前跑 `code-review-gate` + 大文件体检；推送后 CI（ubuntu / Node 24）必须绿。
+
 ## [0.7.6] - 2026-10-03
 
 ### P2：插件自己的**侧消息**发出后必须"换新卡续写"（CM 2026-10-03 当场报障）
