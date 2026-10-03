@@ -4752,14 +4752,43 @@ export function apply(ctx) {
     } catch { return undefined }
   }
 
+  // 读一份会话日志快照（调用方只用 `{ events }`）。
+  // 跨版本策略：**先试 DSH 0.1.6+ 的 `sessionQuery.readSession`，失败再退回旧的 `sessionPersistence.readFrom`**。
+  //   2026-10-04 实测（dsh 0.2.0-rc.2）：`dsh-session-persistence` 里**已无 `readFrom`**
+  //   ⇒ 旧调用必然失败 ⇒ `/switch` 每条会话后面的「首条消息摘要」**一直是空的**（被 catch 吞掉，静默）。
+  //   思路来自外部 PR #1（作者 j4y89tnywy），本实现【在其基础上放宽了 `sp` 为空的限制】：
+  //   新接口只用 `sessionQuery`、不需要 `sp` ⇒ 即使持久化服务已改名/缺失，摘要也能读到。
+  async function readSessionLog(sp, sessionId) {
+    const sq = ctx.get('sessionQuery')
+    if (!sq || typeof sq.readSession !== 'function') {
+      // 可见诊断：区分「服务名不对/未注册」与「接口调用失败」——
+      // 这两者的现象都是"摘要为空"，但修法完全不同（前者要换服务名，后者要修调用）。
+      console.log('[fs] switch: sessionQuery unavailable (got=' + (sq ? typeof sq : 'null')
+        + ', hasReadSession=' + Boolean(sq && sq.readSession) + ')')
+    }
+    if (sq && typeof sq.readSession === 'function') {
+      try {
+        const snap = await sq.readSession(sessionId)
+        if (snap && Array.isArray(snap.events)) return snap
+      } catch (error) {
+        console.log('[fs] switch: sessionQuery.readSession failed for ' + sessionId + ': '
+          + String(error && error.message || error))
+      }
+    }
+    if (sp && typeof sp.readFrom === 'function') return sp.readFrom(sessionId, 0)
+    return undefined
+  }
+
   // 首条用户消息（摘要）：只对**体积可控**的日志读，绝不为列个表去解析几百 MB 的历史。
   async function firstUserText(sp, meta, size) {
     // 2026-10-02 A 方案：调用方现在会传"只有活会话、没有持久化快照"的行（meta === undefined），
     // 以及注册表/持久化服务缺失的情况 ⇒ 这里必须先挡住，否则整张会话卡会崩在 `meta.id` 上。
-    if (!sp || !meta || !meta.id) return ''
+    // 2026-10-04 放宽：**不再要求 `sp` 非空** —— 0.2.0 起 `sessionPersistence` 可能已不存在，
+    // 而新接口 `sessionQuery.readSession` 并不需要它；原先的 `!sp` 判断会让摘要恒空（见上）。
+    if (!meta || !meta.id) return ''
     if (Number.isFinite(size) && size > SWITCH_SUMMARY_MAX_BYTES) return ''
     try {
-      const pending = Promise.resolve(sp.readFrom(meta.id, 0))
+      const pending = Promise.resolve(readSessionLog(sp, meta.id))
       pending.catch(() => {})                       // 超时后仍会 reject：先挂上处理器
       const raced = await Promise.race([
         pending,
