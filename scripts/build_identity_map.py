@@ -183,9 +183,11 @@ def main():
                 reason = "open_id 未取到（HRM 该行 Openid 为空）"
             if not reason:
                 continue
-            item = {"name": nm, "reason": reason}
-            if oid:
-                item["open_id"] = oid     # 🔑 resolve_actor 的 open_id_missing 判据靠它匹配
+            # 🔑 `open_id` 键**必须存在**（表里没有就写 null，**不许省略键**）—— `0225` §一 口径：
+            #    ① `resolve_actor` 的 `open_id_missing` 判据读 `pending[].open_id`；
+            #    ② "这条 pending 到底有没有 id"必须能从结构上看出来 ——
+            #       **省略键** ≠ **值为 null**：前者分不清「本来就没有」还是「忘了写」。
+            item = {"name": nm, "reason": reason, "open_id": oid or None}
             if args.apply:
                 m.setdefault("pending", []).append(item)
                 pending_names.add(nm)
