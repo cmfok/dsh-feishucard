@@ -398,6 +398,11 @@ export function apply(ctx) {
         // 0.7.17（两模式）：full（缺省＝现状行为）| stable（员工显示层收起）。热读，10 秒生效。
         // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
         mode: (typeof bot.mode === 'string' && bot.mode.toLowerCase() === 'stable') ? 'stable' : undefined,
+        // 0.7.18（身份闸门）：**默认关** —— 不写就是关（上游用户不一定需要这个功能；CM 2026-10-04 定）。
+        // 打开后：入站按 `open_id` 查身份表 ⇒ 工具入参里的身份字段一律被覆写成表里的真值；
+        //        拿不到身份则拒绝执行（fail-closed）。
+        // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
+        identityGuard: typeof bot.identityGuard === 'boolean' ? bot.identityGuard : undefined,
       })
     }
     return cleaned
@@ -3363,20 +3368,24 @@ export function apply(ctx) {
     if (!entry || !entry.agent || typeof entry.agent.steer !== 'function') return false
     // ── D5（P1.5 身份注入）· 插话路径也要注入（否则插话进来的那条没有 actor）─────
     //    身份只来自 `evt.sender.sender_id.open_id`（服务端给的、伪造不了）；
-    //    认不出**不弹卡片、不问姓名**（CM 2026-10-04）；表不可达 ⇒ 放行（不许锁死整机）。
+    //    认不出**不弹卡片、不问姓名**（CM 2026-10-04）；
+    //    拿不到身份 ⇒ 拒绝（CM 2026-10-04 裁决：**无表就拒** —— 执行不了总比资料泄露好）。
+    //    🔒 开关 `identityGuard` **默认关**（上游用户不一定需要这个功能）⇒ 关了跳过全部身份逻辑。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
-    try {
-      const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
-      const r = idc.resolver.resolve(openId)
-      identityActor = r.actor
-      idc.store.set(entry.agent.id, { actor: r.actor, chatId, messageId: evt.message_id, tableOk: r.tableOk })
-      console.log('[fs] identity(steer): agent=' + entry.agent.id
-        + ' open_id=' + String(openId).slice(0, 12) + '…'
-        + ' -> ' + (r.actor ? ('OK ' + r.actor.name) : String(r.err || 'no_actor'))
-        + ' tableOk=' + r.tableOk)
-    } catch (error) {
-      console.log('[fs] identity(steer) resolve failed (ignored): ' + String(error && error.message || error))
+    if (bot.cfg && bot.cfg.identityGuard) {
+      try {
+        const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
+        const r = idc.resolver.resolve(openId)
+        identityActor = r.actor
+        idc.store.set(entry.agent.id, { actor: r.actor, chatId, messageId: evt.message_id, tableOk: r.tableOk })
+        console.log('[fs] identity(steer): agent=' + entry.agent.id
+          + ' open_id=' + String(openId).slice(0, 12) + '…'
+          + ' -> ' + (r.actor ? ('OK ' + r.actor.name) : String(r.err || 'no_actor'))
+          + ' tableOk=' + r.tableOk)
+      } catch (error) {
+        console.log('[fs] identity(steer) resolve failed (ignored): ' + String(error && error.message || error))
+      }
     }
     const label = identityActor
       ? '[飞书 ' + (identityActor.name || openId) + '] '
@@ -3569,17 +3578,20 @@ export function apply(ctx) {
     //     记一条日志并**放行** —— 否则一上线就把本机所有工具锁死（事故级）。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
-    try {
-      const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
-      const r = idc.resolver.resolve(openId)
-      identityActor = r.actor
-      idc.store.set(agent.id, { actor: r.actor, chatId, messageId, tableOk: r.tableOk })
-      console.log('[fs] identity: agent=' + agent.id
-        + ' open_id=' + String(openId).slice(0, 12) + '…'
-        + ' -> ' + (r.actor ? ('OK ' + r.actor.name + ' source=' + r.actor.source) : String(r.err || 'no_actor'))
-        + ' tableOk=' + r.tableOk)
-    } catch (error) {
-      console.log('[fs] identity resolve failed (ignored): ' + String(error && error.message || error))
+    // 🔒 身份闸门开关：**默认关**（上游用户不一定需要；CM 2026-10-04）⇒ 关了跳过全部身份逻辑，零开销。
+    if (bot.cfg && bot.cfg.identityGuard) {
+      try {
+        const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
+        const r = idc.resolver.resolve(openId)
+        identityActor = r.actor
+        idc.store.set(agent.id, { actor: r.actor, chatId, messageId, tableOk: r.tableOk })
+        console.log('[fs] identity: agent=' + agent.id
+          + ' open_id=' + String(openId).slice(0, 12) + '…'
+          + ' -> ' + (r.actor ? ('OK ' + r.actor.name + ' source=' + r.actor.source) : String(r.err || 'no_actor'))
+          + ' tableOk=' + r.tableOk)
+      } catch (error) {
+        console.log('[fs] identity resolve failed (ignored): ' + String(error && error.message || error))
+      }
     }
     // 前缀改由【服务端算出的 actor】生成（不再直接贴原始 open_id —— 免得模型把"一段像 id 的文本"当凭据）
     const label = identityActor
@@ -6688,8 +6700,11 @@ export function apply(ctx) {
   ctx.on('tools/execute', async (exec, next) => {
     try {
       const owner = findChatForAgent(exec.agent)
+      // 🔒 开关 `identityGuard` **默认关**（上游用户不一定需要这个功能；CM 2026-10-04 定）
+      //    ⇒ 关着就直接 next()，**零开销、零副作用**（连 store 都不查）。
+      if (!(owner && owner.bot && owner.bot.cfg && owner.bot.cfg.identityGuard)) return next()
       // ⚠️ 此处作用域里没有 `bot`（全局注册）⇒ 只能给 `workspaceRoot()`；内核有多级兜底，给 undefined 也不怕。
-      const rec = owner ? identityCtx(workspaceRoot()).store.get(exec.agent.id) : null
+      const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
       const action = !rec
         ? 'pass-through'                                  // 非飞书回合 ⇒ 不要求飞书身份
         : decideAction({ hasOwner: true, actor: rec.actor })
