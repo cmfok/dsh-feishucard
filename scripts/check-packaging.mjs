@@ -22,6 +22,18 @@
  *   node check-packaging.mjs --repo . --quiet      # 只报错
  *
  * 退出码：0 = 通过；1 = 有问题（可直接用于 CI / 发版前闸门）。
+ *
+ * 🔴 **它自己也要能被证明「会红」** —— 不会红的闸门，等于没有闸门。
+ *    自证方法（2026-10-04 实测过一次，**必须 exit 1**）：
+ *
+ *      mkdir /tmp/pk && cd /tmp/pk
+ *      printf '{"name":"pk","version":"0.0.1","main":"index.js","files":["index.js"]}' > package.json
+ *      printf "import './dep.js'\n" > index.js
+ *      printf 'export const b = 2\n'  > dep.js             # dep.js 【故意不写进 files】
+ *      node <repo>/scripts/check-packaging.mjs --repo .    # ⇒ exit 1，并点名 dep.js
+ *
+ *    反证：把 `dep.js` 补进 `files` ⇒ **同一个夹具**立即 exit 0。
+ *    只验"通过"不验"会红"，就等于没验 —— 本地绿 ≠ 闸门真的在拦。
  */
 
 import fs from 'node:fs'

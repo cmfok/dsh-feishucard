@@ -33,6 +33,11 @@ jobs:
       - name: Packaging integrity
         run: node scripts/check-packaging.mjs --repo .
 
+      # 闸门自己也要能证明「会红」——不会红的闸门等于没有（本项目在检查器上栽过一次）。
+      # 这一行造一个漏文件的夹具，断言闸门 exit 1 且**点名缺的文件**；补齐后必须放行。
+      - name: Packaging gate self-test
+        run: node scripts/check-packaging.selftest.mjs
+
       - name: Smoke test
         run: npm run smoke
 
