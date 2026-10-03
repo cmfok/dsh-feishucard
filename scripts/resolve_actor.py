@@ -9,8 +9,13 @@ fail-closed：任何认不出的情形一律拒绝，绝不拿姓名模糊匹配
     from resolve_actor import resolveActor
     actor, err = resolveActor(open_id, identity_map)   # err=None 或 ResolveError 字符串
 
-错误码（7 种，逐字对接 HOME）：map_unavailable / no_open_id / unknown_person /
-duplicate_open_id / open_id_missing / job_not_granted / (自助兜底另记 identity.unverified)
+错误码（8 种，逐字对接 HOME）：map_unavailable / no_open_id / unknown_person /
+duplicate_open_id / open_id_missing / job_not_granted / not_active /
+(自助兜底另记 identity.unverified)
+
+2026-10-04 追加 `not_active`：原先「人已离职」与「完全不认识这个 open_id」共用
+`unknown_person` ⇒ 上层若按它做兜底（例如弹卡片问姓名），**离职的人会被当成陌生人来处理**。
+离职是**正常拒绝**（他不该被认），与「不认识」是两件事 ⇒ 分开报。
 """
 import json
 
@@ -21,6 +26,7 @@ E_UNKNOWN_PERSON  = "unknown_person"
 E_DUPLICATE       = "duplicate_open_id"
 E_MISSING         = "open_id_missing"
 E_NOT_GRANTED     = "job_not_granted"
+E_NOT_ACTIVE      = "not_active"      # 人已离职 / 终止办理（正常拒绝，≠ 不认识）
 
 def _load(raw):
     """容错读映射表：dict 直接用；str 当作 JSON 串解析。其余 = map_unavailable"""
@@ -70,9 +76,10 @@ def resolveActor(open_id, identity_map):
 
     person = hits[0]
 
-    # ④ 在职校验（离职 = 未知）
+    # ④ 在职校验 —— 离职 / 终止办理 **≠「不认识」**（2026-10-04 分开报，见文件头说明）
+    #    ⇒ 上层看到 `not_active` 应当「正常拒绝」；**不要**走"问姓名"之类的兜底。
     if str(person.get("status", "")) not in ("在职", "active"):
-        return None, E_UNKNOWN_PERSON
+        return None, E_NOT_ACTIVE
 
     # ⑤ 岗位授权：job_id 必须已批（未批 = job_not_granted）
     if not person.get("job_id"):
@@ -99,7 +106,11 @@ if __name__ == "__main__":
              "status": "在职", "scopes": ["公司"], "grants": {"报表": "L1"}},
             {"union_id": "on_wgh", "open_ids": {"cli_main": "ou_wgh_main"},
              "name": "伍国衡", "job_id": "", "status": "在职"},   # 岗位未批
-            {"union_id": "on_gone", "open_ids": {}, "name": "离职者", "status": "离职"},
+            # ⚠️ 必须给 open_ids —— 否则他在【匹配阶段】就落到 unknown_person，
+            #    根本走不到第 ④ 步的在职校验 ⇒ 这条自测就成了**假绿灯**
+            #    （2026-10-04 实测：改了 not_active 后自测仍打印 ✅ unknown_person，就是栽在这里）。
+            {"union_id": "on_gone", "open_ids": {"cli_main": "ou_gone_main"},
+             "name": "离职者", "status": "离职"},
         ],
         "pending": [{"name": "李四", "open_id": "ou_lisi_unk", "reason": "union_id 未取到"}],
     }
@@ -126,7 +137,10 @@ if __name__ == "__main__":
     # job 未批
     _, err = resolveActor("ou_wgh_main", MAP)
     print(("✅" if err == E_NOT_GRANTED else "❌") + " job_not_granted → " + str(err))
-    # 离职
+    # 离职 —— 必须是独立的 `not_active`，**不能**再混成 unknown_person
     _, err = resolveActor("ou_gone_main", MAP)
-    print(("✅" if err == E_UNKNOWN_PERSON else "❌") + " 离职 → " + str(err))
+    print(("✅" if err == E_NOT_ACTIVE else "❌") + " 离职 → " + str(err))
+    # 反面断言：**完全不认识**的人仍然是 unknown_person —— 两者不可混
+    _, err = resolveActor("ou_nobody_main", MAP)
+    print(("✅" if err == E_UNKNOWN_PERSON else "❌") + " 陌生人 → " + str(err))
     print("自测失败数:", bad)
