@@ -34,38 +34,52 @@ export const DEFAULT_MAP_PATH = '/opt/scripts/G9/identity_map.json'
 /** 默认 resolver 路径（服务器）；可用环境变量 MAILBOX_RESOLVER 覆盖 */
 export const DEFAULT_RESOLVER_PATH = '/opt/scripts/G9/resolve_actor.py'
 
-/** resolver 路径候选 —— 同 MAP_CANDIDATES 的道理（一份代码跑两种机器） */
-export const RESOLVER_CANDIDATES = [
-  process.env.MAILBOX_RESOLVER,
-  DEFAULT_RESOLVER_PATH,
-  'P:/Qoder/work/output/g9-identity/resolve_actor.py',
-].filter(Boolean)
-
-export function pickResolverPath (candidates = RESOLVER_CANDIDATES) {
-  for (const c of candidates) {
-    try { if (fs.statSync(c).isFile()) return c } catch { /* 试下一个 */ }
-  }
-  return candidates[0] || DEFAULT_RESOLVER_PATH
+/**
+ * 资产（表 / resolver）路径解析 —— **一律【跟着工作区】走，不写死机器路径**（CM 2026-10-04 要求）。
+ *
+ * 候选顺序（取第一个存在的）：
+ *   1. **环境变量**（`MAILBOX_IDENTITY_MAP` / `MAILBOX_RESOLVER`）—— 部署时覆盖用
+ *   2. **服务器固定路径** `/opt/scripts/G9/…` —— 8 个员工 bot 的生产位置
+ *   3. 🔑 **`<工作区>/output/g9-identity/…`** —— 任何开发机都成立：
+ *        · HOME 工作区 `P:\Qoder\work`
+ *        · CM-OFFICE 工作区 `D:\Work`
+ *      ⇒ 因为表就放在**工作区里**，**Syncthing 会把它同步到各开发机** ⇒ **各机都不会被锁死**。
+ *
+ * ⚠️ **必须是"相对工作区"、不是"相对本文件"**：插件代码住在别人的仓库里
+ *    （`Ai100/projects/dsh-feishucard/`），而**工作区根才是被同步的那一层**。
+ * ⚠️ **也不写死盘符**（`P:` / `D:`）—— 两台开发机的盘符不同，写死等于只在其中一台上有效。
+ */
+export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
+  const out = []
+  const env = process.env[envName]
+  if (env) out.push(env)
+  out.push(serverPath)
+  if (workspaceRoot) out.push(path.join(workspaceRoot, relPath))
+  return out
 }
 
-/**
- * 表路径候选 —— **按顺序取第一个存在的**。
- * 解决"同一份代码跑在两种机器上"：
- *   · 服务器（8 个员工 bot）：`/opt/scripts/G9/identity_map.json`
- *   · HOME（我的工作台）：`P:/Qoder/work/output/g9-identity/identity_map.json`
- * ⇒ **动态探测**（每次调用都判），所以表随时放进来 / 移走都能立刻反映，不必等热重载。
- */
-export const MAP_CANDIDATES = [
-  process.env.MAILBOX_IDENTITY_MAP,
-  DEFAULT_MAP_PATH,
-  'P:/Qoder/work/output/g9-identity/identity_map.json',
-].filter(Boolean)
+const MAP_REL = path.join('output', 'g9-identity', 'identity_map.json')
+const RESOLVER_REL = path.join('output', 'g9-identity', 'resolve_actor.py')
 
-export function pickMapPath (candidates = MAP_CANDIDATES) {
+export function mapCandidates (workspaceRoot) {
+  return assetCandidates(workspaceRoot, 'MAILBOX_IDENTITY_MAP', DEFAULT_MAP_PATH, MAP_REL)
+}
+export function resolverCandidates (workspaceRoot) {
+  return assetCandidates(workspaceRoot, 'MAILBOX_RESOLVER', DEFAULT_RESOLVER_PATH, RESOLVER_REL)
+}
+
+export function pickFrom (candidates, fallback) {
   for (const c of candidates) {
     try { if (fs.statSync(c).isFile()) return c } catch { /* 试下一个 */ }
   }
-  return candidates[0] || DEFAULT_MAP_PATH
+  return candidates[0] || fallback
+}
+
+export function pickMapPath (workspaceRoot) {
+  return pickFrom(mapCandidates(workspaceRoot), DEFAULT_MAP_PATH)
+}
+export function pickResolverPath (workspaceRoot) {
+  return pickFrom(resolverCandidates(workspaceRoot), DEFAULT_RESOLVER_PATH)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -157,7 +171,8 @@ export function decideAction ({ hasOwner, actor, tableOk = true }) {
 //    失败一律返回 { actor:null, err }，**绝不抛**（一条消息失败不该影响整机）
 // ───────────────────────────────────────────────────────────────────────────
 export function makeResolver ({ mapPath = null,
-                              resolverPath = process.env.MAILBOX_RESOLVER || pickResolverPath(),
+                              resolverPath = null,
+                              workspaceRoot = null,
                               python = null, timeoutMs = 8000 } = {}) {
   const cache = new Map()
   let cachedTableMtime = null
@@ -178,12 +193,18 @@ export function makeResolver ({ mapPath = null,
     return (cachedPython = 'python3')
   }
 
-  // **动态取表路径**：显式入参 ＞ 环境变量 ＞ 多候选探测（服务器 / HOME）
-  // ⇒ 每次调用都重新判 ⇒ 表放进来 / 移走立刻生效，不必等热重载。
+  // **动态取路径**：显式入参 ＞ 环境变量 ＞ 服务器固定路径 ＞ `<工作区>/output/g9-identity/`
+  // ⇒ 每次调用都重新判 ⇒ 表放进来 / 移走立刻生效，不必等热重载；
+  // ⇒ **跟着工作区走**，所以 HOME(`P:\Qoder\work`) 与 CM-OFFICE(`D:\Work`) 都能找到（CM 2026-10-04 要求）。
   function currentMapPath () {
     if (mapPath) return mapPath
     if (process.env.MAILBOX_IDENTITY_MAP) return process.env.MAILBOX_IDENTITY_MAP
-    return pickMapPath()
+    return pickMapPath(workspaceRoot)
+  }
+  function currentResolverPath () {
+    if (resolverPath) return resolverPath
+    if (process.env.MAILBOX_RESOLVER) return process.env.MAILBOX_RESOLVER
+    return pickResolverPath(workspaceRoot)
   }
 
   function tableOk () {
@@ -197,7 +218,8 @@ export function makeResolver ({ mapPath = null,
       const mp = currentMapPath()
       if (!openId) return { actor: null, err: 'no_open_id', tableOk: tableOk() }
       if (!tableOk()) return { actor: null, err: 'map_unavailable', tableOk: false }
-      if (!fs.existsSync(resolverPath)) return { actor: null, err: 'resolver_missing', tableOk: true }
+      const rp = currentResolverPath()
+      if (!fs.existsSync(rp)) return { actor: null, err: 'resolver_missing', tableOk: true }
       // 表换了（mtime 变）⇒ 清缓存，避免"旧身份"
       try {
         const mt = fs.statSync(mp).mtimeMs
@@ -215,7 +237,7 @@ export function makeResolver ({ mapPath = null,
       ].join('\n')
       let out
       try {
-        const r = spawnSync(currentPython(), ['-c', code, path.dirname(resolverPath), mp, openId],
+        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId],
           { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, PYTHONIOENCODING: 'utf-8' } })
         out = String(r.stdout || '').trim()
       } catch (e) {

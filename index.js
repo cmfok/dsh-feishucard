@@ -33,7 +33,11 @@ let __turnIdentity = null
 let __identityResolver = null
 function identityCtx () {
   if (!__turnIdentity) __turnIdentity = new TurnIdentityStore()
-  if (!__identityResolver) __identityResolver = makeResolver()
+  // 🔑 表/resolver 的路径**跟着工作区走**（CM 2026-10-04 要求）：
+  //    服务器 `/opt/scripts/G9/` 优先，其次 `<工作区>/output/g9-identity/`。
+  //    ⇒ 表放在工作区里 ⇒ **Syncthing 会把它同步到各开发机** ⇒ HOME(`P:\Qoder\work`) 与
+  //      CM-OFFICE(`D:\Work`) 都找得到，**两台都不会被锁死**。不写死任何盘符。
+  if (!__identityResolver) __identityResolver = makeResolver({ workspaceRoot: workspaceRoot() })
   return { store: __turnIdentity, resolver: __identityResolver }
 }
 
