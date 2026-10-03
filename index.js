@@ -4619,7 +4619,9 @@ export function apply(ctx) {
   // 摘要显示多少字。CM 2026-10-04：「摘要不够长啊，能搞长一点吗？」（实测 lens 全是 61 ⇒ 全部撞上限）。
   // 前缀去掉后正文能显示更多，这里给 120 字（约两行）；要调只改这一个数。
   const SWITCH_SUMMARY_CHARS = 120
-  const SWITCH_SUMMARY_TIMEOUT_MS = 1500
+  // 摘要读取的**单条超时**。CM 2026-10-04 实测：8 条会话里 5 条拿到 `no snapshot …(timeout?)`
+  //   ⇒ 1.5 秒对"加载整份会话日志"（几十 MB）太短 ⇒ 放宽到 5 秒。
+  const SWITCH_SUMMARY_TIMEOUT_MS = 5000
   const SWITCH_WS_LIMIT = 12          // 工作区最多列几个（注册表之外从会话兜底补的也算在里面）
   const SWITCH_SESS_LIMIT = 12        // 单个工作区的会话最多列几行（卡片行数有上限）
   const SWITCH_SESS_PAGE = 5          // CM 2026-10-02：「只显示 5 个会话，每一页显示 5 个，做一个翻页」
@@ -4777,6 +4779,14 @@ export function apply(ctx) {
     if (sq && typeof sq.readSession === 'function') {
       try {
         const snap = await sq.readSession(sessionId)
+        if (!snap || !Array.isArray(snap.events)) {
+          // 诊断：区分「返回 null」「缺 events 字段」「events 不是数组」——三者修法不同。
+          // （CM 2026-10-04 实测：8 条会话里 5 条拿不到快照，而超时阈值当时只有 1.5 秒。）
+          console.log('[fs] switch: readSession odd shape for ' + sessionId
+            + ' got=' + (snap === null ? 'null' : typeof snap)
+            + (snap && typeof snap === 'object' ? ' keys=' + Object.keys(snap).join('|') : '')
+            + ' eventsType=' + (snap ? (Array.isArray(snap.events) ? 'array' : typeof snap.events) : '-'))
+        }
         if (snap && Array.isArray(snap.events)) return snap
       } catch (error) {
         console.log('[fs] switch: sessionQuery.readSession failed for ' + sessionId + ': '
@@ -4814,13 +4824,16 @@ export function apply(ctx) {
           + ' raced=' + (raced === undefined ? 'undefined(timeout?)' : typeof raced))
         return ''
       }
-      for (const ev of raced.events) {
+      // CM 2026-10-04 决策：**摘要用【最近一句】，不用第一句** ——
+      //   ① 会话标题本来就是按开头/主题生成的 ⇒ 摘要再用第一句＝重复；最近一句才互补；
+      //   ② 认出会话靠的是"我刚在聊什么" ⇒ 长会话里第一句早忘了，最近一句才是记忆锚点。
+      //   实现：**从后往前扫，命中即返回**（即最后一条真实用户消息）。
+      for (let i = raced.events.length - 1; i >= 0; i--) {
+        const ev = raced.events[i]
         if (!ev || ev.type !== 'user/message') continue
         // ⚠️ 两种事件结构都要兼容（2026-10-04 实测差异）：
         //   · 旧 `sessionPersistence.readFrom`：{ type, data: { source, content: [{ text }] } }
         //   · 新 `sessionQuery.readSession`：payload 就是 UserMessage 本体（**不一定有 `data` 包装**）
-        //   原实现只读 `ev.data.content` ⇒ 若新结构没有 `data`，则取到空数组 ⇒
-        //   **摘要永远为空且不报错**（静默）—— 这正是 CM 反馈"只有标题、没有内容"的一层原因。
         const d = (ev.data && typeof ev.data === 'object') ? ev.data : ev
         const src = (d && d.source) || {}
         if (src.kind && src.kind !== 'user') continue
@@ -4831,8 +4844,7 @@ export function apply(ctx) {
           .replace(/\s+/g, ' ')
           .trim()
         // 去掉【插件自己加的投递前缀】（`[飞书 ou_…] ` / `[飞书 姓名] ` / `[飞书消息] `）——
-        // 那是给人看的标记，**不该占据摘要**（CM 2026-10-04：「它显示的是飞书开头的那串代码」；
-        // 实测该前缀约 40 字符，而当时上限只有 60 ⇒ 正文只剩几个字）。
+        // 那是给人看的标记，**不该占据摘要**（CM 2026-10-04：「它显示的是飞书开头的那串代码」）。
         text = text.replace(/^\[飞书[^\]]*\]\s*/, '')
         if (text) return text.length > SWITCH_SUMMARY_CHARS ? text.slice(0, SWITCH_SUMMARY_CHARS) + '…' : text
       }
