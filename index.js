@@ -98,12 +98,11 @@ export function apply(ctx) {
   // agent / card / bot / chatId / split 都跨代可用），于是照旧走插话那条路。
   const activeTurns = globalThis.__fsActiveTurns
     || (globalThis.__fsActiveTurns = new Map())   // agentId -> { card, bot, chatId, split }
-  // 0.7.15（审查 HIGH#1979）：**按代**记被 dispose 中断的卡 —— 0.7.14 曾用 globalThis Set 按对象记，
-  // 而卡片对象跨代共享（activeTurns/liveCardRegistry 都是 globalThis Map）⇒ 新代接管同一对象也被拦死
-  // （冻结在「正在工作中…」）且全局 Set 永不清（无界增长，LOW#2361）。WeakSet 在 apply 作用域：
-  // 只拦**本代**（旧代 dispose 时登记进自己的闭包），新代 apply 是新闭包、自己的 WeakSet 为空 ⇒ 接管照常；
-  // WeakSet 不阻止 GC ⇒ 卡与 agent 图随代回收。
-  const interruptedCards = new WeakSet()
+  // 0.7.16（审查 MED#2）：**代际旗**取代按卡对象登记 —— 0.7.15 的 WeakSet 只能拦 dispose 时**已存在**的卡；
+  // dispose 之后本代 runTurn 还会**新建**卡（拆结论卡 makeCardState / 换卡 rotateAdoptedCard），那些新对象
+  // 不在集合里、照发（= 野卡漏洞）。旗按「代」判定：dispose 之后本代**一切**推送（封口/新建卡/入队后才执行的
+  // 任务体）全部拦下；新代 apply 是新闭包、旗=false ⇒ 接管/续卡照常（无按对象簿记，也无全局累积）。
+  let generationDisposed = false
 
   // 刚封口的普通回合卡：agentId -> { card, bot, chatId, sealedAt }
   // 2026-09-27（CM 实证："每次发东西，大部分都会一个内容发两次"）：
@@ -1979,11 +1978,10 @@ export function apply(ctx) {
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
   function syncCard(bot, chatId, card, force) {
-    // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 被中断回合的卡不许再由本代（旧实例）推送**。
-    // 0.7.15（审查 HIGH#1979）：查**本代闭包**的 `interruptedCards`（WeakSet）——
-    //   卡片对象跨代共享，0.7.14 的 globalThis Set 会把新代接管的同一张卡一起拦死（冻结）；
-    //   本代登记只作用于本代 ⇒ 新代 apply 是新闭包、集合为空 ⇒ 接管/续卡照常推送。留痕不抛错。
-    if (card && interruptedCards.has(card)) {
+    // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 本代（旧实例）不许再推任何卡**。
+    // 0.7.16（审查 MED#2）：判据改**代际旗** —— 按对象登记拦不住 dispose 后本代新建的卡；
+    //   旗拦本代一切推送，新代 apply 是新闭包、旗=false ⇒ 接管/续卡照常。留痕不抛错。
+    if (card && generationDisposed) {
       console.log('[fs] card sync skipped: generation disposed (interrupted card left for new instance)')
       return card.queue
     }
@@ -2005,6 +2003,12 @@ export function apply(ctx) {
       // seal），它们在入口检查时 createFailed 还是 false → 都排进队列 → 串行执行时各自 create。
       // 队列内检查才能保证"建卡只成功/尝试一次"（2026-09-15 smoke 实测：入口检查漏掉 3 次 create）。
       if (!card.token && card.createFailed) return
+      // 0.7.16（审查 LOW）：入口检查在 dispose **之前**通过、任务体在 dispose **之后**才执行的窗口 ——
+      // 队列内复检代际旗（与上面 createFailed 的队列内复检同一先例），否则已入队的 PATCH 仍会推出去。
+      if (generationDisposed) {
+        console.log('[fs] card sync skipped inside queue: generation disposed')
+        return
+      }
       const payload = buildCardPayload(card)
       // G：把 markdown 里的**本地图片引用**换成真 `img_key`（飞书只认 key，本地路径会**整卡被拒**）
       try {
@@ -2356,19 +2360,16 @@ export function apply(ctx) {
     //    abort 发生在 dispose **之后** ~40ms（agent 生命周期 effect 被拆 ⇒
     //    agent-loop `machine.cancel({kind:'disposed'})`），那时本代 watcher 已经停了 ⇒ 抓不到。
     //    这里只留"有哪些回合在跑"的线索，由**新实例**播报（见 announceReloadInterrupts）。
+    // 0.7.16（审查 MED#2）：**dispose 一进来就置位**（不依赖是否还有活跃回合）——此后本代一切卡片推送
+    // （封口 / 新建的结论卡 / 换卡 / 入队后才执行的任务体）全部拦截；新代闭包旗=false 不受影响。
+    generationDisposed = true
+    console.log('[fs] dispose(热重载): 本代已标记 disposed（此后本代一切卡片推送被拦截）')
     try {
       const interrupted = []
       for (const [agentId, entry] of Array.from(activeTurns)) {
         if (!entry || !entry.bot || !entry.chatId) continue
-        // 0.7.14（TASK v3 §4 / H3）：把活跃回合的**卡对象**登记 ⇒ 本代后续的封口推送在 syncCard 处被拦下
-        //   —— "半截卡"根因：dispose 停 watcher 后，本代 runTurn 收尾仍 seal+push（web.log 18:39:32 实录）。
-        // 0.7.15（审查 HIGH#1979 / LOW#2359）：登记进**本代闭包的 WeakSet**（不再用 globalThis Set ——
-        //   会连新代一起拦死）；空 catch 补留痕（登记失败 = 守卫静默失效 = 半截卡回归无诊断）。
-        try {
-          if (entry.card) interruptedCards.add(entry.card)
-        } catch (error) {
-          console.log('[fs] dispose(热重载): 登记被中断卡片失败 ' + String(error && error.message || error))
-        }
+        // 0.7.16：按卡登记制已由代际旗取代（见上方 generationDisposed —— 拦本代一切推送）。
+
         interrupted.push({
           sessionId: String(agentId),
           chatId: String(entry.chatId),

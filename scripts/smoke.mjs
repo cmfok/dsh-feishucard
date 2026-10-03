@@ -373,7 +373,11 @@ const ctx = {
       return fakeProc
     },
   },
-  interval(fn) { intervals.push(fn); return () => {} },
+  // 0.7.16 (suite infra): unshift => NEWEST generation polls first. fakeProc is a singleton and
+  // the mock interval disposer is a no-op, so after a mid-suite re-apply the old generation would
+  // always win the chunk race (and, being disposed, its pushes are blocked by design). Production
+  // only ever runs the live generation, so the mock must give it priority.
+  interval(fn) { intervals.unshift(fn); return () => {} },
   effect(fn) {
     effects.push(fn)
     const cleanup = fn()
@@ -2970,6 +2974,13 @@ console.log('47) 热重载卸载：agent.ctx 上的监听必须被注销（high#
   ok(unloaded, '卸载钩子执行后两条水位线均已注销（不再跨代叠加）')
   ok(agentScopeDisposed > beforeDisposed, 'disposer 确实移除过监听（移除次数 ' + agentScopeDisposed + '）')
 }
+  // 0.7.16: this case just disposed the live generation (the generation flag correctly silences it afterwards --
+  // correct production semantics: after HMR the old generation must stay quiet; per-card registration in 0.7.15
+  // could not feel this). The suite needs a live generation to continue => restore like a real hot reload:
+  // re-apply the module (fresh generation, flag=false). Precedent: case 53 re-applies mid-suite, 54+ stay green.
+  const mod47 = await import('../index.js')
+  mod47.apply(ctx)
+  await drain()
 
 console.log('48) 卡片 schema 校验：schema 2.0 不许出现 tag=action（真机 230099/200861 报错）')
 {
@@ -3982,6 +3993,10 @@ console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡�
   const gate62 = new Promise((r) => { release62 = r })
   const prevIdle62 = agent.whenIdle
   agent.whenIdle = () => gate62
+  // 0.7.16（审查 MED#2）：**开启拆卡** —— 封口时旧代会 makeCardState **新建**结论卡并推送；
+  // 那张新卡在 dispose 时还不存在 ⇒ 0.7.15 的按对象 WeakSet 拦不住它（审查指出的野卡漏洞）。
+  // 开关使下面「新建的卡不许发出去」断言从恒真变可证伪：0.7.15 上必红、0.7.16 代际旗上转绿。
+  process.env.DSH_FEISHU_SPLIT_MIN_MS = '0'
   const mark62 = sentCards.length
   const logMark62 = consoleLines.length
   let seq62 = 17000
@@ -4007,7 +4022,9 @@ console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡�
   // takeover log prints the internal id card=card_294 (create log has feishu token msg=om_card_294, strip om_ prefix).
   const tokM = consoleLines.slice(logMark62, logAdopt).join('\n').match(/card created[^\n]*msg=(\S+)/)
   const tok62 = tokM ? tokM[1] : ''
-  const cid62 = tok62.replace(/^om_/, '')
+  // 0.7.16（审查 LOW#2）：接管日志打印 token.slice(-8) ⇒ 期望值同样取 slice(-8)
+  //（去 om_ 前缀只在卡号 3 位时碰巧相等，4 位即假红）。
+  const cid62 = tok62.slice(-8)
   const modA = await import('../index.js')
   modA.apply(ctx)
   await drain()
@@ -4026,8 +4043,12 @@ console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡�
   await settle(3)
   ok(consoleLines.slice(logMark62).some((l) => l.includes('card sync skipped: generation disposed')),
     '★ H3：旧实例的封口推送被拦下（card sync skipped: generation disposed；0.7.13 无此拦截 ⇒ 红）')
+  // 0.7.16（审查 MED#1 更正措辞）：旧断言的「都会出」是错的 —— 旧实例封口已建卡走 PATCH（update），
+  // 这条只数 create ⇒ 本用例原夹具**不拆卡时恒真**（MED#2 的野卡要拆卡才出现）。
+  // 现在本用例开拆卡（见上方 E1）⇒ dispose 后旧代要新建结论卡 ⇒ 0.7.15 必红、0.7.16 转绿。
   ok(sentCards.slice(markAfterDispose).filter((c) => c.op === 'create').length === 0,
-    '★ H3：dispose 之后不许再新建卡（实际 ' + sentCards.slice(markAfterDispose).filter((c) => c.op === 'create').length + ' 张；0.7.13 的半截卡/0.7.14 的拦截失效都会出）')
+    '★ MED#2：dispose 之后旧代**新建**的卡不许发出去（实际 ' + sentCards.slice(markAfterDispose).filter((c) => c.op === 'create').length + ' 张）')
+  delete process.env.DSH_FEISHU_SPLIT_MIN_MS
   await settle(2)
 }
 

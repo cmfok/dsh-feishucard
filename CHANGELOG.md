@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.16] - 2026-10-03
+
+### 修复：0.7.15 独立审查 4 条（**0 critical / 0 high / 2 medium / 2 low**，逐条核对 0 误报）
+
+> 来源：`output\code-review\dsh-feishucard-0715-20261003-210436\REPORT.md`（VERDICT **WARN** 放行，0.7.15 已 push；按 0.7.9 先例逐条核对后全收 ⇒ 本版补完）。
+
+**① MED#2（真漏洞）：按卡对象登记只覆盖 dispose 时已存在的卡**
+- dispose 之后本代 runTurn 还会**新建**卡（拆结论卡 `makeCardState`、换卡 `rotateAdoptedCard`）——
+  那些新对象不在 WeakSet 里 ⇒ 照发 ⇒ 正是 H3 要拦的野卡类别。
+- 现在：**代际旗 `generationDisposed`**（每代闭包一个 boolean，dispose 一进来就置位）——
+  拦本代**一切**推送（封口/新建卡/入队后才执行的任务体），新代闭包旗=false ⇒ 接管/续卡照常；不再需要按对象登记。
+
+**② MED#1（断言恒真）：用例 62 的「不许再新建卡」在原夹具下永远为 0**
+- 旧实例封口已建卡走 PATCH（update），这条只数 create ⇒ 拆卡不开启时恒真、注释措辞也不实。
+- 现在：本用例**开启拆卡**（`DSH_FEISHU_SPLIT_MIN_MS=0`）⇒ dispose 后旧代要新建结论卡 ⇒
+  这条断言变可证伪（0.7.15 上**必红**、0.7.16 转绿），措辞按实测语义重写；用后删环境变量。
+
+**③ LOW：守卫只在 syncCard 入口判 —— dispose 前已入队的任务体会绕过**
+- 现在：队列**任务体内**复检代际旗（与既有 `createFailed` 队列内复检同一先例）。
+
+**④ LOW：用例 62 的 token 期望值（去 `om_` 前缀）只在卡号 3 位时碰巧等于日志的 `token.slice(-8)`**
+- 现在：期望值改用 `slice(-8)`，与接管日志同一取法（4 位卡号不再假红）。
 ## [0.7.15] - 2026-10-03
 
 ### 修复：0.7.14 独立审查 4 条（**0 critical / 1 high / 1 medium / 2 low**，逐条核对 0 误报）
