@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### 修复：身份注入（`identityGuard` 开关，**默认关**）
+
+- **在职校验改为反向排除**：原先只放行 `在职` / `active`，连「兼职」「待入职」也一起拒了。
+  现在只拒 `离职` / `终止办理` / `兼职终止` 三种状态，**其余一律正常**；离职仍单独报 `not_active`
+  （＝正常拒绝，与「不认识」是两件事，好让上层不要对离职者走"问姓名"之类兜底）。
+- **`actor` 回带画像层字段** `open_id` / `person_id`：`open_id` 同时是覆写白名单的成员，
+  **不回带就会被从工具参数里【删除】而不是覆写** —— 即"该字段无法被信任"变成"该字段消失"。
+- **删掉两处与实现相反的口径**：文件头与自测文案都还写着"表不可达 ⇒ **降级放行**"，
+  而同一份文件下面的说明与实现都是 fail-closed（无表即拒）。留着会诱导后人把已经修好的行为改回去。
+- **入站解析失败 ⇒ 拒绝执行**这条链路**此前没有任何端到端守护**（只有模块内自测），
+  现在由**冒烟用例 70** 锚定：开关关不拦 · 开＋认不出必拒（`identity_unresolved`）·
+  **非飞书回合一律放行**（不许把本机自己锁死）· 再打开开关又被拦（反证放行来自开关，而非记录消失）。
+- **拦截器补观测打点** `[fs] identity NOTE[no-record-allow]`：
+  「有会话归属、但没有本轮身份记录」目前按放行处理（**行为未变**）——
+  先量化实际频次，再决定是否收紧（收紧会波及卡片交互与切换会话之后的正常使用）。
+- **身份表生成器**：`pending` 条目**固定带 `open_id` 键**（无值时写 `null`，不再省略键）——
+  "本来就没有这个 id"与"忘了写"必须能从结构上区分开。
+
+### 变更（工程）
+
+- `package.json`：删掉 3 条指向**不存在脚本**的 npm script（`release` / `backfill-tags` / `backfill-releases`），
+  它们会让 `npm run release` 必然失败。
+- `README`「发布」一节：改为说明**机制**（四道硬闸门），不再给出指向私有工具链的命令。
+
 ## [0.7.19] - 2026-10-04
 
 ### 修复：0.7.17 独立审查 **BLOCK** —— 群判定（chatKinds）三条失效路径 ＋ 4 条 low，「群 ⇒ 恒 stable」补完
