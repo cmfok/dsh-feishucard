@@ -2018,7 +2018,8 @@ export function apply(ctx) {
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
   // 0.7.17（两模式）：mode 判定 —— **群一律 stable**（2030：共享的屏不按人变）；
-  // 私聊按 bot 配置（cfg.mode 热读 10s，缺省 full ＝ 与 0.7.16 逐字一致）。
+  // 私聊按 bot 配置（cfg.mode **热读 ≤500ms** —— ensureHelpers 每个 DRAIN_INTERVAL tick 都
+  // 无条件 `bot.cfg = cfg`，CONFIG_REFRESH_MS=10s 只 gate helper 拉起；缺省 full ＝ 与 0.7.16 逐字一致）。
   // 一期按 bot；NODE1 身份表就绪后升二期按人（open_id → 人，跨 bot 统一）。
   function resolveCardMode(bot, chatId) {
     const kinds = bot && bot.chatKinds
@@ -2667,6 +2668,15 @@ export function apply(ctx) {
         if (idx >= 0) activeIndex = idx
       }
       chats.set(chatId, { sessions, activeIndex })
+      // 0.7.19（审查 MED#1-B）：把落盘的 chat 类型恢复回内存 —— 热重载/重启后 chatKinds 是
+      // 空的，没有这步「群 ⇒ 恒 stable」只能靠下一条真消息自愈；无入站的主动推卡（goal/自动轮卡、
+      // 换卡）在恢复前会按 cfg（缺省 full）渲染，把过程叙述泄露给群（用例 69 实测红）。
+      // 旧 state 没有 kind 字段 ⇒ 不写 ⇒ 与旧行为一致（等下一条带 chat_type 的入站补上）。
+      const kind = record && record.kind
+      if (kind === 'group' || kind === 'p2p') {
+        if (!bot.chatKinds) bot.chatKinds = new Map()
+        bot.chatKinds.set(chatId, String(kind))
+      }
     }
     return chats
   }
@@ -2682,6 +2692,11 @@ export function apply(ctx) {
           id: s.id, label: s.label, title: s.title, type: s.type, gen: s.gen,
         })),
         active: active ? active.id : (chat.sessions[0] ? chat.sessions[0].id : 'main'),
+        // 0.7.19（审查 MED#1-B）：chat 类型随 chats 一起落盘（undefined 会被 JSON 丢弃 ⇒
+        // 没记过的 chat 不写字段）。kind 只在 bot.chatKinds 里，persistChats 的 9 个调用点
+        // 都传 bot ⇒ 这里直接读。用例 68 锚这个字段。
+        kind: bot.chatKinds && bot.chatKinds.get(chatId)
+          ? String(bot.chatKinds.get(chatId)) : undefined,
       }
     }
     writeState(bot.cfg.appId, state)
@@ -3444,8 +3459,11 @@ export function apply(ctx) {
     bot.lastChatId = chatId
     // 0.7.17（两模式）：记录 chat 类型（入站事件自带的 chat_type，p2p|group）——
     // 群判据**不信 oc_ 前缀**（2030：飞书单聊与群聊都用 oc_）⇒ 群一律 stable（见 resolveCardMode）。
+    // 0.7.19（审查 MED#1-A）：**只在事件真的带 chat_type 时写** —— 内部合成事件（cardfail 报错通知 /
+    // 热重载自动续跑）没有这个字段，旧写法 `|| 'p2p'` 会把**已知的群记录覆盖成 p2p** ⇒ 群降级 full
+    // ⇒ 过程叙述暴露给群里的员工（用例 66 实测红）。
     if (!bot.chatKinds) bot.chatKinds = new Map()
-    bot.chatKinds.set(chatId, String((evt && evt.chat_type) || 'p2p'))
+    if (evt && evt.chat_type) bot.chatKinds.set(chatId, String(evt.chat_type))
 
     const messageId = evt.message_id
     let text = extractText(evt.content)
@@ -3949,7 +3967,10 @@ export function apply(ctx) {
       } else if (replySeqs.length > 0) {
         // 0.7.17（stable seal）：渲染层隐藏镜像 note ⇒ 去重失去意义；整条答复直接作为 message 上卡
         //（结论可见 = V2）。full 模式走原去重逻辑，一字不改（下方 else 全体原样保留）。
-        if (card.mode === 'stable') {
+        // 0.7.19（审查 LOW#2）：**当场重解析，不读 card.mode** —— 那是上一次 sync 存下的值，
+        // 而紧随其后的渲染（buildCardPayload）每次都会重解析；两帧之间 cfg/chatKinds 变了就错位：
+        // seal 按 stable 推了 reply、渲染却按 full 画 ⇒ 同段答复显示两次（反向则答复消失）。
+        if (resolveCardMode(bot, chatId) === 'stable') {
           card.blocks.push({ type: 'message', text: reply })
           replaced = true
         } else {
@@ -4305,6 +4326,14 @@ export function apply(ctx) {
     }
     if (msg.type === 'event' && msg.eventType === 'im.message.receive_v1') {
       const evt = normalizeEvent(msg.data)
+      // 0.7.19（审查 MED#1-C）：**早记 chat 类型** —— 命令（/switch 等）在 handleInbound 之前
+      // 就从这条链分流走了（`!outcome.turnStarted` 直接 return，见下方 then），永远走不到
+      // handleInbound 里的记录 ⇒ 热重载后群的第一条命令必然绕过 stable 门禁（fail-open，
+      // 用例 67 实测红：/switch 在群里照常出切换卡）。与 handleInbound 同款守卫：带字段才写。
+      if (evt.chat_type) {
+        if (!bot.chatKinds) bot.chatKinds = new Map()
+        bot.chatKinds.set(evt.chat_id, String(evt.chat_type))
+      }
       // Control commands (/stop etc.) bypass the serial chain so they can
       // interrupt a running turn immediately — queuing them behind the turn
       // makes /stop arrive only after the turn finished (2026-08-15).
@@ -5478,6 +5507,13 @@ export function apply(ctx) {
   }
 
   async function handleSwitchAction(bot, chatId, value) {
+    // 0.7.19（审查 LOW#4）：F6 的 stable 门禁原来只拦**文字命令** /switch —— 这里是切换卡的
+    // **按钮回调**，同一能力的另一入口，stable 下同样拒绝（正常路径拿不到切换卡，但
+    // fail-open 场景曾经放行过一次 ⇒ 按钮路径必须自己也有一道门，不能依赖上游没漏）。
+    if (resolveCardMode(bot, chatId) === 'stable') {
+      console.log('[fs] switch card action refused: stable mode chat=' + chatId)
+      return
+    }
     const record = pendingSwitchCards.get(String(value.fs_switch || ''))
     if (!record) {
       // 记录已过期（>15 分钟）：没有 message_id 可改，只能发一条提示（这是唯一会"另起一条"的情况）。
