@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-10-03
+
+### 收口：附件名安全闸 = **单一信源**（第七轮审查）
+
+> 0.7.3 为了补回 `secrets.txt` / `tokens.txt` 这批复数名，把复数又加回了"分隔符界定"的正则里
+> ⇒ 同一个词出现**两套口径**：`secrets-budget.md` 被拦，而单数 `secret-budget.md` 放行（不对称，
+> 也与"松词只在文件名主干完全相等时才算敏感"的注释冲突）。
+> 现按审查建议收口：
+> - **松词（`key`/`env`/`secret`/`token`/`cookie`… 的单复数）只由 `SENSITIVE_STEM` 精确判定**（唯一信源）；
+> - 正则只留**本身就极可疑**的写法（`id_rsa` / `.env` / `private_key` / `keychain` / `.ssh` / `.aws` / `.dsh`）。
+>
+> 效果：`secrets.txt` / `tokens.txt` / `cookies.txt` 仍被拦（主干完全相等），
+> 而 `secret-budget.md` / `secrets-budget.md` 口径一致地放行。
+
 ## [0.7.3] - 2026-10-03
 
 ### 修复：第五轮审查（含一条**本版自己引入的安全回归**）

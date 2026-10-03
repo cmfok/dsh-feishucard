@@ -1409,7 +1409,10 @@ export function apply(ctx) {
   const SAFE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
   const SAFE_FILE_EXT = new Set(['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
     '.mp4', '.opus', '.txt', '.csv', '.md', '.zip'])
-  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|apikey|api[_-]?key|keychain|private[_-]?key|\.ssh|\.aws|\.dsh|secrets|tokens|cookies|passwords|credentials)([\\/_.-]|$)/i
+  // 只留"本身就极可疑"的写法；松词（key/env/secret/token/cookie… 的单复数）**一律交给
+  // SENSITIVE_STEM 精确判定** —— 两套口径并存会造成不对称（审查第七轮：secrets-budget.md 被拦、
+  // 单数 secret-budget.md 却放行）。**唯一信源 = SENSITIVE_STEM**。
+  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|apikey|api[_-]?key|keychain|private[_-]?key|\.ssh|\.aws|\.dsh)([\\/_.-]|$)/i
   // 最松的几个词（key/env/pwd…）只在**文件名主干完全等于它**时才算敏感 ——
   // 否则 `key-notes.pdf` / `env-diff.md` 这类正常文件会被误当成凭证（独立审查 LOW#1412）。
   // ⚠️ 单复数都要在（审查 MED#1412：把松词从正则里挪走后，只剩单数会造成
