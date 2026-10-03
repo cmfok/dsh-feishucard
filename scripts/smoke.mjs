@@ -5,7 +5,7 @@
 //   (create + PATCH updates) -> seal -> final reply on card.
 //
 // Run: node scripts/smoke.mjs   (from the package root)
-import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs'
+import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { EventEmitter } from 'node:events'
@@ -475,7 +475,7 @@ if (COLD) {
     // 审查 MED#475：断言失败后**不能**继续解引用，否则抛 TypeError 把整轮冒烟打断、看不到真因
     const refused = tool
       ? await tool.execute({ title: '没开通道不该发', chatId: CHAT_ID }, { agent, signal: undefined })
-      : { ok: false, detail: '（feishu_approval_form 未注册）' }
+      : { ok: false, missing: true, detail: '（feishu_approval_form 未注册）' }
     ok(refused && refused.ok === false && String(refused.detail).includes('没打开审批单通道'),
       '★ 未开启 ⇒ 调用被明确拒绝（实际：' + JSON.stringify(refused && refused.detail || refused) + '）')
     ok(String(refused && refused.detail).includes('approvalForm'), '拒绝里带"怎么打开"（可被 Agent 转告用户）')
@@ -494,7 +494,7 @@ if (COLD) {
     // 审查 LOW#476：光守住第一处不够 —— 这里再解引用一次，工具没注册照样抛 TypeError 打断整轮
     const pending = tool
       ? tool.execute({ title: '开通道后就该发得出', chatId: CHAT_ID }, { agent, signal: undefined })
-      : Promise.resolve({ ok: false, detail: '（feishu_approval_form 未注册）' })
+      : Promise.resolve({ ok: false, missing: true, detail: '（feishu_approval_form 未注册）' })
     // 这张卡会一直等点击 ⇒ 只等几秒，别把冷启动用例挂住
     await Promise.race([pending.catch(() => { }), new Promise((r) => setTimeout(r, 3000))])
     await drain()
@@ -3294,7 +3294,10 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
   const gMark = sentCards.length
   // 独立审查 HIGH#1：TEMP 是 Windows 专有 ⇒ CI(ubuntu) 上会拼出**相对路径**，
   // LOCAL_IMAGE_RE 认不出、G 用例必红。用 tmpdir() 才是跨平台绝对路径。
-  const picPath = join(tmpdir(), 'fs-smoke-pic.png')
+  // 审查 LOW#3375：夹具放进**本次运行独有**的目录（原先共享 tmpdir + 固定文件名 ⇒ 两次运行会撞车、
+  // 异常退出还会把 id_rsa.png 留在共享 temp 里）。
+  const fixtureDir = mkdtempSync(join(tmpdir(), 'fs-smoke-fix-'))
+  const picPath = join(fixtureDir, 'fs-smoke-pic.png')
   writeFileSync(picPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
   // 审查 MED#3293：同上，工具没注册时要"干净地判红"，不能抛 TypeError
   const gOut = imgTool
@@ -3302,7 +3305,7 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
       text: '把这张图发我 ![示意图](' + picPath + ')',
       chatId: FREE_CHAT,
     }, { agent, signal: undefined })
-    : { ok: false, detail: '（feishu_send 未注册）' }
+    : { ok: false, missing: true, detail: '（feishu_send 未注册）' }
   await drain()
   ok(imageUploads.length >= 1, '★ 本地图片**触发了上传**（POST /open-apis/im/v1/images）')
   const gText = JSON.stringify(sentCards.slice(gMark).map((c) => c.payload))
@@ -3313,14 +3316,14 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
 
   // ---- G-文件（审查 MED#1410：uploadFile/sendFileMessage 曾是**死代码**、文件那半边根本没接线）
   //      本地**文件**链接 ⇒ 上传换 file_key ⇒ 作为**文件消息**发出 ⇒ 卡里只留一句"已发送"
-  const docPath = join(tmpdir(), 'fs-smoke-doc.pdf')
+  const docPath = join(fixtureDir, 'fs-smoke-doc.pdf')
   writeFileSync(docPath, Buffer.from('%PDF-1.4\n% smoke fixture\n'))
   const fileMark = sentCards.length
   const fileUpBefore = fileUploads.length
   const gFileOut = imgTool
     ? await imgTool.execute({ text: '报告在 [季度报告.pdf](' + docPath + ')', chatId: FREE_CHAT },
       { agent, signal: undefined })
-    : { ok: false, detail: '（feishu_send 未注册）' }
+    : { ok: false, missing: true, detail: '（feishu_send 未注册）' }
   await drain()
   ok(Boolean(imgTool) && fileUploads.length > fileUpBefore,
     '★ 本地文件**触发了上传**（POST /open-apis/im/v1/files）')
@@ -3328,13 +3331,16 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
     && sentCards.slice(fileMark).some((c) => JSON.stringify(c.payload || {}).includes('file_v3_smoke_key')),
     '★ 作为**文件消息**真的发出去了（file_key 到位）')
   ok(gFileOut && gFileOut.ok === true, '（工具侧）文件发送成功 ⇒ Agent 拿到 ok')
+  // 审查 LOW#3330：文件那半边也要验"本地路径已从卡里抹掉"（否则整张卡会被飞书拒）
+  ok(!JSON.stringify(sentCards.slice(fileMark).map((c) => c.payload)).includes('fs-smoke-doc.pdf'),
+    '★ 卡里**不再有本地文件路径**（否则整张卡会被飞书拒）')
 
   // ---- 安全闸回归（审查 HIGH#2）：凭证/密钥类路径**绝不外传**
   const upBefore = fileUploads.length + imageUploads.length
   const sensitiveMark = sentCards.length   // 审查 LOW#3344：断言要用**自己那段**窗口，别复用 fileMark
   // 审查 MED#3331：原来指向一个**不存在**的 Windows 路径 ⇒ ENOENT 也会让它"绿"，挡不住 HIGH#2 回归。
   // 现在造一个**真实存在**、唯一拦截理由就是"名字触发安全闸"的夹具（PNG 文件头 + 敏感文件名）。
-  const sensitivePic = join(tmpdir(), 'id_rsa.png')
+  const sensitivePic = join(fixtureDir, 'id_rsa.png')
   writeFileSync(sensitivePic, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
   if (imgTool) {
     await imgTool.execute({
@@ -3359,22 +3365,20 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
       text: '**这段会先被拒** ![图](http://example.com/x.png)',
       chatId: FREE_CHAT,
     }, { agent, signal: undefined })
-    : { ok: false, detail: '（feishu_send 未注册）' }
+    : { ok: false, missing: true, detail: '（feishu_send 未注册）' }
   await drain()
   ok(consoleLines.some((l) => l.includes('plain text send failed')), '★ 兜底失败**留痕**（不再静默）')
   ok(consoleLines.some((l) => l.includes('plain text degraded retry')), '★ 自动**降级重试**（剥掉 markdown 再发一次）')
   // 审查 LOW#3315：mock 在"判定被拒"**之前**就 push 了 ⇒ 上面那条恒真。
   // 用"新增条数 == 2"才能证明**两次尝试都发生了**（首次 + 降级重试）。
   ok(sentCards.slice(fMark).length === 2, '★ 降级重试确实又发了一次（两次尝试都计数，不是空转）')
-  ok(fOut && fOut.ok === false,
+  // 审查 LOW#3357：兜底对象带 missing 标记 ⇒ 这条负向断言不会因为"工具没注册"而假绿。
+  ok(fOut && fOut.ok === false && fOut.missing !== true,
     '★ 两次都失败 ⇒ **工具把失败交回 Agent**（它不会以为发成功了就收工）：'
       + JSON.stringify(fOut && fOut.detail).slice(0, 90))
 
-  // 审查 LOW#3314：夹具用的是共享临时目录里的**固定文件名**，跑完必须清理
-  //（否则会残留，尤其一个叫 id_rsa.png 的文件躺在 %TEMP% 里）。
-  for (const fixture of [picPath, docPath, sensitivePic]) {
-    try { unlinkSync(fixture) } catch { /* 清不掉不影响结论 */ }
-  }
+  // 审查 LOW#3314/#3375：夹具在本次运行独有的目录里，跑完整目录删掉（异常退出也不会污染共享 temp）。
+  try { rmSync(fixtureDir, { recursive: true, force: true }) } catch { /* 清不掉不影响结论 */ }
 }
 console.log('')
 if (failures === 0) {

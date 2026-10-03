@@ -1409,7 +1409,7 @@ export function apply(ctx) {
   const SAFE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
   const SAFE_FILE_EXT = new Set(['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
     '.mp4', '.opus', '.txt', '.csv', '.md', '.zip'])
-  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|secret|secrets|credential|credentials|password|passwd|token|tokens|apikey|api[_-]?key|cookie|cookies|keychain|private[_-]?key|\.ssh|\.aws|\.dsh)([\\/_.-]|$)/i
+  const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|apikey|api[_-]?key|keychain|private[_-]?key|\.ssh|\.aws|\.dsh)([\\/_.-]|$)/i
   // 最松的几个词（key/env/pwd…）只在**文件名主干完全等于它**时才算敏感 ——
   // 否则 `key-notes.pdf` / `env-diff.md` 这类正常文件会被误当成凭证（独立审查 LOW#1412）。
   const SENSITIVE_STEM = new Set(['key', 'keys', 'env', 'pwd', 'secret', 'token', 'password', 'passwd', 'credential', 'credentials', 'cookie'])
@@ -1428,7 +1428,9 @@ export function apply(ctx) {
     return ''
   }
   function looksLikePrivateKey(buf) {
-    return /BEGIN (RSA|OPENSSH|EC|DSA|PGP)? ?PRIVATE KEY/.test(buf.slice(0, 4096).toString('latin1'))
+    // 任何 PEM 私钥标签都拦：含 `BEGIN ENCRYPTED PRIVATE KEY`（openssl pkcs8 -topk8 的产物）
+    // 与 `BEGIN SSH2 ENCRYPTED PRIVATE KEY`（审查 MED#1431 指出原先只认 RSA/OPENSSH/EC/DSA/PGP）。
+    return /BEGIN(?: [A-Z0-9]+)* PRIVATE KEY/.test(buf.slice(0, 4096).toString('latin1'))
   }
   function assertSafeAttachment(filePath, kind) {
     const p = String(filePath || '')
@@ -1708,7 +1710,9 @@ export function apply(ctx) {
     // ② **体积类**：内容本身没毛病，但"整卡太长/元素太多" ⇒ 纯文本只有 1 个元素、通常发得出去，
     //    所以照样要**抢救正文**（审查 MED#1676：并进限流类会让用户一直看不到东西）。
     // 11310 = card table number over limit（见本文件 ~934 行的真机记录）⇒ 属**数量/体积**类，不是写法错。
-    if (/too large|exceed|element.*limit|content.*limit|11310/i.test(s)) return 'toolarge'
+    // ⚠️ 不能只写 `exceed`：`timeout exceeded` / `retries exceeded` 都会被误判成体积类
+    // 并触发"正文抢救"（审查 LOW#1711）⇒ 必须紧跟 limit 才算体积。
+    if (/too large|exceed\w*.{0,20}limit|element.*limit|content.*limit|11310/i.test(s)) return 'toolarge'
     // ③ **限流类**：重发也会被限 ⇒ 走退避/熔断，别谎报"摘掉片段就好了"（审查 MED#1513）
     if (/frequency|rate limit|rate_limit|99991400/i.test(s)) return 'limited'
     return 'transport'
@@ -1976,7 +1980,6 @@ export function apply(ctx) {
           })
           // 看门狗判据：有工具在跑 ⇒ 静默属于"正常等工具"，不是"上游没回包"
           card.pendingTools = Number(card.pendingTools || 0) + 1
-          card.stallNotified = false
           card.idleKind = ''
           appendTool(card, id)
           changed = true
@@ -1987,7 +1990,6 @@ export function apply(ctx) {
           const tool = card.tools.get(String(id))
           if (tool) {
             if (tool.status === 'running') card.pendingTools = Math.max(0, Number(card.pendingTools || 0) - 1)
-            card.stallNotified = false
             const block = event.data.message.content && event.data.message.content[0]
             tool.status = block && block.isError ? 'failed' : 'completed'
             if (tool.status === 'failed') {
@@ -2040,7 +2042,6 @@ export function apply(ctx) {
           card.lastEventAt = Date.now()
           card.idleMinutes = 0
           card.idleKind = ''
-          card.stallNotified = false
           card.stallNotifiedAt = 0
           void syncCard(bot, chatId, card, false).catch(() => {})
         } else if (card.status === 'running' && card.lastEventAt) {

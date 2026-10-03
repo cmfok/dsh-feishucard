@@ -12,7 +12,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node >=22.15 才有 zlib.zstdDecompressSync（index.js 顶层就用它读 .zstd 会话日志）；
+          # 本机生产运行时是 v24 ⇒ CI 与生产对齐。
+          # 真因记录：Node 20 上 `import { zstdDecompressSync } from 'node:zlib'` 直接
+          # SyntaxError（does not provide an export named ...）⇒ 此前每一次 push 的 CI 都是红的。
+          node-version: 24
 
       - name: Syntax check
         run: node --check index.js && node --check helper.cjs
