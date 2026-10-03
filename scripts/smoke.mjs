@@ -2842,10 +2842,17 @@ console.log('45) exit_plan_mode 经【工具层】接管（2026-10-02 换的通�
   const planCardOf = (since) => cardsSince(since).filter((c) => c.op === 'create')
     .find((c) => JSON.stringify(c.payload).includes('计划已写好'))
 
-  // (a) 红线：非飞书 agent / 空计划 ⇒ 两个监听器都必须 next()
+  // (a) 红线：非飞书 agent / 空计划 ⇒ **所有**监听器都必须 next()
+  // ⚠️ 2026-10-04：原先写死 `length === 2`（当时 tools/execute 上只有 exit_plan_mode +
+  //    ask_user_question 两条【专用】拦截）。0.7.18 新增了【通用】身份覆写拦截
+  //    （`ctx.on('tools/execute')`：不拦任何工具、只覆写身份、一律 next）⇒ 变成 3 个
+  //    ⇒ 写死的 2 让这条**红线误报**（CI run 37150060118 唯一失败项，本地同样复现）。
+  //    红线的本意是「**不许吞掉**非飞书的工具调用」，**不是「必须恰好 2 个」**
+  //    ⇒ 改成 `>= 2`（下限守住"两条专用拦截都在"），并把实际数量打进消息便于以后自查。
   const foreign = await Promise.all(capture(emitCtx('tools/execute',
     { name: 'exit_plan_mode', agent: { id: 'agent-not-feishu' }, arguments: { plan }, signal: undefined }, nextSpy)))
-  ok(foreign.length === 2 && foreign.every((o) => o.value === 'next'), '非飞书 agent ⇒ 一律交回下一个（红线）')
+  ok(foreign.length >= 2 && foreign.every((o) => o.value === 'next'),
+    '非飞书 agent ⇒ 一律交回下一个（红线；listeners=' + foreign.length + '）')
   const emptyPlan = await Promise.all(capture(emitCtx('tools/execute',
     { name: 'exit_plan_mode', agent, arguments: { plan: '   ' }, signal: undefined }, nextSpy)))
   ok(emptyPlan.every((o) => o.value === 'next'), '计划正文为空 ⇒ 交回下一个（不吞）')
@@ -4159,6 +4166,236 @@ console.log('65) ★ 0.7.17 群一律 stable＋三开关全关（C）：mode 配
   ok(ops65.length >= 1, '（前提）群消息建了卡（实际 ' + ops65.length + ' 张）')
   ok(last65.includes('群答复-GROUP65-乙'), '★ 群：答复照常显示')
   ok(!last65.includes('群叙述-GROUP65-甲'), '★ 群：过程叙述**不渲染**（群里一律 stable；0.7.16 无过滤 ⇒ 红）')
+  await settle(2)
+}
+
+console.log('66) ★ 0.7.19 RED-A 群判定不许被内部合成事件覆盖（cardfail 注入缺 chat_type ⇒ 群降级 full）')
+{
+  // 审查 MED（两份审查交叉印证）发现 1-A：notifyCardFailure 往 handleInbound 注入的事件**不带 chat_type**，
+  // 旧实现 `bot.chatKinds.set(chatId, String(evt.chat_type || 'p2p'))` 无条件覆盖 ⇒ 群记录被改写成 p2p
+  // ⇒ resolveCardMode 落到 cfg（缺省 full）⇒ 过程叙述暴露给群。锚定：覆盖发生的**紧接着那一轮**
+  //（注入轮自己）必须仍按 stable 渲染。cfg.mode 缺省（=full），群降级只能靠 chatKinds。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  await settle(2)
+  const GROUP66 = 'oc_group66_test'
+  const feed66 = (msgId, text) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: { message_id: msgId, message_type: 'text', chat_type: 'group',
+                    chat_id: GROUP66, content: JSON.stringify({ text }) },
+        sender: { sender_id: { open_id: 'ou_test' } },
+      },
+    }) + '\n'
+  }
+  let seq66 = 20000
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq66, data: { message: { content: [{ type: 'text', text: '过程叙述-A66-甲' }] } } },
+      { type: 'assistant/message', seq: ++seq66, data: { message: { content: [{ type: 'text', text: '答复-A66-乙' }] } } },
+    )
+  }
+  const mark66a = sentCards.length
+  feed66('om_group66_m1', '群判定-建立 group 记录')
+  await settle(5)
+  const ops66a = cardsSince(mark66a).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last66a = ops66a.length ? JSON.stringify(ops66a[ops66a.length - 1].payload) : ''
+  ok(ops66a.length >= 1, '（前提）群 M1 建了卡（实际 ' + ops66a.length + ' 张）')
+  ok(last66a.includes('答复-A66-乙') && !last66a.includes('过程叙述-A66-甲'),
+    '（前提）M1 按 stable 渲染（group 记录已建立：答复在、过程滤）')
+
+  // 注入触发：create 被拒（230099 且不含 11310 ⇒ classify=rejected ⇒ 非 toolarge ⇒
+  // notifyCardFailure 走 else 分支 ⇒ 往 handleInbound 注入**无 chat_type** 的合成事件）。
+  const mark66b = sentCards.length
+  const logMark66 = consoleLines.length
+  rejectPatches = 1
+  rejectPatchesBody = { code: 230099, msg: 'Failed to create card content (injected: chatKinds overwrite RED)' }
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq66, data: { message: { content: [{ type: 'text', text: '过程叙述-INJECT-丙' }] } } },
+      { type: 'assistant/message', seq: ++seq66, data: { message: { content: [{ type: 'text', text: '注入答复-INJECT-丁' }] } } },
+    )
+  }
+  feed66('om_group66_m2', '触发卡片失败注入')
+  await settle(6)
+  rejectPatches = 0
+  rejectPatchesBody = null
+  const log66 = consoleLines.slice(logMark66)
+  ok(log66.some((l) => l.includes('card failure notice sent')),
+    '（前提）触发了非 toolarge 失败注入（card failure notice sent；没触发则本用例恒真=假保险丝）')
+  const ops66b = cardsSince(mark66b).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last66b = ops66b.length ? JSON.stringify(ops66b[ops66b.length - 1].payload) : ''
+  ok(ops66b.length >= 1, '（前提）注入轮建了卡（实际 ' + ops66b.length + ' 张；没有卡则断言无从锚定）')
+  ok(last66b.includes('注入答复-INJECT-丁'),
+    '（前提）注入轮渲染出了答复（证明卡是活的，不是死卡假绿）')
+  ok(!last66b.includes('过程叙述-INJECT-丙'),
+    '★ 注入轮仍按 stable 渲染：内部事件不许把群改写成 p2p（旧实现 || \'p2p\' 覆盖 ⇒ full ⇒ 红）')
+  await settle(2)
+}
+
+console.log('67) ★ 0.7.19 RED-C 热重载后群第一条命令 /switch 仍要被拒（门禁跑在记录之前 ⇒ fail-open）')
+{
+  // 审查 MED 发现 1-C：/switch 门禁（handleCommand）跑在 handleInbound 的 chatKinds 记录之前，
+  // 而热重载后 chatKinds 清零（发现 1-B）⇒ 群第一条命令必然绕过 F6 门禁（fail-open）。
+  // 修复：handleHelperMessage 的 normalizeEvent 之后**早记** chat_type（命令分支也覆盖）。
+  // 本用例锚定：re-apply 之后，同群发 /switch 必须仍被「稳定版不支持」拒绝。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  await settle(2)
+  const GROUP67 = 'oc_group67_test'
+  const feed67 = (msgId, text) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: { message_id: msgId, message_type: 'text', chat_type: 'group',
+                    chat_id: GROUP67, content: JSON.stringify({ text }) },
+        sender: { sender_id: { open_id: 'ou_test' } },
+      },
+    }) + '\n'
+  }
+  const mark67a = sentCards.length
+  feed67('om_group67_m1', '群判定-热重载前建立 group 记录')
+  await settle(5)
+  ok(cardsSince(mark67a).filter((c) => c.payload && c.payload.schema === '2.0').length >= 1,
+    '（前提）热重载前群 M1 建了卡（group 记录已建立）')
+
+  // 模拟热重载 = **先卸载旧代**（case 51 同款流程），否则新旧两代并存 ⇒ 两代 helper 竞争消费
+  // 同一入站流 ⇒ 断言结果不纯（RED 首跑实测：68 被留有 group 记录的旧代代劳 ⇒ 假绿）。
+  for (const cleanup67 of effectCleanups) { try { cleanup67() } catch { /* 卸载副作用不关心 */ } }
+  globalThis.__fsReloadHint = null
+  const mod67 = await import('../index.js')
+  mod67.apply(ctx)
+  await drain()
+  await drain()
+
+  const mark67b = sentCards.length
+  feed67('om_group67_switch', '/switch')
+  await settle(5)
+  const touched67 = cardsSince(mark67b)
+  ok(touched67.some((c) => JSON.stringify(c.payload || {}).includes('稳定版不支持')),
+    '★ 热重载后群第一条命令 /switch 仍被拒（旧实现：门禁时 chatKinds 空 ⇒ cfg 缺省 full ⇒ 放行 ⇒ 红）')
+  await settle(2)
+}
+
+console.log('68) ★ 0.7.19 RED-B 群判定必须随 chats 落盘（persistChats 写 kind —— 旧实现不写 ⇒ 红）')
+{
+  // 审查 MED 发现 1-B：chatKinds 只在内存、不随 bot.chats 落盘 ⇒ 每次热重载群判定清零。
+  // 修复 = persistChats 写 kind + loadChats 恢复。本用例锚修复**本体**（落盘字段）。
+  // ⚠️ RED 首跑教训：「重启后再发一条群消息」那条路判别不了 B —— 真群消息自带 chat_type，
+  // 入站当场把 kind 写对（自愈）⇒ 旧 68 恒绿（假保险丝）。行为面改由用例 69 锚（无入站主动推卡）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  await settle(2)
+  const GROUP68 = 'oc_group68_test'
+  const feed68 = (msgId, text) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: { message_id: msgId, message_type: 'text', chat_type: 'group',
+                    chat_id: GROUP68, content: JSON.stringify({ text }) },
+        sender: { sender_id: { open_id: 'ou_test' } },
+      },
+    }) + '\n'
+  }
+  let seq68 = 21000
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push(
+      { type: 'assistant/message', seq: ++seq68, data: { message: { content: [{ type: 'text', text: '过程叙述-B68-甲' }] } } },
+      { type: 'assistant/message', seq: ++seq68, data: { message: { content: [{ type: 'text', text: '答复-B68-乙' }] } } },
+    )
+  }
+  const mark68 = sentCards.length
+  feed68('om_group68_m1', '落盘-建立 group 记录')
+  await settle(5)
+  const ops68 = cardsSince(mark68).filter((c) => c.payload && c.payload.schema === '2.0')
+  const last68 = ops68.length ? JSON.stringify(ops68[ops68.length - 1].payload) : ''
+  ok(ops68.length >= 1 && last68.includes('答复-B68-乙') && !last68.includes('过程叙述-B68-甲'),
+    '（前提）M1 按 stable 渲染（chat 记录已建立）')
+
+  const statePath68 = join(process.env.FS_CONFIG_DIR,
+    'state-' + String(APP_ID).replace(/[^a-zA-Z0-9]/g, '') + '.json')
+  let state68 = null
+  try { state68 = JSON.parse(readFileSync(statePath68, 'utf8')) } catch { state68 = null }
+  const rec68 = state68 && state68.chats && state68.chats[GROUP68]
+  ok(Boolean(rec68), '（前提）M1 的 chat 记录已落盘（state 文件里有该群）')
+  ok(rec68 && rec68.kind === 'group',
+    '★ chat_kind 随 chats 落盘（persistChats 写 kind=group；旧实现不写 ⇒ 红）')
+  await settle(2)
+}
+
+console.log('69) ★ 0.7.19 RED-B2 重启后【无入站的主动推卡】仍 stable：goal 轮卡不许泄露过程叙述')
+{
+  // B 的真实行为击穿（OCR 报告同款路径）：重启后、该群还没有新入站时，goal/自动轮卡经
+  // findChatForAgent（按**已落盘的 session id** 认领，见 index.js:4424 与用例 50 先例）解析
+  // where —— 全程不经飞书入站 ⇒ chatKinds 不会"自愈"。未修复：loadChats 不恢复 kind ⇒
+  // chatKinds 空 ⇒ cfg 缺省 full ⇒ 过程叙述上卡（泄露给群里的员工）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  await settle(2)
+  const GROUP69 = 'oc_group69_test'
+  const feed69 = (msgId, text) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: { message_id: msgId, message_type: 'text', chat_type: 'group',
+                    chat_id: GROUP69, content: JSON.stringify({ text }) },
+        sender: { sender_id: { open_id: 'ou_test' } },
+      },
+    }) + '\n'
+  }
+  agent.send = function (message) { this.sent.push(message) }
+  feed69('om_group69_m1', '建会话+落盘（供跨代认领）')
+  await settle(5)
+  const sess69 = createdSessionIds[createdSessionIds.length - 1] || agent.id
+  ok(Boolean(sess69), '（前提）拿到已落盘的会话 id（跨代认领的钥匙：' + sess69 + '）')
+
+  // 卸旧代 + re-apply（热重载语义，同 67）
+  for (const cleanup69 of effectCleanups) { try { cleanup69() } catch { /* 卸载副作用不关心 */ } }
+  globalThis.__fsReloadHint = null
+  const mod69 = await import('../index.js')
+  mod69.apply(ctx)
+  await drain()
+  await drain()
+
+  // goal 轮（全程无飞书入站）：id 用落盘会话 id（findChatForAgent 按它认领），
+  // session 用顶层 agent 的活事件流（process 事件从这里读）。
+  const adapt69 = { id: sess69, ctx: agentCtx, session: agent.session }
+  const mark69 = sentCards.length
+  let seq69 = 25000
+  agentEvents.push({
+    type: 'user/message', seq: ++seq69,
+    data: {
+      content: [{ type: 'text', text: '<goal_round>\nRound: 1/10\n</goal_round>' }],
+      source: { kind: 'goal', goalId: 'g69', revision: 1, round: 1 },
+    },
+  })
+  emitCtx('agent/status', { agent: adapt69, status: 'running' })
+  await drain()
+  agentEvents.push(
+    { type: 'assistant/message', seq: ++seq69, data: { message: { content: [{ type: 'text', text: '目标轮过程叙述-B69-甲' }] } } },
+    { type: 'assistant/message', seq: ++seq69, data: { message: { content: [{ type: 'text', text: '目标轮结论-B69-乙' }] } } },
+  )
+  await drain()
+  emitCtx('agent/status', { agent: adapt69, status: 'idle' })
+  await settle(4)
+  const body69 = JSON.stringify(cardsSince(mark69))
+  ok(body69.includes('第 1 轮'),
+    '（前提）goal 轮卡建立且卡面轮次可见（跨代 owner 认领成功 —— 事件流真的进卡了）')
+  ok(body69.includes('目标轮结论-B69-乙'), '（前提）goal 轮结论渲染出来了（卡是活的）')
+  ok(!body69.includes('目标轮过程叙述-B69-甲'),
+    '★ 重启后无入站的 goal 轮按 stable 渲染（过程叙述不渲染；旧实现 kind 不恢复 ⇒ full ⇒ 红）')
   await settle(2)
 }
 
