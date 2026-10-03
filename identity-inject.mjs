@@ -22,6 +22,7 @@
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 
 /** actor 里允许/必须被覆写的身份字段（白名单，规格 §2.5 定死） */
 export const IDENTITY_KEYS = Object.freeze([
@@ -206,6 +207,15 @@ export function makeResolver ({ mapPath = null,
     if (process.env.MAILBOX_RESOLVER) return process.env.MAILBOX_RESOLVER
     return pickResolverPath(workspaceRoot)
   }
+  // 🔑 **本地增量**：每台一份，**放在工作区之外**（`~/.dsh-feishucard/`）
+  //    ⇒ **天然不参与 Syncthing** ⇒ HOME / CM-OFFICE **各写各的**（两台 bot 的 app_id 不同），
+  //      **不会互相覆盖**（主表是共享的、只读；增量只补 `open_ids{本机 bot 的 app_id}`）。
+  //    CM 2026-10-04 关切：「表放工作区会同步到公司电脑，那公司和服务器也不会被锁死」——
+  //    主表共享解决"读得到"，本地增量解决"各自认得出"。
+  function currentLocalMapPath () {
+    if (process.env.MAILBOX_IDENTITY_LOCAL) return process.env.MAILBOX_IDENTITY_LOCAL
+    try { return path.join(os.homedir(), '.dsh-feishucard', 'identity_map.local.json') } catch { return '' }
+  }
 
   function tableOk () {
     try { return fs.statSync(currentMapPath()).isFile() } catch { return false }
@@ -227,17 +237,26 @@ export function makeResolver ({ mapPath = null,
         cachedTableMtime = mt
       } catch { /* 读不到 mtime 就用旧缓存 */ }
       if (cache.has(openId)) return { ...cache.get(openId), tableOk: true }
+      // 主表 ＋ **本地增量** 合并后再解析（增量只补 `open_ids`；其余字段以主表为准）
       const code = [
-        'import json,sys',
+        'import json,sys,os',
         'sys.path.insert(0, sys.argv[1])',
         'from resolve_actor import resolveActor',
         'm = json.load(open(sys.argv[2], encoding="utf-8-sig"))',
+        'lp = sys.argv[4] if len(sys.argv) > 4 else ""',
+        'if lp and os.path.isfile(lp):',
+        '    loc = json.load(open(lp, encoding="utf-8-sig"))',
+        '    byname = {p.get("name"): p for p in m.get("people", [])}',
+        '    for per in loc.get("people", []):',
+        '        tgt = byname.get(per.get("name"))',
+        '        if tgt is not None:',
+        '            tgt.setdefault("open_ids", {}).update(per.get("open_ids") or {})',
         'a, e = resolveActor(sys.argv[3], m)',
         'print(json.dumps({"actor": a, "err": e}, ensure_ascii=True))',
       ].join('\n')
       let out
       try {
-        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId],
+        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId, currentLocalMapPath()],
           { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, PYTHONIOENCODING: 'utf-8' } })
         out = String(r.stdout || '').trim()
       } catch (e) {
