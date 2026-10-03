@@ -84,6 +84,10 @@ let createReturnsEmptyId = false   // 建卡幂等测试：模拟返回体缺 me
 // 「建结论卡那一次」而不误伤过程卡的建卡。0 = 不启用。
 let failCreatesFrom = 0
 const globalFetch = globalThis.fetch
+// 2026-10-03 F/G 用例要用的 mock 状态
+const imageUploads = []
+const fileUploads = []
+let rejectPatches = 0
 globalThis.fetch = async (url, init) => {
   const u = String(url)
   if (u.includes('/auth/v3/tenant_access_token/internal')) {
@@ -102,12 +106,32 @@ globalThis.fetch = async (url, init) => {
     if (resourceShouldFail) return { ok: false, status: 403, text: () => Promise.resolve('forbidden') }
     return { ok: true, status: 200, arrayBuffer: async () => resourceBytes }
   }
+  if (u.includes('/im/v1/images')) {
+    imageUploads.push({ url: u })
+    return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: { image_key: 'img_v3_smoke_key' } })) }
+  }
+  if (u.includes('/im/v1/files')) {
+    fileUploads.push({ url: u })
+    return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: { file_key: 'file_v3_smoke_key' } })) }
+  }
   if (u.includes('/im/v1/messages')) {
     const raw = JSON.parse(init.body)
     const payload = typeof raw.content === 'string' ? JSON.parse(raw.content) : raw
     sentCards.push({ op: init.method === 'PATCH' ? 'update' : 'create', payload })
     if (init.method === 'PATCH') {
       return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0 })) }
+    }
+    if (rejectPatches > 0) {
+      // F 用例：模拟"内容被拒"（真机原话 code 230099 / ErrCode 200570 / invalid image keys）
+      // —— 建卡与 PATCH **都要能命中**（新建一轮是 `create`，不是 PATCH）
+      rejectPatches -= 1
+      return {
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify({
+          code: 230099,
+          msg: 'Failed to create card content, ext=ErrCode: 200570; ErrMsg: card contains invalid image keys',
+        })),
+      }
     }
     if (failCreatesFrom > 0) {
       failCreatesFrom -= 1
@@ -439,13 +463,23 @@ if (COLD) {
     ok(createsSince(before).length === 0, 'DSH_FEISHU_GOAL_CARDS=0 ⇒ 目标轮不自动建卡（不刷屏）')
     emitCtx('agent/status', { agent, status: 'idle' })
   } else if (COLD === 'form-off') {
-    // 2026-10-03：审批单是**可选通道，默认关** —— 配置里没写 approvalForm（或 false）时
-    // **一个工具都不注册**（对外部使用者＝零噪声），并留痕。
-    ok(!registeredTools.some((t) => t && t.name === 'feishu_approval_form'),
-      'approvalForm 未开启 ⇒ feishu_approval_form **根本不注册**（零噪声）')
-    ok(consoleLines.some((l) => l.includes('approval form tool NOT registered')), '并留痕（可日志复验）')
-    ok(registeredTools.some((t) => t && t.name === 'feishu_send'), '（前提）别的工具照常注册 —— 证明不是"啥都没加载"')
-    // 0.6.4（CM 2026-10-03：「公司电脑的 BOT 想开怎么办？」）：**热开启必须免重启生效**
+    // 2026-10-03 **方案 B（CM 定稿）**：审批单工具**始终注册** ——
+    // 好处是 Agent 能主动告诉用户"这里有个通道、要不要开"；"开不开"仍由配置决定：
+    // 该 bot 没写 `approvalForm: true` 时，调用被**明确拒绝**并把"怎么打开"写在返回里。
+    ok(registeredTools.some((t) => t && t.name === 'feishu_approval_form'),
+      '★ 方案 B：approvalForm 未开启时工具**仍然注册**（Agent 才有机会提示用户去开）')
+    ok(consoleLines.some((l) => l.includes('方案 B：始终注册')), '并留痕（可日志复验）')
+    ok(registeredTools.some((t) => t && t.name === 'feishu_send'), '（前提）别的工具照常注册')
+    // 调用必须被拒且"话能照做"（CM 要的兜底：Agent 收到信息）
+    const tool = registeredTools.find((t) => t && t.name === 'feishu_approval_form')
+    const refused = await tool.execute({ title: '没开通道不该发', chatId: CHAT_ID },
+      { agent, signal: undefined })
+    ok(refused && refused.ok === false && String(refused.detail).includes('没打开审批单通道'),
+      '★ 未开启 ⇒ 调用被明确拒绝（实际：' + JSON.stringify(refused && refused.detail || refused) + '）')
+    ok(String(refused && refused.detail).includes('approvalForm'), '拒绝里带"怎么打开"（可被 Agent 转告用户）')
+    ok(!sentCards.some((c) => JSON.stringify(c.payload || {}).includes('没开通道不该发')),
+      '被拒时**一张卡都没发**（不瞎发）')
+    // 热开启：改配置 + 过 10 秒热读 ⇒ 同一工具从"被拒"变成"真的能发"
     writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
       bots: [{
         name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
@@ -454,9 +488,14 @@ if (COLD) {
     }, null, 2))
     await new Promise((r) => setTimeout(r, 11000))   // 等过热读节拍（ensureHelpers 每 10 秒重读配置）
     await drain()
-    ok(registeredTools.some((t) => t && t.name === 'feishu_approval_form'),
-      '★ 运行中把 approvalForm 改成 true ⇒ **10 秒内工具自动注册**（不用重启）')
-    ok(consoleLines.some((l) => l.includes('approval form tool registered')), '并留痕（可日志复验）')
+    const mark = sentCards.length
+    const pending = tool.execute({ title: '开通道后就该发得出', chatId: CHAT_ID },
+      { agent, signal: undefined })
+    // 这张卡会一直等点击 ⇒ 只等几秒，别把冷启动用例挂住
+    await Promise.race([pending.catch(() => { }), new Promise((r) => setTimeout(r, 3000))])
+    await drain()
+    ok(sentCards.slice(mark).some((c) => JSON.stringify(c.payload || {}).includes('开通道后就该发得出')),
+      '★ 运行中把 approvalForm 改成 true（10 秒热读）⇒ **同一工具立刻能发卡**（不用重启）')
   }
   console.log(failures === 0 ? 'COLD PASS (' + COLD + ')' : 'COLD FAIL (' + COLD + '): ' + failures + ' 条')
   process.exit(failures === 0 ? 0 : 1)
@@ -1913,11 +1952,13 @@ console.log('31) 结论独立成卡（CM 2026-10-01 B 方案，17:3x 修正：**
   ok(beforeConclusion.includes('结论见下方卡片'), '过程卡留一句指路')
   ok(JSON.stringify(creates[creates.length - 1].payload).includes('已完成'), '结论卡的状态栏写「已完成」')
   // CM 2026-10-01 A 方案：**过程卡不摆状态栏**（无目标/无上下文/无缓存），只留一行裸状态
-  // 判据用「目标模式」这条状态栏专属文案（`grey-50` 不能当判据 —— 工具折叠面板也是 grey-50）
-  ok(!beforeConclusion.includes('目标模式'),
+  // 判据换成「缓存命中」（= 完整状态栏的指标段）。
+  // ⚠️ 2026-10-03 H 之后**不能再拿「目标模式」当判据**：状态栏首段现在是三模式标签
+  //   （🧭普通/📋计划/🎯目标），裸状态行里也会出现它 ⇒ 会假红。
+  ok(!beforeConclusion.includes('缓存命中'),
     '过程卡**不显示状态栏**（没有目标/上下文/缓存那一条）')
   ok(beforeConclusion.includes('运行中') || beforeConclusion.includes('已完成'), '过程卡保留一行裸状态')
-  ok(JSON.stringify(creates[creates.length - 1].payload).includes('目标模式'),
+  ok(JSON.stringify(creates[creates.length - 1].payload).includes('缓存命中'),
     '结论卡带完整状态栏（灰底那一行在结论卡上）')
 
   // (b) 未达阈值（恢复默认 30s；本轮的 80ms 远不够）→ 维持单卡
@@ -2456,7 +2497,21 @@ console.log('42) 计划模式退出申请（exit_plan_mode）：`user-questions/
     '计划正文**完整**在卡上（含标题与正文，不是只有标题的空卡）')
   const rows = rowsOf(card)
   // 2026-10-02 CM：「审批文字+按钮+拒绝文字+按钮 ⇒ 文字放在按钮上，审批绿、拒绝红」。
-  ok(rows.length === 1, '审批卡只有**一排**按钮（不是"文字 + 按钮"各占一行；实际 ' + rows.length + ' 排）')
+  // 2026-10-03 CM（I）：「批准和拒绝在同一行，**另开一行**去做目标模式这个选择」
+  //   ⇒ 两排：行1＝批准/拒绝（bisect）· 行2＝整行「🎯 以目标模式跑」。
+  ok(rows.length === 2, '审批卡**两排**：行1＝批准/拒绝 · 行2＝「以目标模式跑」（实际 ' + rows.length + ' 排）')
+  const goalRow = rows[1]
+  const goalBtn = (((goalRow && goalRow.columns) || [])[0] || {}).elements
+  const goalButton = (goalBtn || [])[0]
+  ok(Boolean(goalButton) && goalButton.tag === 'button'
+    && goalButton.text && goalButton.text.content === '🎯 以目标模式跑',
+    '★ 行2 是整行按钮「🎯 以目标模式跑」（实际：'
+      + JSON.stringify(goalButton && goalButton.text && goalButton.text.content) + '）')
+  ok(Boolean(goalButton) && goalButton.behaviors && goalButton.behaviors[0]
+    && goalButton.behaviors[0].value && goalButton.behaviors[0].value.fs_plan_goal !== undefined,
+    '★ 该按钮带新命名空间 { fs_plan_goal }（既有三类分派未动）')
+  ok(Boolean(goalRow) && ((goalRow.columns || []).length === 1),
+    '行2 只有**一列**（整行宽度 ⇒ 长文案不会被截断）')
   const row = rows[0]
   ok(Boolean(row) && row.flex_mode === 'bisect', '两个按钮**同一排**等分（flex_mode=bisect）')
   const btns = ((row && row.columns) || []).map((c) => (c.elements || [])[0])
@@ -2805,7 +2860,10 @@ console.log('48) 卡片 schema 校验：schema 2.0 不许出现 tag=action（真
         if (inColumn ? n > 2 : n > 24) (inColumn ? longNarrow : longWide).push(t)
       }
       if (Array.isArray(e.elements)) walkBtn(e.elements, inColumn)
-      for (const col of (e.columns || [])) walkBtn(col && col.elements, true)
+      // ⚠️ 2026-10-03：**单列** column_set ＝ 整行按钮（例：计划卡的「🎯 以目标模式跑」），
+      //    不是"窄列"；只有**多列**共享一行时才算窄列（≤2 字那条约束才适用）。
+      const multiCol = Array.isArray(e.columns) && e.columns.length > 1
+      for (const col of (e.columns || [])) walkBtn(col && col.elements, multiCol)
     }
   }
   for (const c of sentCards) {
@@ -3085,7 +3143,23 @@ console.log('52) 审批单卡通道（feishu_approval_form）：工具 / 版式 
   ok(decided && decided.timedOut === false && String(decided.cardId || '').length > 0, '工具结果带 cardId 且非超时')
   const receipt = sentCards.slice(decideMark).filter((c) => c.op === 'update').pop()
   const rp = (receipt && receipt.payload) || {}
-  ok(JSON.stringify(rp).includes('已记录你的选择：采纳'), '★ 卡**就地变回执卡**（旧卡不再可点）')
+  const rpText = JSON.stringify(rp)
+  // J（2026-10-03 CM）：「审批卡是特殊的存在，点了以后**不应该把旧的内容清掉**，
+  //   就应该把**两个按钮那个位置**变成'你已经审批过了'」⇒ 三条断言锁死这个语义。
+  ok(rpText.includes('你已经审批过了：采纳'), '★ 按钮那一行换成了「你已经审批过了：采纳」')
+  ok(rpText.includes('身份标签变更单') && rpText.includes('变更类型') && rpText.includes('① 类别'),
+    '★ **正文全部保留**（标题 + 长文本字段 + 分区①都还在 —— 不再整卡变两行回执）')
+  const receiptBtns = []
+  for (const el of ((rp.body && rp.body.elements) || [])) {
+    if (el && el.tag === 'action') {
+      for (const a of (el.actions || [])) if (a && a.tag === 'button') receiptBtns.push(a)
+    }
+    if (el && el.tag === 'button') receiptBtns.push(el)
+    for (const col of ((el && el.columns) || [])) {
+      for (const ce of (col && col.elements) || []) if (ce && ce.tag === 'button') receiptBtns.push(ce)
+    }
+  }
+  ok(receiptBtns.length === 0, '★ 点完后**不再有任何按钮**（实际 ' + receiptBtns.length + ' 个）')
   ok(rp.header && rp.header.template === 'green', '采纳 ⇒ 回执卡头绿色')
   ok(consoleLines.some((l) => l.includes('approval form decided:') && l.includes('-> 采纳')), '留痕 `approval form decided`')
 
@@ -3203,6 +3277,46 @@ console.log('52) 审批单卡通道（feishu_approval_form）：工具 / 版式 
     '★ 开关关掉 ⇒ 带 `card` 的提问**回退**成普通提问卡（绝不误发审批单）')
 }
 
+console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Agent 收得到」；本地图片必须先换 image_key')
+{
+  const imgTool = registeredTools.find((t) => t && t.name === 'feishu_send')
+  ok(Boolean(imgTool), '（前提）拿到 feishu_send 工具')
+  // ⚠️ 夹具要点（踩过）：`feishu_send` 在**目标会话有活跃卡**时会**主动跳过**
+  //    （设计如此：回复会自动进卡片，别另发一条）⇒ 返回 ok:true 但**没有真发**，
+  //    于是上传根本不会被触发。这里用一个"没有活跃卡"的会话，才走得到真发送。
+  const FREE_CHAT = 'oc_smoke_nocard_001'
+
+  // ---- G：正文里的本地图片 ⇒ 先上传换 key（飞书**只认 img_key**；本地路径会**整张卡被拒**）
+  const gMark = sentCards.length
+  const picPath = join(process.env.TEMP || '.', 'fs-smoke-pic.png')
+  writeFileSync(picPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  const gOut = await imgTool.execute({
+    text: '把这张图发我 ![示意图](' + picPath + ')',
+    chatId: FREE_CHAT,
+  }, { agent, signal: undefined })
+  await drain()
+  ok(imageUploads.length >= 1, '★ 本地图片**触发了上传**（POST /open-apis/im/v1/images）')
+  const gText = JSON.stringify(sentCards.slice(gMark).map((c) => c.payload))
+  ok(gText.includes('img_v3_smoke_key'), '★ 卡里换成了**真 `image_key`**（图片才会显示）')
+  ok(!gText.includes('fs-smoke-pic.png'), '★ 卡里**不再有本地文件名**（否则整张卡会被飞书拒）')
+  ok(gOut && gOut.ok === true, '（工具侧）发卡成功 ⇒ Agent 拿到 ok')
+  ok(consoleLines.some((l) => l.includes('image uploaded')), '上传留痕 `image uploaded`')
+
+  // ---- F：连"兜底纯文本"都被拒 ⇒ ①留痕 ②**降级重试**（剥掉 markdown）③**把失败交回 Agent**
+  const fMark = sentCards.length
+  rejectPatches = 2                     // 第一次 + 降级重试都拒：模拟"这段就是发不出去"
+  const fOut = await imgTool.execute({
+    text: '**这段会先被拒** ![图](http://example.com/x.png)',
+    chatId: FREE_CHAT,
+  }, { agent, signal: undefined })
+  await drain()
+  ok(consoleLines.some((l) => l.includes('plain text send failed')), '★ 兜底失败**留痕**（不再静默）')
+  ok(consoleLines.some((l) => l.includes('plain text degraded retry')), '★ 自动**降级重试**（剥掉 markdown 再发一次）')
+  ok(sentCards.length > fMark, '降级重试确实又发了一次（不是空转）')
+  ok(fOut && fOut.ok === false,
+    '★ 两次都失败 ⇒ **工具把失败交回 Agent**（它不会以为发成功了就收工）：'
+      + JSON.stringify(fOut && fOut.detail).slice(0, 90))
+}
 console.log('')
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')

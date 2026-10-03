@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-03
+
+### 大版本：**失败必须可见** + **图片/文件真送达** + **计划→目标承接** + **审批卡保留正文** + **通道开关定稿**
+
+> 本版一次性落地 CM 2026-10-03 集中提出的 9 条需求（计划已过目并批准）。硬约束不变：
+> 只新增分派（`fs_switch` / `fs_question` / `fs_approval` 一行未改）· 一张卡一人一事 ·
+> 超时**可见作废** · 不硬编码凭证 · 落地走空闲闸门 · **只备不落**（等 CM 发话）。
+
+| 条目 | 改动 | 关键点 |
+|:--|:--|:--|
+| **F 失败可见** | `notifyCardFailure()` + `stripUnsendable()` + `payloadPlainText()` + `classifyCardFailure()` | 卡片被拒/熔断/重试耗尽 ⇒ ①**先抢救正文**（摘掉非法片段后重发纯文本）②**告诉用户**（带飞书原始 code）③**给 Agent 回执**（注入系统提示，它才不会以为发成功了）。判重：同一会话同一类原因 **2 分钟**内只发一次；"卡坏了"优先于"没动静"。**唯一收口点** `stripUnsendable` 同时挂在 `sendPlainText` 上 ⇒ 所有兜底自动免疫"兜底与主路同因失败"这个老毛病 |
+| **G 上传** | `uploadImage()`（`POST /open-apis/im/v1/images`）· `uploadFile()`（`/im/v1/files`）· `inlineLocalImages()` · `collectImageHolders()`（**递归**） | 飞书卡片图片**只认 `img_key`**，本地路径会**整张卡一起拒** ⇒ 发卡前把 `![](本地路径)` 换成真 `image_key`；≤10MB 等限制**明确提示**不静默；**授权类防呆**（疑似二维码不自动上传，改发链接 —— 守 A29） |
+| **P1-5 发前清洗** | `sanitizeMarkdownForFeishu()` + `sanitizeCardElements()` | **接在既有降级链之后**（表格降级 → 长文切块 → 清洗），不新开一条；只治"已知会整卡被拒/漏标签原文"的写法（含 `<font>**X**</font>` 跨标签嵌套） |
+| **H 状态栏三模式** | `modeLabelFor()` + `statusTextFor()` + 扫 `plan/mode` 事件 | 状态栏首段＝`🧭 普通模式 / 📋 计划模式 / 🎯 目标模式`；判据全用现成可读源（`plan/mode` 会话事件 · `goalSnapshot()`）；读不到就显示"普通"，**不猜** |
+| **I 计划→目标承接** | `planGoalRow()` + `fs_plan_goal` 新分派 | 计划审批卡**行1＝批准/拒绝**（原样）· **行2＝整行「🎯 以目标模式跑」**；点它＝①按「批准」回答（退出计划模式）②用**计划全文**建目标 ③卡就地变回执。建目标失败 ⇒ **可见提示**、不留半截状态 |
+| **J 审批卡保留正文** | `settledActionElements()` + `updateApprovalCard()`（**新补**）+ `formResultCardPayload(..., originalElements)` | CM：「审批卡是特殊的存在，点了以后**不应该把旧的内容清掉**，就应该把两个按钮那个位置变成'你已经审批过了'」⇒ 两张审批卡都**保留正文**，只换按钮行；**不再撤回消息**。**顺带修真 bug**：旧代码撤回失败时调的 `updateApprovalCard` **全文件未定义** ⇒ ReferenceError、卡不更新 |
+| **A 通道定稿（方案 B）** | 注册段 | 审批单工具**始终注册**（Agent 才能主动告诉用户"有通道、要不要开"）；未开的 bot 调用 ⇒ **明确拒绝** + 返回可转告的"怎么打开" |
+| **B 重载自动续跑** | `announceReloadInterrupts()` | 重载打断后不只播报：**复用入站通道**注入「从断点继续，别重做」，提示同步改「我已自动让它接着做」；每会话一次 |
+| **看门狗增强** | `DSH_TOOL_NOTICE_MIN=3` · `DSH_NOTICE_REPEAT_MS=10min` · `stallNotifiedAt` | CM：「为什么又卡那么久？」——**长工具调用也必须播报**（此前只在"上游没回包"时说话，我跑 4 分钟测试他全程无感）⇒ 现在**两种静默都发一条新消息**（只改卡面灰字收不到通知），同一种静默最多每 10 分钟一条 |
+
+**证据与回归**：`node --check`=0；主集 `SMOKE PASS (sentCards=246, sessions=14)` ＋ 冷启动变体 `COLD PASS (form-off)`，`❌` 0 条。
+新增/改写断言覆盖：F（兜底失败留痕 + **降级重试** + **失败交回 Agent**）· G（本地图片**真的上传换 `img_key`**、卡里不再有本地文件名）·
+H（状态栏三模式标记）· I（计划卡两排版式 + `fs_plan_goal`）· J（点完保留正文 + 不再有按钮）· A（始终注册 + 未开被拒 + 热开启）· 看门狗（两种静默都播报）。
+
+**过程中被断言抓出的两个真 bug（都已修）**
+1. `feishu_send` 原来**只看 HTTP 状态**判成功 ⇒ 飞书用「200 + `code:230099`」表示"卡片内容被拒"时它返回 `ok:true`，**Agent 就以为发出去了**（正是"它自己干着干着收工"的成因）。
+2. `sendPlainText` 里内联顺序写反（**先**剥本地图片标记、**后**才上传）⇒ **图片永远传不上去**（日志里连 `inline images` 都没有）。
+
 ## [0.6.4] - 2026-10-03
 
 ### Fixed（可选通道的**热开启**缺口：运行中打开 `approvalForm`，工具 10 秒内自己冒出来）

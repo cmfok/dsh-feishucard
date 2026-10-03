@@ -103,17 +103,30 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
   ① 类别 × L 档变化（🔹不变 / 🔸收窄）→ ② 技能变化（➕新增 / ➖取消 / ✅不变）→ ③ 证据原文（引用块）→ ④ 影响面 → ⑤ 不批的后果 →
   **两个带色按钮**：`✅ 采纳`(primary 蓝) / `❌ 驳回`(danger 红)（没有「⑥ 操作」标题，也没有第三个「我要改」——要提意见直接回消息）。
   **短/长判据**：字段显式 `short:true/false` 优先；否则**纯 ASCII/数字且 ≤24 字 ⇒ 短**（并排）、**含中日韩文字 ⇒ 长**（独占一行）。
-  **⚠️ 默认关（可选通道）**：要在 `~/.dsh-feishucard/feishu.config.json` 里给某个 bot 加 `"approvalForm": true` 才启用 ——
-  没开时**连工具都不注册**（外部使用者零噪声），开了但某个 bot 没开则该 bot 调用被明确拒绝。**改完 10 秒内自动生效，不用重启**。
+  **⚠️ 默认关（可选通道）**：要在 `~/.dsh-feishucard/feishu.config.json` 里给某个 bot 加 `"approvalForm": true` 才启用。
+  **0.7.0 起改为「方案 B：工具始终注册」**——这样 Agent 能主动告诉你"这里有审批单通道、要不要开"；
+  没开的 bot 调用会被**明确拒绝**并把"怎么打开"写在返回里（可被 AI 直接转告）。**改完 10 秒内自动生效，不用重启**。
   **分区可泛化**：除了本仓的「身份标签」预设（`categories/skills/evidence/impact/risk`），也可以直接给
   `sections: [{title, lines}]` 做**任意**审批单（标题自动补 ①~⑩）。
   两条触达入口：**工具 `feishu_approval_form`**（结构化参数，发卡后**等他点**，把选择当**工具结果**返回；
   目标会话自动取调用方 agent 的飞书会话，非飞书会话明确报错、绝不瞎发）· 或 `ask_user_question` 的
   `questions[0].card` 适配（回答按 `selected:[选择]` 回传，调用方零改动）。
   **硬规矩**：一张卡只装一个人、一件事；30 分钟没点 ⇒ **可见地**作废（卡变超时态 + 一条纯文本，**绝不默认通过或驳回**）；
-  点完卡**就地变回执卡**，旧卡再点给可见提示而不是静默失败。Opt-in only (`"approvalForm": true` per bot; the tool is not even
-  registered when nobody enables it) — sections are generic (`sections: [{title, lines}]`) with the repo's identity-tag layout kept as a preset;
-  one card = one person/matter, 30-minute visible timeout, in-place receipt after a tap.
+  **点完只换按钮那一行、正文全留**（0.7.0；见下条"审批卡保留正文"），旧卡再点给可见提示而不是静默失败。
+- **失败必须可见 / Fail-visible（0.7.0）**：卡片被飞书拒、熔断、重试耗尽 ⇒ ①**先抢救正文**（把发不出去的片段摘掉后重发纯文本）
+  ②**告诉用户**（带飞书原始 `code`）③**给 Agent 一条可读回执**（它会知道自己"没送达"，不会以为发成功了就收工）。
+  同一原因 **2 分钟**内只发一次；所有纯文本兜底都过**唯一收口点** `stripUnsendable()`（本地图片路径、卡片不支持的 HTML 标签）。
+- **图片/文件真送达 / Real image & file delivery（0.7.0）**：飞书卡片图片**只认 `img_key`**（本地路径会让**整张卡**被拒），
+  所以发卡前会把正文里的 `![](本地路径)` **自动上传换 key**（`im/v1/images` / `im/v1/files`），图片真的显示；
+  超限（>10MB 等）与权限不足都给**明确提示**；**授权类疑似二维码不自动上传**（改发链接，遵守"授权只发链接"那条规矩）。
+- **状态栏三模式 / Three session modes（0.7.0）**：状态栏首段是 `🧭 普通模式 / 📋 计划模式 / 🎯 目标模式`，
+  判据是现成可读源（会话事件 `plan/mode` ＋ 目标快照），读不到就显示"普通"，不猜。
+- **计划 → 目标承接（0.7.0）**：计划审批卡 = **行1**`批准/拒绝` ＋ **行2**整行 `🎯 以目标模式跑`；
+  点行2 ＝ 退出计划模式 ＋ 用**计划全文**建目标 ＋ 卡变回执（正文保留）。建目标失败会明说，不留半截状态。
+- **审批卡保留正文 / Keep the body after a tap（0.7.0）**：审批类卡片（计划审批卡、审批单卡）点完**不再撤消息、不再整卡重建**，
+  只把**按钮那一行**换成「✅ 你已经审批过了：…（时间）」；超时/作废同理。
+- **重载自动续跑 / Auto-resume after reload（0.7.0）**：插件热重载打断那一轮后，新实例不只播报，
+  还会**自动把那一轮接上**（注入「从断点继续，别重做」）；每会话一次。
 - **提问卡按钮上色 / Colored option buttons（2026-10-03）**：选项按钮现在带 `type`（飞书不传就是灰的）——
   规则：显式 `buttonType` > 词义（驳回/拒绝/取消… ⇒ 红）> 第一个 ⇒ 蓝 > 其余灰；**向后兼容**，不传不报错。
   `ask_user_question` option buttons now carry a `type` (primary / danger / default) instead of all being grey.

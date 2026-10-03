@@ -138,8 +138,8 @@ export function apply(ctx) {
   // ⇒ 可能是上一代在应答。这里留住 disposer，随本代卸载一起注销（见 ctx.effect）。
   const agentScopeDisposers = []
 
-  // 审批单工具（可选通道）的注册 disposer —— 声明放在**最前面**：`ensureHelpers()`（每 10 秒热读配置）
-  // 会在 apply 流程之外调用 `maybeRegisterApprovalFormTool()`，不能让它撞上 TDZ。
+  // 审批单工具（方案 B）**始终注册** —— 这个声明只是为了让"注册 disposer"有个统一名字，
+  // 真正的注册在下面的 `ctx.effect` 里（声明放最前面是为了避开 TDZ：ensureHelpers 也会用到它）。
   let approvalFormDisposer = null
 
   // 载荷/正文指纹（只为留痕：飞书对 2.0 卡片只回占位符，正文读不回来；
@@ -483,6 +483,25 @@ export function apply(ctx) {
     }
   }
 
+  // 2026-10-03 F（CM：卡片的任何报错，用户要看得见、**Agent 也要收到**）：
+  // 「发送前最后一道保险」。飞书对卡片是**整张卡一起拒**：只要里面有一个非法片段
+  //（本地图片路径、不支持的 HTML 标签），正文会**连坐一起丢** —— 真机原话：
+  //   `code 230099 / ErrCode 200570 / card contains invalid image keys / image key D:\Work\…\auth-qr2.png`
+  // 而 `sendPlainText` **本身也是发卡片**（下面的 elements/tag:'markdown'）⇒ 兜底会**同因再挂**，
+  // 于是两条路一起哑、用户那边就是"干着干着突然停了"。
+  // ⇒ 所以把清洗放在**这一个唯一收口点**上：任何纯文本兜底都自动免疫。
+  // ⚠️ 只剥"飞书真不支持/会整卡被拒"的东西；**`<font>` 是要保留的**（卡片 markdown 支持颜色），
+  //    之前那个坑是**跨标签嵌套**（`<font>**X**</font>`），那个在 P1-5 的发卡链里按"已知好形态"修正。
+  function stripUnsendable(text) {
+    let out = String(text == null ? '' : text)
+    // ① 本地图片路径（Windows 盘符 / file:// / POSIX 绝对路径）⇒ 换成看得懂的说明
+    out = out.replace(/!\[([^\]]*)\]\(\s*(?:[A-Za-z]:[\\/]|file:\/\/|(?:\/|\\)[^)]*)[^)]*\)/g,
+      (m, alt) => '（图片未发送：飞书只接受**已上传**的 image_key' + (alt ? '，原图说明：' + alt : '') + '）')
+    // ② 卡片 markdown **不支持**的 HTML 标签（会整卡被拒，或把标签原文漏给用户）
+    out = out.replace(/<\/?(?:div|span|table|thead|tbody|tr|td|th|html|body|script|style|iframe)\b[^>]*>/gi, '')
+    return out
+  }
+
   async function sendPlainText(bot, chatId, text) {
     const cfg = bot.cfg
     const hasCreds = typeof cfg.appId === 'string' && cfg.appId
@@ -494,9 +513,21 @@ export function apply(ctx) {
       if (!cfg.ownerOpenId) return { status: 0, text: '没有可用的 chat_id：先给机器人发条消息，或配置 ownerOpenId' }
       receiveIdType = 'open_id'
     }
+    // G（2026-10-03）：纯文本兜底/工具发卡也走**同一条内联链** ——
+    // 本地图片引用先上传换 `img_key`（飞书只认 key；本地路径会把**整张卡**拒掉）。
+    // ⚠️ 顺序**必须**是"先上传、后剥离"：第一版写反了（先 stripUnsendable）⇒ 本地图片标记
+    //    在进 inlineLocalImages 之前就被换成"（图片未发送…）"了，**图永远传不上去**（冒烟抓出）。
+    let body = String(text == null ? '' : text)
+    try {
+      const res = await inlineLocalImages(bot, body)
+      body = res.text
+    } catch (error) {
+      console.log('[fs] inline images (plain) failed: ' + String(error && error.message || error))
+    }
+    body = stripUnsendable(body)
     const card = {
       config: { wide_screen_mode: true },
-      elements: [{ tag: 'markdown', content: text }],
+      elements: [{ tag: 'markdown', content: body }],
     }
     const res = await httpJson(
       'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=' + receiveIdType,
@@ -509,6 +540,38 @@ export function apply(ctx) {
       const parsed = parseJson(res.text)
       rememberMessage(parsed && parsed.data && parsed.data.message_id, 'bot 的一条消息：' + String(text))
     } catch {}
+    // F（2026-10-03）：**纯文本兜底自己失败也要可见** —— 旧实现只打一行日志，
+    //   用户那边就是"什么都没有"（CM 原话："干着干着突然停了"）。
+    //   这里的处置：① 留痕（可日志复验）② 用**最保守的纯文本**再试一次（去掉所有 markdown
+    //   语法与链接，只剩单行字）—— 因为整卡被拒的头号原因就是里面的非法片段/语法。
+    let parsedRes = parseJson(res.text)
+    const okSent = res.status >= 200 && res.status < 300 && parsedRes && parsedRes.code === 0
+    if (!okSent) {
+      console.log('[fs] plain text send failed: status=' + res.status + ' '
+        + String(res.text || '').slice(0, 200))
+      try {
+        const bare = String(text == null ? '' : text)
+          .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+          .replace(/[*_`>#\[\]()]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 400)
+        if (bare) {
+          const retry = await httpJson(
+            'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=' + receiveIdType,
+            'POST',
+            { 'Content-Type': 'application/json', Authorization: 'Bearer ' + await tenantAccessToken(bot, cfg.appId, cfg.appSecret) },
+            { receive_id: target || cfg.ownerOpenId, msg_type: 'interactive', content: JSON.stringify({ config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: bare }] }) },
+          )
+          parsedRes = parseJson(retry.text)
+          const okRetry = retry.status >= 200 && retry.status < 300 && parsedRes && parsedRes.code === 0
+          console.log('[fs] plain text degraded retry: status=' + retry.status + ' ok=' + okRetry)
+          return retry
+        }
+      } catch (error) {
+        console.log('[fs] plain text degraded retry failed: ' + String(error && error.message || error))
+      }
+    }
     return res
   }
 
@@ -576,6 +639,12 @@ export function apply(ctx) {
       idleToolName: '',
       pendingTools: 0,
       stallNotified: false,
+      // 2026-10-03：上次"长静默播报"的时刻（同一种静默最多每 10 分钟播一条，防刷屏）
+      stallNotifiedAt: 0,
+      // 2026-10-03 H：计划模式开关（读会话 `plan/mode` 事件）—— 状态栏据此显示「📋 计划模式」
+      planActive: false,
+      // 2026-10-03 F：这张卡是否已经做过"正文抢救"（内容被拒 ⇒ 摘片段重发纯文本，只做一次）
+      rescued: false,
     }
   }
 
@@ -972,18 +1041,37 @@ export function apply(ctx) {
   //      · 最后一步是"请求已发出"、之后零事件 ⇒ **上游没回包**（该动手了）
   //    并且"上游没回包"静默超过 `DSH_STALL_NOTICE_MIN` 分钟会**另发一条纯文本**（新消息才提醒）。
   const DSH_STALL_NOTICE_MIN = 5
+  // 2026-10-03 追加（CM：「为什么又卡那么久？」——我跑一个 4 分钟的冒烟命令，他那边**什么都不知道**）：
+  // **长工具调用也必须播报**，而且必须是**一条新消息**（只改卡面上那行灰字他看不到通知）。
+  // 阈值更低（3 分钟），同一种静默**最多每 10 分钟播一条**（防刷屏）。
+  const DSH_TOOL_NOTICE_MIN = 3
+  const DSH_NOTICE_REPEAT_MS = 10 * 60 * 1000
+  // H（2026-10-03 CM）：「状态栏这里应该变成三个不同的状态：**普通模式 / 计划模式 / 目标模式**」。
+  // 判据全部用**现成的可读源**，不猜：
+  //   · 计划：会话事件 `plan/mode`（`dsh-plan-mode` 每次切换都 append，见其 lib/index.js:377/392）
+  //   · 目标：`goalSnapshot(agent)` —— 就是底部"目标条"用的同一个读接口（`!view` = 未激活）
+  function modeLabelFor(card) {
+    if (card && card.planActive) return '📋 计划模式'
+    try {
+      const agent = card && card.agent
+      if (agent && goalSnapshot(agent)) return '🎯 目标模式'
+    } catch { /* 读不到就按普通模式，不编 */ }
+    return '🧭 普通模式'
+  }
   function statusTextFor(card) {
-    if (card.status === 'sealed') return '_✅ 已完成_'
-    if (card.status === 'completed') return '_已完成_'
-    if (card.status === 'error') return '_失败_'
+    const mode = modeLabelFor(card)
+    if (card.status === 'sealed') return '_' + mode + ' · ✅ 已完成_'
+    if (card.status === 'completed') return '_' + mode + ' · 已完成_'
+    if (card.status === 'error') return '_' + mode + ' · 失败_'
     if (card.idleMinutes > 0) {
       if (card.idleKind === 'tools') {
-        return '_🔧 工具' + (card.idleToolName ? ' `' + card.idleToolName + '`' : '') + ' 还在跑：已 '
-          + card.idleMinutes + ' 分钟没有新动作（**正常**，别急）_'
+        return '_' + mode + ' · 🔧 工具' + (card.idleToolName ? ' `' + card.idleToolName + '`' : '')
+          + ' 还在跑：已 ' + card.idleMinutes + ' 分钟没有新动作（**正常**，别急）_'
       }
-      return '_⏳ 上游已 ' + card.idleMinutes + ' 分钟**没有回包**（模型侧卡住／网络慢，**不是卡片坏了**）_'
+      return '_' + mode + ' · ⏳ 上游已 ' + card.idleMinutes
+        + ' 分钟**没有回包**（模型侧卡住／网络慢，**不是卡片坏了**）_'
     }
-    return '_运行中…_'
+    return '_' + mode + ' · 运行中…_'
   }
 
   // ---- 底部「目标条」＋ 上下文/缓存（改造③，CM 2026-10-01 定稿）-----------------
@@ -1274,7 +1362,240 @@ export function apply(ctx) {
     }
     // 兜底：卡片没有 agent（读不到会话）时，状态行不能因此消失
     if (!footerDrawn) elements.push({ tag: 'markdown', content: statusTextFor(card) })
+    // P1-5：出卡前**最后一道清洗**（接在表格降级/长文切块之后，见 sanitizeCardElements 注释）
+    sanitizeCardElements(elements)
     return { schema: '2.0', config: { wide_screen_mode: true }, body: { elements } }
+  }
+
+  // ---- G · 本地图片/文件上传（2026-10-03）--------------------------------------
+  // 为什么必须上传：飞书卡片的图片字段**只认 `img_key`**（官方：「图片的 Key。可通过上传图片接口获得」，
+  // `img_key` 必填），本地路径一律被拒、而且是**整张卡一起拒**
+  //（真机：`code 230099 / ErrCode 200570 / card contains invalid image keys / image key D:\…\auth-qr2.png`）。
+  // 权限：上传走 `im:resource`（本机 work bot 已实测具备）。
+  const IMAGE_MAX_BYTES = 10 * 1024 * 1024            // 官方限制：图片 ≤10MB
+  const LOCAL_IMAGE_RE = /!\[([^\]]*)\]\(\s*((?:[A-Za-z]:[\\/]|file:\/\/|\/|\\)[^)]*)\)/g
+  function baseNameOf(p) {
+    return String(p || '').replace(/^file:\/\//i, '').split(/[\\/]/).filter(Boolean).pop() || ''
+  }
+  function looksLikeAuthArtifact(filePath) {
+    // A29 防呆（CM 2026-10-03 明确规矩）：授权类（二维码等）**不自动上传成图片**，
+    // 应该发**可点击的授权链接**。这里挡一道，避免"规矩靠自觉"。
+    return /(^|[\\/_.-])(qr|qrcode|auth|login|oauth|scan)([\\/_.-]|$)/i.test(String(filePath || ''))
+  }
+  async function uploadImage(bot, filePath) {
+    const buf = readFileSync(filePath)
+    if (buf.length > IMAGE_MAX_BYTES) {
+      throw new Error('图片 ' + (buf.length / 1048576).toFixed(1) + 'MB 超过飞书上限 10MB')
+    }
+    if (looksLikeAuthArtifact(filePath)) {
+      throw new Error('授权类的图（疑似二维码）按规矩不发图，请改发可点击的授权链接')
+    }
+    const form = new FormData()
+    form.append('image_type', 'message')
+    form.append('image', new Blob([buf]), baseNameOf(filePath) || 'image.png')
+    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
+      body: form,
+    })
+    const parsed = parseJson(await res.text())
+    const key = parsed && parsed.data && parsed.data.image_key
+    if (!(res.status >= 200 && res.status < 300) || !key) {
+      throw new Error('图片上传失败：status=' + res.status + ' '
+        + JSON.stringify(parsed || {}).slice(0, 180))
+    }
+    console.log('[fs] image uploaded: ' + baseNameOf(filePath) + ' bytes=' + buf.length + ' key=' + key)
+    return key
+  }
+  async function uploadFile(bot, filePath, displayName) {
+    const buf = readFileSync(filePath)
+    const name = String(displayName || baseNameOf(filePath) || 'file')
+    const ext = (name.split('.').pop() || '').toLowerCase()
+    const FILE_TYPES = {
+      pdf: 'pdf', doc: 'doc', docx: 'doc', xls: 'xls', xlsx: 'xls',
+      ppt: 'ppt', pptx: 'ppt', mp4: 'mp4', opus: 'opus',
+    }
+    const form = new FormData()
+    form.append('file_type', FILE_TYPES[ext] || 'stream')
+    form.append('file_name', name)
+    form.append('file', new Blob([buf]), name)
+    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/files', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
+      body: form,
+    })
+    const parsed = parseJson(await res.text())
+    const key = parsed && parsed.data && parsed.data.file_key
+    if (!(res.status >= 200 && res.status < 300) || !key) {
+      throw new Error('文件上传失败：status=' + res.status + ' '
+        + JSON.stringify(parsed || {}).slice(0, 180))
+    }
+    console.log('[fs] file uploaded: ' + name + ' bytes=' + buf.length + ' key=' + key)
+    return key
+  }
+  async function sendFileMessage(bot, chatId, fileKey, note) {
+    const target = chatId || bot.lastChatId || ''
+    if (!target) return false
+    if (note) await sendPlainText(bot, chatId, note).catch(() => { })
+    const res = await httpJson(
+      'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id',
+      'POST',
+      { 'Content-Type': 'application/json', Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
+      { receive_id: target, msg_type: 'file', content: JSON.stringify({ file_key: fileKey }) },
+    )
+    const okSent = res.status >= 200 && res.status < 300
+    console.log('[fs] file message sent chat=' + target + ' status=' + res.status + ' key=' + fileKey)
+    return okSent
+  }
+  // 把一段文本里的**本地图片引用**换成真 `img_key`；换不掉的换成一句说明（**绝不整段丢**）
+  async function inlineLocalImages(bot, text) {
+    const src = String(text == null ? '' : text)
+    const matches = [...src.matchAll(LOCAL_IMAGE_RE)]
+    if (!matches.length) return { text: src, uploaded: 0, failures: [] }
+    let out = src
+    const failures = []
+    let uploaded = 0
+    for (const m of matches) {
+      try {
+        const key = await uploadImage(bot, m[2])
+        out = out.replace(m[0], '![' + m[1] + '](' + key + ')')
+        uploaded += 1
+      } catch (error) {
+        const why = String(error && error.message || error)
+        failures.push(why)
+        out = out.replace(m[0], '（图片未发送：' + why + '）')
+      }
+    }
+    return { text: out, uploaded, failures }
+  }
+  // 发卡**前**的异步加工：递归找出所有含本地图片引用的 `content` 字段并换成 img_key
+  //（**必须递归**：笔记/字段可能被包在 column_set / div.fields / 折叠面板里，浅层遍历会漏）
+  function collectImageHolders(node, out) {
+    if (!node || typeof node !== 'object') return out
+    if (typeof node.content === 'string' && node.content.includes('![')) out.push(node)
+    for (const key of Object.keys(node)) {
+      const v = node[key]
+      if (Array.isArray(v)) {
+        for (const item of v) collectImageHolders(item, out)
+      } else if (v && typeof v === 'object') {
+        collectImageHolders(v, out)
+      }
+    }
+    return out
+  }
+  async function inlinePayloadImages(bot, payload) {
+    const holders = collectImageHolders(payload, [])
+    const failures = []
+    let uploaded = 0
+    for (const holder of holders) {
+      LOCAL_IMAGE_RE.lastIndex = 0                       // 全局正则：先复位再 test（否则会漏）
+      if (!LOCAL_IMAGE_RE.test(holder.content)) continue
+      LOCAL_IMAGE_RE.lastIndex = 0
+      const res = await inlineLocalImages(bot, holder.content)
+      holder.content = res.text
+      uploaded += res.uploaded
+      failures.push(...res.failures)
+    }
+    if (uploaded || failures.length) {
+      console.log('[fs] inline images: uploaded=' + uploaded + ' failed=' + failures.length
+        + (failures.length ? ' first=' + failures[0].slice(0, 120) : ''))
+    }
+    return { payload, failures }
+  }
+
+  // ---- F · 卡片失败的**统一出口**（2026-10-03，CM：报错必须让用户看见、**Agent 收到**）----
+  // 判重：同一会话 + 同一类原因，**2 分钟窗口内只发一次**（复用 CONCLUSION_DEDUPE 的口径）；
+  //       "卡坏了" 优先于 "没动静"（stall 那条是独立机制，两者同命中时只发这条）。
+  const FAILURE_NOTICE_WINDOW_MS = 120000
+  function failureNotices() {
+    return globalThis.__fsFailureNotices || (globalThis.__fsFailureNotices = new Map())
+  }
+  function classifyCardFailure(text) {
+    return /230099|invalid image|200570|200861|11310|too large|frequency/i.test(String(text || ''))
+      ? 'rejected' : 'transport'
+  }
+  function payloadPlainText(payload) {
+    try {
+      const els = (payload && payload.body && payload.body.elements) || []
+      const parts = []
+      for (const el of els) {
+        if (!el) continue
+        if (el.tag === 'markdown' && typeof el.content === 'string') parts.push(el.content)
+        else if (el.tag === 'div' && el.text && typeof el.text.content === 'string') parts.push(el.text.content)
+      }
+      return parts.join('\n\n')
+    } catch { return '' }
+  }
+  function notifyCardFailure(bot, chatId, info) {
+    try {
+      const reason = String((info && info.reason) || '卡片发送失败')
+      const klass = classifyCardFailure(reason)
+      const codeMatch = reason.match(/"code"\s*:\s*(\d+)/) || reason.match(/\bcode[=: ]+(\d+)/i)
+      const code = String((info && info.code) || (codeMatch ? codeMatch[1] : ''))
+      const key = String(chatId || '-') + '|' + klass
+      const seen = failureNotices()
+      if (Date.now() - Number(seen.get(key) || 0) < FAILURE_NOTICE_WINDOW_MS) return
+      seen.set(key, Date.now())
+      const tip = '⚠️ **卡片发送失败**（' + klass + '）' + (code ? '｜飞书 code=' + code : '') + '\n'
+        + '原因：' + reason.slice(0, 220) + '\n'
+        + (klass === 'rejected'
+          ? '已把**发不出去的片段**（如本地图片路径）摘掉后重发，**正文没有丢**。'
+            + '要让图片真的显示，需要先上传到飞书换 `image_key`。'
+          : '网络/限流类失败：已按退避重试若干次，**不会无限重试**，这张卡之后不再更新。')
+      void sendPlainText(bot, chatId, tip).catch(() => {})
+      console.log('[fs] card failure notice sent chat=' + chatId + ' kind=' + klass
+        + (code ? ' code=' + code : ''))
+      // ② 让 **Agent 也收到**（复用入站通道注入系统提示；下一次推理必然看到）
+      const note = '（系统提示：你上一步的**输出没有送达用户** —— 卡片被飞书拒了（' + klass
+        + (code ? '，code ' + code : '') + '）。'
+        + (klass === 'rejected'
+          ? '常见原因：写了**本地图片路径**（飞书只认已上传的 image_key），或用了卡片不支持的写法。'
+            + '请改用可发送的形式；**正文已用纯文本兜底发给用户了**，别重复整段。'
+          : '偏网络/限流，稍后重发即可。') + '）'
+      void handleInbound(bot, {
+        message_id: 'cardfail-' + Date.now().toString(36),
+        message_type: 'text',
+        chat_id: chatId,
+        content: JSON.stringify({ text: note }),
+      }).catch(() => {})
+    } catch (error) {
+      console.log('[fs] card failure notice failed: ' + String(error && error.message || error))
+    }
+  }
+
+  // ---- P1-5 · 发卡前的"清洗"（2026-10-03）--------------------------------------
+  // 位置：**接在既有降级链之后**（表格降级 `demoteOverflowTables` → 长文切块 `chunkText` → 这里），
+  //       不新开一条链 —— 否则两套降级逻辑会互相打架（查重结论）。
+  // 范围：**只治已知会让飞书整卡被拒 / 把标签原文漏给用户的写法**，不做通用重写
+  //（避免"清洗过头"把正常内容吃掉；真出问题还能靠 F 的失败出口兜住）。
+  function sanitizeMarkdownForFeishu(text) {
+    let out = String(text == null ? '' : text)
+    // ① 跨标签嵌套（真机踩过：`<font color='white'>**批准</font>**` ⇒ 标签原文漏给用户）
+    //    ⇒ 规范成已知好形态：**加粗在外、颜色在内**
+    out = out.replace(/<font([^>]*)>\s*(\*\*|__)([\s\S]*?)\2\s*<\/font>/gi, '$2<font$1>$3</font>$2')
+    // ② 卡片 markdown **不支持**的 HTML 标签（与 stripUnsendable 共用同一张黑名单）
+    out = out.replace(/<\/?(?:div|span|table|thead|tbody|tr|td|th|html|body|script|style|iframe)\b[^>]*>/gi, '')
+    return out
+  }
+  function sanitizeCardElements(elements) {
+    let touched = 0
+    for (const el of elements || []) {
+      if (!el || typeof el !== 'object') continue
+      const holders = []
+      if (typeof el.content === 'string') holders.push(el)
+      if (el.text && typeof el.text.content === 'string') holders.push(el.text)
+      if (Array.isArray(el.fields)) {
+        for (const f of el.fields) {
+          if (f && f.text && typeof f.text.content === 'string') holders.push(f.text)
+        }
+      }
+      for (const h of holders) {
+        const after = sanitizeMarkdownForFeishu(h.content)
+        if (after !== h.content) { h.content = after; touched += 1 }
+      }
+    }
+    if (touched) console.log('[fs] sanitized for feishu: ' + touched + ' field(s)')
+    return elements
   }
 
   // Serialized, rate-limited, backoff'd, breakered card sync.
@@ -1298,6 +1619,14 @@ export function apply(ctx) {
       // 队列内检查才能保证"建卡只成功/尝试一次"（2026-09-15 smoke 实测：入口检查漏掉 3 次 create）。
       if (!card.token && card.createFailed) return
       const payload = buildCardPayload(card)
+      // G：把 markdown 里的**本地图片引用**换成真 `img_key`（飞书只认 key，本地路径会**整卡被拒**）
+      try {
+        await inlinePayloadImages(bot, payload)
+      } catch (error) {
+        console.log('[fs] inline images failed: ' + String(error && error.message || error))
+      }
+      // F：留一份"纯文本版"，卡片被拒时用它抢救正文（sendPlainText 内部还会再剥一次非法片段）
+      const rescueText = payloadPlainText(payload)
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(new Error('card request timed out')), CARD_TIMEOUT)
       const wasPatch = Boolean(card.token)
@@ -1338,16 +1667,30 @@ export function apply(ctx) {
         if (card.token) card.createFailed = false
       } catch (error) {
         card.failCount += 1
+        const message = String(error && error.message || error)
+        const klass = classifyCardFailure(message)
         if (!wasPatch) card.createFailed = true   // 建卡失败 → 放弃该卡，交给兜底纯文本
         const delay = CARD_RETRY_BASE * 2 ** (card.failCount - 1)
         if (card.failCount >= CARD_MAX_FAILURES) {
           card.circuitOpen = true
-          console.log('[fs] card circuit opened chat=' + chatId + ': '
-            + String(error && error.message || error))
+          console.log('[fs] card circuit opened chat=' + chatId + ': ' + message)
         } else {
           card.retryUntil = Date.now() + delay
           console.log('[fs] card sync failed chat=' + chatId + ' fail=' + card.failCount
-            + ' retry=' + delay + 'ms: ' + String(error && error.message || error))
+            + ' retry=' + delay + 'ms: ' + message)
+        }
+        // ---- F（2026-10-03）：失败**不再静默** --------------------------------------
+        // ① 内容被拒（230099 类）：**先把正文救回来** —— 摘掉发不出去的片段后重发纯文本。
+        //    这一步是"用户那边突然什么都不动了"的直接解药（旧实现让兜底也带着非法片段再挂一次）。
+        if (klass === 'rejected' && rescueText && !card.rescued) {
+          card.rescued = true
+          void sendPlainText(bot, chatId, rescueText)
+            .then(() => { console.log('[fs] card body rescued chat=' + chatId) })
+            .catch(() => { })
+        }
+        // ② 统一出口：用户看得见的说明 + **Agent 收得到的回执**（判重窗口内只发一次）。
+        if (klass === 'rejected' || card.failCount >= CARD_MAX_FAILURES) {
+          notifyCardFailure(bot, chatId, { reason: message })
         }
       } finally {
         clearTimeout(timer)
@@ -1390,7 +1733,11 @@ export function apply(ctx) {
     for (let i = from; i < events.length; i++) {
       const event = events[i]
       if (!event || !event.data) continue
-      if (event.type === 'assistant/message') {
+      if (event.type === 'plan/mode') {
+        // H：计划模式开关落成会话事件 ⇒ 状态栏据此显示「📋 计划模式」（不猜、不额外请求）
+        const want = Boolean(event.data && event.data.active)
+        if (card.planActive !== want) { card.planActive = want; changed = true }
+      } else if (event.type === 'assistant/message') {
         const spoken = extractProcessText(event.data.message)
         if (spoken) {
           appendNote(card, spoken, event.seq)
@@ -1471,6 +1818,7 @@ export function apply(ctx) {
           card.idleMinutes = 0
           card.idleKind = ''
           card.stallNotified = false
+          card.stallNotifiedAt = 0
           void syncCard(bot, chatId, card, false).catch(() => {})
         } else if (card.status === 'running' && card.lastEventAt) {
           // 诚实状态（2026-10-03 改：**有诊断含义**，不再让人误以为"它在忙"）：
@@ -1492,13 +1840,22 @@ export function apply(ctx) {
             card.idleKind = next > 0 ? kind : ''
             void syncCard(bot, chatId, card, false).catch(() => {})
           }
-          if (kind === 'silent' && mins >= DSH_STALL_NOTICE_MIN && !card.stallNotified) {
-            card.stallNotified = true
-            const note = '⏳ 上游已经 ' + mins + ' 分钟**没有回包**（模型侧卡住／网络慢，不是卡片坏了，'
-              + '也不是我在埋头干活）。你回我一句话就会强制重新发起这一轮。'
-            void sendPlainText(bot, chatId, note).catch(() => {})
-            console.log('[fs] stall notice sent: chat=' + chatId + ' mins=' + mins
-              + ' card=' + String(card.token || '-').slice(-8))
+          // 长静默 ⇒ **发一条新消息**（只改卡面他收不到通知）：
+          //   · kind='tools'（有工具在跑）阈值 3 分钟 —— 说清"这是正常的，不是卡住"
+          //   · kind='silent'（上游没回包）阈值 5 分钟 —— 说清"回我一句就会重新发起"
+          const threshold = kind === 'tools' ? DSH_TOOL_NOTICE_MIN : DSH_STALL_NOTICE_MIN
+          if (mins >= threshold
+            && Date.now() - Number(card.stallNotifiedAt || 0) >= DSH_NOTICE_REPEAT_MS) {
+            card.stallNotifiedAt = Date.now()
+            const running = [...card.tools.values()].filter((t) => t && t.status === 'running')
+            const toolName = card.idleToolName || (running.length ? String(running[running.length - 1].name || '') : '')
+            const note = kind === 'tools'
+              ? '🔧 我还在跑工具' + (toolName ? ' `' + toolName + '`' : '')
+                + '（已 ' + mins + ' 分钟）。这是**正常**的，不是卡住 —— 跑完我会继续往下做。'
+              : '⏳ 上游已经 ' + mins + ' 分钟**没有回包**（模型侧卡住／网络慢，不是卡片坏了，'
+                + '也不是我在埋头干活）。你回我一句话就会强制重新发起这一轮。'
+            void sendPlainText(bot, chatId, note).catch(() => { })
+            console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
           }
         }
       } catch (error) {
@@ -1652,8 +2009,28 @@ export function apply(ctx) {
         notified.set(sessionId, Date.now())
         void sendPlainText(bot, chatId,
           '♻️ 插件已热重载：上一轮被热重载打断（不是模型出错，也不是你的操作）。'
-          + '刚才那轮没说完的不会自己继续 —— 你回我一句就行。').catch(() => { })
+          + '**我已自动让它接着做** —— 如果它没接上，你回我一句就行。').catch(() => { })
         console.log('[fs] hot reload interrupt notice: agent=' + sessionId + ' chat=' + chatId)
+        // ---- 丙 · 被打断就**自动续跑**（2026-10-03 CM 指定）---------------------------------
+        // 光发一条"被打断了"不够：新实例直接把那一轮接上 —— 复用**入站通道**塞一句系统提示
+        //（`handleInbound` 会照常建卡、跑回合、封口），让它从断点继续。
+        // 成本：多跑一轮（可能多花 token）；保护：每会话只续一次（与提示共用 `notified`）。
+        try {
+          void handleInbound(bot, {
+            message_id: 'reload-resume-' + Date.now().toString(36),
+            message_type: 'text',
+            chat_id: chatId,
+            content: JSON.stringify({
+              text: '（系统提示：插件刚热重载，上一轮被打断。请**从断点继续**，'
+                + '已经做完的部分不要重做；若其实已经做完，就一句话说明结论即可。）',
+            }),
+          }).catch((error) => {
+            console.log('[fs] reload auto-resume failed: ' + String(error && error.message || error))
+          })
+          console.log('[fs] reload auto-resume: agent=' + sessionId + ' chat=' + chatId)
+        } catch (error) {
+          console.log('[fs] reload auto-resume failed: ' + String(error && error.message || error))
+        }
       } catch (error) {
         console.log('[fs] hot reload interrupt notice failed: ' + String(error && error.message || error))
       }
@@ -3032,9 +3409,6 @@ export function apply(ctx) {
     const refresh = now - lastConfigCheck >= CONFIG_REFRESH_MS
     if (refresh) lastConfigCheck = now
     const list = await readConfig()
-    // 可选通道（审批单）**热开启**：配置里出现 `approvalForm: true` ⇒ 本次热读就把工具注册上
-    // （10 秒内生效，不用重启；已经注册过则是空操作）。
-    maybeRegisterApprovalFormTool(list)
 
     // Stop helpers whose bot was removed from config.
     for (const [appId, bot] of bots) {
@@ -3256,6 +3630,39 @@ export function apply(ctx) {
     return undefined
   }
 
+  // J（2026-10-03 CM）：「审批卡它是一个**特殊的存在**，点了以后**不应该把旧的内容清掉**，
+  //   就应该把**两个按钮那个位置**变成"你已经审批过了"」。
+  // ⇒ 所有审批类卡片点完之后：**正文原样保留**，只把 `action` 那一行换成状态行。
+  //   （旧实现两处都不对：计划/工具审批卡**直接撤回消息**；审批单卡**整卡重建成两行回执**。）
+  function settledActionElements(elements, statusLine) {
+    const out = (Array.isArray(elements) ? elements : []).map((el) => (el && typeof el === 'object' ? { ...el } : el))
+    const line = { tag: 'markdown', content: String(statusLine || '') }
+    // 判据要兼容**三种**动作行写法（本仓历史上都出现过）：
+    //   · `tag:'action'`（+actions[]）· `tag:'column_set'`（列里装 button）· 单个 button / interactive_container
+    const isActionRow = (el) => {
+      if (!el || typeof el !== 'object') return false
+      if (el.tag === 'action' || el.tag === 'button' || el.tag === 'interactive_container') return true
+      if (el.tag === 'column_set' && Array.isArray(el.columns)) {
+        return el.columns.some((c) => Array.isArray(c && c.elements)
+          && c.elements.some((e) => e && (e.tag === 'button' || e.tag === 'interactive_container')))
+      }
+      return false
+    }
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (isActionRow(out[i])) {
+        out[i] = line
+        return out
+      }
+    }
+    out.push(line)
+    return out
+  }
+  function settledStamp() {
+    try {
+      return new Date().toLocaleString('zh-CN', { hour12: false })
+    } catch { return new Date().toISOString() }
+  }
+
   function approvalCardPayload(toolName, reason, token) {
     return {
       config: { wide_screen_mode: true },
@@ -3280,7 +3687,16 @@ export function apply(ctx) {
     }
   }
 
-  function approvalResultCardPayload(toolName, label) {
+  function approvalResultCardPayload(toolName, label, originalElements) {
+    const status = '**' + String(label) + '**\n_' + settledStamp() + '_'
+    if (Array.isArray(originalElements) && originalElements.length) {
+      // J：正文留着，只换按钮行（CM 2026-10-03）
+      return {
+        config: { wide_screen_mode: true },
+        header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'blue' },
+        elements: settledActionElements(originalElements, status),
+      }
+    }
     return {
       config: { wide_screen_mode: true },
       header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'blue' },
@@ -3293,28 +3709,25 @@ export function apply(ctx) {
     }
   }
 
-  // Withdraw the approval card once it is decided so it does not linger at the
-  // bottom of the chat while the reply card keeps updating (2026-08-16 CM
-  // design, mirroring ZCode's in-flow permission UX). Falls back to updating
-  // the card in place when recall is unavailable.
-  async function dismissApprovalCard(bot, record, label) {
+  // J（2026-10-03 CM 定稿）：审批卡点完**不再撤回消息**、也不再重建卡 ——
+  //   就地 PATCH 同一张卡：**正文原样**，只把 action 行换成「你已经审批过了」。
+  //   （旧实现是 DELETE 撤回；撤回失败时走的那条"就地更新"分支调的 `updateApprovalCard` **全文件未定义**
+  //    ⇒ 真机一旦撤回失败就会抛 ReferenceError、卡停在原样、还留一条 unhandled rejection。）
+  async function updateApprovalCard(bot, record, label) {
     if (!record || !record.cardId) return
     try {
-      const accessToken = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
-      const res = await httpJson(
-        'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(record.cardId),
-        'DELETE',
-        { Authorization: 'Bearer ' + accessToken },
-      )
-      const parsed = parseJson(res.text)
-      if (!(res.status >= 200 && res.status < 300) || !parsed || parsed.code !== 0) {
-        throw new Error('recall failed: ' + (res.text || JSON.stringify(res)))
-      }
-      console.log('[fs] approval card recalled: ' + record.request.toolName)
+      await updateInteractive(bot, record.cardId,
+        approvalResultCardPayload(record.request && record.request.toolName, label, record.elements))
+      console.log('[fs] approval card updated in place: '
+        + String((record.request && record.request.toolName) || '') + ' -> ' + String(label))
     } catch (error) {
-      console.log('[fs] approval card recall failed, updating in place: ' + String(error && error.message || error))
-      await updateApprovalCard(bot, record, label)
+      console.log('[fs] approval card update failed: ' + String(error && error.message || error))
     }
+  }
+
+  async function dismissApprovalCard(bot, record, label) {
+    if (!record || !record.cardId) return
+    await updateApprovalCard(bot, record, label)
   }
 
   function askApprovalCard(bot, chatId, request) {
@@ -3348,7 +3761,10 @@ export function apply(ctx) {
         request.signal.addEventListener('abort', onAbort)
         record.signalOff = () => request.signal.removeEventListener('abort', onAbort)
       }
-      sendInteractive(bot, chatId, approvalCardPayload(request.toolName, request.reason, token))
+      // J：留一份**原始正文**（点完之后只把 action 行换成状态行，别的原样保留）
+      const cardPayload = approvalCardPayload(request.toolName, request.reason, token)
+      record.elements = cardPayload.elements
+      sendInteractive(bot, chatId, cardPayload)
         .then((msgId) => {
           record.cardId = msgId
           console.log('[fs] approval card sent: ' + request.toolName + ' token=' + token)
@@ -4436,7 +4852,7 @@ export function apply(ctx) {
       recentForms.set(chatId, { token: value.fs_form, answeredAt: Date.now() })
       try { record.resolve({ choice, timedOut: false, form: record.form, cardId: record.cardId }) } catch { }
       if (record.cardId) {
-        updateInteractive(record.bot, record.cardId, formResultCardPayload(record.form, choice))
+        updateInteractive(record.bot, record.cardId, formResultCardPayload(record.form, choice, undefined, record.elements))
           .catch((error) => {
             console.log('[fs] form card update failed: ' + String(error && error.message || error))
             // 兜底：卡改不动也必须有一条可见反馈，绝不让点击看起来"死了"。
@@ -4446,6 +4862,91 @@ export function apply(ctx) {
       return
     }
     // Question-option buttons (ask_user_question card).
+    // ---- I（2026-10-03 CM）：计划审批卡第二行「以目标模式跑」------------------------------
+    // **只新增**这一条分派（fs_switch / fs_question / fs_approval 一行不动）。
+    // 语义：① 先按「批准」回答（⇒ harness 退出计划模式）② 用**计划全文**建目标
+    //       ③ 卡片就地变回执（正文保留，只换按钮区 —— 与 J 同口径）
+    if (value.fs_plan_goal !== undefined) {
+      const chatId = data && data.context && data.context.open_chat_id
+      const record = chatId ? pendingQuestions.get(chatId) : undefined
+      if (!record || record.token !== value.fs_plan_goal) {
+        console.log('[fs] plan goal button: record not found for chat ' + chatId
+          + ' token=' + value.fs_plan_goal)
+        if (chatId) {
+          const ownerBot = findBotForChat(chatId)
+          if (ownerBot) {
+            sendPlainText(ownerBot, chatId, '⚠️ 这张计划卡已经处理过了。看我最新一条消息，或直接回我文字。')
+              .catch(() => { })
+          }
+        }
+        return
+      }
+      const q = (record.questions && record.questions[0]) || {}
+      const approve = String(planApproveLabel(q) || '')
+      pendingQuestions.delete(chatId)
+      if (record.timer) clearTimeout(record.timer)
+      recentQuestions.set(chatId, { token: value.fs_plan_goal, answeredAt: Date.now() })
+      console.log('[fs] plan goal: approved + starting goal mode for chat=' + chatId
+        + ' planChars=' + String(q.detail || '').length)
+      // ② 用计划全文建目标 + ③ 卡就地变回执（`handleCardAction` **不是 async** ⇒ 放异步 IIFE 里，
+      //    先把「批准」答出去让会话继续，建目标失败**可见地**告诉用户，绝不留半截状态）
+      const planText = String(q.detail || q.question || '按已批准的计划执行')
+      void (async () => {
+        let goalOk = false
+        let goalWhy = ''
+        try {
+          const goals = ctx.get('goals')
+          const bot = findBotForChat(chatId)
+          const chat = bot && bot.chats && typeof bot.chats.get === 'function' ? bot.chats.get(chatId) : undefined
+          const agent = (bot && chat) ? await resolveAgent(bot, chat) : undefined
+          if (!goals || typeof goals.create !== 'function') {
+            goalWhy = '没有 goals 服务'
+          } else if (!agent) {
+            goalWhy = '拿不到这个会话的 agent'
+          } else {
+            goals.create(agent, { objective: planText })
+            goalOk = true
+            console.log('[fs] plan goal created: chat=' + chatId + ' planChars=' + planText.length)
+          }
+        } catch (error) {
+          goalWhy = String(error && error.message || error)
+        }
+        if (!goalOk) {
+          console.log('[fs] plan goal failed: ' + goalWhy)
+          try {
+            const bot = findBotForChat(chatId)
+            if (bot) {
+              await sendPlainText(bot, chatId, '✅ 计划已批准；但**目标没建起来**（' + goalWhy
+                + '）—— 回我一句我立刻按这份计划开跑。')
+            }
+          } catch { /* 提示失败也不能影响批准本身 */ }
+        }
+        if (record.bot && record.cardId) {
+          const status = goalOk
+            ? '**🎯 已切到目标模式，按这份计划开跑**\n_' + settledStamp() + '_'
+            : '**✅ 已批准；目标未建起来（' + goalWhy + '）**\n_' + settledStamp() + '_'
+          const kept = [{ tag: 'markdown', content: '**计划（已批准）**\n\n' + planText }]
+          try {
+            await updateInteractive(record.bot, record.cardId, {
+              schema: '2.0',
+              config: { wide_screen_mode: true },
+              header: {
+                title: { tag: 'plain_text', content: goalOk ? '🎯 已进入目标模式' : '📋 计划已批准' },
+                template: goalOk ? 'green' : 'orange',
+              },
+              body: { elements: settledActionElements(kept, status) },
+            })
+          } catch (error) {
+            console.log('[fs] plan goal card update failed: ' + String(error && error.message || error))
+          }
+        }
+      })()
+      // ① 先按「批准」回答 ⇒ 退出计划模式（与点「批准」同一条路）
+      splitLiveCardAfterAnswer(record.agentId)
+      record.resolve(buildQuestionAnswer(record.questions, approve))
+      return
+    }
+
     if (value.fs_question !== undefined && value.fs_option !== undefined) {
       const chatId = data && data.context && data.context.open_chat_id
       const record = chatId ? pendingQuestions.get(chatId) : undefined
@@ -4869,6 +5370,29 @@ export function apply(ctx) {
     return index === 0 ? 'primary' : 'default'
   }
 
+  // I（2026-10-03 CM）：「做完计划以后习惯性地想让你以这个计划为准、去开目标模式，但现在这个承接链是断的」
+  //   ⇒ 计划审批卡**另开一行**放整行按钮「以目标模式跑」；点它 = ① 先按「批准」回答（退出计划模式）
+  //     ② 用**计划全文**建目标 ③ 卡片就地变回执（正文保留，只换按钮区 —— 与 J 同一口径）。
+  function planGoalRow(token) {
+    return {
+      tag: 'column_set',
+      flex_mode: 'stretch',
+      columns: [{
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [{
+          tag: 'button',
+          type: 'primary',
+          width: 'fill',
+          text: { tag: 'plain_text', content: '🎯 以目标模式跑' },
+          behaviors: [{ type: 'callback', value: { fs_plan_goal: token } }],
+        }],
+      }],
+    }
+  }
+
   function questionOptionRow(option, token, index, displayLabel) {
     const shown = displayLabel !== undefined
       ? String(displayLabel)
@@ -4982,7 +5506,8 @@ export function apply(ctx) {
               + '\n\n' + questionHint(q),
           },
           ...(planButtons
-            ? [planButtons]
+            // 行1＝批准/拒绝（原样）· 行2＝整行「以目标模式跑」（I，2026-10-03）
+            ? [planButtons, planGoalRow(token)]
             : opts.map((option, index) => questionOptionRow(option, token, index, optionDisplayLabel(q, option)))),
         ],
       },
@@ -5147,14 +5672,31 @@ export function apply(ctx) {
   }
 
   /** 点完后的回执卡（就地替换，旧卡不再可点）。 */
-  function formResultCardPayload(form, choice, note) {
+  function formResultCardPayload(form, choice, note, originalElements) {
     const f = (form && typeof form === 'object') ? form : {}
+    const status = '**✅ 你已经审批过了：' + String(choice) + '**'
+      + (note ? '\n' + String(note) : '')
+      + '\n_' + settledStamp() + '_'
+    const template = choice === '驳回' ? 'red' : (choice === '改' ? 'orange' : 'green')
+    // J（2026-10-03 CM）：「点了以后不应该把旧的内容清掉，就应该把两个按钮那个位置变成
+    //   '你已经审批过了'」⇒ 审批单卡**正文（字段区 + ①~⑤ 分区）全部保留**，只换掉 action 行。
+    if (Array.isArray(originalElements) && originalElements.length) {
+      return {
+        schema: '2.0',
+        config: { wide_screen_mode: true },
+        header: {
+          title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
+          template,
+        },
+        body: { elements: settledActionElements(originalElements, status) },
+      }
+    }
     return {
       schema: '2.0',
       config: { wide_screen_mode: true },
       header: {
         title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
-        template: choice === '驳回' ? 'red' : (choice === '改' ? 'orange' : 'green'),
+        template,
       },
       body: {
         elements: [
@@ -5183,7 +5725,8 @@ export function apply(ctx) {
         console.log('[fs] approval form timed out: ' + String((form && form.title) || '') + ' chat=' + chatId)
         if (record.cardId) {
           void updateInteractive(record.bot, record.cardId, formResultCardPayload(form, '（超时未操作）',
-            '⏰ 已超过 ' + FORM_TIMEOUT_MIN + ' 分钟未操作，这张单**自动作废**。要办的话请让 AI 重新发一张。')).catch(() => {})
+            '⏰ 已超过 ' + FORM_TIMEOUT_MIN + ' 分钟未操作，这张单**自动作废**。要办的话请让 AI 重新发一张。',
+            record.elements)).catch(() => {})
         }
         void sendPlainText(record.bot, chatId, '⏰ 审批单「' + String((form && form.title) || '') + '」超过 '
           + FORM_TIMEOUT_MIN + ' 分钟未操作，**已自动作废**（没有替你默认通过或驳回）。').catch(() => {})
@@ -5195,13 +5738,16 @@ export function apply(ctx) {
           clearTimeout(record.timer)
           if (record.cardId) {
             void updateInteractive(record.bot, record.cardId, formResultCardPayload(form, '（已作废）',
-              '这一轮已经结束了，这张单作废 —— 要办的话请让 AI 重新发一张。')).catch(() => {})
+              '这一轮已经结束了，这张单作废 —— 要办的话请让 AI 重新发一张。', record.elements)).catch(() => {})
           }
           reject(new Error('approval form aborted'))
         }
         signal.addEventListener('abort', onAbort)
       }
-      sendInteractive(bot, chatId, approvalFormCardPayload(form, record.token))
+      // J：留一份原始正文（点完/超时/作废都只换 action 行，正文不清）
+      const formCard = approvalFormCardPayload(form, record.token)
+      record.elements = formCard && formCard.body && formCard.body.elements
+      sendInteractive(bot, chatId, formCard)
         .then((msgId) => {
           record.cardId = msgId
           try { rememberMessage(msgId, 'bot 的审批单：' + String((form && form.title) || '')) } catch { }
@@ -5647,7 +6193,7 @@ export function apply(ctx) {
       }
       try {
         const res = await sendPlainText(bot, chatId, String(args.text))
-        return { ok: res.status >= 200 && res.status < 300, status: res.status, detail: String(res.text || '').slice(0, 1000) }
+        return { ok: (() => { const p = parseJson(res.text); return res.status >= 200 && res.status < 300 && p && p.code === 0 })(), status: res.status, detail: String(res.text || '').slice(0, 1000) }
       } catch (error) {
         return { ok: false, status: 0, detail: String(error && error.message || error) }
       }
@@ -5824,36 +6370,18 @@ export function apply(ctx) {
       }
     },
   })
-  // 注册**按配置**（2026-10-03）：审批单是可选通道 ⇒ 没有任何 bot 打开 `approvalForm` 时
-  // **一个工具都不注册**（对外部使用者＝零噪声，连工具名都看不到）。
-  // ⚠️ 但是"开了要能自己冒出来"（CM 2026-10-03 追问「公司电脑的 BOT 想开怎么办」）：
-  //    只做启动时读一次是不够的 —— 启动时没人开会话里就永远没有这个工具。
-  //    ⇒ 同一个函数也挂在 `ensureHelpers()`（每 10 秒热读配置）里，**改完配置 10 秒内自动注册**，不用重启。
-  function maybeRegisterApprovalFormTool(list) {
-    if (approvalFormDisposer) return                                   // 已注册（幂等）
-    if (!Array.isArray(list) || !list.some((c) => c && c.approvalForm === true)) return
+  // 注册策略（2026-10-03 CM 定稿 **方案 B**）：**始终注册**这个工具 ——
+  // 这样 Agent 能**主动告诉用户**"这里有个审批单通道、要不要开"；"开不开"仍由**用户/配置**决定：
+  // 该 bot 没写 `approvalForm: true` 时，调用会被**明确拒绝**，并把"怎么打开"写在返回里（AI 可直接转告）。
+  //（0.6.2～0.6.4 是"没开就不注册"＝零噪声，但 Agent 无从提示 ⇒ CM 明确切到 B。）
+  ctx.effect(() => {
     try {
-      approvalFormDisposer = ctx.tools.register(approvalFormTool)
-      console.log('[fs] approval form tool registered（approvalForm: true）')
+      const disposer = ctx.tools.register(approvalFormTool)
+      console.log('[fs] approval form tool registered（方案 B：始终注册；是否可用按各 bot 的 approvalForm 判定）')
+      return () => { try { if (typeof disposer === 'function') disposer() } catch { /* 卸载失败不影响别的 */ } }
     } catch (error) {
       console.log('[fs] approval form tool registration failed: ' + String(error && error.message || error))
-    }
-  }
-  ctx.effect(() => {
-    void readConfig().then((list) => {
-      if (!Array.isArray(list) || !list.some((c) => c && c.approvalForm === true)) {
-        console.log('[fs] approval form tool NOT registered（没有 bot 打开 approvalForm）')
-        return
-      }
-      maybeRegisterApprovalFormTool(list)
-    }).catch((error) => {
-      console.log('[fs] approval form tool registration skipped: ' + String(error && error.message || error))
-    })
-    return () => {
-      if (typeof approvalFormDisposer === 'function') {
-        try { approvalFormDisposer() } catch { /* 卸载时失败不影响别的 */ }
-      }
-      approvalFormDisposer = null
+      return () => { }
     }
   })
 
