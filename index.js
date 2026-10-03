@@ -4616,6 +4616,9 @@ export function apply(ctx) {
   //    并**顺手挂进 `workspaceRegistry`**（best-effort）⇒ GUI 侧边栏也立刻看得到它。
   const SWITCH_CARD_TTL_MS = 15 * 60 * 1000
   const SWITCH_SUMMARY_MAX_BYTES = 4 * 1024 * 1024   // 只对小于此体积的日志读"首条消息"当摘要
+  // 摘要显示多少字。CM 2026-10-04：「摘要不够长啊，能搞长一点吗？」（实测 lens 全是 61 ⇒ 全部撞上限）。
+  // 前缀去掉后正文能显示更多，这里给 120 字（约两行）；要调只改这一个数。
+  const SWITCH_SUMMARY_CHARS = 120
   const SWITCH_SUMMARY_TIMEOUT_MS = 1500
   const SWITCH_WS_LIMIT = 12          // 工作区最多列几个（注册表之外从会话兜底补的也算在里面）
   const SWITCH_SESS_LIMIT = 12        // 单个工作区的会话最多列几行（卡片行数有上限）
@@ -4822,11 +4825,16 @@ export function apply(ctx) {
         const src = (d && d.source) || {}
         if (src.kind && src.kind !== 'user') continue
         const raw = (d && d.content) || (d && d.message && d.message.content) || []
-        const text = (Array.isArray(raw) ? raw : [])
+        let text = (Array.isArray(raw) ? raw : [])
           .map((c) => (c && typeof c.text === 'string' ? c.text : ''))
           .join(' ')
-          .replace(/\s+/g, ' ').trim()
-        if (text) return text.length > 60 ? text.slice(0, 60) + '…' : text
+          .replace(/\s+/g, ' ')
+          .trim()
+        // 去掉【插件自己加的投递前缀】（`[飞书 ou_…] ` / `[飞书 姓名] ` / `[飞书消息] `）——
+        // 那是给人看的标记，**不该占据摘要**（CM 2026-10-04：「它显示的是飞书开头的那串代码」；
+        // 实测该前缀约 40 字符，而当时上限只有 60 ⇒ 正文只剩几个字）。
+        text = text.replace(/^\[飞书[^\]]*\]\s*/, '')
+        if (text) return text.length > SWITCH_SUMMARY_CHARS ? text.slice(0, SWITCH_SUMMARY_CHARS) + '…' : text
       }
       // 一条**可见诊断**：本会话里一个 user/message 的正文都没取到时，把实际见到的事件类型打出来。
       // （避免再次出现"摘要为空但日志全绿"的静默失败）
