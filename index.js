@@ -1519,7 +1519,7 @@ export function apply(ctx) {
           elements.push({
             tag: 'column_set',
             flex_mode: 'none',
-            background_style: STEER_NOTICE_BG,
+            background_style: block.bg || STEER_NOTICE_BG,
             columns: [{
               tag: 'column',
               width: 'weighted',
@@ -1528,7 +1528,7 @@ export function apply(ctx) {
               padding: '6px 10px 6px 10px',
               elements: [{
                 tag: 'markdown',
-                content: '**' + STEER_NOTICE_TITLE + '**\n\n' + text,
+                content: '**' + (block.title || STEER_NOTICE_TITLE) + '**\n\n' + text,
               }],
             }],
           })
@@ -2652,14 +2652,24 @@ export function apply(ctx) {
             // 0.7.21（独立审查 MEDIUM）：**额度也在发送成功之后才扣** —— 原先发送前就 +1，
             //   一条因网络/风控没发出去的消息照样吃掉一次配额 ⇒ CM 一轮里可能只看到 1 条提示。
             //   发送失败则不扣、也不换卡（换卡的唯一理由就是"提示压在长卡上面"，没发出去就不成立）。
-            void sendPlainText(bot, chatId, note).then(() => {
+            // 2026-10-05（CM 定的分界：**还能不能继续**）：
+            //   kind='tools'（有工具在跑）＝ 还能继续 ⇒ **只写回原卡**，不另发消息
+            //     （跑完一定会更新结论/发卡，那就是通知；中途另发只是打扰）。
+            //   kind='silent'（上游没回包）＝ **不能继续** ⇒ 保持另发（CM 点名「这种必须提示」）。
+            if (kind === 'tools') {
               card.stallNoticeCount = Number(card.stallNoticeCount || 0) + 1
-              console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
-              rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
-            }, (error) => {
-              console.log('[fs] stall notice send failed (额度不扣，等下一个静默窗口重试): '
-                + String(error && error.message || error))
-            })
+              appendCardNotice(bot, chatId, '🔧 还在跑', note, 'grey-50')
+              console.log('[fs] stall notice -> card only (tools running): chat=' + chatId + ' mins=' + mins)
+            } else {
+              void sendPlainText(bot, chatId, note).then(() => {
+                card.stallNoticeCount = Number(card.stallNoticeCount || 0) + 1
+                console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
+                rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
+              }, (error) => {
+                console.log('[fs] stall notice send failed (额度不扣，等下一个静默窗口重试): '
+                  + String(error && error.message || error))
+              })
+            }
           }
         }
       } catch (error) {
@@ -3063,7 +3073,14 @@ export function apply(ctx) {
         // 0.7.20（CM 2026-10-04 拍定）：**先判真实情况，再按情况说话**。
         //   旧实现无条件发"上一轮被打断，我已自动让它接着做"，并且真的注入一条假消息（见下方删除说明）。
         const state = reviveCardForChat(sessionId, chatId, bot)
-        void sendPlainText(bot, chatId, reloadNoticeText(state.kind)).catch(() => { })
+        // 2026-10-05（CM 定的分界）：mirrored / revived ＝ 还能继续 ⇒ 只写回**原卡**，不另发；
+        //   idle / no-agent / 判不准 ＝ 不能继续（等不到结论）⇒ 保持另发。
+        const reloadNotice = reloadNoticeText(state.kind)
+        if (state.kind === 'mirrored' || state.kind === 'revived') {
+          appendCardNotice(bot, chatId, '♻️ 已热重载', reloadNotice, 'grey-50')
+        } else {
+          void sendPlainText(bot, chatId, reloadNotice).catch(() => { })
+        }
         console.log('[fs] hot reload interrupt notice: agent=' + sessionId + ' chat=' + chatId
           + ' state=' + state.kind)
         // ---- 已删除：热重载「假消息注入」（2026-10-04 CM 下令，方案第 1 点）-----------------
@@ -8381,6 +8398,41 @@ export function apply(ctx) {
   //   用户看到的是最底下那条提示、以为我们停了。与"插话必须换卡"同源（CM 2026-10-02）⇒
   //   发完侧消息就把该会话正在跑的卡**换到下面新卡继续**（旧卡就地封口＋一行说明、正文原样保留）。
   //   复用答题/插话那套 `entry.split()`：新卡游标 = 当前事件位 ⇒ 不重放、不丢。
+  // 2026-10-05（CM 定的分界：**还能不能继续**）：还能继续的状态提示**只写回原卡**、不另发消息。
+  //   · 为什么不发也安全：它还在工作 ⇒ 收尾一定会更新/发结论卡 ⇒ 那本身就是通知
+  //     （CM 原话：「他还在工作，就一定会发结论卡，我等着结论卡就有提示了」）。
+  //   · 用 notice 块（醒目、不参与 cardTableCount、不进结论摘要）—— 正好是「状态行」该有的隔离性。
+  //   · 定位方式与 rotateLiveCardForChat 同源（activeTurns → autoCards → liveCardRegistry），
+  //     但**不换卡**：只 push 一行后 sync。
+  //   · 同一 title 只保留一条（stall 会按分钟反复走到，不能刷出一堆块）。
+  function appendCardNotice(bot, chatId, title, text, bg) {
+    const tt = String(title || '').trim()
+    const tx = String(text || '').trim()
+    if (!tt || !tx) return false
+    const put = (card, label) => {
+      if (!card || card.status !== 'running' || !Array.isArray(card.blocks)) return false
+      const block = { type: 'notice', title: tt, text: tx }
+      if (bg) block.bg = bg
+      const idx = card.blocks.findIndex((b) => b && b.type === 'notice' && String(b.title || '') === tt)
+      if (idx >= 0) card.blocks[idx] = block
+      else card.blocks.push(block)
+      void syncCard(bot, chatId, card, false).catch(() => { })
+      console.log('[fs] status notice -> card only (' + label + '): chat=' + chatId + ' title=' + tt)
+      return true
+    }
+    for (const e of activeTurns.values()) {
+      if (e && String(e.chatId || '') === String(chatId || '') && put(e.card, 'turn')) return true
+    }
+    for (const e of autoCards.values()) {
+      if (e && String(e.chatId || '') === String(chatId || '') && put(e.card, 'auto')) return true
+    }
+    for (const e of liveCardRegistry.values()) {
+      if (e && String(e.chatId || '') === String(chatId || '') && put(e.card, 'adopted')) return true
+    }
+    console.log('[fs] status notice -> no live card, nothing appended: chat=' + chatId + ' title=' + tt)
+    return false
+  }
+
   function rotateLiveCardForChat(chatId, label) {
     const text = label || SIDE_NOTICE_OLD
     try {
