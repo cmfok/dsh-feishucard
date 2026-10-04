@@ -1932,7 +1932,9 @@ export function apply(ctx) {
       if (!existsSync(target)) { skipped += 1; continue }
       // ⚠️ 键里要带**文件身份**（大小+修改时间）：否则同一路径的文件**内容更新后**会被永久
       // 当成"已发过"而不再送达（审查 MED#1634）。同一份文件在多次卡同步中仍只发一次。
-      let dedupeKey = String(chatId || '') + '|' + target
+      // ⚠️ 2026-10-05：键里**还要带 appId** —— 7 个 bot 收进 1 个进程后这条 Set 是实例级的，
+      //   同一群里 A、B 两个 bot 发同一个文件时，B 会被判"已发过"而**不发**（多 bot 单实例串扰第二类）。
+      let dedupeKey = String((bot && bot.cfg && bot.cfg.appId) || '') + '|' + String(chatId || '') + '|' + target
       try {
         const st = statSync(target)
         dedupeKey += '|' + st.size + '|' + Math.round(st.mtimeMs)
@@ -3817,12 +3819,25 @@ export function apply(ctx) {
     }
   }
 
-  // ---- inbound dedup (2026-09-15) -------------------------------------------
-  // 按 message_id 记住最近处理过的入站消息，防"重连重投 / 双 helper"导致整轮重复。
+  // ---- inbound dedup (2026-09-15；2026-10-05 修「多 bot 互相误判重投」) ----------
+  // 按 **bot + message_id** 记住最近处理过的入站消息，防"重连重投 / 双 helper"导致整轮重复。
+  // ⚠️ 2026-10-05 CM 报障「一条消息里 @ 多个 agent，只有一个回」根因就在这里：
+  //    7 个 bot 收进 1 个进程后 `seenInboundIds` 是**实例级**的；同一条群消息会被每个
+  //    bot 各收一次，第一个消费掉之后，其余 bot 落到 handleInbound 全被判成
+  //    `duplicate inbound skipped` **静默丢弃**（真机：六个 bot 里两个 mentioned=true，
+  //    只有一个建了卡，另一个被 duplicate 吞掉）。
+  //    去重的本意是防**同一个 bot** 收到重投（长连接 at-least-once / 双 helper），
+  //    不是防"别的 bot 也收到同一条群消息"⇒ 键必须带 bot 维度。
   const SEEN_INBOUND_MAX = 200
   const seenInboundIds = new Set()
-  function isDuplicateInbound(messageId) {
+  function inboundKey(bot, messageId) {
     const id = String(messageId || '')
+    if (!id) return ''
+    const who = String((bot && bot.cfg && bot.cfg.appId) || (bot && bot.name) || '')
+    return who + '|' + id
+  }
+  function isDuplicateInbound(bot, messageId) {
+    const id = inboundKey(bot, messageId)
     if (!id) return false
     if (seenInboundIds.has(id)) return true
     seenInboundIds.add(id)
@@ -3836,8 +3851,8 @@ export function apply(ctx) {
 
   // 只「窥探」是否已处理过 —— **绝不能在这里认领**：调用方若随后没真正投递出去，
   // 它落到 handleInbound 时会被 isDuplicateInbound 判成重投而**静默丢弃**。
-  function inboundAlreadySeen(messageId) {
-    const id = String(messageId || '')
+  function inboundAlreadySeen(bot, messageId) {
+    const id = inboundKey(bot, messageId)
     return id ? seenInboundIds.has(id) : false
   }
 
@@ -3856,7 +3871,7 @@ export function apply(ctx) {
     // 它有副作用（把 id 记进 seenInboundIds）；一旦下面 steer 没走成、函数 return false
     // 落到 handleInbound，那里再查一次 ⇒ 已"见过" ⇒ 判重投直接丢掉
     // ⇒ **所有飞书消息被静默吞掉**（日志特征：duplicate inbound skipped 连发）。
-    if (inboundAlreadySeen(evt.message_id)) return true   // 重投：直接吞掉，不重复插话
+    if (inboundAlreadySeen(bot, evt.message_id)) return true   // 重投：直接吞掉，不重复插话
     const chat = bot.chats.get(chatId)
     if (!chat) return false
     const active = chat.sessions[chat.activeIndex]
@@ -3905,7 +3920,7 @@ export function apply(ctx) {
       return false
     }
     // 到这里才算真的投出去了 ⇒ 现在认领 message_id，防止重投被插两次。
-    isDuplicateInbound(evt.message_id)
+    isDuplicateInbound(bot, evt.message_id)
     // 2026-10-02 CM：「我"插话"了以后，你应该新开卡片。不然我说的话全部堆到下面，
     // 但是你一直在旧卡片上更新」⇒ 插话**必须换卡**：复用答题后那套 split()，
     // 旧卡就地封口（留一行指路），后续内容写到下面新卡的第一块（醒目彩色块）。
@@ -3945,7 +3960,7 @@ export function apply(ctx) {
     // 入站去重：飞书长连接是 at-least-once，重连后会重投未 ack 的事件；
     // 进程内也可能有两份 helper 订阅同一 app。没有去重时同一条消息会跑两整轮、
     // 产出两张内容相同的卡（2026-09-15 CM 反馈"同一段东西分两个卡片发"）。
-    if (isDuplicateInbound(evt.message_id)) {
+    if (isDuplicateInbound(bot, evt.message_id)) {
       console.log('[fs] duplicate inbound skipped: ' + String(evt.message_id || ''))
       return
     }
