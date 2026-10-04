@@ -4,6 +4,23 @@
 
 A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Harness agent sessions: official-SDK long connection (no public URL needed), dedicated per-chat sessions, `/new /switch /list /help` commands, a typing reaction, and a **streaming reply card** — inline agent notes, collapsible tool-call panels with status symbols, and rate-limit / backoff / circuit-breaker / plain-text fallback reliability.
 
+## 功能矩阵 / Feature matrix
+
+| 功能 | 说明 |
+|:--|:--|
+| 流式回复卡片 | 过程话语内联 + 工具调用折叠面板（带状态符号）+ 内联 agent 备注；失败时纯文本降级 |
+| 单实例多 bot | 一个 DSH 实例挂多个飞书机器人，各自绑定 workspace 与 `AGENTS.md` |
+| 群里 @ 才回复 | 群聊只在被 @ 时处理（避免多 bot 互相刷屏）；单聊照常全处理 |
+| 审批卡 / 提问卡 | 工具审批与 `ask_user_question` 直接落到飞书卡片，点按钮即回 |
+| `/switch` 两级选择 | 先选工作区（与 GUI 侧边栏同源），再选会话：接管或新建；另有 `/list` `/new` `/help` |
+| 身份注入 | 入站消息按 `open_id` 解析为「人」；工具入参里的身份字段由身份表覆写 |
+| 长连接收发 | 官方 SDK WebSocket 长连接，无需公网 IP / 域名 / 隧道 |
+| 可靠性兜底 | 限流 / 退避 / 熔断 / 纯文本降级；helper 崩溃后可自动拉起 |
+
+English summary: streaming reply card, many bots in one instance (own workspace + `AGENTS.md` each),
+mention-gated group replies, approval / ask cards, two-level `/switch` picker, identity injection,
+long-connection transport, and rate-limit / backoff / circuit-breaker / text fallback.
+
 单包即用：Host 插件（桥接逻辑）+ helper 子进程（长连接）+ bundle 补丁（自动注册）。One package, three pieces: host plugin, long-connection helper subprocess, and an auto-registered bundle patch.
 
 > 独立自研，不依赖任何第三方 DSH 飞书插件。配置独立存放于 `~/.dsh-feishucard/`；检测到旧生态路径（`~/.cc-connect/`）有配置时启动自动迁移一次。不要与其他 DSH 飞书插件同时安装（同一飞书 App 的 WS 长连接互踢）。

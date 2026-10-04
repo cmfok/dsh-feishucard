@@ -1,0 +1,45 @@
+# dsh-feishucard
+
+> DeepSeek Harness (DSH) ↔ Feishu / Lark bridge plugin with a streaming reply card.
+> Self-developed (not a fork). MIT licensed. Node >= 22.15.
+
+## What it is
+
+A DSH (DeepSeek Harness) host plugin that bridges Feishu / Lark chats to DSH agent sessions over the
+**official SDK WebSocket long connection** — no public IP, domain, or tunnel required.
+Packaged as one npm package: host plugin + long-connection helper subprocess + an auto-registered
+bundle patch.
+
+## Capabilities
+
+- **Streaming reply card** — inline agent notes, collapsible tool-call panels with status symbols
+- **Many bots in ONE instance** — each bot bound to its own workspace and `AGENTS.md`
+- **Mention-gated group replies** — in group chats the bot answers only when mentioned; private chats always answer
+- **Approval cards & ask-user questions** — tool approvals and agent questions arrive as Feishu cards; tap to answer
+- **`/switch` two-level picker** — workspace → session (same source as the GUI sidebar), plus `/list` `/new` `/help`
+- **Identity injection** — inbound messages resolve to a person; tool-call identity fields are overwritten from the identity table
+- **Reliability fallbacks** — rate-limit handling, backoff, circuit breaker, plain-text fallback
+
+## Install
+
+```
+npm i dsh-feishucard
+```
+
+Then register the plugin with DSH (see `README.md` for the exact `dsh plugin add` / profile patch steps).
+
+## Configuration
+
+- Config file: `~/.dsh-feishucard/feishu.config.json`
+- Shape: `{ "bots": [ { "name": "...", "workspace": "/abs/path", "appId": "cli_...", "appSecret": "..." } ] }`
+- Requires a Feishu (Lark) custom app with the **bot** capability and **long connection** enabled
+
+## Keywords
+
+dsh, deepseek-harness, feishu, lark, streaming-card, interactive-card, lark-bot, ai-agent, chatbot, cordis
+
+## Links
+
+- Repository: https://github.com/cmfok/dsh-feishucard
+- Changelog: https://github.com/cmfok/dsh-feishucard/blob/master/CHANGELOG.md
+- Security: https://github.com/cmfok/dsh-feishucard/blob/master/SECURITY.md
