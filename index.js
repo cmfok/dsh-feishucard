@@ -119,14 +119,106 @@ export function apply(ctx) {
   // 查不到活跃回合 ⇒ **没有插话，而是另起一轮、另开一张卡**；与此同时上一代那条仍在跑的
   // 回合继续更新它自己的卡 ⇒ 同一对话里两张卡并行长（＝"重复"）。
   // 处置：挂到 globalThis —— 新实例能直接看见上一代正在跑的回合（entry 里的
-  // agent / card / bot / chatId / split 都跨代可用），于是照旧走插话那条路。
+  // agent / card / bot / chatId 都跨代可用）。
+  // 🔴 2026-10-04（独立审查 HIGH-1，0.7.21）：**`rotate` / `split` 不跨代可用** —— 它们是登记那一代
+  //   的闭包，里面用的是**那一代的 `generationDisposed`**。调用它们 ⇒ 推送全被代际旗吞掉，
+  //   而且旧代的 `startCardWatcher` 会把本代正在跑的 watcher 抢停并覆盖登记 —— 这张卡从此不再更新。
+  //   所以跨代条目一律先问 `closuresAreOurs(entry)`（见下），不是本代的就换成本代等价通道。
   const activeTurns = globalThis.__fsActiveTurns
-    || (globalThis.__fsActiveTurns = new Map())   // agentId -> { card, bot, chatId, split }
+    || (globalThis.__fsActiveTurns = new Map())   // agentId -> { card, bot, chatId, gen, rotate, split }
   // 0.7.16（审查 MED#2）：**代际旗**取代按卡对象登记 —— 0.7.15 的 WeakSet 只能拦 dispose 时**已存在**的卡；
   // dispose 之后本代 runTurn 还会**新建**卡（拆结论卡 makeCardState / 换卡 rotateAdoptedCard），那些新对象
   // 不在集合里、照发（= 野卡漏洞）。旗按「代」判定：dispose 之后本代**一切**推送（封口/新建卡/入队后才执行的
   // 任务体）全部拦下；新代 apply 是新闭包、旗=false ⇒ 接管/续卡照常（无按对象簿记，也无全局累积）。
   let generationDisposed = false
+
+  // 0.7.21（HIGH-1）：**本代编号**。跨代共享表里要靠它分辨"这条记录是谁登记的"，
+  //   从而决定 entry.rotate / entry.split 能不能调（只有本代登记的才能调）。
+  const GEN_ID = (globalThis.__fsGenSeq = Number(globalThis.__fsGenSeq || 0) + 1)
+  const closuresAreOurs = (entry) => Boolean(entry) && entry.gen === GEN_ID
+  // 外代闭包被跳过时必须留痕（本文件口径：不许静默跳过），但同一张卡只留一次（每拍都会走到）。
+  const foreignClosureLogged = new Set()
+  const logForeignClosureSkip = (where, key) => {
+    const tag = where + '|' + key
+    if (foreignClosureLogged.has(tag)) return
+    foreignClosureLogged.add(tag)
+    console.log('[fs] foreign-generation closure skipped: ' + where + ' agent=' + key
+      + ' (本代改用等价通道，不去调上一代的 rotate/split)')
+  }
+
+  // 0.7.21（HIGH-2）：**跨代补发队列（托孤）**。旧代被代际旗拦下的推送绝不能直接丢 ——
+  //   丢了就是 CM 报的那张"永远停在正在工作中…"的卡：卡对象已被旧代改成 sealed，
+  //   本代 watcher 的 `card.status === 'running'` 分支不再进 ⇒ **没有任何自愈通道**。
+  //   旧代把"欠的那一次推送"记在这里，由**本代**的定时器补发（补发时推的是卡片对象的
+  //   当前状态，所以收尾内容/封口状态都会一次到位）。
+  //   边界（两条，都是刻意的）：
+  //   ① 只补发**已经在会话里存在**的卡（`card.token` 非空 = 之前推送成功过 ⇒ 补发是 PATCH）。
+  //      旧代 dispose 之后新建的卡没有 token ⇒ 补发等于往会话里凭空**多塞一张卡**（野卡），
+  //      那种情况由 runTurn 自己的**单卡回退**负责把结论留在过程卡上
+  //      （见 `conclusion card failed, falling back to single card`），指路语会一起改掉。
+  //   ② 只有**本代认识这个会话**（能解析出 bot）时才补发，否则 TTL 到点丢弃并留痕。
+  const cardRelay = globalThis.__fsCardRelay || (globalThis.__fsCardRelay = [])
+  const CARD_RELAY_TTL_MS = 60000   // 60 秒内没人接手就丢弃（本代根本没有这个会话）
+  const CARD_RELAY_MAX = 24         // 只留最近的若干条，防跨代累积
+  function relayCardPush(card, chatId) {
+    if (!card || !chatId) return
+    if (cardRelay.some((it) => it.card === card)) return   // 一张卡一次（补发时推的是当前状态）
+    cardRelay.push({ card, chatId, at: Date.now() })
+    if (cardRelay.length > CARD_RELAY_MAX) cardRelay.splice(0, cardRelay.length - CARD_RELAY_MAX)
+    console.log('[fs] card push handed to next generation: chat=' + chatId
+      + ' card=' + String(card.token || '-').slice(-8) + ' queued=' + cardRelay.length)
+  }
+  function drainCardRelay() {
+    if (!cardRelay.length) return
+    const now = Date.now()
+    // 0.7.21（独立审查）：**一拍最多补发一条**，通道不可用就**整批停下**（条目留着，TTL 兜底）。
+    //   原因：补发走的是真 bot 真凭据 ⇒ 队列里堆几条就一口气往会话里推几张同形卡，
+    //   既撞飞书额度（AIAD H1 最小调用量），也容易让 CM 连着看到几张内容相近的卡。
+    for (let i = cardRelay.length - 1; i >= 0; i--) {
+      const it = cardRelay[i]
+      // 本代在托孤**之后**已经推过更新的内容 ⇒ 撤销。
+      //   比的是入队时刻 `at`，不是内容水位：旧代欠的那一次通常是**收尾/封口**
+      //   （status=sealed、结论由 note 升为 message），这类变化**不产生新事件**
+      //   ⇒ lastScannedAt 原地不动，按水位判定会误判"已送达"，卡就永远停在
+      //   「正在工作中…」（正是 CM 报的那个障）。
+      //   取**严格大于**：`lastPushedAt` 记的是组装载荷那一刻的水位，
+      //   一次"恰好在托孤那一瞬组装、送达却在封口之前"的推送，水位可能与 `at` 同值 ⇒
+      //   用 `>=` 会把这种没带上新状态的推送当成已送达。宁可多一次幂等 PATCH，不可漏终态。
+      if (Number(it.card.lastPushedAt || 0) > it.at) {
+        cardRelay.splice(i, 1)
+        continue
+      }
+      // 没有 token ⇒ 这是旧代 dispose **之后**才新建的卡（会话里根本不存在它）。
+      //   绝不补发（那等于凭空多塞一张野卡），这种欠账由 runTurn 的单卡回退还。
+      if (!it.card.token) {
+        if (now - it.at > CARD_RELAY_TTL_MS) {
+          console.log('[fs] relayed card push dropped (card never existed in this chat): chat=' + it.chatId)
+          cardRelay.splice(i, 1)
+        }
+        continue
+      }
+      // 这张卡还在**重试退避窗口**里（上次推失败，retryUntil 之前推了也会被 syncCard 拦下）。
+      //   0.7.21（独立审查）：必须**留着这条**再看下一张 —— 旧实现直接调 syncCard 并打印
+      //   "delivered" 后 splice，而那次调用其实被 retryUntil 挡回 ⇒ **唯一一次自愈机会被
+      //   静默吃掉，日志还撒谎**。这里跳过（continue）等退避过去，由 TTL 兜底。
+      if (now < Number(it.card.retryUntil || 0)) continue
+      const bot = findBotForChat(it.chatId)
+      if (!bot) {
+        // 本代解析不到这个会话的 bot ⇒ 通道是真坏着：不许把后面的卡继续硬塞，整批停下等下一拍。
+        if (now - it.at > CARD_RELAY_TTL_MS) {
+          console.log('[fs] relayed card push dropped (no bot for this chat within '
+            + Math.round(CARD_RELAY_TTL_MS / 1000) + 's): card=' + String(it.card.token || '-').slice(-8))
+          cardRelay.splice(i, 1)
+        }
+        break
+      }
+      try { void syncCard(bot, it.chatId, it.card, true).catch(() => { }) } catch { }
+      console.log('[fs] relayed card push delivered: chat=' + it.chatId
+        + ' card=' + String(it.card.token || '-').slice(-8))
+      cardRelay.splice(i, 1)
+      break
+    }
+  }
 
   // 刚封口的普通回合卡：agentId -> { card, bot, chatId, sealedAt }
   // 2026-09-27（CM 实证："每次发东西，大部分都会一个内容发两次"）：
@@ -702,7 +794,10 @@ export function apply(ctx) {
     card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === WORKING_PLACEHOLDER))
     return before - card.blocks.length
   }
-  function makeCardState(agent) {
+  // 0.7.20：`from` = 被接续的**上一张卡**（换卡/分卡/答题续写都算同一轮的延续）。
+  //   只继承一件事：静默提示**已播次数**。否则"提示一发就换卡"会把计数器一起换掉，
+  //   上限形同虚设（2026-10-04 独立审查后自查发现：换卡链上的卡每张都从 0 重新数 ⇒ 还是刷屏）。
+  function makeCardState(agent, from) {
     return {
       agent: agent || null,
       // 底部状态栏形态（CM 2026-10-01 定 A 方案）：
@@ -737,6 +832,15 @@ export function apply(ctx) {
       pendingTools: 0,
       // 2026-10-03：上次"长静默播报"的时刻（同一种静默最多每 10 分钟播一条，防刷屏）
       stallNotifiedAt: 0,
+      // 0.7.20：这一轮已播过几次静默提示（上限 DSH_STALL_NOTICE_MAX；**换卡时从上一张继承**，
+      //   见 makeCardState 的 `from`），以及「agent 已 idle 且无拥有者」的起始时刻
+      //   （孤儿卡补封口的宽限计时，见 CARD_ORPHAN_SEAL_MS）。
+      stallNoticeCount: Number(from && from.stallNoticeCount || 0),
+      idleSince: 0,
+      // 0.7.20：内容进卡 / 推送成功 的两个时刻（配对使用，见 scanCard 尾部与 syncCard 成功处）。
+      //   热重载接管靠它判定"这张卡欠不欠一次推送"，不靠无脑重推（无脑重推=内容重复）。
+      lastScannedAt: 0,
+      lastPushedAt: 0,
       // 2026-10-03 H：计划模式开关（读会话 `plan/mode` 事件）—— 状态栏据此显示「📋 计划模式」
       // 初值必须**回扫会话**（见 lastPlanModeActive），不能硬编码 false：否则开关之后建的卡全错。
       planActive: lastPlanModeActive(agent),
@@ -1184,6 +1288,19 @@ export function apply(ctx) {
   // 阈值更低（3 分钟），同一种静默**最多每 10 分钟播一条**（防刷屏）。
   const DSH_TOOL_NOTICE_MIN = 3
   const DSH_NOTICE_REPEAT_MS = 10 * 60 * 1000
+  // 0.7.20（CM 2026-10-04 报障「365/375/385/395/405 分钟一直刷」）：**同一轮最多播 2 次**。
+  //   计数按「卡」存放，但**换卡时从上一张继承**（见 makeCardState 的 from 参数）——
+  //   因为每次播报都会换一张新卡，不继承的话封顶会被自己的换卡动作绕过。
+  //   真卡住也只需提醒两次；第三次起只会把会话刷成噪声，而 CM 该做的动作（/stop 或回一句）已经知道。
+  const DSH_STALL_NOTICE_MAX = 2
+  // 0.7.20：**孤儿卡补封口的宽限**。判据是「agent 已 idle 且没有任何回合拥有者」，
+  //   而 runTurn 收尾是 `stopCardWatcher()` → `activeTurns.delete()` → 最后一次封口
+  //   （见本文件 runTurn 收尾那段，删除拥有者与封口之间只有几行代码），
+  //   不留宽限就可能抢在它前面封口、把「✅ 本轮结束」写两遍。
+  //   阈值取 3000ms = **10 拍轮询**（CARD_POLL_INTERVAL 300ms）：远大于上面那几行的间隔，
+  //   又不至于让真孤儿卡多挂太久（2026-10-04 独立审查 MED#1 要求加大余量；
+  //   原先写 1200ms 只是"连续 3 拍"，余量偏薄）。
+  const CARD_ORPHAN_SEAL_MS = 3000
   // H（2026-10-03 CM）：「状态栏这里应该变成三个不同的状态：**普通模式 / 计划模式 / 目标模式**」。
   // 判据全部用**现成的可读源**，不猜：
   //   · 计划：会话事件 `plan/mode`（`dsh-plan-mode` 每次切换都 append，见其 lib/index.js:377/392）
@@ -2033,6 +2150,9 @@ export function apply(ctx) {
     //   旗拦本代一切推送，新代 apply 是新闭包、旗=false ⇒ 接管/续卡照常。留痕不抛错。
     if (card && generationDisposed) {
       console.log('[fs] card sync skipped: generation disposed (interrupted card left for new instance)')
+      // 0.7.21（HIGH-2）：**拦下不等于丢掉**。这一轮的收尾只剩这一次推送没发出去，
+      // 把它托付给活着的实例补发，否则这张卡就永远停在收尾前的样子（CM 报的"重载后卡片不更新"）。
+      relayCardPush(card, chatId)
       return card.queue
     }
     if (!card || !bot || card.circuitOpen) {
@@ -2048,7 +2168,16 @@ export function apply(ctx) {
     // 0.7.17（两模式）：每次推送前重解析一次（cfg 热读 ⇒ 改模式 10 秒内对新推送生效）。
     card.mode = resolveCardMode(bot, chatId)
     const now = Date.now()
-    if (now < card.retryUntil) return card.queue
+    // 0.7.21（独立审查 MEDIUM）：`force`（封口/换卡/补发这类"最后一次机会"的推送）过去会被
+    //   退避窗口**静默吞掉** —— 一旦这张卡刚失败过，收尾就再也不有人推（真孤儿卡）。
+    //   不改退避策略（那是防刷屏的），但必须留痕，否则排查时看不出"为什么没推"。
+    if (now < card.retryUntil) {
+      if (force) {
+        console.log('[fs] forced card sync deferred by retryUntil (in '
+          + (card.retryUntil - now) + 'ms): card=' + String(card.token || '-').slice(-8))
+      }
+      return card.queue
+    }
     if (card.token && !force && now - card.lastSyncAt < CARD_MIN_INTERVAL) return card.queue
     card.queue = card.queue.catch(() => {}).then(async () => {
       // 队列**内部**再检查一次：syncCard 会被多处几乎同时调用（建卡时 force、watcher、
@@ -2059,8 +2188,11 @@ export function apply(ctx) {
       // 队列内复检代际旗（与上面 createFailed 的队列内复检同一先例），否则已入队的 PATCH 仍会推出去。
       if (generationDisposed) {
         console.log('[fs] card sync skipped inside queue: generation disposed')
+        relayCardPush(card, chatId)   // 同上：入队后才轮到执行才被拦 ⇒ 一样要托孤
         return
       }
+      // 0.7.21（MEDIUM）：先记下"这次载荷覆盖到哪条内容"—— 成功后把它写成水位（见下面 lastPushedAt）。
+      const deliveredWatermark = Number(card.lastScannedAt || 0)
       const payload = buildCardPayload(card)
       // G：把 markdown 里的**本地图片引用**换成真 `img_key`（飞书只认 key，本地路径会**整卡被拒**）
       try {
@@ -2093,6 +2225,12 @@ export function apply(ctx) {
           } catch {}
         }
         card.lastSyncAt = Date.now()
+        // 0.7.20：这次推送**成功落达** ⇒ 记录"内容已推到哪儿"。
+        // 0.7.21（独立审查 MEDIUM）：这里记的**不是时刻而是水位** —— 取"载荷组装那一刻"的
+        //   lastScannedAt。原先两处都取 `Date.now()`，于是「推送进行中（T0 起）→ 期间扫进新内容
+        //   （T1）→ 推送在 T2>T1 才成功」会把 T1 的内容一起算成"已送达"，而那次载荷里根本没有它
+        //   ⇒ 热重载接管时判定 unpushed=false，欠的那一次就永远不补了。
+        card.lastPushedAt = deliveredWatermark
         // 引用透传（改造⑤）：卡片内容随回合推进才成形（建卡那刻只有「正在工作中…」）
         // ⇒ **每次成功同步都重取摘要**，CM 引用时才看得到"引的是哪张、说了什么"。
         // 真机实证：只登记建卡那一刻 → 引用回来的是「bot 的回复卡片：正在工作中…」。
@@ -2219,6 +2357,10 @@ export function apply(ctx) {
       }
     }
     card.cursor = events.length
+    // 0.7.20：内容**进卡**的时刻（与"推出去"的时刻配对，见 lastPushedAt）。
+    //   热重载接管时要靠这两个时刻判断"上一代攒在内存里的内容推没推出去"——
+    //   不看这个的话，要么漏推（CM 报的"重载后卡片不更新"），要么每次重载无脑重推（=重复）。
+    if (changed) card.lastScannedAt = Date.now()
     return changed
   }
 
@@ -2242,6 +2384,31 @@ export function apply(ctx) {
   // 不接管的话两代各自开卡 ⇒ 就是 CM 报的"两张卡并行长"。
   const liveCardRegistry = globalThis.__fsLiveCards || (globalThis.__fsLiveCards = new Map())
 
+  // 0.7.20：**回合是否真的还活着** —— 读 dsh agent 自己的状态（`get status` ⇒ 'idle' | 'running'，
+  //   见 dsh-agent-loop/lib/index.js:790）。这是**唯一与插件代际无关**的存活判据：
+  //   热重载后旧实例的 `await whenIdle()` 链条还在，但它的封口推送被代际旗拦掉，
+  //   卡面就永远停在 running —— 只看卡/只看表都会误判，只有问 agent 本身才准。
+  //   读不到（对象没这个 getter）时**按活着处理**：宁可少封一张卡，也不许把还在跑的一轮误封成结束。
+  function agentIsRunning(agent) {
+    try {
+      const st = agent && agent.status
+      if (st === 'idle') return false
+      if (st === 'running') return true
+      return true
+    } catch { return true }
+  }
+
+  // 0.7.20：找"这个会话当前那张还在跑的卡"（本代 watcher ∪ 跨代 registry 都查）。
+  //   为什么两张都查：热重载"续卡"发生在 apply 顶层（比播报早），接管成功的话卡就在本代 Set 里；
+  //   接管不了（上一代的东西本代看不到）时只能靠 registry —— 只查一张必然漏。
+  function liveCardForChat(chatId) {
+    const hit = (e) => (e && e.card && e.card.status === 'running'
+      && String(e.chatId || '') === String(chatId || '') ? e : null)
+    for (const e of liveCardWatchers) { const found = hit(e); if (found) return found }
+    for (const e of liveCardRegistry.values()) { const found = hit(e); if (found) return found }
+    return null
+  }
+
   // 0.7.8：本卡还是不是"这张会话当前最新的在跑卡"。
   //   判据：同会话里存在**序号更大（＝更晚创建）且仍 running** 的卡 ⇒ 本卡已被顶掉（僵尸卡）。
   //   为什么需要它：热重载"续卡"会接管上一代的卡；若那张卡早已不是会话当前的卡，它就再也扫不到
@@ -2261,8 +2428,104 @@ export function apply(ctx) {
     for (const entry of liveCardRegistry.values()) { if (stale(entry)) return false }
     return true
   }
+  // 0.7.20（CM 批准的方案第 3 点）：给"回合已经不在了、卡却还挂在 running"的孤儿卡**补封口**。
+  //   成因（有出处）：上一代 runTurn 收尾时先 `activeTurns.delete()`、再发最后一次 PATCH，
+  //   而那一次 PATCH 被 `generationDisposed` 拦掉（见 syncCard 入口）⇒ 卡面永远停在「正在工作中…」，
+  //   并且它的定时器还会按 10 分钟一条无限播"上游没回包"（CM 报障的 365→405 分钟）。
+  //   文案只写**当场能证实**的事：① 由本实例补的封口（=收尾推送丢了）② 卡上内容就是全部进度
+  //   ③ 请求没丢。不写"其实已经跑完"这种无法证实的断言。
+  function sealFinishedAfterReload(agent, card, bot, chatId, why) {
+    console.log('[fs] orphan card sealed after reload: chat=' + chatId
+      + ' card=' + String((card.token || '-')).slice(-8) + ' why=' + why)
+    card.sealing = true
+    // 补扫一次：把断流期间落在会话里、还没镜像上卡的内容收进来（不补扫 = 白丢尾段）
+    try { scanCard(agent, card) } catch (error) {
+      console.log('[fs] orphan seal catch-up scan failed: ' + String(error && error.message || error))
+    }
+    card.status = 'sealed'
+    card.idleMinutes = 0
+    card.idleKind = ''
+    dropWorkingPlaceholder(card)
+    card.blocks.push({
+      type: 'message',
+      text: '♻️ 插件热重载：这一轮此刻已经不在跑了，卡面却还停在「正在工作中…'
+        + '」（收尾那次卡片更新丢了，**由本实例补的封口**）。'
+        + '卡上的内容就是它跑到哪儿的全部内容；你的请求没有丢，要继续请再发一句。',
+    })
+    try { void syncCard(bot, chatId, card, true).catch(() => { }) } catch { }
+  }
+
+  // 自动轮（目标轮／回执轮）的收口：补扫 → 把最后一段过程话语提升为正文 → 判定成功/失败 → 封口推送。
+  // 0.7.21（独立审查 MEDIUM）：从 `agent/status` 的 idle 分支**抽成函数**，因为热重载接管来的
+  //   自动卡也要收口（补封口那条），旧实现只会走普通回合的 `sealFinishedAfterReload`
+  //   ⇒ 目标卡上写「这一轮收尾被吞了」，而真实原因是「这一轮跑完了／失败了」——文案说假原因。
+  // `openedAt` 必须是**这一轮开始时**的事件游标（不是卡面游标），否则"最后一段话/失败标记"
+  //   会摘到上一轮的内容。
+  function closeAutoRoundCard(agent, card, bot, chatId, openedAt, kind, why, byReload) {
+    if (!card) return
+    card.sealing = true
+    // 封口前**必须补扫**（与普通回合 runTurn 的 catch-up scan 同源）：
+    // 目标轮的收尾话语（"进度（第 N 轮）…"）几乎与轮结束同时到达，
+    // watcher 一拍（300ms）常常来不及镜像 → 不补扫就会只剩工具记录、
+    // 一句话都没有（CM 2026-09-16 反馈，取证：会话里 seq 有整段文字，卡上 notes=0）。
+    try { scanCard(agent, card) } catch (error) {
+      console.log('[fs] goal catch-up scan failed: ' + String(error && error.message || error))
+    }
+    // 把本轮最后一段话提升为**正式消息块**：过程话语有 500 字截断，
+    // 轮次的进度汇报通常远超这个长度，截断后 CM 看不到实质内容。
+    const closing = lastAssistantTextSince(agent, openedAt || 0)
+    let promoted = false
+    if (closing.seq !== undefined) {
+      for (let i = card.blocks.length - 1; i >= 0; i--) {
+        const block = card.blocks[i]
+        if (block.type === 'note' && block.seq === closing.seq) {
+          card.blocks[i] = { type: 'message', text: closing.text }
+          promoted = true
+          break
+        }
+      }
+    }
+    if (!promoted && closing.text) card.blocks.push({ type: 'message', text: closing.text })
+    // 失败轮不能谎报成功（2026-09-18，与普通回合 runTurn 同源的问题）：
+    // 上游报错（如 402 余额不足）会让整轮**没有任何产出**，旧实现照样写「✅ 本轮结束」+
+    // status='sealed' → 目标模式下同样"看不出为什么不动了"。失败标记只认上游显式 reason。
+    const failure = turnFailureReason(sessionEvents(agent.session), openedAt || 0)
+    if (failure && !closing.text) {
+      card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：' + failure.text })
+    } else if (!closing.text && card.tools.size === 0) {
+      // 与普通回合同源（2026-09-21）：没有产出、也没有失败标记时，**不许**写「✅ 本轮结束」装成功。
+      card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI）' })
+    }
+    const silent = !closing.text && card.tools.size === 0
+    card.status = (failure || silent) ? 'error' : 'sealed'
+    card.blocks.push({ type: 'message', text: (failure || silent) ? '❌ 本轮失败' : '✅ 本轮结束' })
+    if (byReload) {
+      // 诚实标注（A24：不许把"我们这边收尾丢了"说成"上游没回包"，也不许假装是正常收尾）
+      card.blocks.push({ type: 'message',
+        text: '♻️ 插件热重载：这一轮**内容已经跑完**，只是收尾那次卡片更新丢了 ⇒ 由本实例补的封口。' })
+    }
+    console.log('[fs] auto card sealed: agent=' + String(agent && agent.id) + ' kind=' + (kind || 'goal')
+      + ' failure=' + (failure ? failure.text : 'none') + ' silent=' + silent
+      + (why ? ' why=' + why : '')
+      + ' closing_hash=' + shortHash(String(closing.text || '')) + ' closing_len=' + String(closing.text || '').length
+      + ' card=' + (card.token || '-') + ' blocks=' + card.blocks.length)
+    try { void syncCard(bot, chatId, card, true).catch(() => { }) } catch { }
+  }
+
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
     const entry = { agent, card, bot, chatId, stop: null }
+    const sealAsFinished = (why) => {
+      // 0.7.21（MEDIUM）：接管来的**自动轮**卡（目标轮／回执轮）收口要走自动轮那套
+      //   （补扫→提升正文→失败归因→✅/❌），旧实现一律用普通回合的补封口文案 ⇒
+      //   目标卡上写的是"收尾被吞了"，而不是"这一轮跑完了/失败了"，说的不是人话。
+      const re = liveCardRegistry.get(String(agent && agent.id))
+      if (re && re.card === card && re.autoKind) {
+        closeAutoRoundCard(agent, card, bot, chatId, Number(re.autoOpenedAt || 0), re.autoKind, why, true)
+      } else {
+        sealFinishedAfterReload(agent, card, bot, chatId, why)
+      }
+      try { stop() } catch { }
+    }
     const timer = setInterval(() => {
       if (card.sealing) return
       try {
@@ -2293,6 +2556,7 @@ export function apply(ctx) {
           card.idleMinutes = 0
           card.idleKind = ''
           card.stallNotifiedAt = 0
+          card.idleSince = 0
           void syncCard(bot, chatId, card, false).catch(() => {})
         } else if (card.status === 'running' && card.lastEventAt) {
           // 诚实状态（2026-10-03 改：**有诊断含义**，不再让人误以为"它在忙"）：
@@ -2305,7 +2569,28 @@ export function apply(ctx) {
             const running = [...card.tools.values()].filter((t) => t && t.status === 'running')
             card.idleToolName = running.length ? String(running[running.length - 1].name || '') : ''
           }
-          const next = mins >= DSH_IDLE_NOTICE_MIN ? mins : 0
+          // 0.7.20（CM 报障「卡住就一直刷：365/375/385/395/405 分钟」）：先分清
+          //   「**上游真没回包**」和「**这一轮早就跑完了，只是收尾被热重载吞掉**」——
+          //   旧实现只看卡片自己，永远分不出来，于是孤儿卡按 10 分钟一条无限播（真机 mins 一路涨到 405）。
+          //   判据用 dsh 自己的 `agent.status` + 回合拥有者（两张表都跨代共享），不靠时间猜。
+          const ownerAlive = activeTurns.has(String(agent && agent.id))
+            || autoCards.has(String(agent && agent.id))
+          // 「回合记录还挂着」不能用来给卡面那句话作保 —— 只有 agent **本人**报 running，
+          //   「上游没有回包」才是真话（ownerAlive 只说明我们这边还没收尾）。
+          const turnAlive = agentIsRunning(agent)
+          if (!agentIsRunning(agent) && !ownerAlive) {
+            if (!card.idleSince) card.idleSince = Date.now()
+            if (Date.now() - card.idleSince >= CARD_ORPHAN_SEAL_MS) {
+              sealAsFinished('turn finished but seal lost with the old generation')
+              return
+            }
+          } else {
+            card.idleSince = 0
+          }
+          // 卡面那句「上游已 N 分钟没有回包」**只在回合还活着时写**（0.7.20）：
+          //   agent 已 idle、回合却还挂着 ⇒ "没有回包"是假话（它根本不在等回包），
+          //   宁可这一格留空，也不能让卡面挂着一句诊断不了的话（E6：提示必须有诊断含义）。
+          const next = (mins >= DSH_IDLE_NOTICE_MIN && turnAlive) ? mins : 0
           // ⚠️ 只在"分钟数变化"时同步 —— 别因为 kind 变了就多同步一次：
           //    冒烟里「同一回执不重复播报」那条断言把**卡片 PATCH 更新**也算进长度，
           //    多一次无谓更新就会把它判红（这是真代价，不是测试洁癖）。
@@ -2333,6 +2618,23 @@ export function apply(ctx) {
               try { stop() } catch { }
               return
             }
+            // 0.7.20 闸门②：**agent 已经不是 running** ⇒ 这句"上游没回包"就是假话
+            //   （典型来源：上一代遗留的卡，它那一轮已经结束了）。不播，等上面的补封口处理。
+            if (!agentIsRunning(agent)) {
+              console.log('[fs] stall notice suppressed: agent idle (turn already over) chat=' + chatId
+                + ' card=' + String((card.token || '-')).slice(-8) + ' kind=' + kind + ' mins=' + mins)
+              card.stallNotifiedAt = Date.now()
+              return
+            }
+            // 0.7.20 闸门③：**同一轮最多播 DSH_STALL_NOTICE_MAX 次**（计数跨换卡继承），之后只留灰字状态，
+            //   不再往会话里发消息（真卡住也不需要刷屏；CM 该做的动作第一条提示里已经写了）。
+            if (Number(card.stallNoticeCount || 0) >= DSH_STALL_NOTICE_MAX) {
+              console.log('[fs] stall notice suppressed: reached cap chat=' + chatId
+                + ' card=' + String((card.token || '-')).slice(-8) + ' kind=' + kind
+                + ' mins=' + mins + ' count=' + card.stallNoticeCount)
+              card.stallNotifiedAt = Date.now()
+              return
+            }
             card.stallNotifiedAt = Date.now()
             const running = [...card.tools.values()].filter((t) => t && t.status === 'running')
             const toolName = card.idleToolName || (running.length ? String(running[running.length - 1].name || '') : '')
@@ -2340,16 +2642,22 @@ export function apply(ctx) {
               ? '🔧 我还在跑工具' + (toolName ? ' `' + toolName + '`' : '')
                 + '（已 ' + mins + ' 分钟）。这是**正常**的，不是卡住 —— 跑完我会继续往下做。'
               : '⏳ 上游已经 ' + mins + ' 分钟**没有回包**（模型侧卡住／网络慢，不是卡片坏了，'
-                + '也不是我在埋头干活）。你回我一句话就会强制重新发起这一轮。'
+                + '也不是我在埋头干活）。这一轮还挂着：发 /stop 结束它，或者直接再说一句都行。'
+                + '（同一轮最多提醒 ' + DSH_STALL_NOTICE_MAX + ' 次，之后不再刷屏。）'
             // P2（审查 MED#1841）：sendPlainText 是"先取 token/传图再 POST"的异步链，
             // 同步紧跟着换卡的话，两条请求顺序不保证 ⇒ 新卡可能落在提示**上方**（正是要修的症状）。
             // ⇒ 必须 **.then() 链在发送成功之后**再换卡。
-            void sendPlainText(bot, chatId, note)
-              .catch(() => { })
-              .then(() => {
-                console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
-                rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
-              })
+            // 0.7.21（独立审查 MEDIUM）：**额度也在发送成功之后才扣** —— 原先发送前就 +1，
+            //   一条因网络/风控没发出去的消息照样吃掉一次配额 ⇒ CM 一轮里可能只看到 1 条提示。
+            //   发送失败则不扣、也不换卡（换卡的唯一理由就是"提示压在长卡上面"，没发出去就不成立）。
+            void sendPlainText(bot, chatId, note).then(() => {
+              card.stallNoticeCount = Number(card.stallNoticeCount || 0) + 1
+              console.log('[fs] stall notice sent: chat=' + chatId + ' kind=' + kind + ' mins=' + mins)
+              rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD)
+            }, (error) => {
+              console.log('[fs] stall notice send failed (额度不扣，等下一个静默窗口重试): '
+                + String(error && error.message || error))
+            })
           }
         }
       } catch (error) {
@@ -2470,13 +2778,24 @@ export function apply(ctx) {
     if (n > 0) console.log('[fs] dispose(热重载): 停掉 ' + n + ' 个 watcher（卡片留给新实例续卡）')
   })
 
+  // 0.7.21（MEDIUM）：给**跨代 registry** 的那条登记打上"这是一轮自动轮（目标／回执）"的标记。
+  //   为什么打在 registry 条目上而不是卡上：`startCardWatcher` 每建一个 watcher 就换一个新的
+  //   entry 对象并覆盖登记 ⇒ 标记必须在每次起 watcher 之后重打（见下面三处调用点）。
+  //   热重载接管／补封口时靠它决定"用自动轮那套收口"还是"用普通回合那套"（封口文案要说真实原因）。
+  function markAutoRound(agent, kind, openedAt) {
+    const re = liveCardRegistry.get(String(agent && agent.id))
+    if (!re) return
+    re.autoKind = kind || 'goal'
+    re.autoOpenedAt = Number(openedAt || 0)
+  }
+
   // 表格额度换卡（续卡通道专用）：旧卡保留表格，新卡接续游标，不丢不重。
   function rotateAdoptedCard(agent, reason, oldText) {
     const key = String(agent && agent.id)
     const entry = liveCardRegistry.get(key)
     if (!entry || !entry.card) return
     const old = entry.card
-    const fresh = makeCardState(agent)
+    const fresh = makeCardState(agent, old)
     fresh.cursor = old.cursor
     fresh.footerMode = 'bare'
     old.sealing = true
@@ -2493,8 +2812,77 @@ export function apply(ctx) {
     try { void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => { }) } catch { }
     entry.card = fresh
     if (entry.stop) { try { entry.stop() } catch { } }
+    const keepKind = entry.autoKind
+    const keepOpenedAt = entry.autoOpenedAt
     entry.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, (r) => rotateAdoptedCard(agent, r))
+    if (keepKind) markAutoRound(agent, keepKind, keepOpenedAt)   // 0.7.21：标记随新登记条目带走
     console.log('[fs] 续卡通道：表格换卡 card=' + String(fresh.token || '-').slice(-8))
+  }
+
+  // 封口前把卡上被 `MAX_NOTE_CHARS`(500) 截断的**过程正文**按 seq 从会话事件里还原成完整正文。
+  // 由来（CM 2026-10-02）：「我发信息给你，若你刚好在应答的时候，你会直接截断掉需要打印结果
+  // 的那些回复的内容，导致我看不到」—— 插话会换卡，旧卡就此封口，而新卡游标从当前位置起
+  // 不重放 ⇒ 旧卡上那 500 字就是 CM 能看到的全部。2026-10-04 起两处共用（runTurn 的 split
+  // 与接管卡的 splitAdoptedCard），所以抽成函数，不复制第二份逻辑。
+  function expandTruncatedNotes(agent, card) {
+    try {
+      const liveEvents = sessionEvents(agent.session)
+      let expanded = 0
+      for (let i = 0; i < card.blocks.length; i++) {
+        const b = card.blocks[i]
+        if (!b || b.type !== 'note' || b.seq === undefined) continue
+        let full = ''
+        for (let k = liveEvents.length - 1; k >= 0; k--) {
+          const ev = liveEvents[k]
+          if (!ev || ev.seq === undefined) continue
+          if (ev.seq === b.seq) {
+            if (ev.type === 'assistant/message') full = extractProcessText(ev.data && ev.data.message)
+            break
+          }
+          if (ev.seq < b.seq) break
+        }
+        if (full && full.length > String(b.text || '').length) {
+          card.blocks[i] = { type: 'note', seq: b.seq, text: full }
+          expanded++
+        }
+      }
+      if (expanded > 0) console.log('[fs] 插话封口：还原 ' + expanded + ' 段被截断的过程正文')
+    } catch (error) {
+      console.log('[fs] 插话封口还原失败（不影响换卡）: ' + String(error && error.message || error))
+    }
+  }
+
+  // 0.7.21（HIGH-1）：**插话/答题换卡落在"接管来的卡"上**时的本代等价通道。
+  //   旧实现只在 activeTurns / autoCards 里找 `split()` —— 热重载之后那两条要么没有条目、
+  //   要么条目属于**上一代**（闭包已被代际旗封死，调一次这张卡就再也不更新）。结果是
+  //   0.7.x 一直在保护的「插话必须换卡」在重载后**静默失效**。
+  //   本函数与 rotateAdoptedCard 同构，差别只有 split 的语义：新卡游标 = **当前事件位**
+  //   （旧卡已镜像的内容绝不重放），并且带 notice（旧卡留一行指路、新卡首块放醒目正文）。
+  function splitAdoptedCard(agent, notice) {
+    const entry = liveCardRegistry.get(String(agent && agent.id))
+    if (!entry || !entry.card || entry.card.status !== 'running') return false
+    const old = entry.card
+    expandTruncatedNotes(agent, old)
+    const fresh = makeCardState(agent, old)
+    fresh.cursor = sessionEvents(agent.session).length
+    fresh.footerMode = 'bare'
+    old.sealing = true
+    old.status = 'sealed'
+    dropWorkingPlaceholder(old)
+    old.blocks.push((notice && notice.old)
+      || { type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
+    try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
+    if (notice && notice.fresh) fresh.blocks.push(notice.fresh)
+    fresh.blocks.push({ type: 'message', text: '继续处理中…' })
+    try { void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => { }) } catch { }
+    entry.card = fresh
+    if (entry.stop) { try { entry.stop() } catch { } }
+    const keepKind75 = entry.autoKind
+    const keepOpenedAt75 = entry.autoOpenedAt
+    entry.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, (r) => rotateAdoptedCard(agent, r))
+    if (keepKind75) markAutoRound(agent, keepKind75, keepOpenedAt75)   // 0.7.21：标记随新登记条目带走
+    console.log('[fs] 续卡通道：插话/答题换卡 card=' + String(fresh.token || '-').slice(-8))
+    return true
   }
 
   // 热重载「续卡」：新实例接管上一代还没封口的卡（同一张卡上继续更新）。
@@ -2506,6 +2894,31 @@ export function apply(ctx) {
         liveCardRegistry.delete(key)
         continue
       }
+      // 0.7.20（CM 报障「卡住就一直刷」的**源头治理**）：接管前先问 agent 本人。
+      //   它已经 idle、且这一轮无人认领（`activeTurns` 跨代共享，此刻旧代的 runTurn 早返回了）
+      //   ⇒ 这一轮其实已结束，只是收尾推送被代际旗吞掉，卡面才停在 running。
+      //   这种卡**绝不接管**（接管=养出一张扫不到新事件、却按"当前这一轮"口吻无限播的僵尸卡），就地补封口。
+      // 🔴 0.7.21（独立审查 MEDIUM）：**不能只看一眼就判死**。目标轮／回执轮之间存在
+      //   "agent 已经 idle、下一轮还没起"的**正常间隙**，旧实现零宽限 ⇒ 正好落在这个间隙里的
+      //   热重载会把刚建好的目标卡当场封口（CM 看到"目标轮刚开就结束"）。
+      //   改法：静默时长还没超过 watcher 自己那套孤儿宽限（CARD_ORPHAN_SEAL_MS，连续两拍确认）
+      //   ⇒ 先照常接管，交给 watcher 的补封口去判（机制已存在，不新造第二套）。
+      const idleFor = Date.now() - Number(card.lastEventAt || 0)
+      if (!agentIsRunning(entry.agent) && !activeTurns.has(key) && !autoCards.has(key)
+        && idleFor >= CARD_ORPHAN_SEAL_MS) {
+        // 自动轮的卡用它自己的收口（补扫+提升正文+失败归因+✅/❌），封口文案才说得出真实原因
+        if (entry.autoKind) {
+          closeAutoRoundCard(entry.agent, card, entry.bot, entry.chatId,
+            Number(entry.autoOpenedAt || 0), entry.autoKind, 'adopt-skip: auto round over', true)
+        } else {
+          sealFinishedAfterReload(entry.agent, card, entry.bot, entry.chatId,
+            'adopt-skip: agent idle and turn not owned')
+        }
+        liveCardRegistry.delete(key)
+        console.log('[fs] 热重载续卡：补封口（不接管）agent=' + key
+          + ' card=' + String(card.token || '-').slice(-8) + ' idleFor=' + idleFor + 'ms')
+        continue
+      }
       // 0.7.8：接管前先判"它还是不是这张会话当前最新的在跑卡"（协作信箱任务③：从源头不产生僵尸卡）。
       //   不是 ⇒ **封口而不接管**（否则新实例会养出一张永远扫不到新事件、却还按"当前这一轮"口吻播报的卡）。
       if (!isLiveCardForChat(entry.chatId, card)) {
@@ -2514,14 +2927,39 @@ export function apply(ctx) {
         dropWorkingPlaceholder(card)
         card.blocks.push({ type: 'message', text: '♻️ 插件热重载：本卡已不是当前这张，停止更新（后续内容见下方卡片）。' })
         try { void syncCard(entry.bot, entry.chatId, card, true).catch(() => { }) } catch { }
+        // 0.7.21（独立审查 LOW）：封口了就必须把登记一起摘掉 —— 旧实现漏了这行，
+        //   于是这张**已封口**的卡继续留在跨代 registry 里，下一轮重载的"接管／补封口"
+        //   分支还会再看到它（并可能据此判断"上一轮还活着"）。
+        liveCardRegistry.delete(key)
         console.log('[fs] 热重载续卡：跳过（已不是当前卡）agent=' + key
           + ' card=' + String(card.token || '-').slice(-8))
         continue
       }
       card.bornSeq = nextCardStamp()   // 接管 ⇒ 它现在才是"当前卡"（跨代序号必须重打，见 isLiveCardForChat）
+      // 0.7.20（CM 批准的方案第 2 点）：接管**立刻**补扫 + 强推一次。
+      //   旧实现只起定时器 ⇒ 上一代攒在 card.blocks 里、PATCH 被拦的那些内容，要等下一次
+      //   有新事件才会被推出去（CM 报的"热重载后卡片不更新"正是这个）。
+      //   补扫的结果只用来决定是否刷新"上次活跃时刻"：扫到新事件才算它真的还在动，
+      //   扫不到就保留旧时刻（静默时长必须真实，不许为了让提示好看而造假）。
+      let caughtUp = false
+      try { caughtUp = Boolean(scanCard(entry.agent, card)) } catch (error) {
+        console.log('[fs] 热重载续卡补扫失败: ' + String(error && error.message || error))
+      }
+      if (caughtUp) card.lastEventAt = Date.now()
+      // 只在**真的欠一次推送**时才强推：内容进卡的时刻(lastScannedAt) 晚于 推送成功的时刻(lastPushedAt)。
+      //   旧代一切正常 ⇒ 两个时刻相等 ⇒ 不推（无脑重推会让卡面内容重复，CM 2026-10-04 独立审查 HIGH#1）。
+      const unpushed = Number(card.lastScannedAt || 0) > Number(card.lastPushedAt || 0)
+      if (caughtUp || unpushed) {
+        try { void syncCard(entry.bot, entry.chatId, card, true).catch(() => { }) } catch { }
+      }
       console.log('[fs] 热重载续卡：接管 agent=' + key + ' card=' + String(card.token || '-').slice(-8)
-        + ' blocks=' + card.blocks.length)
+        + ' blocks=' + card.blocks.length + ' catchup=' + caughtUp + ' unpushed=' + unpushed)
+      const keepKindAdopt = entry.autoKind
+      const keepOpenedAtAdopt = entry.autoOpenedAt
       entry.stop = startCardWatcher(entry.agent, card, entry.bot, entry.chatId, (r) => rotateAdoptedCard(entry.agent, r))
+      // 0.7.21：接管不打断自动轮 —— 标记必须跟着搬到新登记条目上，
+      //   否则这张目标卡之后的收口又会退回"普通回合"那套文案（同一个 MEDIUM 换个入口复发）。
+      if (keepKindAdopt) markAutoRound(entry.agent, keepKindAdopt, keepOpenedAtAdopt)
     } catch (error) {
       console.log('[fs] 热重载续卡失败（不影响其它功能）: ' + String(error && error.message || error))
     }
@@ -2537,6 +2975,60 @@ export function apply(ctx) {
   // 边界：只对"重载时确实有回合在跑"的情况播报（线索为空 ⇒ 不发任何东西，杜绝噪声）；
   //   每会话只播一次（globalThis 去重，幂等）；窗口外的旧线索直接丢弃。
   const RELOAD_NOTICE_WINDOW_MS = 120000
+
+  // 0.7.20（CM 批准的方案第 4 点）：**这一轮还在跑，但一张卡都没跟上**（接管失败／dsh 重启）
+  //   ⇒ 新建一张卡，从**当前游标**续镜像。全程不碰 agent：不发消息、不打断、不让它重跑。
+  //   游标取"当前事件总数"⇒ 只镜像从现在往后的内容，历史不重放（重放=CM 看到重复）。
+  //   返回一个**事实判定**（供播报文案选分支），不返回"我做了什么"的乐观结论。
+  function reviveCardForChat(sessionId, chatId, bot) {
+    try {
+      const agent = liveAgentsById().get(String(sessionId))
+      if (!agent) return { kind: 'no-agent' }
+      if (!agentIsRunning(agent)) return { kind: 'idle', agent }
+      if (liveCardForChat(chatId)) return { kind: 'mirrored', agent }
+      // 注意：这里**故意**不传 `from` ⇒ 新卡的 stall 播报额度从 0 重新计。
+      //   换卡续写（rotate）继承额度，是因为"同一轮的内容被切到下一张卡"，额度应当连续；
+      //   而复活出来的是**一张全新的卡**（旧卡已经不存在了），CM 看到的就是新卡，
+      //   再沿用旧额度会让新卡一次都播不出来 —— 卡真的又卡住时反而失声。
+      const card = makeCardState(agent)
+      card.cursor = sessionEvents(agent.session).length
+      card.blocks.push({
+        type: 'message',
+        text: '♻️ 插件热重载：这一轮仍在进行，旧卡没跟过来 —— 已新建这张卡**从当前进度继续**'
+          + '（不重发之前的内容，也不让 agent 重跑）。',
+      })
+      void syncCard(bot, chatId, card, true).catch(() => { })
+      startCardWatcher(agent, card, bot, chatId, (r) => rotateAdoptedCard(agent, r))
+      console.log('[fs] reload revive: new card chat=' + chatId + ' agent=' + sessionId
+        + ' cursor=' + card.cursor)
+      return { kind: 'revived', agent, card }
+    } catch (error) {
+      console.log('[fs] reload revive failed: ' + String(error && error.message || error))
+      return { kind: 'unknown' }
+    }
+  }
+
+  function reloadNoticeText(kind) {
+    if (kind === 'mirrored') {
+      return '♻️ 插件已热重载：**这一轮没被打断，还在跑**，卡片继续在原来那张上更新。'
+        + '我没有给 agent 发任何消息，也不会让它重跑。'
+    }
+    if (kind === 'revived') {
+      return '♻️ 插件已热重载：这一轮还在跑，但原来的卡片没跟到新实例 —— '
+        + '已**新建一张卡从当前进度继续镜像**（之前的内容不重发，agent 也不会重跑）。'
+    }
+    if (kind === 'idle') {
+      return '♻️ 插件已热重载：这一轮此刻已经不在跑了（跑完或被重载打断，dsh 没上报是哪种）。'
+        + '卡面若还停在「正在工作中…」，本实例会补一次封口；你的请求没有丢，要继续请再发一句。'
+    }
+    if (kind === 'no-agent') {
+      return '♻️ 插件已热重载：这个会话的 agent 已不在本实例（多半 dsh 也重启了），这一轮我没有接管。'
+        + '要继续请再发一句。'
+    }
+    return '♻️ 插件已热重载：这一轮的接管状态我暂时判不准（原因已记日志 '
+      + '`[fs] reload revive failed`）。如果卡片停住了，你回我一句即可。'
+  }
+
   function announceReloadInterrupts(attempt) {
     const hint = globalThis.__fsReloadHint
     if (!hint) return
@@ -2566,32 +3058,19 @@ export function apply(ctx) {
         const bot = bots.get(String((item && item.appId) || '')) || Array.from(bots.values())[0]
         if (!bot) continue
         notified.set(sessionId, Date.now())
-        void sendPlainText(bot, chatId,
-          '♻️ 插件已热重载：上一轮被热重载打断（不是模型出错，也不是你的操作）。'
-          + '**我已自动让它接着做** —— 如果它没接上，你回我一句就行。').catch(() => { })
-        console.log('[fs] hot reload interrupt notice: agent=' + sessionId + ' chat=' + chatId)
-        // ---- 丙 · 被打断就**自动续跑**（2026-10-03 CM 指定）---------------------------------
-        // 光发一条"被打断了"不够：新实例直接把那一轮接上 —— 复用**入站通道**塞一句系统提示
-        //（`handleInbound` 会照常建卡、跑回合、封口），让它从断点继续。
-        // 成本：多跑一轮（可能多花 token）；保护：每会话只续一次（与提示共用 `notified`）。
-        try {
-          void handleInbound(bot, {
-            message_id: 'reload-resume-' + Date.now().toString(36),
-            message_type: 'text',
-            chat_id: chatId,
-            _internal: true,   // 同上：别把"续跑"提示吃成提问卡的回答
-
-            content: JSON.stringify({
-              text: '（系统提示：插件刚热重载，上一轮被打断。请**从断点继续**，'
-                + '已经做完的部分不要重做；若其实已经做完，就一句话说明结论即可。）',
-            }),
-          }).catch((error) => {
-            console.log('[fs] reload auto-resume failed: ' + String(error && error.message || error))
-          })
-          console.log('[fs] reload auto-resume: agent=' + sessionId + ' chat=' + chatId)
-        } catch (error) {
-          console.log('[fs] reload auto-resume failed: ' + String(error && error.message || error))
-        }
+        // 0.7.20（CM 2026-10-04 拍定）：**先判真实情况，再按情况说话**。
+        //   旧实现无条件发"上一轮被打断，我已自动让它接着做"，并且真的注入一条假消息（见下方删除说明）。
+        const state = reviveCardForChat(sessionId, chatId, bot)
+        void sendPlainText(bot, chatId, reloadNoticeText(state.kind)).catch(() => { })
+        console.log('[fs] hot reload interrupt notice: agent=' + sessionId + ' chat=' + chatId
+          + ' state=' + state.kind)
+        // ---- 已删除：热重载「假消息注入」（2026-10-04 CM 下令，方案第 1 点）-----------------
+        //   旧实现在这里调 `handleInbound` 塞一条 `_internal` 的"（系统提示：请从断点继续）"，
+        //   前提是"热重载打断了这一轮"。真机日志否证了这个前提：重载前后会话游标连续推进
+        //   （同步根下的 `output/dsh-install/web.log` L85640–L85690）⇒ agent 根本没停。
+        //   后果：它跑完真正的一轮之后，把这条假消息当成**新的用户指令**再跑一轮幻影回合
+        //   （CM 报障②）。而重载风暴（实测相邻 apply 仅隔 4 秒）会把幻影轮乘倍。
+        //   现在：重载只做**卡片侧**的接管/补扫/复活，一律不触碰 agent。
       } catch (error) {
         console.log('[fs] hot reload interrupt notice failed: ' + String(error && error.message || error))
       }
@@ -3174,6 +3653,8 @@ export function apply(ctx) {
       chat_id: message.chat_id,
       chat_type: message.chat_type,
       content: message.content,
+      // 2026-10-04：群聊"@ 才回复"判据需要 mentions（消息级；部分客户端只在 content 里带）
+      mentions: Array.isArray(message.mentions) ? message.mentions : undefined,
       create_time: message.create_time,
       // 改造⑤（2026-10-01）：引用回复的上下文 —— parent_id=被引用的那条消息，
       // root_id=该话题的根消息。旧实现整条丢弃，agent 因此看不出 CM 在回哪张卡。
@@ -3430,13 +3911,25 @@ export function apply(ctx) {
     // 旧卡就地封口（留一行指路），后续内容写到下面新卡的第一块（醒目彩色块）。
     try {
       const brief = String(text).replace(/\s+/g, ' ').slice(0, 300)
-      if (typeof entry.split === 'function') {
-        const ok = entry.split({
-          old: { type: 'message', text: '📨 你的消息已插话送达 —— 后续内容见下方新卡。' },
-          fresh: { type: 'notice', text: brief },
-        })
+      const notice = {
+        old: { type: 'message', text: '📨 你的消息已插话送达 —— 后续内容见下方新卡。' },
+        fresh: { type: 'notice', text: brief },
+      }
+      // 0.7.21（HIGH-1）：`entry.split` 只有**本代**登记的才可调 —— 热重载之后跨代表里
+      //   常留着上一代那条（它那一轮还在跑），调它的后果是"插话换卡换出一张永不更新的卡"。
+      //   外代条目改走本代的接管通道 splitAdoptedCard（同样的插话语义），保护不降级。
+      const ours = closuresAreOurs(entry)
+      if (ours && typeof entry.split === 'function') {
+        const ok = entry.split(notice)
         if (ok !== true) {
           console.log('[fs] steer card split skipped (card already sealed); message still delivered')
+        }
+      } else {
+        if (!ours) logForeignClosureSkip('split:steer', String(entry.agent && entry.agent.id))
+        if (splitAdoptedCard(entry.agent, notice)) {
+          console.log('[fs] steer card split via adopted-card channel')
+        } else {
+          console.log('[fs] steer card split skipped (no live card this generation); message still delivered')
         }
       }
     } catch (error) {
@@ -3691,7 +4184,7 @@ export function apply(ctx) {
           text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
         })
         void syncCard(bot, chatId, card, true).catch(() => {})
-        const fresh = makeCardState(turnAgent)
+        const fresh = makeCardState(turnAgent, card)
         fresh.footerMode = 'bare'      // 换表新卡仍是"过程卡"
         fresh.cursor = carry
         fresh.rotatedThisTurn = true   // P5③：本轮已换过卡 ⇒ 收尾不再另开结论卡
@@ -3707,6 +4200,8 @@ export function apply(ctx) {
       const entry = {
         // agent 一并登记：回合进行中收到新消息时要能直接 steer（见 steerActiveTurn）。
         card, bot, chatId, agent: turnAgent,
+        // 0.7.21（HIGH-1）：登记方**代际编号** —— 下面这两个函数是闭包，只有本代能调。
+        gen: GEN_ID,
         // notice（可选）：{ old, fresh } —— 插话走这条时，旧卡留一行、新卡顶部放醒目块；
         // 答题路径不传（保持原样「✅ 已收到你的选择，继续处理中…」）。
         // 侧消息换卡通道（P2）：走换卡路径（carry = 旧卡游标），**不是**答题路径的 split()
@@ -3724,31 +4219,8 @@ export function apply(ctx) {
           // seal 时结论又只取"末尾那一段文本"（段与段之间没有工具调用就停）
           // ⇒ **前半段正文彻底看不到**（只剩旧卡上那 500 字）。
           // 修法：封口前把这些 note **按 seq 从会话事件里还原成完整正文** —— 一个字都不丢。
-          try {
-            const liveEvents = sessionEvents(turnAgent.session)
-            let expanded = 0
-            for (let i = 0; i < card.blocks.length; i++) {
-              const b = card.blocks[i]
-              if (!b || b.type !== 'note' || b.seq === undefined) continue
-              let full = ''
-              for (let k = liveEvents.length - 1; k >= 0; k--) {
-                const ev = liveEvents[k]
-                if (!ev || ev.seq === undefined) continue
-                if (ev.seq === b.seq) {
-                  if (ev.type === 'assistant/message') full = extractProcessText(ev.data && ev.data.message)
-                  break
-                }
-                if (ev.seq < b.seq) break
-              }
-              if (full && full.length > String(b.text || '').length) {
-                card.blocks[i] = { type: 'note', seq: b.seq, text: full }
-                expanded++
-              }
-            }
-            if (expanded > 0) console.log('[fs] 插话封口：还原 ' + expanded + ' 段被截断的过程正文')
-          } catch (error) {
-            console.log('[fs] 插话封口还原失败（不影响换卡）: ' + String(error && error.message || error))
-          }
+          // （0.7.21 起与接管卡的 splitAdoptedCard 共用同一个函数。）
+          expandTruncatedNotes(turnAgent, card)
           card.blocks.push(notice && notice.old
             ? notice.old
             : { type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
@@ -3756,7 +4228,7 @@ export function apply(ctx) {
           // 2) Open a fresh card below for the rest of this turn. Resume the
           // watcher from the CURRENT event position so events already shown
           // on the old card are not replayed onto the fresh one.
-          const fresh = makeCardState(turnAgent)
+          const fresh = makeCardState(turnAgent, card)
           fresh.footerMode = 'bare'    // 答题后续写仍是"过程卡"
           // 新卡游标 = 当前事件位置：split 之前的内容**已经**在旧卡上，绝不能再重放一遍
           // （旧实现的 seal 前补扫从 seqBefore 重放整轮，造成新卡与旧卡内容大面积重复）。
@@ -4324,7 +4796,71 @@ export function apply(ctx) {
   }
 
   function handleHelperMessage(bot, msg) {
+
+  // 身份未解析期间最多扣住多少条群消息（防"永远取不到 open_id"时无界堆积）
+  const GROUP_HOLD_MAX = 20
+
+  // 2026-10-04：取本 bot 的 open_id / app_name（群聊"@ 才回复"的判据）。缓存；失败留空。
+  // 0.7.21：**并发去重** —— 入站预热和群判据的"扣住等重投"会在同一拍各调一次，
+  //   不去重就是每条冷启动群消息白发两个请求；失败时清掉在途标记，下一条允许重试。
+  async function ensureBotOpenId(bot) {
+    if (bot.botOpenId) return bot.botOpenId
+    if (bot.botOpenIdInFlight) return bot.botOpenIdInFlight
+    bot.botOpenIdInFlight = (async () => {
+      try {
+        const accessToken = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
+        const res = await httpJson(
+          'https://open.feishu.cn/open-apis/bot/v3/info',
+          'GET',
+          { Authorization: 'Bearer ' + accessToken },
+        )
+        const parsed = parseJson(res.text)
+        const oid = parsed && parsed.bot && parsed.bot.open_id
+        if (typeof oid === "string" && oid) {
+          bot.botOpenId = oid
+          bot.botAppName = (parsed.bot && parsed.bot.app_name) || ''
+          console.log('[fs] bot open_id resolved: ' + oid.slice(0, 12) + ' name=' + bot.botAppName)
+        } else {
+          console.log('[fs] bot open_id NOT resolved: ' + String(res.text || '').slice(0, 160))
+        }
+      } catch (error) {
+        console.log('[fs] bot open_id fetch failed: ' + String(error && error.message || error))
+      } finally {
+        bot.botOpenIdInFlight = null
+      }
+      return bot.botOpenId || ''
+    })()
+    return bot.botOpenIdInFlight
+  }
+
+  // 群聊里这条消息是否 @ 了本 bot。
+  // 飞书 mention 的 `id` 有两种形态：① 字符串 open_id ② 对象 {open_id,...}；
+  // 且 open_id 是"应用视角"的值（跨应用/跨查询方不同）⇒ 再加 app_name 兜底。
+  function isBotMentioned(evt, bot) {
+    if (!bot) return false
+    const oid = bot.botOpenId || ''
+    const bname = bot.botAppName || ''
+    if (!oid && !bname) return false
+    const list = []
+    if (Array.isArray(evt.mentions)) list.push(...evt.mentions)
+    if (!list.length && evt.content) {
+      try {
+        const p = JSON.parse(evt.content)
+        if (p && Array.isArray(p.mentions)) list.push(...p.mentions)
+      } catch { /* 非 JSON content 无 @ 信息 */ }
+    }
+    for (const m of list) {
+      if (!m || typeof m !== "object") continue
+      const raw = m.id
+      const cand = typeof raw === 'string' ? raw : ((raw && raw.open_id) || '')
+      if (oid && cand && cand === oid) return true
+      if (bname && m.name && String(m.name) === bname) return true
+    }
+    return false
+  }
     if (!msg || typeof msg !== 'object') return
+    // 2026-10-04：收到任何 helper 消息就预热本 bot 的 open_id/app_name（@ 判据要用）
+    if (!bot.botOpenId) ensureBotOpenId(bot).catch(() => {})
     // Raw debug events from the helper's invoke hook are observation-only —
     // the same event is re-emitted by the registered handler right after.
     if (msg.raw) {
@@ -4333,6 +4869,64 @@ export function apply(ctx) {
     }
     if (msg.type === 'event' && msg.eventType === 'im.message.receive_v1') {
       const evt = normalizeEvent(msg.data)
+      // 2026-10-04（CM 定的规则）：**群聊里只有 @ 本 bot 才处理**；单聊（p2p）照旧全处理。
+      // 为什么：群里多个 bot 彼此都会收到对方的消息，无差别处理就会互相回复 ⇒ 无限互刷
+      // （实测两个 bot 在同一群 5 分钟刷出 3666 条事件、上百张卡片）。只认 @ 既止住互刷，
+      // 又保留"@ 一下来协作"（人对 bot、bot 对 bot 都靠 @ 触发）。
+      // 注意：本块必须位于 `const evt = normalizeEvent(...)` **之后** —— 早于它引用 evt
+      //       会抛 `Cannot access 'evt' before initialization`（2026-10-04 踩过，全员不响应）。
+      if (String(evt.chat_type) === 'group') {
+        const senderType = String((evt.sender && evt.sender.sender_type) || '')
+        const mentioned = isBotMentioned(evt, bot)
+        if (!bot.botOpenId) ensureBotOpenId(bot).catch(() => {})
+        let rawMentions = evt.mentions
+        if (!rawMentions && evt.content) {
+          try { rawMentions = JSON.parse(evt.content).mentions } catch { rawMentions = undefined }
+        }
+        console.log('[fs] group msg diag: sender_type=' + senderType
+          + ' mentioned=' + mentioned
+          + ' botOpenId=' + String(bot.botOpenId || '').slice(0, 16)
+          + ' botName=' + String(bot.botAppName || '')
+          + ' mentions=' + JSON.stringify(rawMentions || []).slice(0, 260))
+        if (!mentioned) {
+          // 0.7.21：`!bot.botOpenId` 时这条**不是**"没 @"，而是"还不知道自己是谁"。
+          //   直接 return 会让每次重启/热重载后的**第一条群消息即使 @ 了也无声消失**
+          //   （真机表现＝"群里 @ 它第一次没反应，第二次才理"）。冒烟实证：移植这道门后
+          //   13 条群用例全红，全红在同一条缝上。
+          //   修法：身份解析完成前把该 bot 的群消息**按到达顺序扣住**（只有第一条触发取身份，
+          //   所以重投顺序＝到达顺序），解析成功后原样重投；**取不到身份**才按"没 @"丢弃
+          //   （保持 CM 定的 fail-closed，不放大互刷风险）。
+          if (!bot.botOpenId) {
+            const held = bot.pendingGroupMsgs || (bot.pendingGroupMsgs = [])
+            if (held.length >= GROUP_HOLD_MAX) {
+              console.log('[fs] group msg dropped (bot open_id unresolved and hold queue full): '
+                + String(evt.message_id || ''))
+              return
+            }
+            held.push(msg)
+            console.log('[fs] group msg held pending bot open_id: ' + String(evt.message_id || '')
+              + ' queued=' + held.length)
+            if (held.length === 1) {
+              ensureBotOpenId(bot).then(() => {
+                const list = bot.pendingGroupMsgs || []
+                bot.pendingGroupMsgs = []
+                if (!bot.botOpenId) {
+                  console.log('[fs] group msgs dropped (bot open_id unresolved): count=' + list.length)
+                  return
+                }
+                console.log('[fs] replaying held group msgs: count=' + list.length)
+                for (const item of list) handleHelperMessage(bot, item)
+              }).catch((error) => {
+                console.log('[fs] group msg hold failed: ' + String(error && error.message || error))
+                bot.pendingGroupMsgs = []
+              })
+            }
+            return
+          }
+          console.log('[fs] group msg without @bot ignored: ' + String(evt.message_id || ''))
+          return
+        }
+      }
       // 0.7.19（审查 MED#1-C）：**早记 chat 类型** —— 命令（/switch 等）在 handleInbound 之前
       // 就从这条链分流走了（`!outcome.turnStarted` 直接 return，见下方 then），永远走不到
       // handleInbound 里的记录 ⇒ 热重载后群的第一条命令必然绕过 stable 门禁（fail-open，
@@ -7085,6 +7679,10 @@ export function apply(ctx) {
     const stopTimer = ctx.interval(() => {
       void ensureHelpers()
       drainOutput()
+      // 0.7.21（HIGH-2）：跨代补发队列（托孤）就挂在这个既有节拍上 —— 不新开定时器。
+      try { drainCardRelay() } catch (error) {
+        console.log('[fs] card relay drain failed: ' + String(error && error.message || error))
+      }
     }, DRAIN_INTERVAL)
     // 改造①：子代理回执轮询（1s）——必须在**回合状态之外**独立跑，
     // 否则又回到"只在回合启动那一拍判定"的老毛病。
@@ -7483,7 +8081,9 @@ export function apply(ctx) {
 
   function openGoalCard(agent, bot, chatId, info, existing) {
     // state.rotate：把"表格额度换卡"那条通道交出去（见 makeAutoCardEntry.split —— 评审 low#7）
-    const state = { card: null, stop: null, rotate: null }
+    // state.openedAt（0.7.21）：这一轮**开始时**的事件游标 —— 收口时靠它把"最后一段话/失败标记"
+    //   限定在本轮之内；换卡会重起 watcher，所以必须存在 state 上而不是卡上（卡的游标会变）。
+    const state = { card: null, stop: null, rotate: null, openedAt: 0 }
     // 表格额度换卡：与普通回合的 rotateTables 同机制（旧卡留表格，后续写新卡，游标接续不丢不重）
     const rotate = (reason, oldText) => {
       if (!state.stop || !state.card || state.card.status !== 'running') return
@@ -7497,12 +8097,13 @@ export function apply(ctx) {
         text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
       })
       void syncCard(bot, chatId, state.card, true).catch(() => {})
-      const fresh = makeCardState(agent)
+      const fresh = makeCardState(agent, state.card)
       fresh.cursor = carry
       // 0.7.10（独立审查 LOW#7044）：**不设** rotatedThisTurn —— 自动卡换卡不经过 runTurn 的收尾判定（死存）。
       state.card = fresh
       void syncCard(bot, chatId, fresh, true).catch(() => {})
       state.stop = startCardWatcher(agent, fresh, bot, chatId, rotate)
+      markAutoRound(agent, info && info.kind, state.openedAt)   // 0.7.21：换卡 ⇒ 新 entry 要重打标记
       const live = autoCards.get(agent.id)
       if (live) live.card = fresh
     }
@@ -7518,8 +8119,12 @@ export function apply(ctx) {
     }
     card.blocks.push({ type: 'message', text: info.title || ('🎯 目标模式 · 第 ' + (info.round || 1) + ' 轮开始，正在工作…') })
     state.card = card
+    // 0.7.21：本轮开始的事件游标（= 此刻卡上的游标）。收口时"最后一段话/失败标记"
+    //   都按它裁剪到本轮之内 —— 换卡不改这个值（卡的游标会变，本轮的起点不会）。
+    state.openedAt = Number(card.cursor) || 0
     void syncCard(bot, chatId, card, true).catch(() => {})
     state.stop = startCardWatcher(agent, card, bot, chatId, rotate)
+    markAutoRound(agent, info && info.kind, state.openedAt)   // 0.7.21：见 markAutoRound 说明
     if (existing) {
       console.log('[fs] auto card reused chat=' + chatId + ' msg=' + (card.token || '-')
         + ' kind=' + ((info && info.kind) || 'goal'))
@@ -7714,7 +8319,10 @@ export function apply(ctx) {
       chatId,
       agent,
       kind,
-      openedAt: Number.isFinite(state.card && state.card.cursor) ? state.card.cursor : 0,
+      // 0.7.21（HIGH-1）：同 activeTurns —— rotate/split 是**本代**闭包，跨代条目一律不许调。
+      gen: GEN_ID,
+      openedAt: Number.isFinite(state.openedAt) ? state.openedAt
+        : (Number.isFinite(state.card && state.card.cursor) ? state.card.cursor : 0),
       stop: () => (state.stop ? state.stop() : undefined),
       // 侧消息换卡通道（P2）：转交给自动卡的 rotate（同为 carry 语义）
       rotate: (reason, oldText) => (typeof state.rotate === 'function' ? state.rotate(reason, oldText) : undefined),
@@ -7729,7 +8337,7 @@ export function apply(ctx) {
           old.blocks.push({ type: 'message', text: '✅ 已收到你的选择，继续处理中…' })
           void syncCard(entry.bot, entry.chatId, old, true).catch(() => {})
           // 2) 新卡接在当前事件位置：split 之前的内容已经在旧卡上，绝不重放
-          const fresh = makeCardState(agent)
+          const fresh = makeCardState(agent, old)
           fresh.cursor = sessionEvents(agent.session).length
           fresh.blocks.push({ type: 'message', text: '继续处理中…' })
           state.card = fresh
@@ -7740,6 +8348,7 @@ export function apply(ctx) {
           // 一旦满 5 张表还有待镜像事件，demoteOverflowTables() 就会把多出来的表降级成代码块，
           // 破坏"表格额度换卡…永远不降级表格"那条不变量。改成接上 openGoalCard 的 rotate。
           state.stop = startCardWatcher(agent, fresh, entry.bot, entry.chatId, state.rotate || null)
+          markAutoRound(agent, kind, entry.openedAt)   // 0.7.21：新 watcher ⇒ 新登记条目，标记要重打
           entry.card = fresh
           console.log('[fs] auto card split after answer: agent=' + agent.id + ' chat=' + entry.chatId)
         } catch (error) {
@@ -7763,22 +8372,37 @@ export function apply(ctx) {
       // ⚠️ 审查 MED#7069：**不能**用 `entry.split()` —— 那是"答题路径"语义（新卡游标 = 事件末尾），
       //    会**跳过还没镜像的事件**；换卡路径（rotateTables/rotate）用的是 carry = 旧卡当前游标，
       //    才满足"不重放、不丢"。所以这里调 entry.rotate()。
-      for (const entry of activeTurns.values()) {
+      // 🔴 0.7.21（HIGH-1）：`entry.rotate` 是**登记那一代的闭包** —— 外代的调了就废（推送被代际旗
+      //    全吞，且旧代的 startCardWatcher 会抢停本代 watcher）⇒ 只调本代登记的条目，
+      //    外代条目一律跳过，让它落到下面 registry 那条**本代**通道（rotateAdoptedCard）。
+      for (const [key, entry] of activeTurns.entries()) {
         if (!entry || String(entry.chatId || '') !== String(chatId || '')) continue
         if (!entry.card || entry.card.status !== 'running') continue
         if (typeof entry.rotate !== 'function') continue
+        if (!closuresAreOurs(entry)) { logForeignClosureSkip('rotate:turn', key); continue }
         entry.rotate('side', text)
         console.log('[fs] side notice -> live card rotated: chat=' + chatId + ' kind=turn')
         return true
       }
       // ⚠️ 审查 MED#7063：看门狗/失败提示**也会**从自动卡（目标轮/回执轮）的 watcher 发出 ⇒
       //    那些轮同样要覆盖，否则症状照旧（且不许静默）。
-      for (const entry of autoCards.values()) {
+      for (const [key, entry] of autoCards.entries()) {
         if (!entry || String(entry.chatId || '') !== String(chatId || '')) continue
         if (!entry.card || entry.card.status !== 'running') continue
         if (typeof entry.rotate !== 'function') continue
+        if (!closuresAreOurs(entry)) { logForeignClosureSkip('rotate:auto', key); continue }
         entry.rotate('side', text)
         console.log('[fs] side notice -> live card rotated: chat=' + chatId + ' kind=' + String(entry.kind || 'auto'))
+        return true
+      }
+      // 0.7.20：热重载「接管／复活」的卡**只存在于跨代 registry**（既不在 activeTurns 也不在 autoCards）。
+      //   旧实现在这里打 "nothing to rotate" ⇒ 这类卡发完静默提示后不换卡，提示压在长卡下面（症状照旧）。
+      //   走续卡通道自己的 rotateAdoptedCard —— 同样是"旧卡留内容 + 新卡按游标接续"，不重放、不丢。
+      for (const entry of liveCardRegistry.values()) {
+        if (!entry || String(entry.chatId || '') !== String(chatId || '')) continue
+        if (!entry.agent || !entry.card || entry.card.status !== 'running') continue
+        rotateAdoptedCard(entry.agent, 'side', text)
+        console.log('[fs] side notice -> live card rotated: chat=' + chatId + ' kind=adopted')
         return true
       }
       // 没有"正在跑的卡"⇒ 没有可换的卡：明确留痕（本文件口径：不许静默跳过）
@@ -7791,17 +8415,29 @@ export function apply(ctx) {
 
   function splitLiveCardAfterAnswer(agentId) {
     if (!agentId) return false
+    // 0.7.21（HIGH-1）：三条通道按"本代优先"排 —— 跨代表里属于**上一代**的条目一律跳过
+    //   （它的 split 是旧闭包，调了就把这张卡的镜像链路打死），最后落到本代的接管通道。
     const turn = activeTurns.get(agentId)
-    if (turn && typeof turn.split === 'function') {
+    if (turn && typeof turn.split === 'function' && closuresAreOurs(turn)) {
       try { turn.split(); return true } catch (error) {
         console.log('[fs] question split failed (turn): ' + String(error && error.message || error))
         return false
       }
     }
+    if (turn && typeof turn.split === 'function') logForeignClosureSkip('split:turn', String(agentId))
     const auto = autoCards.get(agentId)
-    if (auto && typeof auto.split === 'function') {
+    if (auto && typeof auto.split === 'function' && closuresAreOurs(auto)) {
       try { auto.split(); return true } catch (error) {
         console.log('[fs] question split failed (auto): ' + String(error && error.message || error))
+        return false
+      }
+    }
+    if (auto && typeof auto.split === 'function') logForeignClosureSkip('split:auto', String(agentId))
+    // 热重载接管来的卡：只存在于跨代 registry ⇒ 走本代的等价通道（语义与 split 完全一致）
+    const adopted = liveCardRegistry.get(String(agentId))
+    if (adopted && adopted.agent) {
+      try { if (splitAdoptedCard(adopted.agent, null)) return true } catch (error) {
+        console.log('[fs] question split failed (adopted): ' + String(error && error.message || error))
         return false
       }
     }
@@ -7829,49 +8465,10 @@ export function apply(ctx) {
         if (!live) return
         autoCards.delete(agent.id)
         try { if (live.stop) live.stop() } catch {}
-        const card = live.card
-        if (card) {
-          // 封口前**必须补扫**（与普通回合 runTurn 的 catch-up scan 同源）：
-          // 目标轮的收尾话语（"进度（第 N 轮）…"）几乎与轮结束同时到达，
-          // watcher 一拍（300ms）常常来不及镜像 → 不补扫就会只剩工具记录、
-          // 一句话都没有（CM 2026-09-16 反馈，取证：会话里 seq 有整段文字，卡上 notes=0）。
-          try { scanCard(agent, card) } catch (error) {
-            console.log('[fs] goal catch-up scan failed: ' + String(error && error.message || error))
-          }
-          // 把本轮最后一段话提升为**正式消息块**：过程话语有 500 字截断，
-          // 轮次的进度汇报通常远超这个长度，截断后 CM 看不到实质内容。
-          const closing = lastAssistantTextSince(agent, live.openedAt || 0)
-          let promoted = false
-          if (closing.seq !== undefined) {
-            for (let i = card.blocks.length - 1; i >= 0; i--) {
-              const block = card.blocks[i]
-              if (block.type === 'note' && block.seq === closing.seq) {
-                card.blocks[i] = { type: 'message', text: closing.text }
-                promoted = true
-                break
-              }
-            }
-          }
-          if (!promoted && closing.text) card.blocks.push({ type: 'message', text: closing.text })
-          // 失败轮不能谎报成功（2026-09-18，与普通回合 runTurn 同源的问题）：
-          // 上游报错（如 402 余额不足）会让整轮**没有任何产出**，旧实现照样写「✅ 本轮结束」+
-          // status='sealed' → 目标模式下同样"看不出为什么不动了"。失败标记只认上游显式 reason。
-          const failure = turnFailureReason(sessionEvents(agent.session), live.openedAt || 0)
-          if (failure && !closing.text) {
-            card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：' + failure.text })
-          } else if (!closing.text && card.tools.size === 0) {
-            // 与普通回合同源（2026-09-21）：没有产出、也没有失败标记时，**不许**写「✅ 本轮结束」装成功。
-            card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI）' })
-          }
-          const silent = !closing.text && card.tools.size === 0
-          card.status = (failure || silent) ? 'error' : 'sealed'
-          card.blocks.push({ type: 'message', text: (failure || silent) ? '❌ 本轮失败' : '✅ 本轮结束' })
-          console.log('[fs] auto card sealed: agent=' + agent.id + ' kind=' + (live.kind || 'goal') + ' failure=' + (failure ? failure.text : 'none') + ' silent=' + silent
-            + ' closing_hash=' + shortHash(String(closing.text || '')) + ' closing_len=' + String(closing.text || '').length
-            + ' card=' + (card.token || '-') + ' blocks=' + card.blocks.length)
-          void syncCard(live.bot, live.chatId, card, true).catch(() => {})
+        if (live.card) {
+          closeAutoRoundCard(agent, live.card, live.bot, live.chatId,
+            Number(live.openedAt || 0), live.kind, 'auto round finished')
         }
-        console.log('[fs] auto card sealed: agent=' + agent.id + ' kind=' + (live.kind || 'goal'))
         return
       }
       if (status !== 'running') return

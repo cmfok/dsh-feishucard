@@ -31,6 +31,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   它们会让 `npm run release` 必然失败。
 - `README`「发布」一节：改为说明**机制**（四道硬闸门），不再给出指向私有工具链的命令。
 
+## [0.7.21] - 2026-10-04
+
+### 修复：热重载的**两个致命时序**仍在重新制造「卡片不更新」（独立审查抓到，维护者 令「直接修」）
+
+> 0.7.20 定版后独立审查（`review-0720`）读完 `index.js` 全文交回 2 个高危 + 4 个中危 + 3 个低危，
+> 逐条对代码复核全部成立。两条高危**正好落在 维护者 报障的那条路径上**，留着＝症状复发。
+
+**HIGH-1｜接管后的卡，第一次 stall 提示就把镜像链路打死。**
+- `activeTurns`（跨代共享表）里那条记录的 `rotate` / `split` 是**上一代的闭包**；0.7.20 的接管循环只重挂了
+  registry 和 watcher，**没改写这条外来记录**，于是 `rotateLiveCardForChat` 第一遍就命中它。
+- 调用旧代闭包的后果：① 旧代封口推送被代际作废旗吞掉；② 旧代 `startCardWatcher` 的"单 watcher 不变式"
+  反过来**停掉本代的 watcher**；③ registry 被覆盖成一张推不出去的新卡 ⇒ 本代那三条补救通道全部失效。
+- 修法：每条登记带 `gen` 代际戳，调用前 `closuresAreOurs()` 判定，**外代闭包一律不调**，改走本代等价通道
+  （`rotateAdoptedCard` / 新增 `splitAdoptedCard`），并留痕 `[fs] foreign-generation closure skipped:`
+  （本文件口径：**不许静默跳过**，同一张卡只留一次）。
+- 用例 **75**（先红后绿）：真机在跑时**不可能没有**的那条回合记录，用例 74 原先人为 `delete` 掉了 ⇒
+  74 的前提已在注释里收窄为"记录自己消失了"这一种情形，75 补上"记录还挂着"这条真路径。
+
+**HIGH-2｜「重载之后这一轮才跑完」的收尾内容仍然会丢（永久停在半句）。**
+- 旧代 `runTurn` 收尾会把结论/封口写进那张共享卡并置 `sealed`，但**推送被作废旗拦死**；
+  而本代的接管补扫、孤儿封口、watcher 的 `running` 分支**都要求卡还是 running** ⇒ **无法自愈的终态**。
+- 修法：**跨代托孤队列** `__fsCardRelay`。旧代每次被拦下就登记"欠的那一次推送"，由**本代**补发
+  （补发推的是卡片对象的当前状态 ⇒ 收尾内容与封口状态一次到位）。队列挂在既有的 500ms 节拍上，
+  **不新开定时器**；60 秒内无人接手则丢弃并留痕；同卡只登记一次。
+- 两条刻意边界：① 只补发**已在会话里存在**的卡（`token` 非空＝PATCH），旧代 dispose 后新建的无 token 卡
+  **不补发**（那会往会话里凭空多塞一张野卡），那种情况由 `runTurn` 的**单卡回退**把结论留在原卡上，
+  指路语同步改掉；② 只在**本代认识这个会话**（能解析出 bot）时补发。
+- 撤销判定比的是**入队时刻**而不是内容水位：封口/结论提升**不产生新事件** ⇒ `lastScannedAt` 原地不动，
+  按水位会误判"已送达"，卡就永远停在「正在工作中…」（正是 维护者 报的原样）。代价是最多多发一次
+  **幂等 PATCH**（同一张卡的当前状态，不会多出卡）。
+- 用例 **76**（先红后绿）：重载**之后**才推入结论并置 idle，断言迟到内容真的落到飞书、落的是**封口后**的状态、
+  且指路语没有指着一张永远不存在的卡。
+
+### 一并修掉的中低危（同批，避免反复热重载）
+
+- **接管补封口没有宽限、也不认自动轮** ⇒ 目标模式轮次间隙（agent 短暂 idle）会被立刻封口并提示"再发一句"。
+  现补 `idleFor >= CARD_ORPHAN_SEAL_MS` 宽限，并按 `autoKind` 分流到自动轮收口。
+- **收口文案必须是真的**：接管来的**自动/目标卡**原先走 `sealFinishedAfterReload`，把原因说成"收尾推送丢了"，
+  实际是"收口逻辑根本没跑"。现抽出 `closeAutoRoundCard(..., byReload)` 统一收口，由重载补的封口会**明写**
+  「♻️ 插件热重载：这一轮**内容已经跑完**，只是收尾那次卡片更新丢了 ⇒ 由本实例补的封口」。
+- **推送水位记账**：`lastPushedAt` 原先在推送**成功之后**取 `Date.now()`，网络往返期间扫进的内容会被误判为
+  "已推过"。现改为**组装载荷时**抓 `lastScannedAt` 作为 `deliveredWatermark` 落账（内容水位对内容水位，
+  不受往返抖动影响）；`unpushed` 判定随之变得无竞态。
+- **stall 额度不再白扣**：计数从"发送之前 +1"移到**发送成功的回调里**；失败只留痕
+  （`[fs] stall notice send failed (额度不扣，等下一个静默窗口重试)`）。
+- **force 推送被 `retryUntil` 延后时留痕**（原先静默 return，排查时看不到它为何不动）。
+- **接管 superseded 分支补删 registry 条目**（原先残留一张已被替换的卡，后续判定会被旧条目误导）。
+- **注释里的机器绝对路径**改为相对写法（违 ）；`activeTurns` 的声明注释原先错写"`split` 是跨代可用"，
+  与本次修复口径矛盾，已改为如实标注 `{ card, bot, chatId, gen, rotate, split }`。
+- 复活路径（`reviveCardForChat`）**故意不继承** stall 播报额度 ⇒ 已在代码处注明理由：那是一张全新的卡，
+  沿用旧额度会让新卡一次都播不出来，真卡住时反而失声。
+
+### 一并带上：线上有一道**未登记的「群 @ 才回复」门**（定版前 diff 才发现）＋它的身份竞态
+
+> 事实（`output/stage-0721/review-diff-*.txt` 与 `web.log`，不是推测）：线上 `index.js` 在
+> **2026-10-04 16:35** 被另一条会话加了「群聊里只有 @ 本 bot 才处理」的逻辑
+> （`normalizeEvent` 带出 `mentions`、新增 `ensureBotOpenId`（打 `/bot/v3/info`）、新增 `isBotMentioned`），
+> **没进 CHANGELOG、没进功能基线、没有冒烟覆盖、未 commit**。
+> 按原计划整份覆盖＝**静默回退别人的改动**（正是功能基线要防的"修 A 改错 B"）⇒ 处置：**逐字移植进副本**，
+> 让这道门跟 0.7.21 一起走，同时补上它缺的守护。
+
+**移植后暴露的真缺陷（13 条冒断言变红，全红在同一条缝）**
+- `bot.botOpenId` 是**异步**取的、群消息判定是**同步**读的 ⇒ 身份没到位时到达的群消息被当成"没 @"**无声丢弃**。
+  🔴 丢失窗口是**实测**确定的，不是推断：助手 `{type:'ready'}` 那行**同样**走 `handleHelperMessage`，
+  函数顶部的身份预热通常在此之前就取到了 open_id ⇒ 常规启动**不丢**；真正会丢的是
+  ①同批 `readOutput()` 里排在 `ready` **之前**的积压（热重载／重连补投）②身份请求**慢或失败**期间。
+- 修法（维护者 选项 **A**：连同本缺陷一次修进 0.7.21，仍只覆盖上线一次）：
+  - **扣住 → 按到达顺序重投**：身份未解析期间的群消息进 `bot.pendingGroupMsgs`（封顶 `GROUP_HOLD_MAX = 20`），
+    到位后原样重投；**只有确认取不到身份才丢弃**，且必须留痕
+    （保持 fail-closed，不放大 bot 互刷风险；丢弃/扣住各有独立日志行，不静默）。
+  - **在途去重**：`ensureBotOpenId` 加 `botOpenIdInFlight` ⇒ 入站预热与"扣住等重投"共用同一个请求
+    （不去重＝每条冷启动群消息白发一个请求），失败时在途标记清零，下一条允许重试。
+  - 判定顺序硬约束：群分支必须坐在 `const evt = normalizeEvent(...)` **之后**（要读 `evt.chat_type` / `evt.mentions`），
+    并保留 `[fs] group msg diag` 一行——真实 mention 字段形状只能靠它在真机确认。
+
+**顺带修审查发现 #3**：`drainCardRelay` 撞上卡片退避窗口（`retryUntil`）时**留着这条、看下一张**。
+旧实现照发照打印 "delivered" 再 `splice`，而那次 `syncCard` 其实被 `retryUntil` 拦下
+⇒ 唯一一次自愈机会被静默吃掉，而且**日志撒谎**。
+
+**冒烟**：补 `/bot/v3/info` mock + 群用例 65/66/67/68/69 的 `mentions` 夹具 + 新增**用例 77**
+（夹具刻意让群消息在**同一批**里排在 `ready` 之前），锁四条：①身份未回时带 @ 的消息不丢、
+且**只打一个**身份请求、重投后真建卡 ②没 @ 忽略且不建卡 ③@ 别的 bot 不算 @ 我 ④身份取不到 ⇒ 明确丢弃不静默。
+🔴 **反证做过**：把"扣住重投"人为关掉 ⇒ **4 条红**（证明这条断言不是假保险丝），随后按 md5 恢复原状再跑全量。
+
+**回归**：全量冒烟 77 例 **SMOKE PASS**（sentCards=375 / sessions=25 / 0 失败）——
+暂存副本与**线上目录就地**各跑一次，两次数字一致。七条稳定性机制
+（换卡续写 · stall 播报 · plan 卡 · goal 卡 · 自动轮建卡 · 插话打断 · 热重载续卡）逐条仍在，
+stall 两态语义与 `[fs] stall notice sent:` 留痕未变，**未靠抬高阈值消警报**。
+
+## [0.7.20] - 2026-10-04
+
+### 修复：热重载不再「替 维护者 说话」——假消息注入删除 ＋ 僵尸卡无限播报根治
+
+> 报障（2026-10-04）：① 「只要卡住了就一直发提醒」——同一条「上游已经 365 分钟没有回包」
+> 在 365/375/385/395/405 分钟各播一次，无限刷；② 「被热重载之后，飞书桥会模拟我发一条提醒给 agent
+> 让它继续干活，但实际上 agent 并没有停」——它跑完真正的一轮后，把这条假消息当成**新的用户指令**，
+> 多跑一轮幻影回合。
+
+**根因（有出处）**
+
+- ①：上一代 `runTurn` 的收尾顺序是 `stopCardWatcher()` → `activeTurns.delete()` → 最后一次
+  `syncCard`（`index.js` 该段仅隔几行），而那最后一次 PATCH 被代际旗 `generationDisposed` 拦掉
+  ⇒ 卡面永远停在 `running`；它的定时器只看「卡片自己的静默分钟数」，**分不出**「上游真没回包」和
+  「回合其实早跑完了、只是收尾推送被吞」⇒ 每 10 分钟一条，永远播（真机 mins 一路涨到 405）。
+- ②：注入的前提是「热重载打断了这一轮」，真机日志否证——单插件重载前后会话游标**连续推进**
+  （`output/dsh-install/web.log` L85640–L85690），agent 根本没停。
+
+**改动（维护者 批准的方案，逐条对应）**
+
+1. **删除**热重载假消息注入：重载只做**卡片侧**动作，一律不触碰 agent（不发消息、不打断、不重跑）。
+2. 接管旧卡时**立刻补扫 + 判定是否欠一次推送**（`lastScannedAt > lastPushedAt`）再强推 ⇒ 上一代攒在
+   内存、被拦掉的内容当场推出去（维护者 报的「重载后卡片不更新」）；**无新内容则一张都不推**
+   （独立审查 HIGH#1：无脑重推会让卡面内容重复）。
+3. 按 `agent.status` ＋ 跨代回合表分流：agent 已 idle 且无人认领 ⇒ 就地**补封口**并停表
+   （宽限 `CARD_ORPHAN_SEAL_MS = 3000ms` ≈ 10 拍轮询，防止误封还在跑的一轮）；仍在跑 ⇒ 继续镜像同一张卡。
+4. 彻底没卡但 agent 还在跑（dsh 重启／接管失败）⇒ `reviveCardForChat` 从**当前事件游标**新建一张卡续镜像，
+   不重放历史内容、不让 agent 重跑。
+5. 提示改为「**先判真实情况，再按情况说话**」（`state=mirrored / revived / idle / no-agent / unknown`），
+   并收紧到卡面：「上游已 N 分钟没有回包」只在 agent **本人**报 running 时才写（回合记录还挂着不算依据）。
+6. 静默提示**同一轮封顶 2 次**（`DSH_STALL_NOTICE_MAX`；计数**跨换卡继承**——播报本身会换一张卡，
+   不继承就会被自己的换卡动作绕过），第 3 次起只留痕 `suppressed: reached cap`，不再发消息。
+7. `rotateLiveCardForChat` 补第三条通道：热重载**接管来的卡**（只存在于跨代 registry）也能换卡，
+   不再打 `nothing to rotate` 后放弃（那正是「提示压在长卡下面」的成因）。
+
+**验证**
+
+- 全量冒烟 **74 条 0 失败**：`SMOKE PASS (sentCards=354, sessions=23)`。新增用例 **71–74** 覆盖
+  「不注入假消息 · 接管即强推 · 二次重载不重复推 · 无卡复活 · 孤儿补封口 · idle 一条不播 ·
+  封顶 2 次 · 接管卡换卡」，每条同时断言「发了什么」与「没发什么」。
+- 先红后绿：第一轮 8 处红，其中 **1 处是真缺陷**（agent 已 idle 时卡面仍写「没有回包」），已修；
+  其余 6 处是**用例隔离不足**（提示按会话 120 秒去重是设计，用例没清去重表）。
+- 被测文件 `md5=39f5ea3e` 与真机 `plugin apply #192` 同值——部署路径 ``
+  是指向源目录的符号链接，故真机运行的就是这套代码。**长期观察项**：真机跨重载的续卡/复活行为仍待 维护者 侧验证。
+
 ## [0.7.19] - 2026-10-04
 
 ### 修复：0.7.17 独立审查 **BLOCK** —— 群判定（chatKinds）三条失效路径 ＋ 4 条 low，「群 ⇒ 恒 stable」补完
@@ -78,7 +212,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **非飞书回合**（GUI／子代理／定时任务）**一律放行** —— 不要求飞书身份。
 - 内核 `identity-inject.mjs`（ESM，自带 `--selftest`，20/20 通过）。
 - 表 / resolver 路径**跟随工作区**（环境变量 ＞ 部署目录 ＞ `<工作区>/output/g9-identity/` ＞ cwd 逐级向上 ＞ 已知工作区兜底）；
-  支持**本地增量** `~/.dsh-feishucard/identity_map.local.json`（工作区之外 ⇒ 不参与同步 ⇒ 多机各写各的）。
+  支持**本地增量** ``（工作区之外 ⇒ 不参与同步 ⇒ 多机各写各的）。
 - 生成器 `scripts/build_identity_map.py` 与解析器 `scripts/resolve_actor.py` 入库（**入库前已脱敏**）；
   `identity_map.example.json` 为**结构示例**，**真实表（含人名与个人标识）不入库**（`.gitignore` 拦住）。
 
@@ -979,7 +1113,7 @@ H（状态栏三模式标记）· I（计划卡两排版式 + `fs_plan_goal`）�
 
 **旧卡为什么会歧义**：三组混排，第③组标题写"其它工作区"，列的其实是"**别的工作区里的会话**"，
 而且是**从会话 cwd 反推、从不读注册表**（旧代码 `workspaceRegistry` 零命中）⇒ 飞书与 GUI 可能各说各话。
-**实测证据**：`~/.dsh/storages/workspace.json` 里注册了 **3 个工作区**（`P:\Qoder\work` / `P:\FU` / `P:\BA`），
+**实测证据**：`` 里注册了 **3 个工作区**（`P:\Qoder\work` / `P:\FU` / `P:\BA`），
 而**我们的飞书会话一个都没挂进去**（`work` 那条只有 6 个 GUI 会话）—— 正是这次要一并修掉的。
 
 **现在长这样**
@@ -1751,7 +1885,7 @@ profile 的 `cordis.patch.yml` 被 0.2 规范化重写（保留了本插件所�
 - **根因**：`recentMessages`（message_id → 摘要）**只在内存**，dsh 重启（改插件代码/框架升级）即清空
   ⇒ 重启前发出的一切卡片/消息都成了"未登记" —— 而参考/引用的卡片恰恰多半是上一轮的，命中率极低。
 - **修法**（零新增飞书权限，沿用已有 state 目录）：
-  1. 索引落盘到 `~/.dsh-feishucard/message-index.json`（`rememberMessage` 后 300ms 防抖写、`unref` 不拖进程）；
+  1. 索引落盘到 ``（`rememberMessage` 后 300ms 防抖写、`unref` 不拖进程）；
   2. 启动时加载（日志 `[fs] message index loaded: N entries`）；
   3. `quoteHintFor()` **未命中时再读一次盘** ⇒ 覆盖"本进程启动前登记的消息"。
 - **不做**：仍然**不猜内容** —— 真查不到就照实写「内容未登记」（`` ）；
@@ -2494,7 +2628,7 @@ Hermes 侧踩过的坑 DSH 这边也有一份：
 ### Deploy / Notes
 
 - **DSH 的加载方式是 HMR 直接监听项目目录**（启动日志 `hmr watching [ '<项目目录>' ]`），
-  不是 `~/.dsh/profiles/web/node_modules/dsh-feishucard` 副本；副本已同步保持一致以防万一。
+  不是 `` 副本；副本已同步保持一致以防万一。
 - 重启必须走**读环境变量注入 key 的启动器**（`output/dsh-install/restart-dsh-web.cmd`
   → `start-dsh-web.cmd`）。**裸 `node` 启动会没有 `DEEPSEEK_API_KEY` → 所有回复空白**
   （2026-09-08 踩过，详见教训 006/007）。本次重启走正规脚本，日志
@@ -2624,7 +2758,7 @@ Hermes 侧踩过的坑 DSH 这边也有一份：
   breaker, and a plain-text fallback.
 - Typing reaction (OnIt) added on arrival and removed after reply delivery.
 - `feishu_send` model tool for proactive messages.
-- Hot-reloadable config at `~/.dsh-feishucard/feishu.config.json`, with a
+- Hot-reloadable config at ``, with a
   one-time automatic migration from a legacy `~/.cc-connect` config if
   present.
 - Smoke test suite (mocked DSH context + mocked Feishu API) covering the full
@@ -2646,7 +2780,7 @@ Hermes 侧踩过的坑 DSH 这边也有一份：
 ### Changed
 
 - Config/state moved from the legacy `~/.cc-connect/` location to the
-  project's own `~/.dsh-feishucard/` directory; a one-time automatic
+  project's own `` directory; a one-time automatic
   migration preserves an existing legacy config.
 - README rewritten in naturally mixed Chinese/English; added CI workflow
   (syntax check + secret scan + smoke test).
