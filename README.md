@@ -14,12 +14,18 @@ A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Ha
 | 审批卡 / 提问卡 | 工具审批与 `ask_user_question` 直接落到飞书卡片，点按钮即回 |
 | `/switch` 两级选择 | 先选工作区（与 GUI 侧边栏同源），再选会话：接管或新建；另有 `/list` `/new` `/help` |
 | 身份注入 | 入站消息按 `open_id` 解析为「人」；工具入参里的身份字段由身份表覆写 |
+| Agent 互认（0.8.0） | 群里 @ 到了谁、这条消息是谁发的、卡片被谁点的——三个身份都会标注并喂给 agent；出站 `@[名字]` 展开成**真 @**（能唤醒对方 bot）。🔴 **只标注、不授权**：权限仍然只认身份闸门解析出来的那个人 |
+| bot 名单采集 | `scripts/collect_bot_roster.mjs` 采集同群 bot 的 `union_id` / 本应用视角 `ou`，插件按 mtime 热读。飞书成员接口**只返回人不返回 bot**（真机取证 V5），所以名单必须自己采 |
+| 群接力（默认关） | `groupRelay` 默认 `self_only`＝与旧版一字不动（没 @ 本 bot 的群消息一律忽略）；显式 opt-in 才放宽，内置三层防互刷预算 |
 | 长连接收发 | 官方 SDK WebSocket 长连接，无需公网 IP / 域名 / 隧道 |
 | 可靠性兜底 | 限流 / 退避 / 熔断 / 纯文本降级；helper 崩溃后可自动拉起 |
 
 English summary: streaming reply card, many bots in one instance (own workspace + `AGENTS.md` each),
 mention-gated group replies, approval / ask cards, two-level `/switch` picker, identity injection,
 long-connection transport, and rate-limit / backoff / circuit-breaker / text fallback.
+Since 0.8.0 also: agent mutual recognition (who was mentioned, who sent the message, who tapped the
+card — annotated for the agent, never used as authorization), outbound `@[name]` that really pings
+another bot, a collected bot roster, and an opt-in group relay with anti-loop budgets (default off).
 
 单包即用：Host 插件（桥接逻辑）+ helper 子进程（长连接）+ bundle 补丁（自动注册）。One package, three pieces: host plugin, long-connection helper subprocess, and an auto-registered bundle patch.
 
@@ -304,6 +310,38 @@ python scripts/build_identity_map.py --seed seed.json --app-id cli_xxxxxxxx --ap
 > `unknown_person`，上层若按它做兜底（例如问姓名），**离职的人会被当成陌生人来处理** ——
 > 而离职是正常拒绝，不该被兜底。
 
+## Agent 互认与 @ 的语义（0.8.0）
+
+三个此前**完全丢失**的信息现在都会喂给 agent（明细行只进会话上下文，**卡片上不出现**）：
+
+| 信息 | 形态 | 来源 |
+|:--|:--|:--|
+| 这条消息谁发的 | 前缀 `[飞书 姓名] ` ＋ 尾部 `【发送方】kind=user\|bot name=… open_id=…` | `sender.sender_id` + roster |
+| 这条消息 @ 了谁 | 正文里 `@_user_N` 还原成 `@名字`，尾部 `【本条 @ 的对象】@名(kind id=前10位)` | `mentions[]`（V1：对象或字符串两种形态都认） |
+| 卡片是谁点的 | 审批/提问结果里的 `clicker` ＝ `[点击者 姓名\|ou前8位]` | `card.action.trigger` 的 `data.operator`（V3 形状） |
+
+**出站 @**：`feishu_send` 的 `at` 参数，或正文里手写 `@[名字]` / `@「名字」` / `@all`，命中后展开成真 @。
+
+> ⚠️ **@ 是会通知人的**：@ 到活人＝对方收到消息提醒，@ 到别的 bot＝**唤醒那个 agent 跑一轮**。
+> 所以解析不到时**保留原文**并追加 `（未能 @ 出：X）`，**重名歧义时一个都不 @** ——
+> 宁可 @ 不出来，也不发幽灵 @。
+> 卡片内 @ 失效时可整条降级为 `msg_type=post`（`DSH_FEISHU_AT_MODE=post`；post 内容必须包 `zh_cn` 层）。
+
+> 🔴 **旁证不等于授权**：以上三条只解决「看得见」，**不改变权限口径**。能不能执行某动作，
+> 仍然只认身份闸门 `resolveActor(open_id)` 解析到的人；名字对得上、roster 里有、卡片 operator
+> 是熟脸——这些都**不是**授权依据。`identityGuard` 关着时，互认照常显示，权限照常不判。
+
+**bot 名单**（跨应用 id 目录）：`node scripts/collect_bot_roster.mjs` 生成到
+`FS_CONFIG_DIR`（默认 `~/.dsh-feishucard/`）`bot_roster.json`，**0600、放在工作区之外**，
+插件按 mtime 热读；查不到 id 时打 `[fs] roster miss` 留痕，**不静默**。
+必须自采的原因见取证 V5：飞书成员接口返回的成员**只有人不包含 bot**。
+
+**群接力 `groupRelay`**：默认 `self_only`＝没 @ 本 bot 的群消息一律忽略（与 0.7.x 一字不动）。
+实测两个 bot 同群 5 分钟能刷出 **3666** 条事件，所以放宽只在 bot 配置或 `groupRelayChats`
+群白名单**显式 opt-in** 时发生，并且内置三层预算：同一发送方 90s 内接力 >3 条 ⇒ 冻结该配对
+10 分钟；同群 60s 内 >8 条 ⇒ 整群丢弃；群里出现**任意人**的消息 ⇒ 立刻清零复臂。
+计数器**只对经 relay 转发的 bot 消息**生效，人发的消息永远不吃预算。
+
 ## 开发 / Development
 
 ```sh
@@ -342,6 +380,18 @@ npm run sync                   # 同步到 profile 副本（含体检 + 校验�
 
 - 门槛**只审不改** —— 出报告 → **逐条打开源码复核**（区分真缺陷与误报）→ 修 → **重跑一次**取证，不"改了就说好了"。
 - 当前状态：`0.4.25` 修完上一轮 BLOCK 的全部 high/medium（复核 4/4 全真、零误报）。
+
+## 权限设计裁决速查（CM 裁决回写，2026-10-05）
+
+本节把散在台账/CHANGELOG 里的权限类裁决固化成速查，agent 不用再翻台账或问 CM：
+
+- **审批形式 = 原生审批单**（D7，2026-09-25）。开通受限功能一律发审批单报 CM；**审批向 CM、批 1 次长期有效、维护者（CM）免审批**（0.7.17 经评审定案）。
+- **两模式 full / stable**（0.7.17）：私聊按 `bot.cfg.mode`（缺省 full），**群聊一律 stable**。stable 折叠过程叙述，`/switch` 直接拒绝——**员工一个会话就够**（CM 裁决：普通员工切会话默认关闭、不能打开）。
+- **员工档三开关的落点**：员工 preset 禁 plan/goal 工具；员工 bot 不开 `approvalForm`。
+- **身份闸门 `identityGuard` 默认关**（0.7.18，本仓库会发布给外部）。开启后：按飞书服务端 `open_id` 查身份表覆写身份字段，**拿不到身份 ⇒ 拒绝执行**（fail-closed——CM 2026-10-04：「执行不了总比资料泄露好」）。
+- **最小权限原则**（CM 2026-10-03）：权限首先收到最小，可以不开的先不开；有问题的列清单待 CM 拍板。
+- **数据权限模型**（D23/D24，2026-09-30）：角色 × 数据域 × 级别；兼职只给 L0 公开信息（D43）。权限在**取数层**不在说话层（D146）——工具拿不到的数据就当不存在。
+- 🔴 **线上现状（2026-10-05）**：服务器 `feishu.config.json` 均未写 `identityGuard`（默认关）⇒ 收紧在线上尚未生效；拦截器「有 owner 无记录 = 放行」与内核 deny 语义相反的偏差已在**中台 #27 挂账**（打点 ca9997d），开启排在 0.8.0 部署回归绿之后。
 
 ## License
 

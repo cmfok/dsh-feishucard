@@ -5,7 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-05
+
+本版按 CM 2026-10-05 的裁决成型：把「agent 互认」三档（P0/P1/P2）与**尚未发布的 0.7.22 批次**
+合并成**一个包、一次部署**（服务器实跑字节＝本地 `bd5421c`，即 0.7.21 那批，2026-10-05 SSH 实测；
+此前交接材料写的"0.7.19"已过期，见下文「已知未完成」的纠正条）。因此下面同时挂着互认新增、原 0.7.22 的三项修复，
+以及原本悬在 `[Unreleased]` 上的身份注入修复。
+
+### 新增（agent 互认 · 解决「群里看不见对方 bot / 不知道谁点了卡」）
+
+起因是 CM 报告的三件事：服务器上的 agent 在群里互相看不到对方的 id/名字；卡片正文里 @ 其他 agent
+对方收不到；点卡片按钮的人是谁也不知道。诊断结论是**数据通道缺失**，不是权限问题。
+
+- **P0 入站还原**：`mentions[].id` 的两种形态都认（真机取证 V1＝对象 `{open_id,union_id,user_id}`，
+  老客户端给字符串）；`@_user_N` 占位符在**进入 `splitCommand` 之前**就还原成正文里的 `@名字`
+  —— 顺带修好了「群里 @bot 再说斜杠命令」此前不被认成命令的老问题。
+  明细行 `【本条 @ 的对象】@名(kind id=前10位)` 与 `【发送方】kind=… name=… open_id=…`
+  **只拼进会话文本、绝不进卡片**（卡片是给用户看的，id 不外泄）。
+- **P0 bot 名单（roster）**：`loadBotRoster` 按 mtime 热读 `bot_roster.json` 认名，
+  查不到就打 `roster miss` **不静默**；名字优先级 `identityActor` → roster → 退化 `机器人`/`用户`。
+  🔴 **旁证不等于授权**：认名只影响可读性，授权仍然只认 `resolver.resolve(openId)` 命中 store。
+- **P0 群接力（可选通道，默认一字未动）**：新配置键 `groupRelay` / `groupRelayChats`
+  （`off` / `mentions_any` / `all` / **`self_only`＝默认**）。防互刷三层预算：同一配对 90 秒超 3 条
+  ⇒ 冻结该配对 10 分钟；单个群 60 秒超 8 条 ⇒ 整群丢弃；任何人发一句话即刻复臂。
+  只有**接力来的 bot 消息**才消耗预算。
+- **P0 富文本容灾**：`salvageTextFromRich` 与 `extractText` 的 post 分支补齐卡片里的
+  @ / 按钮 / 图片 ⇒ 转发过来的卡片内容不再是一句空话。
+- **P1 出站 @**：`expandAtTokens` 认 `@[名字]` / `@「名字」` / `@all`，命中换成真 `<at id=ou>`
+  （**真的会通知对方、真的会唤醒对方的 bot**）；查无此名 ⇒ 保留原文并追加「（未能 @ 出：X）」；
+  **重名歧义一个都不 @**。`DSH_FEISHU_AT_MODE=post` 走 post 降级通道（真机取证 V4：post 必须包
+  `zh_cn`，否则 code 230001）。`feishu_send` 工具参数新增 `at`。
+- **P2 点击者身份**：`clickerTagFor` 产出 `[点击者 姓名|ou前8位]`；卡片回调读 `data.operator`
+  （真机取证 V3）并**每次点击都留痕**；审批单/提问卡/计划确认的写回结果新增顶层键 `clicker`，
+  审批单的 `detail` 文本里也带上点击者 ⇒ agent 读文本就知道是谁点的，不必猜。
+  审批单的 `output.schema` 同步声明 `clicker`（原 `additionalProperties:false` 会把它删掉）。
+- **P0-5 身份判定 JS 降级通道**：`resolveActorJs` 逐条镜像 `resolve_actor.py`（同错误码、
+  `open_id` 必须回带、纯函数不读时钟/不写文件/不调网络）；**默认走 JS**，只有
+  `MAILBOX_RESOLVER_FORCE_PY=1` 才 `spawnSync` 打 python —— 服务器没有 python3 时身份门禁不能整体失效。
+  两条通道判定必须一字不差，否则「换运行环境＝换安全语义」。
+- **新脚本 `scripts/collect_bot_roster.mjs`**：采集群内 bot 名单与成员 union_id，幂等合并，
+  采不到**不写空文件**。
+- **守护用例**：冒烟 **85–93**（85/86/90 入站还原、87/91 出站 @、88/89 防互刷与接力预算、
+  92 点击者、93 会话摘要不外泄互认明细——断言挂在 **`/list`** 那层，因为 `/switch` 会话卡的摘要要过
+  `clipSessionName`（上限 16 字），在那一层断"摘要里没有 id"是**恒真**，夹住它的是裁剪不是剥离）。
 
 ### 修复：身份注入（`identityGuard` 开关，**默认关**）
 
@@ -30,6 +72,863 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `package.json`：删掉 3 条指向**不存在脚本**的 npm script（`release` / `backfill-tags` / `backfill-releases`），
   它们会让 `npm run release` 必然失败。
 - `README`「发布」一节：改为说明**机制**（四道硬闸门），不再给出指向私有工具链的命令。
+
+### 修复（原 `[0.7.22]` 批次 —— 从未单独发布，CM 裁决并入本版）
+
+交接清单（`信箱/inbox/20261005-0105-HOME-FYI-飞书桥工作盘点与交接…`）中本机可完成的三项：多 bot 提问卡串扰、结论卡交班、helper 凭证明文。
+
+#### 修复
+
+- **提问卡串扰（多 bot 单实例）**：`pendingQuestions` / `recentQuestions` 原先按 `chatId` 索引，
+  同一个群里 A、B 两个 bot 各弹一张提问卡时，后弹的 `set(chatId)` **直接覆盖**前一张的 record
+  ⇒ 先那张卡点按钮、回文字都没反应。现按可用信息分两条通道：文字回答路径键加 `appId`（与 0.7.21
+  的入站/文件去重同口径）；卡片按钮路径改按 **token** 索引 —— 卡里本来就嵌了 `randomUUID` 的 token，
+  它是唯一键，天然不串，而 `findBotForChat(chatId)` 在同群两 bot 下本身就是猜的。
+  `recentQuestions` 随之改按 token 存，旧卡点击的「已处理过」提示不再依赖会话归属。
+- **结论卡交班**：热重载窗口里「建结论卡」被代际旗自我拦截时，旧实现只能丢弃（无 token ⇒ 判为野卡）
+  再降级成单卡 ⇒ 结论卡的独立形态永久丢失。现在结论卡带 `createOnRelay` 标记进托孤队列，
+  由活着的实例 **POST 真建**；队列到期仍建不出来时降级成纯文本（形态降级，内容不丢），
+  并且已被接手的卡不再重复发纯文本（防"一个内容发两次"）。
+- **自我拦截不计入熔断**：请求在飞期间本代被 dispose 的失败，旧实现照样 `failCount += 1` ⇒
+  几次连续热重载就把这张会被后续自动轮复用的卡打进 `circuitOpen`，连累后面好几轮开不出结论卡。
+  现在这类失败不计数、不置 `createFailed`，直接托付下一跳。
+- **helper 凭证不再上命令行**（安全）：`node helper.cjs <appId> <appSecret>` 里的 appSecret 原文
+  同机任何账号 `ps aux` 可见，而服务器上有 7 个 `agt*` 账号。改为 index.js 写一份 **0600** 凭证文件
+  （`~/.dsh-feishucard/helper-cred-<appId>.json`，与 `feishu.config.json` 同级同暴露面），
+  只把**路径**交给 helper；bot 从配置里移除时删除该文件。
+  ⚠️ **部署必须 `index.js` + `helper.cjs` 同批覆盖** —— 只换单文件会让新旧两半对不上（旧 helper 读不到 argv）。
+  `helper.cjs` 保留 env / argv 两条兼容通道；但显式给了 `--cred` 而文件不可用时**直接退出**，
+  不再退回 argv（实测踩过的坑：`argv[2]` 恰是字面量 `--cred`，被当 appId 去连飞书，报错指向假 id）。
+
+- **审批单卡同型修复（同类排查）**：`pendingForms` / `recentForms` 与提问卡是同一个毛病 ——
+  按 `chatId` 单键，同群两 bot 或同一会话两张单时，后一张 `set` 覆盖前一张的 record
+  ⇒ 先那张单点按钮必判 "record not found"，用户点了没反应、AI 那头干等到 30 分钟超时。
+  改按 `record.token`（`randomUUID`）索引；代价是表不再天然有界 ⇒ 与 `recentQuestions`
+  共用同一套 TTL + 上限回收（`RECENT_ANSWER_TTL_MS` / `RECENT_ANSWER_MAX`）。
+
+### 独立审查门槛（`code-review-gate`）修复
+
+首轮门槛判定 **BLOCK**（0 critical / 1 high / 2 medium / 5 low），逐条核对后全部为真，均已修：
+
+- **HIGH**：`relayCreateFallback` 内部重新 `findBotForChat(chatId)`，而唯一调用点上一行刚按
+  `!bot` 分支进来 ⇒ 同拍必然还是 undefined，两条降级路径全是死代码，结论照样静默丢。
+  现由调用方把已解析好的 bot 传进来；并且真正能降级的「**有 bot 但建卡失败**」那条路也会触发。
+- **MEDIUM 1**：`hasRelayFor(turn.card)` 把「排进托孤队列」等同于「已交付」，但熔断中的卡、
+  以及无 token 又没有 `createOnRelay` 的卡到期就被丢弃 ⇒ 永远送不出去，却因这里返回 true
+  而放弃纯文本兜底。改为只有**仍可被送出去**的排队才算已交付。
+- **MEDIUM 2**：`createOnRelay` 分支建卡 fire-and-forget 后**无条件** splice ⇒ 新代这次 POST
+  若因网络/限流/5xx 失败（不属 `rejected`/`toolarge`，不会走 `rescueText`），条目已删、
+  结论一个字都没到。现看结果：拿不到 token 且未救援过才降级，且不重复发（防"一个内容发两次"）。
+- **LOW ×5**：`recentQuestions` 改 token 键后只增不删 ⇒ 补 TTL + LRU 上限；结论指路语
+  `'✅ 本轮完成，结论见下方卡片。'` 在 4 处字面复制 ⇒ 抽成 `CONCLUSION_POINTER` 常量；
+  helper 凭证文件名脱敏字符直接删除会让 `cli_a+1` 与 `cli_a1` 撞同一个文件 ⇒ 文件名改挂
+  appId 的 sha256（可读前缀仅便于人工排查）；helper 致命路径诊断重复且 `process.exit` 前
+  异步 `stdout` 可能丢行 ⇒ 改 `fs.writeSync` 并一次带全路径与原因；
+  argv 明文通道静默兜底 + env 排在 argv 之前（多 bot 机器会连错应用）⇒ 顺序改为
+  文件 → argv → env，且走 argv 时明确告警。
+
+复跑门槛判定 **WARN**（0 high / 1 medium / 3 low），同样逐条核对为真并修完：
+
+- **MEDIUM**：降级检查跑在 `push.then` 里，而 dispose 在飞请求时 `syncCard` 会**把这张卡重新
+  托孤**给下一代并正常返回 ⇒ 队列里它还在（下一代照样建出来），这一代却判定"没 token"去降级
+  写回过程卡 ⇒ 同一段结论同时出现在过程卡与新结论卡上，正是"一个内容发两次"。现在先看队列
+  （在队 = 会送达 = 不降级），并给 `relayCreateFallback` 加一次性的 `relayFallbackDone` 防重入。
+- **LOW ×3**：`relayed card push delivered` 在请求 settle 前就同步打印，建卡失败时这句是假的
+  ⇒ 改到 then 里并按结果分 `delivered` / `degraded`；提问卡与审批单的有界回收代码逐字重复 ⇒
+  抽成 `rememberBounded(map, token)` 两处共用；用例 78 一条断言文案「甲的回回答不进甲」歧义 ⇒ 改写。
+
+第三轮门槛（仍是 **WARN**：0 high / 2 medium / 6 low）又挑出两条同类的真缺陷，已修：
+
+- **MEDIUM**：降级写回过程卡时没检查这张卡**推不推得动** —— `syncCard` 对 `circuitOpen` 或还在
+  `retryUntil` 退避窗口内的卡直接 return（`force` 也一样被退避拦下），于是结论只 append 进内存、
+  一个字都没到，而日志已经写了"degraded onto the process card"、`relayFallbackDone` 又把这条
+  降级锁死再没机会 ⇒ 静默丢失。现在按"能不能真的推"取判据，推不动就退回纯文本那条通道。
+- **MEDIUM**：托孤队列条目只存 `{card, chatId, at}`，接手的那代靠 `findBotForChat(chatId)` **猜**
+  发送身份 —— 而本包要解决的正是"同群两个 bot"：两个 bot 都认识这个会话，它返回**配置里第一个**
+  匹配 ⇒ 结论卡可能建在别人（另一个 app）的身份上，真主人之后对这张卡的 PATCH 全失败。
+  现在条目带上归属 bot 的 `appId`（跨代只传字符串，`bots` 是每代各自的 Map），接手代先按
+  `appId` 还原、还原不到才退回按会话猜。
+- **LOW**：队列超上界时旧实现 `splice` 掉最老几条且**不留痕不降级** ⇒ 结论无声消失；
+  现在被挤掉的建卡意图照样走一次降级。另修夹具两处：`appOfCommand` 读凭证文件失败时静默返回
+  `''`（会把"夹具坏了"伪装成"插件没问题"）⇒ 改成留痕；假 token 前缀 `tok_` 在发/收两侧各写
+  一遍字面量 ⇒ 抽成 `TOKEN_PREFIX`。
+- **LOW（断言强度）**：用例 62/76 的"托孤的结论卡真建出来"只数 `op === 'create'` 的记录 ——
+  mock 是在决定成功/失败**之前**就把记录 push 进去的 ⇒ 一次失败的建卡也算"建成"。
+  改为必须带 `msgId`（与用例 80 同口径）。
+- **夹具误报一条**：审查认为 `appOfCommand` 在 Windows 上因 `quoteArg` 双写反斜杠而必然读不到
+  文件、用例 78 会掉回单 bot。实测不成立（Win32 路径 API 会折叠连续反斜杠，且 78 的按 bot 归属
+  断言一直是绿的）⇒ 不按其建议加 `.replace(/\\(.)/g,'$1')`（那会把单反斜杠分隔符一起吃掉），
+  只采纳其中"失败要留痕"的部分。
+
+第四轮门槛判定 **BLOCK**（0 critical / 1 high / 1 medium / 5 low），逐条核对为真；其中 HIGH 那条
+在复跑时**暴露出比报告更大的范围**，最终按根因修：
+
+- **HIGH（根因修复）**：报告指出 `relayCreateFallback` 在**发起** PATCH 之前就把 `relayFallbackDone`
+  锁死 —— 写回过程卡那次 PATCH 若栽在网络/限流/5xx（不属 `rejected`/`toolarge`，不触发内部
+  `rescueText`），闩已锁、看门狗已停、这张卡也不在 `recentTurnCards` 里，没有任何人再推它 ⇒ 静默丢失。
+  按建议改成"PATCH settle 后复核是否真的送达"时，顺出了**真正的根因**：`syncCard` 失败只把
+  `retryUntil` **写在卡上，却没有兑现它的定时器** —— 于是这张卡此后每一次推送（含封口/降级这类
+  `force`）都被 `retryUntil` 入口闸静默吞掉，而 runTurn 那边 `cardDelivered` 只看"有 token 且未熔断"
+  ⇒ 连纯文本兜底都不发。日志特征（真机/冒烟同形）：`card sync failed … retry=1000ms`
+  → `forced card sync deferred by retryUntil` → `card reply delivered`，用户端只看到"卡片不动了"。
+  现在新增**本代退避定时器** `scheduleCardRetry`：到点自动 `force` 重推同一张卡（PATCH 幂等，
+  不会再开一张），一旦成功 `retryUntil` 归零、定时器自撤不再补推。不挂的三种情况 = 无 token
+  （建卡失败该走纯文本，重复建卡会留孤儿卡）/ `circuitOpen`（熔断的语义就是别再推）/
+  `rescued`（整卡正文已用纯文本救回，再推同一份被拒载荷＝同样内容发两次）。
+  dispose 时**全部清掉**：卡片留给新实例经托孤队列续推，两代各推一次就是发两次。
+  `relayCreateFallback` 的送达判据同步加第四条 `willBeRetried` —— 已排上退避重推的卡不再判"没送达"，
+  否则纯文本与定时器会各发一次。
+- **MEDIUM**：用例 78 是同群双 bot 的唯一夹具，却从不触发托孤 ⇒ 本轮新加的"按入队 `appId` 还原卡片
+  主人"那条分支，在单 bot 下与"按会话猜"返回**同一个对象**，写反了（如 `bots.get(it.chatId)`）也不会红。
+  已补 **用例 81** 正面钉住。
+- **LOW ×5**：0600 凭证文件写失败时**退回 argv**（等于把本次要消灭的 `ps aux` 明文暴露又请回来）
+  ⇒ 改 **fail-closed**：不 spawn，日志直接给出手工启动方式，会话仍由 API 通道照常工作；
+  `procForApp` 与 `fakeProc` 两份逐字相同的 proc 形状（契约一改就漂移）⇒ 抽 `makeFakeProc()`；
+  用例 78 teardown 不清 `extraProcs` ⇒ 补 `extraProcs.clear()`（残留缓冲会被当入站事件冲出去、
+  使运行顺序依赖）；用例 79 只钉住降级的一条分支 ⇒ 补 **用例 83**；
+  dispose 在飞时把 create **重新入队**可能双发 —— 本次**不采纳**，理由见下面「已知取舍」。
+
+第六轮门槛判定 **BLOCK**（**1 critical / 0 high / 4 medium / 9 low**，模型 deepseek-flash，
+8 文件 / 7m48s），逐条核对：**critical + 4 条 medium 全部属实、0 误报**；low 里 6 条属实已修，
+3 条记为取舍（见下）。修复全部在**本版本自己新增的那条链路**上（0.7.x 的行为一字未动）：
+
+- **CRITICAL（互认的名单来源整条不可用）**：`scripts/collect_bot_roster.mjs` 的 `api()` 只取
+  `parsed.data` 信封，而 `auth/v3/tenant_access_token/internal` 与 `bot/v3/info` **真机就是顶层字段**
+  （生产侧 `index.js:755` / `index.js:5505` 同读法可佐证）⇒ 采集脚本在**第一个 bot 就抛**
+  `tenant_token empty`，即 README 推荐的 `node scripts/collect_bot_roster.mjs` 从来没跑通过。
+  改 `return parsed.data || parsed`。**真机验证**（本机实跑 `--dry-run`，只读接口、按纪律不写文件）：
+  三个 bot 全部走到"采完"，群数 0 ⇒ 输出"采集结果为空…**不写文件**、保留上一版"；
+  修复前同一条命令在第一步就抛。⚠️ 走 `data` 信封的 `im/v1/chats`、`/members` 两个接口本机群里
+  没 bot ⇒ **这两条分支仍只在服务器上有群的环境里才验得到**。
+- **MEDIUM#1（失败会被当成"这个群没有成员"＝fail-open）**：成员拉取失败只 `console.error` 后继续
+  ⇒ 该群以 `member_unions: []` 落库，而下游 `resolveAtTarget`（`index.js:4134`）对空数组的短路语义是
+  **"不收窄"** ⇒ 跨群同名的人会被误 @；且合并段只在"群缺失"时保留旧值，这次失败会**覆盖**旧名单。
+  改为：失败打 `members_incomplete` 标记，合并时把旧目录里该群的 `member_unions` 并回来
+  （对齐本文件头部"宁可用旧目录"的纪律）。
+- **MEDIUM#2（身份缓存只盯主表）**：`identity-inject.mjs` 的解析缓存只在**主表** mtime 变化时清空，
+  但 0.8.0 的 JS 分支**也读本地增量表** ⇒ 改增量表 / 切 `MAILBOX_RESOLVER_FORCE_PY` 在换主表前
+  一直吐旧结果。清缓存判据改成三段签名（主表 mtime｜增量表 mtime｜forcePy），变量随之更名
+  `cachedTableSig`。
+- **MEDIUM#3（离线闸门闭包不对称）**：`test-fold-tables.mjs` 抽依赖时，常量体只跟常量
+  ⇒ 若某个常量写成 `const X = someTopLevelFn(...)`，那个函数不会被带上，抽出的命名空间调用时
+  `ReferenceError`（正是该文件要避免的"把离线闸门炸掉"）。改为函数/常量双向跟；
+  顺带修掉 `make()` 在 entry 循环里逐次调用（同一段 `new Function` 被编译 N 份、断言读的是 N 个实例）。
+- **MEDIUM#4（`mentions_any` 的判据写成了"不是我就算"）**：`index.js` 的
+  `m.mentioned_type === 'bot' || (cand && !mine)` —— 真机 `mentions` **没有可靠的类型字段**
+  （`normalizeMentionList` 里 `mentioned_type` 是"有就记"的可选值），于是**人 @ 人**也放行
+  ⇒ 本 bot 闯进没点它的对话、白烧一个回合并发卡（这正是 `groupRelay` 要防的那类互刷）。
+  改法：类型明确是 `user` ⇒ 不认；类型缺失 ⇒ 只认 **bot 目录里查得到的 ou/名字**，没目录就不认
+  （宁可漏放不误唤醒）。**新守护**：用例 89 追加两条断言（人 @ 人 ⇒ 既不放行也不建卡），
+  该断言对旧实现必红。
+- **LOW ×6 已修**：`.then()` 缺终点 `.catch` ⇒ 兜底路径自身抛错会变成 unhandled rejection、
+  最后那道纯文本反而被吞（补 `.catch` + 留痕）；`rosterState.missLogged` 只增不减 ⇒ 500 条封顶清空
+  （它只为"同一 id 不刷屏"，与 `rememberBounded` 修的是同一类泄漏）；点击者名字改按
+  **收到事件的那条连接自带的 bot** 解析（多 bot 同群时 `findBotForChat` 只会返回该群第一个 bot，
+  属 0.7.22 坑 2"按会话猜身份"的同源形状）；用例 84 的前提不成立时**记失败并跳过**，
+  不再用 `holder84.retryUntil = …` 抛 TypeError 打挂整个 smoke（后面所有用例会跟着被跳过）；
+  `resolveActorJs` 的"纯函数"说法与实际不符（会就地合并 `localMap` 进传入映射）⇒ 注释改准并写明
+  调用方必须传当场 parse 的对象；roster 两遍 join 的**改名残余风险**写进注释，并收紧为
+  "两遍人数不一致 ⇒ 不并 view"（宁可缺视角，不可并错人）。
+- **LOW ×3 不采纳（记取舍）**：① `index.js:4359` 嵌套三元改 if/else —— 属可读性，改动落在
+  文本抽取主干上，发布边界上不碰已验证代码；② `index.js:4194` relay 预算三档阈值/
+  `POST_SEND_MAX_LINES` 抽常量 —— 同批不做（这些值本就是运行期调参项，抽名不改行为，留下一版）；
+  ③ roster 用 `user_id` 抓第三遍以彻底消除改名误并 —— 需要真机验证采集面，本次只做"人数不一致不并"。
+
+### 已知取舍（第四轮 LOW#1）
+
+- `syncCard` 在请求在飞期间被 dispose 时**不置** `createFailed` 而是重新托孤（0.7.22 清单#2 的
+  "自我拦截不计入熔断"），于是「客户端超时但飞书侧其实已经建成」这种极少数情况，下一代可能再建
+  一张 ⇒ 属"重复送达"这一类。反向选择（撤掉重新入队）会把**偶发重复**换成**必然丢失**，与本版本
+  要消灭的静默丢失方向相反，故保留现状；收窄手段是接管侧按入队时刻撤销条目（`drainCardRelay` 的
+  `at` 比对）＋ `hasRelayFor` 只认"仍可被送出去"的排队，两者已分别由用例 80 / 用例 76 锚定。
+
+### 测试
+
+- 冒烟新增 **用例 78**（同群双 bot 提问卡互不串扰：文字回答只结掉本 bot 那张、按钮点击按 token
+  路由、验证不 PATCH 到另一张卡）与 **用例 79**（托孤的结论卡**建不出来**时结论仍必须写到飞书 ——
+  判据取 **PATCH** 而非"窗口里出现过这段文字"，因为建卡失败那次 POST 的请求体本身就带结论）；
+  **用例 80**（建卡 POST **在飞途中本代又被 dispose** ⇒ 卡片已重新托孤给下一代，这一代不许降级，
+  否则同一段结论既写回过程卡又被下一代建成卡 = 发两次。为此给 mock 加了「闸门卡住这次建卡、
+  放行时抛瞬时故障」的接缝，`shouldThrow` 在 await **之前**取值）。
+- **反证**（不接受「写了断言就以为验到了」）：把 index.js 临时退回修复前跑同一套 ⇒
+  `SMOKE FAIL: 7 assertion(s) failed`，7 条**全部落在 78/79 内**，零附带损伤；恢复后 md5 与实验前一致。
+  用例 80 单独反证（只关掉那条队列守卫）⇒ `SMOKE FAIL: 2`，两条都在 80 内，其中
+  「不许降级写回过程卡」实测**写回数=1**（= 同一段结论既在过程卡上、又被下一代建成卡），
+  证伪了"这条断言反正都会绿"。恢复 md5 后复跑 `SMOKE PASS`（395 卡 / 27 会话）。
+- 第四/五轮再加三条，把上面 MEDIUM 与 LOW#5 点名的"新分支无断言"补齐：
+  **用例 81**（同群双 bot ＋ 结论卡在飞途中**连换两代** ⇒ 断言每一次托孤补建的卡都带 `app === 乙`，
+  一次都不许落在甲的身份上；这是"按入队 appId 还原主人"唯一的正面覆盖）、
+  **用例 82**（结论写回过程卡那次 PATCH 失败 ⇒ 退避到点必须有人再推：日志出现 `retrying deferred
+  card sync`、含正文的成功 PATCH **恰好一次**、纯文本 **0 次**、且不被判成"没送达"）、
+  **用例 84**（`holderPushable === false` 那条最后防线：把接管到的过程卡 `retryUntil` 拨到将来 ⇒
+  走 `relayed card create degraded to plain text`，纯文本恰好一次、成功 PATCH 零次）。
+  ⚠️ 编号无 `83)`（日志号 84 / 标识符曾沿用 83，第五轮门槛 LOW 已对齐到 84）——
+  本文件此前把它写成"用例 83"，从断言消息反查源码会对不上号，已改正。
+- **反证（用例 82）**：只把 `scheduleCardRetry(...)` 那一行注掉跑同一套 ⇒ `SMOKE FAIL: 2`，
+  两条正好是 82 的「退避到点有人再推」与「成功 PATCH 恰好一次（实际=0）」，**其余 81 个用例零附带损伤**
+  （顺带证明这条定时器不是别的用例的隐形依赖）；恢复后复跑 `SMOKE PASS`（409 卡 / 28 会话）。
+- **0.8.0 互认批次（用例 85–93）的实测证据**：全量 `SMOKE PASS (sentCards=436, sessions=30)`，
+  三个冷启动变体 `SMOKE_COLD=form-off / notice-off / goal-off` 各 `COLD PASS`（rc 全 0）；
+  字节清单与日志分别落 `output/bytes080d.txt` + `output/smoke080d.log`（用例 93 重写后那一版）、
+  `output/bytes080e.txt` + `output/gate080e.log`（定版字节 `package.json=0.8.0` 的第一轮全闸门）、
+  `output/bytes080f.txt` + `output/gate080f.log` + `output/smoke080f-full.log`（第六轮门槛修复后，
+  插件自报版本行 `plugin apply #30 v0.8.0`）。🔴 **引用口径**：冒烟汇总行（`smoke.mjs:6149`）只输出
+  `SMOKE PASS (sentCards=…, sessions=…)`，**不输出用例数**（用例编号只出现在断言文本里）⇒ 转述
+  本次结果请写「全量冒烟 `SMOKE PASS (sentCards=436, sessions=30)`、RC=0、断言编号最大到用例 93」，
+  不要写成"93 个用例全绿"——那个数字我没有机器出处。
+  同批闸门：`node --check` ×6、`npm run check`、
+  `check-packaging` ✅、`identity-inject --selftest` **36/0**、`test-fold-tables` **ALL PASS**、
+  `python scripts/resolve_actor.py` **自测失败 0**。
+  ⚠️ 上面这些 `output/…` 证据文件落在**工作区根目录的 `output/`**（仓库之外），不在本插件目录里。
+  🔴 **待部署字节 = 已验证字节**（2026-10-05 第七轮之后复核）：`bytes080g.txt` 终态记录的 md5 与
+  当前工作区逐一对上 —— `index.js 41a684c0… / helper.cjs 62ac162d… / identity-inject.mjs b7720c50… /
+  package.json 0f3826c2… / collect_bot_roster.mjs d587fa3a…`，即清单#4 要覆盖的那四个文件就是闸门 G
+  跑过的那份字节，中间没有漂移。⚠️ 本条曾写过 `bytes080f.txt` 的 `index.js 2351de8c…` —— 那是**第六轮**
+  字节，第七轮的 M1/M2 两处修复改了 `index.js`，引用时以 G 为准。
+- **用例 92/93 各踩过一个"假绿灯"，两处坑都记下来（下次写断言的人不必重踩）**：
+  1. 夹具三个helper `cardElements / allButtons / divRows` 收的是**整条 `sentCards` 记录**（内部自取
+     `.payload`）⇒ 传 payload 进去静默得到空数组，审批单卡会"没有按钮"。92 第一版就是这么红的。
+  2. 断"摘要里没有 `open_id=`"必须挂在**不裁剪**的那一层：`/switch` 会话卡的摘要过
+     `clipSessionName`（`SESSION_NAME_MAX = 16` ⇒ 尾部必成 `…`），在那层这条断言**恒真**；
+     93 第一版因此一边红（引用提示被裁掉）一边假绿（明细"消失"是裁的，不是剥的）。
+     现改挂 `/list`（同一份 `r.summary` 原样渲染）。
+
+### 第七轮门槛（只审第六轮 BLOCK 的修复本身）：**WARN** — 0 critical / 0 high / 3 medium / 2 low
+
+判定 **WARN**（fail-on: high；8 文件，OCR 9m22s，`output/code-review/dsh-feishucard-20261005-074551/`）。
+三条 medium **逐条核对源码后确认为真，已全部修**：
+
+- **M1 `index.js` `relayCreateFallback`：一次性闩写在退回守卫之前 ⇒ 把"没降级成功"也当成"已降级"**。
+  旧写法 `if (card) { if (card.relayFallbackDone) return; card.relayFallbackDone = true }` 放在
+  `if (!bot || !text) return` **上面**，而 `bot` 由调用方传入 —— 队列满驱逐那条路传的是
+  `owner = bots.get(it.appId) || findBotForChat(it.chatId)`，**可以为 undefined** ⇒ 这一次一个字都没发出去，
+  却已经把 `relayFallbackDone` 锁死，同一张卡之后再也没机会降级 ⇒ **结论永久丢失**（正是 0.7.22
+  要消灭的那一类静默丢失）。改为**读闩在前、上闩在后**：`if (card && card.relayFallbackDone) return`
+  → 过守卫 → `if (card) card.relayFallbackDone = true`。**归属条目 H9 / 五条坑 #3**。
+- **M2 `index.js` 凭证写盘失败路径把 `bot.spawningAt = 0` ⇒ 自己拆掉了起连冷却**。
+  `spawningAt` 是每 bot 的 5 秒冷却时间戳（判据 `if (now - bot.spawningAt < 5000) continue`，
+  `ensureHelpers` 每 `DRAIN_INTERVAL`=500ms 跑一轮），清零＝**允许立即重试**：配置目录只读这类
+  **持续性**写盘失败会变成每 500ms 一次 `writeHelperCred` + 每次刷这条多行日志的无界风暴，
+  且 `bot.proc` 留着指向刚 kill 的死句柄。改为**保留开头写入的时间戳**（重试节奏自然回到 5 秒）
+  ＋ `bot.proc = undefined`（与下面 `helper start failed` 那条路径一致）。
+- **M3 `scripts/collect_bot_roster.mjs` 幂等合并"整行跳过旧行" ⇒ 把上次采到的视角抹掉**。
+  旧写法只在**这次没采到**时保留旧行（`if (!peopleRows.has(uid)) set(旧行)`），而"采到 ≠ 采全"：
+  `open_id` 遍失败、`union_id` 遍成功时，本次条目已经带着**空的 `views`** 进了 `peopleRows`，
+  旧行（含上次采到的 open_id）被整行丢弃 ⇒ `resolveAtName`/`resolveAtTarget` 走 `views[myApp]`
+  取不到人，**这批人变成点不了名**，和本文件自己的纪律「宁可用旧的」相反，也和自己刚写的
+  `member_unions` 回填自相矛盾。`bots` 与 `people` 两处合并都改为**旧为底、本次覆盖**
+  （`Object.assign({}, row.views || {}, cur.views || {})`），并保留 `name` 兜底。
+
+两条 low 的处置：
+
+- **LOW#2（人数一致检查挡不住两遍之间改名）—— 部分误报，但点子成立**。核实：两遍是背靠连发，
+  中途改名时 `openPass.length === unionPass.length` 照样为真 ⇒ 该检查只挡得住"某一遍被截断"。
+  我原先的注释**已经**把这个场景写作「残余风险（如实记，别把注释写成保证不并错人）」，所以不算
+  替 bug 背书；但"本脚本按后者从严"确实会被读成改名保险 ⇒ **不改行为，只把话钉死**（新增四行注释
+  明确"这不是改名保险"，真正闭环要么抓第三遍 `user_id`、要么比较两遍姓名集合）。
+- **LOW#1（离线自检抽常量时行尾注释吞掉后续拼接声明）—— 不修，理由写在案**。核实现状：被抽进
+  bundle 的只有 `PURPOSE_LINE_RE`(index.js:1202) 与 `MAX_PURPOSE_CHARS`(1203)，
+  且 `Number()` 直读的 `FOLD_CHUNK_CHARS`(1320) / `CARD_MAX_TABLES` 均**无行尾注释** ⇒ 当前不咬人。
+  不采纳建议补丁的原因：它是对 `body` 做纯字符串 `replace(/\s+\/\/[^\n]*$/,'')`，会把**值里本身含
+  `//` 的常量**（例如字符串字面量 `'a // b'`）连值一起削掉 —— 补丁本身引入新故障类；要做对需要真正的
+  词法分析，超出一个离线自检脚本该有的复杂度（违反"不过度工程"）。
+- **M1 不造假覆盖**：它的可达路径就是上面「已知未完成」里已经挂着的那条**无专用断言的降级入口**
+  （要命中得往队列灌过 `CARD_RELAY_MAX`(=24) 条在飞托孤条目）。这条缺口第七轮之后**性质变重**了 ——
+  它不只是"没断言"，还恰好是 M1 唯一的触发面，所以在这里点名：补断言的人请先补 M1。
+
+**重验状态（已回填，闸门 G 全绿）**：重验在**第七轮修复后的字节**上跑完，证据记
+`output/bytes080g.txt` + `output/smoke080g.log` + `output/gate080g.log`：
+
+| 闸门 | 结果 | 数字出处 |
+|---|---|---|
+| `node --check` ×3（index / helper / collect） | OK | `gate080g.log` 前三行 |
+| `node scripts/smoke.mjs` | `SMOKE_RC=0`，`SMOKE PASS (sentCards=436, sessions=30)`，全文 **0 处 ❌** | `smoke080g.log:2926` |
+| 冷启动三变体 `form-off / notice-off / goal-off` | 三个 `COLD PASS`，rc 各 0 | `smoke080g.log` 各自末行 |
+| `npm run check` | `NPMCHECK_RC=0` | 同上 |
+| `node scripts/check-packaging.mjs` | `PACK_RC=0`，「打包完整性：✅ 通过」 | 同上 |
+| `node identity-inject.mjs --selftest` | `SELFTEST_RC=0`，**自测通过 36 ｜ 失败 0**（含 JS/Py parity 8 条） | 同上 |
+| `node scripts/test-fold-tables.mjs` | `FOLD_RC=0`，`ALL PASS` | 同上 |
+| `python scripts/resolve_actor.py` | `PY_RESOLVE_RC=0`，「自测失败数: 0」 | 同上 |
+
+插件自报版本行：`plugin apply #1 v0.8.0 md5=41a684c0 bytes=562873` —— 与 `bytes080g.txt` 首记录的
+`index.js` 字节一致，证明跑的就是被修过的那一版（不是缓存/旧文件）。
+🔴 **口径提示**：汇总行只报 `sentCards/sessions`，**不报用例数**，所以本段不写"XX 个用例全绿"。
+第六轮的绿灯（`smoke080f-full.log`）跑在**旧字节**（`index.js 2351de8c…`）上，只替第六轮的修复作证，
+不替第七轮；第七轮由上表作证。
+`collect_bot_roster.mjs` 的 LOW#2 纯注释补充发生在 G 启动之后（`4dff98cf…` → 终态 `d587fa3a…`），
+已确认**没有任何运行期代码 import 该脚本**（`index.js` 与 `smoke.mjs` 里均只在注释中提到它），
+故 G 的行为结论不受影响；终态字节单独复校过 `node --check` ✅ 与真实入口 `--dry-run`
+（按预期在「找不到配置」处 fail-fast，rc 0）。
+**G 全绿之后本包在本地已具备推送条件**；剩下的只是清单#1（commit/tag/push）与清单#4（整包部署）。
+2026-10-05 CM 已对这两项点头（「可以推送」「服务器版本可以更新」），并追加一条：本地验不了的
+（M1/M2/M3）走"先部署再上服务器取证"。G 之后又跑了第八轮（中台 #25 报障修复），**推送与部署
+的判据以闸门 H 的终态字节为准**，不是本段的 G。
+
+### 第八轮（外部使用方报障 · 中台 #25 HOME#DSH 真机实证）：会话明细里的 id 被截断 ⇒ agent 身份反查整条断掉
+
+报障原文（2026-10-05 14:51，CM 飞书实测）三条症状：①`【发送方】` 里 `name` 恒为「用户」；
+②`open_id` 只剩 `ou_8f981df60`（完整是 `ou_` + 32 位 hex）；③`union_id` 同样截到 12 位。
+**后果不是难看，是功能断了**：agent 拿这个 id 去调 contact API 直接 `99992351 invalid id`，
+只能靠 union_id 前缀手工比对。
+
+逐条核对源码后的定性（两处是真缺陷，一条是部署缺口）：
+
+- **②③ = 真缺陷，本包已修**。`senderLabelFooter` 写的是 `openId.slice(0, 12)` / `union_id` 同样截 12，
+  `mentionFooter` 是 `.slice(0, 10)` —— 这两个 footer **只拼进喂给 agent 的会话文本**，不是卡片。
+  "id 一律截断"这条口径的来源是 **卡片与日志** 的隐私边界（B3/B4 + R10，用例 85/93 守的就是卡片那一侧），
+  把它顺手动到会话文本上，等于让 agent 拿着半个 id 干活 ⇒ **改法：会话明细给完整 id，卡片/日志一字不改**。
+  全仓复核过剩余 6 处 `slice(0, 10/12)`（`index.js` 4217/4321/4340/4566/4795/7073）全部在
+  `console.log` 里，属日志侧，维持截断。`clickerTagFor` 的 `ou前8位` 也维持 —— 它会落进卡片正文，
+  是 B3 的红区，用例 92 明令不许放宽。
+- **① name 恒「用户」 = 部署缺口，不是代码分支错**。取名优先级是
+  `identityActor` → `rosterNameFor` → 兜底「用户」：服务器 9 份配置里**都没有 `identityGuard` 键**
+  （默认关 ⇒ 第一档永远拿不到），而 `bot_roster.json` **尚未生成**（采集脚本 `collect_bot_roster.mjs`
+  这次才随包上服务器，且服务器侧至今没有它的任何一份副本）⇒ 只剩兜底。
+  所以这条的闭环动作是"部署 + 跑采集"，不是改代码；已在下面「服务器侧取证」里挂成验收项。
+
+**防回归（不许只改不钉）**：用例 85 追加一段真形状夹具（`ou_` + 32 位 hex、`on_` + 31 位），
+四条断言 —— 会话文本必须带**完整** `open_id`/`union_id`、@ 对象明细必须带完整 id（两套口径一致）、
+且这条长 id 消息**照样成了卡**（防止靠"没发卡"蒙过前两条）、完整 id 一个字都不进卡片。
+另外把 85/86 里原来写着"id 前 10 位"的两句断言文案改成"完整 id"—— 夹具里的 id 本来就只有 10 来字符，
+旧文案在改动后成了**说截断、测不出截断**的假话，这种文案比没断言更坏。
+
+**重验状态（已回填，闸门 H 全绿）**：改动落在 `index.js`（两处 footer）与 `scripts/smoke.mjs`
+（用例 85 追加 + 85/86 文案）。闸门 H 按 #21 的完整口径在**终态字节**上整跑一遍，全部 rc 0：
+
+| 闸 | 结果 | 出处 |
+|---|---|---|
+| `node --check` ×5（index/helper/identity-inject/smoke/collect_bot_roster） | 逐个 rc 0 | `gate080h.log` |
+| 全量冒烟 | `SMOKE PASS (sentCards=438, sessions=30)`，全文 `❌` 计数 **0** | `smoke080h.log`（2940 行） |
+| 冷启动三变体 `form-off` / `notice-off` / `goal-off` | 各 `COLD PASS`，rc 0 | `gate080h.log` |
+| `npm run check` / `check-packaging.mjs` | rc 0 / 「打包完整性：✅ 通过」 | `gate080h.log` |
+| `identity-inject.mjs --selftest` | 自测通过 36 ｜ 失败 0 | `gate080h.log` |
+| `test-fold-tables.mjs` | `ALL PASS` | `gate080h.log` |
+| `python scripts/resolve_actor.py` | 自测失败数: 0 | `gate080h.log` |
+
+被跑的字节（STEP0 与 STEP9 两次 `md5sum` 逐项一致 ⇒ 整轮无漂移）：
+`index.js 8ad1d783…`、`helper.cjs 62ac162d…`、`identity-inject.mjs b7720c50…`、
+`package.json 0f3826c2…`、`scripts/collect_bot_roster.mjs d587fa3a…`、`scripts/smoke.mjs 4abf80c0…`
+（清单文件 `output/bytes080h.txt`）。相比 G，只有 `index.js`（`41a684c0…` → `8ad1d783…`）与
+`smoke.mjs` 因本轮修复而变，其余四件字节未动。
+本轮新增的四条断言在 H 里逐条可见（`smoke080h.log` 2710-2713 行）：会话明细带完整
+`open_id`/`union_id`、@ 对象明细同样带完整 id、（前提）长 id 这条照常成卡、完整 id 绝不进卡片 —— 四条全绿。
+G 绿灯**没有**清零的三条账（M1 relay 闩 / M2 helper 起连冷却 / M3 roster 幂等合并）H 同样碰不到，
+继续挂到清单#4 部署后的服务器回归取证，不在这里冒领。
+
+### 第九轮（CM 真机报障 2026-10-05）：`/model` 卡上同一个模型名出现两遍 ⇒ 按 provider 分组
+
+现象：发 `/model`，弹出来的卡里**同一个模型名字重复了两次**，而且看不出点的是哪一条。
+
+根因不在宿主重复返回，在**本插件把两层结构压平成了单层**：
+
+- 宿主 `listModels(provider)` 的去重只在**单个 provider 内**（`dsh-llm/lib/index.js` 里
+  `seen.has(model.id)` 命中即抛 `INVALID_CATALOG`）；**跨 provider 不去重是设计如此** ——
+  同一条模型 id 合法地挂在多条 provider 路由上（官方 / 镜像 / 不同 settingsNs）。
+- 宿主 GUI 因此按 provider 分组渲染：`dsh-api-session-controller/lib/types/catalog.js` 的
+  `buildModelCatalog` 返回的是 `kind:'group'` + `group.name`（组标题 = provider 显示名）。
+- 本插件的 `listModelChoices()` 把 `providers × models` 直接拉平成一个数组，`modelCardPayload()`
+  再按每行两个按钮排开、按钮文字只写 `c.model` ⇒ 两条路由共有的模型必然并排显示两次。
+
+改法（与 GUI 同源，不自己发明第二套）：新增 `groupChoicesByProvider()`，卡片**一个 provider 一段**，
+段标题用宿主给的 `provider.name`；按钮文字仍是 model id、`value` 仍是 `provider|model`
+⇒ **切换逻辑一字未动**（`switchModelForAgent` / 点击回调那条链完全没碰），只改排布。
+`sendModelPicker` 的日志顺带带上 `providers=test=2,mirror=2`，下次再有"看着重复"的报障，
+一行日志就能分清是**两条路由共有**（正常）还是**同一路由内重复**（才是 bug）。
+
+**防回归**：用例 **94**（宿主 `llm` 服务在冒烟里原本没有 mock ⇒ 本次补 `llmOverride` 桩，
+默认仍返回 `undefined`，其余用例照旧走"拿不到清单"分支不受影响）。夹具给两条路由
+（`test` / `mirror`）共用 `test-model`，八条断言：出了卡（前提）、两段各带 provider 显示名、
+共有的模型在两段各一个按钮且 `value` 指回自己那条路由、按钮不串组、**每段内部无重复按钮**
+（这条把"拉平"与"分组"分开来：组内无重复 ⇒ 出现两次只可能来自跨路由）、`▶` 高亮必须
+provider 也对得上（镜像段的同名模型不许被标成当前）、卡面用 id 不用 display name（本轮不动口径）。
+
+**重验状态（已回填，闸门 I 全绿）**：被跑字节 `output/bytes080i.txt`
+（`index.js f99cd61d…`／`scripts/smoke.mjs bf8e9354…`，其余四件与 G/H 相同），
+脚本首尾两次 `md5sum` 逐项一致 ⇒ 整轮无漂移；`node --check` ×5、全量冒烟
+`SMOKE PASS (sentCards=441, sessions=30)` 且全文 0 处 ❌、三冷启动变体各 `COLD PASS`、
+`npm run check` / `check-packaging` / `--selftest`（36 通过 0 失败）/ `test-fold-tables`（ALL PASS）/
+`resolve_actor.py`（失败 0）rc 全 0；证据 `output/gate080i.log` + `output/smoke080i.log`
+（用例 94 八条在 2940 行之后）。
+⚠️ 一处口径备注：`gate080i.log` 里冒烟那一步的标签写着 `smoke(H)` —— 那是脚本从
+`gate080h.sh` 复制时没改的**字符串**，被跑的是 I 的字节（同文件 STEP0/STEP9 清单可证）。
+M1/M2/M3 三条挂账 I 同样碰不到，仍等服务器取证。
+
+### 第十轮（代码审查门槛第九次跑出的 10 条 · 逐条核对后全部落实）
+
+门槛（`ocr`，独立审查）这轮给 **WARN**：**5 条 MEDIUM + 5 条 LOW**
+（证据 `output/code-review/dsh-feishucard-20261005-155204/findings.json`）。
+按门槛纪律**逐条开文件核对**（不照抄结论），结论是 **10 条机制全部成立**，其中两条要和已有裁决
+对齐后才动手 —— 记录如下，避免后来人把它们当"审查员说了算"。
+
+⚠️ **编号别混**：下文 M1–M5 / L1–L5 是**这一次门槛跑出的 finding 序号**（与 `findings.json`
+同序，故意不改名，方便回溯），和本文件「第七轮」那三条**服务器挂账** M1/M2/M3
+（relay 闩 / helper 起连节奏 / roster 合并语义）**不是同一套**，也不是 `功能基线.md` 里
+L 域的功能编号（L1 出站 @ / L2 防互刷 / L3 点击者身份）。第七轮那三条挂账**本轮一条都没清零**
+—— 冒烟结构上碰不到（M2 不走真机 `ctx.shell`、M3 无运行期 import、M1 要灌过 `CARD_RELAY_MAX`），
+仍等服务器取证。
+
+**M1 · 点击者 id：一个函数两套口径**（`clickerTagFor`）
+第八轮刚裁定「给 agent 的 id 必须完整、卡面/日志保持截断」（中台 #25），但 `clickerTagFor`
+只有一份实现、无条件 `ou.slice(0, 8)` ⇒ 回给 agent 的 `clicker` 还是半截 id，拿去通讯录反查
+必报 99992351（和 #25 同一条死法）。**改法**：加 `full` 参数分流，同一个函数两个口径
+（复制第二份必然漂移）。三个 agent 落点（`fs_form` 的 `record.resolve`、`fs_plan_goal` /
+`fs_question` 的 `ans.clicker`）换 `clickerRef`；console 留痕与 `dismissApprovalCard` 追加文本
+继续用截断那份。用例 92 的断言随之改成完整 id，并**新增一条反向断言**：回执卡面上不许出现
+完整 open_id（"给 agent 的全量"≠"给用户看的全量"）。
+
+**M2 · 离线函数切片的"更聪明"版本反而更脆**（`scripts/test-fold-tables.mjs`）
+上一轮为了让括号计数不被字符串/注释带偏，加了跳过引号与注释的词法扫描 —— 它**不认正则字面量**：
+`index.js:1383` 的 `/^\s*```/` 里三个反引号被当成模板串开头，深度永远回不到 0，切片扫穿函数末尾，
+炸出来的 `SyntaxError` 指向完全无关的行。**改法**：退回朴素计数，但把"防带偏"改成三道**绊线**
+（切片里出现第二个两格缩进的顶层 function / 收尾不是「两空格 + }」/ `new Function` 编译不过 ⇒
+一律点名报错），并把函数改成**懒抽取**（只有断言真引用到才 `grab`，无关函数怎么写都影响不到闸门）。
+
+**M3 · 卡片点击必须来自「发起会话」**（新增 `cardClickOutsideOriginChat`，4 个站点）
+`pendingForms` / `questionByToken` 用 token 认卡，但 token 只回答"这是哪一张卡"，不回答
+"点的人该不该算"：卡被**转发**到别的会话后，那条新消息带着**同一个 `value`**，在那边点一下
+照样答掉了原会话这张单（0.7.22 的隔离修的是"同群两个 bot 抢答案"，没覆盖"同一 bot 跨会话"）。
+**改法**：token 认卡 + `record.chatId` 认会话，两个判据都要；不一致时**可见地**拒绝
+（留痕 `card click ignored (not the originating chat)` + 在误点的会话回一句说明），绝不静默吞点击。
+站点覆盖 `fs_form` / `fs_plan_goal` / `fs_question`，并按 §1.6 同类排查补了审查清单没写的
+**`fs_approval`**（那张卡给的是 `allow-once` 工具权限，跨会话点等于把权限发给别的会话）。
+用例 **95** 钉住：群里点 ⇒ 单不作答 + 留痕 + 有说明；回原会话点 ⇒ 照常生效（防"一刀切把正常点击也挡了"）。
+
+**M4 · roster 采集脚本漏掉单 bot 配置**（`scripts/collect_bot_roster.mjs`）
+只认 `cfg.bots` 数组，而插件 `normalizeConfig`（`index.js:614-619`）明确兼容顶层
+`appId`/`appSecret` 的单 bot 老写法 ⇒ 这类配置下采集结果为空、`bot_roster.json` 永远补齐不了，
+出站 @ 与点击者认名整条没数据。**改法**：兼容单 bot 形状（`appSecret` 仍走凭证文件，不落命令行）。
+
+**M5 · 分页"取不到 page_token"不能当成"没有下一页"**
+`has_more=true` 但 `page_token` 缺失时旧代码**静默停止翻页** ⇒ 名单被截断，而下游
+`resolveAtTarget` 的空数组短路＝**不收窄**，跨群同名的人会被误 @。**改法**：抽共用
+`takePageToken()`，这种情况直接抛错；成员那条路径的抛错被既有 try/catch 接住 ⇒
+`members_incomplete=true` ⇒ 合并时沿用旧目录里已采到的名单（宁可用旧的，不可用半截的）。会话列表
+那条同样抛，让整次采集失败而不是写一份残缺目录。
+
+**L1 · `@` 令牌要左右边界**（`expandAtTokens`）
+只有右侧负向前瞻 ⇒ 邮箱 `sales@all.com` 里的 `@all` 命中 ⇒ **真·@ 全体**；`@[文字](链接)`
+被当成 `@[人名]` ⇒ 链接文字被吃掉。**改法**：左侧 `(?<![\w$])`、`]` 后紧跟 `(`/`[` 时整条不匹配。
+用例 87 补三条：邮箱与链接原样保留、那一条**一个 @ 都没展开**、裸 `@all` 与 `@[姓名]` 照常展开。
+
+**L2 · provider 显示名不受我们控制**（`groupChoicesByProvider`）
+段标题直接进 lark_md 的 `**…**`，而名字来自宿主 `listProviders()` 的 `p.name`：可能是对象
+（`String(obj)` ⇒ 卡上印 `[object Object]`）、可能带 `*`/`_`/反引号（顶穿排版）、可能没给。
+**改法**：只接受字符串 + 剥元字符 + 回退 provider id + 最终兜底「（未命名路由）」。
+用例 94 补三种形状的夹具，并钉住"回退只动显示名、按钮 `value` 仍是 `provider|model`"。
+
+**L3 · 依赖扫描的字面边界**：文档写了"排除属性访问 `a.b`"，实现没做 ⇒ 负向后行补成
+`(?<![\w$.])`；串内标识符仍可能多收（无害，如实写在注释里，不假称已排除）。
+
+**L4 / L5 · 冒烟夹具卫生**：用例 89 写单 bot 配置后**没有重新起代 / 重新绑定会话**，
+留下"下一代的 bot 视角没绑上"的隐患 ⇒ 补 teardown + 重新 `apply` + 绑定；用例 94 只有
+"正常名字"的 provider ⇒ 补 L2 三种畸形形状。这两条不改运行时行为，但决定断言是不是恒真。
+
+**过程中踩到的两处假绿灯（如实记）**：回执卡文案判据最初按「已记录你的选择」写 ——
+`formResultCardPayload` 有 `originalElements` 时实际写的是「你已经审批过了」，过滤后是**空数组**，
+于是"隐私断言"在空集合上恒真；提问卡那条同理（「已收到你的选择」是**流式卡封口**文案，
+本代没有活流式卡）。两处都改成按线上真实文案取判据，并保留"前提"断言防空集合蒙过。
+
+**重验状态（已回填，闸门 J 全绿）**：被跑字节 `output/bytes080j.txt`（七件 —— 本轮把
+`scripts/test-fold-tables.mjs` 也纳入清单，M2 改的就是它；`index.js 9d8a12b8…`／
+`scripts/smoke.mjs 2b975250…`／`scripts/collect_bot_roster.mjs 31472ed5…`，
+`helper.cjs`／`identity-inject.mjs`／`package.json` 三件与 I 相同 ⇒ 本轮改动全在代码与用例侧），
+脚本首尾两次 `md5sum` 逐项一致 ⇒ 整轮无漂移。`node --check` ×6、全量冒烟
+`SMOKE PASS (sentCards=457, sessions=30)`（I 是 441/30；+16 张卡来自用例 87 边界三条、
+94 畸形 provider、95 跨会话点击），全文 **719 处 ✅ / 0 处 ❌**、用例编号覆盖到 **95**；
+三冷启动变体各 `COLD PASS`；`npm run check` / `check-packaging`（打包完整性 ✅）/
+`identity-inject.mjs --selftest`（**36 通过 0 失败**）/ `test-fold-tables`（ALL PASS）/
+`resolve_actor.py`（自测失败 0）**rc 全 0**。证据 `output/gate080j.log` + `output/smoke080j.log`。
+⚠️ 闸门标签这次没写错（I 轮曾把冒烟那步标成 `smoke(H)`，本轮首尾清单即 J）。
+
+**部署脚本随本轮补漏（清单#4）**：`output/server-inspect-20261004/step44-deploy-080.sh` 原本
+只覆盖 `index.js`／`helper.cjs`／`identity-inject.mjs`／`package.json` 四件，而
+`scripts/collect_bot_roster.mjs` 在 `package.json` 的 `files` 里、0.8.0 的 roster 采集与出站 @
+认名全靠它 —— 和 step43 漏带 `identity-inject.mjs` 是同一类错（覆盖后服务器跑旧采集器）。
+已改为：字节闸门换成 J 清单 + 五件同批 + **补建步**（有 `index.js` 却没有
+`scripts/collect_bot_roster.mjs` 的副本，按旧单文件覆盖法永远带不进去，这里显式
+`mkdir -p` 后补上并按目录属主 `chown`）。示例配置与文档**不**往服务器覆盖：那是运维手改的
+模板，运行态读的是 `feishu.config.json`，覆盖它只会有冲掉别人配置的风险。
+本地 `bash -n`（外层）+ 把 `\$`/`\\` 还原成远端实际收到的样子后再 `bash -n`（正文）双双通过 —— 这次改动踩到过一个真坑：
+step44 的第 2、3 步本来在**同一个** `<<REMOTE` 会话里，补建块一开始写成第二个 `ssh` 调用，
+副本内的 `REMOTE` 提前把外层 heredoc 结掉，`bash -n` 报 `line 98: unexpected token |`。
+
+
+### 第十一轮（推送前自查 ＋ 门槛第十次跑：1 critical / 2 medium / 9 low）
+
+门槛（`ocr`，只审桥这 8 个文件）结论 **BLOCK**：证据
+`output/code-review/dsh-feishucard-20261005-164847/`（1 critical / 0 high / 2 medium / 9 low）。
+逐条开文件核对：**11 条成立、1 条是已记录的契约不是缺陷**（`identity-inject.mjs:260` 的
+`resolveActorJs` 会写进调用方传进来的 `identityMap` —— 第 240-242 行已明写这条语义，
+且当前唯一调用方在缓存未命中时重新解析一份新表，不受影响；不改行为、不假称已修）。
+
+**critical · 第十轮那道守卫自己把审批卡点死了**（`index.js` 第四个站点）
+第十轮做 §1.6 同类排查时，把 `cardClickOutsideOriginChat(record, chatId)` 补到了 `fs_approval`
+分支 —— 但那个分支**没有 `chatId` 这个绑定**：前三处各自的 `const chatId` 都声明在**自己那个
+if 块**里，本分支在块外，函数级只有 `evtChatId`。ESM 严格模式读未声明标识符抛
+`ReferenceError`，调用方 `try { handleCardAction(...) } catch` 把它吞成一条
+`card action error` 日志 ⇒ `record.settle()` 永不执行 ⇒ **所有**审批卡点击失效、工具请求挂到
+超时自动拒绝。改成 `evtChatId`（同一个值）。
+🔴 **漏检根因比这条 bug 更值得记**：`node --check` 查不出未声明标识符（那是运行期错误），
+而全量冒烟对审批卡点击通道**一条用例都没有**（`grep fs_approval scripts/smoke.mjs` = 0 命中）
+⇒ 闸门 J 那 719 条断言一片绿，却没覆盖这条通道。补**用例 96**：接管 ⇒ 发卡 ⇒ 群里点不作答
+＋留痕＋说明＋**不交回 next** ⇒ 回发起会话点 ⇒ `await` 拿到 `allowed-once`
+＋全程没有 `card action error`。后半段就是这类回归的绊线——守卫再引用不存在的变量，
+断言当场红，不会再靠审查员救火。
+
+**MEDIUM ×2**
+- `collect_bot_roster.mjs` 的 `api()` 不带超时，而脚本全程串行（token → bot 信息 → 会话列表 →
+  每群两遍成员）；一个卡住的端点能把整轮 cron 挂死，而"只在全部成功时写文件"意味着后果是
+  **roster 长期陈旧**、出站 @ 与点击者认名整条静默降级。加 `AbortSignal.timeout(15000)`。
+- 同文件 `members_incomplete` 的语义比它的用途宽：标记在**任何一遍**失败时置位，而它唯一的
+  消费者（合并旧名单）服务于 `member_unions` —— 那是**只由 union 遍**填的。于是"open 遍失败、
+  union 遍已采全"时照样把旧名单并回来 ⇒ 把**已退群的人**重新请回收窄集合，恰好削弱了这条
+  保险丝本身。改成标记只跟 union 遍；open 遍失败的代价是 `views` 缺一角，那由"旧 views 为底"
+  的合并兜住，不需要第二个标记。
+
+**LOW ×9**（逐条核对，全部改）
+- `clickerTagFor` 截断分支写死 `ou.slice(0, 8)`：回调**只带 union_id** 时得到空串，卡面/留痕
+  渲染成 `[点击者 陈明|]` —— 这一支的目的本来就是"卡片侧留个截断 id"，全丢等于没留。
+  补 `ou || union` 回退（与 full 分支同口径），并加断言钉住两侧。
+- `expandAtTokens` 的 `@「」` 一支**漏了左边界**（另两支都有）⇒ `mail@「员工B」` 照样展开成真 @，
+  与第八轮"左右都要边界"的裁决自相矛盾。三支一律 `(?<![\w$])`。
+- `cardClickOutsideOriginChat` 里"由哪个 bot 去说这句拒绝"又用 `findBotForChat(chatId)` 猜 ——
+  正是本次改动在点击者取数上刚否掉的同源形状（单实例多 bot 同群 ⇒ 返回该群配置里第一个 bot）。
+  改成调用方把连接自带的 `evtBot` 传进来，传不到才降级去猜；四个站点全部传。
+- `feishu_send` 的 `at` 参数组装 token 只剥方括号 ⇒ 名字里混进换行/制表时拼出 `@[查无\n此人]`，
+  违反 `[^\]\n]{1,60}` 语法、**整条不匹配**：@ 没展开、原文照发，连「（未能 @ 出：…）」都不出现
+  （比声明失败更坏的是无声失败）。改成剥 `[\]\r\n\t]` 后 trim。
+- `test-fold-tables.mjs` 用 `consts.join('')` 拼接闭包源码，而常量切片规则是"取到行尾"——
+  带行尾注释的定义（`const bots = new Map() // appId -> Bot runtime`）会把注释一起交出来，
+  后面每条声明都落进注释里 ⇒ `new Function` 抛裸 `SyntaxError`，三道"点名报错"绊线一个碰不到。
+  改成逐条换行（注释只吞自己那个 `;`，声明由 ASI 正常收尾）。
+- 同文件 `Number(constSrc.get('FOLD_CHUNK_CHARS'))` 没有存在性检查：常量定义改多行或缩进变化时
+  得到 `NaN`，下游断言报"5000 > NaN"这种看不出根因的失败，与本文件"异常必须指向切片/闭包"的
+  契约相反。加 `numConst()`：抽不到 / 抽到但不是数字 ⇒ 点名报错。
+- `identity-inject.mjs` 的 JS 分支把**所有**异常都加 `resolver_js_failed:` 前缀，而 `loadMapJs`
+  抛的正是文档里那条 `map_unavailable` ⇒ 同一份坏主表，JS 通道吐 `resolver_js_failed:map_unavailable`、
+  Python 通道吐 `map_unavailable`，两条通道口径不等价（按错误码做看板/日志抓取会静默失配）。
+  改成：文档内的码原样透出，其它意外才带前缀。
+- 冒烟用例 95 的 `fs_question` token 用固定下标链取（`columns[1].elements[0].behaviors[0]`），
+  正是本文件用例 78 的注释警告过的写法：布局一变（选项数、计划审查卡的第一排形状）某环是
+  `undefined` ⇒ 抛未捕获 TypeError 带走整个进程。改回正则抓取。
+
+**推送前自查抓到的第二条（不在 findings 里，是我自己写的）**：第八/九轮为了钉住"id 不许截断"，
+把真机取证里的**真实** `open_id`/`union_id` 抄进了冒烟夹具 —— 这个文件随包推到公开仓库，
+等于把当事人的飞书身份标识公开发出去。已全部换成 `md5("dsh-smoke-*")` 派生的**假 id**（形状仍真：
+`ou_`/`on_` + 32 位 hex，否则防回归断言就白写），并在夹具旁写明"值必须是假的"。
+随后拿本机身份数据里的**每一个**真实 id 全包反扫一遍：只剩 `identity_map.example.json` 的全零占位。
+🔴 如实记一条**没动**的：夹具沿用仓库既有的示例人名（`identity-inject.mjs` 10 处、
+`resolve_actor.py` 3 处，**0.7.21 就已发布**，本次新增只在冒烟里出现 12 处）。
+改名要连带动 `resolve_actor.py --selftest` 的期望值，且历史提交里的那份删不掉（要删得改历史）——
+这一条留给维护者裁决，我不擅自扩大改动面。
+
+**为什么这轮把发布链停下**：维护者已给"可以推送／服务器版本可以更新"的授权，但授权的是
+**这批功能**，不是"知道有 critical 还照推"。`fs_approval` 那条一旦上线＝线上所有审批卡点击失效，
+比原来的跨会话口子更坏。所以顺序是：修完 → 重跑闸门 → 复跑门槛 → 再推。
+
+**闸门 L 的结果：3 条红，红在夹具不在产品**（证据 `output/gate080l.log` +
+`output/smoke080l.log`：其余 726 条断言全绿、四个 `SMOKE_COLD`/离线闸门全 `RC=0`，
+唯用例 96 的三条红）。日志证明产品行为是对的（`card click ignored (not the originating chat)`
+＋误点会话回了说明＋全程无 `card action error`），红的是我刚写的断言：`emitCtx` 把**同一个**
+`next` 发给**每一个**监听器（不是链式往下传），而 96 跑在十几次热重载之后 ⇒ 老代次的监听器
+一律"查无此 agent 的会话"各自转交一次，于是 ① `runs96[0]` 取到的是**转交**的返回值而不是被
+接管的那条 Promise，② "拒掉不算转交"按总数判必红。改成按**对象身份**过滤出被接管的那一条、
+转交只比**接管之后的增量**。🔴 这类"断言写错导致产品被冤枉"与第九轮那条"回执文案判据写错导致
+空数组假绿"是同一族——**夹具自己也要能被证伪**，所以两条都留了字面注释。
+当时定的定版闸门＝**M**（K 因 index.js 中途改动作废、L 因 smoke.mjs 中途改动作废）。
+🔴 **M 随后也作废**：第十二轮门槛把 HIGH 那条（用例 96 缺"回到发起会话点 ⇒ 真放行"的**正向**
+点击）补上后，`index.js`／`smoke.mjs` 字节再次变化 ⇒ 定版闸门改认 **N**，见下一节。
+
+### 第十二轮（门槛第十二次跑：0 critical / 1 high / 2 medium / 8 low）
+
+**先记一个好消息**：上一轮那条 critical（审批卡守卫引用未声明的 `chatId`）**这轮归零**。
+同一套规则、同一批文件再跑一次吐出 0 critical ⇒ 独立复核也认为那条死路已经闭合，
+不是"我自己说修好了就算修好"。
+
+报告：`output/code-review/dsh-feishucard-20261005-173146/`（8 文件 · 27,753,671 tokens ·
+20m2s · 判定 **BLOCK**，因为 fail-on 门槛设的是 high）。**逐条打开对应代码核对，11 条全部
+核实为真，没有一条判成误报** —— 其中最有价值的三条恰恰都长在**测试夹具自己**身上：
+
+- **HIGH（`scripts/smoke.mjs` 用例 96）**：整段只在 `GROUP85`（别的会话）点了一次，**没有回到
+  发起会话点第二下**。而审批卡只有在发起会话里的点击才会 `settle('allowed-once')`
+  （`cardClickOutsideOriginChat(record, evtChatId, evtBot)` 为真时直接 return），超时又是真
+  `setTimeout` 十分钟 ⇒ `win96` 只可能是 `__no-settle__`，这条断言**必然失败**；更要紧的是
+  "发起会话点 ⇒ 真放行"这条**唯一能抓住上一轮 CRITICAL** 的正向路径从来没被跑到过。
+  补一次 `tapValue({ fs_approval, fs_action: 'allow' }, …, CHAT_ID)`，跑通后输出
+  `★★★★ 回到发起会话点 ⇒ 真放行（settle=allowed-once）`。
+  🔴 教训：**写了断言 ≠ 断言覆盖了那条路**，绊线自己也得是可执行的。
+- **MEDIUM（`scripts/smoke.mjs` 用例 81 托孤补发）**：`relay81` 只按 `op === 'create'` 计数，
+  而 fetch mock 是**先把记录推进 `sentCards`、再过在飞闸门/抛错**的 ⇒ G2 那次故意失败的中途
+  POST 已经在里面，且它的 `app` 同样等于 `APP2` ⇒ 三条断言在"补发根本没建出卡"的情况下
+  **照样全绿**。同文件用例 80 的 `built80`、用例 76 的 `conclusionCreated` 都过滤了 `c.msgId`，
+  只有这里漏了 ⇒ 补 `&& c.msgId`，与同类用例口径拉平。
+- **MEDIUM（`index.js` 指路语常量）**：第九轮为"按字面全等匹配"抽了 `CONCLUSION_POINTER`，
+  但**同一族的另一句**（`✅ 已收到你的选择，继续处理中…`）仍散在四处字面量里
+  （摘卡 / 上卡 / 降级 / 回填），而 `cardLabel()` 的比较就是 `b.text === 字面量` ⇒ 改任一处
+  文案都会**静默失去**跳过过滤，正是当初抽常量要防的那个重复内容 bug。抽成 `ANSWER_POINTER`
+  并把四处代码全换（只剩注释里的「」引用保留原文，它不是匹配点）。
+- **LOW×8（逐条落实）**：
+  ① `loadBotRoster` 解析失败时**不推进 `mtime`** ⇒ 快速路径对该版本永远命中不了，之后每条
+  入站消息都重读文件＋重打一句 `roster parse failed`（名单长期坏＝日志刷屏＋每条消息一次
+  stat+read）。加 `rosterState.badMtime`：记住坏的那一版，文件真的变了（mtime 变）才再读。
+  ② `identityMapPeople()` 是**同一族缺陷的第二个站点**（本机没有 `bot_roster.json` 时每个
+  `@[名]` 都落到这条路，且卡片流式重排期间反复走它 ⇒ 整张身份表被同步 `JSON.parse` 若干遍）
+  ⇒ 同样加 `identMapState.badMtime`。
+  ③ 卡片抠字 walker 里两处**嵌套三元**（本仓清单禁嵌套三元）⇒ 展平成"先给默认值、再逐条
+  `if / else if` 覆盖"。
+  ④ `feishu_send` 的 at 参数注释把口径说过头了：那个字符类只排除右方括号与换行，
+  **名字中间的空格是合法的**、照常送去解析；剥回车/制表符只因那已经不是"一个名字"的形状。
+  注释按代码真实行为改准（上一版的说法会诱导后来人"顺手把空格也剥掉"，那是改错方向）。
+  ⑤ `collect_bot_roster.mjs` 的 --config / --out 用 `argv[++i]` 取值却不检查后面有没有值：
+  选项落在末尾时静默变成 undefined ⇒ 脚本**退回默认配置路径**去读凭证。对一个读凭证、
+  写 0600 名单的脚本，"以为指了别处、其实用的默认那份"比直接报错坏得多。加 `needValue`：
+  缺值或后面跟的是另一个选项 ⇒ 报错并 `exit 2`（实测两种写法都立刻退出）。
+  ⑥ `test-fold-tables.mjs` 两处 `new Function`：本仓安全清单把 Function 构造器列为禁用项，
+  这里是**只吃本地 `../index.js` 切出的片段**、输入永不出仓库的测试专用用法 ⇒ 不改成禁用，
+  但在两处各写一行**信任边界**说明；将来谁把外部文本接进来，那行说明就是喊停的地方。
+  ⑦ 同文件 `bundle()` 只认两种可抽形状（两格缩进的 function 声明、两格缩进的单行 const），
+  其它形状**静默跳过** ⇒ 抽出的命名空间少一个定义，直到断言调用它才炸成裸
+  `ReferenceError`，与本文件"任何一道不过就点名报错"的契约相反（`grab()` 的三道校验只拦
+  "切片算多了"，拦不住"闭包算少了"）。加两道点名绊线：抽不出的**入口**、以及引用到但
+  抽不出来的**依赖**，各自点名报错。🔴 绊线不是写完就算数——临时把两段自检塞进文件跑了一遍，
+  实测输出 `断言入口抽不出来: CARD_LABEL_SKIP…` 与 `依赖闭包抽不到定义: CARD_LABEL_SKIP…`
+  两条都真的会触发（第一条：`CARD_LABEL_SKIP` 是跨行 const；第二条：`cardLabel` 引用它），
+  验完即删。**顺带踩到两个坑**：a) 自检块写在文件末尾的 `process.exit(...)` 之后 ⇒ 一行都没跑，
+  差点以为绊线是装饰；b) 用 `node -e` 探正则时 Git Bash 把双反斜杠压成退格符，探测结果全错，
+  结论必须以真跑脚本为准（对应 A25「验证要用生产的方式跑」）。
+  ⑧ `collect_bot_roster.mjs` 写临时文件前没建目录：`--out` 指向尚不存在的目录（或用
+  `FS_CONFIG_DIR` 指新路径）时直接 ENOENT，最后只由 `main().catch` 打一句"采集失败（不写文件）"
+  ＋栈，看不出是目录问题；插件侧写配置是 `mkdirSync(configDir(), { recursive: true })` 的口径。
+  写盘前补同样一句 —— 并**顺手抓到一个自己引入的运行时坑**：`dirname` / `mkdirSync` 当时
+  没有加进 import，`node --check` 查不出来（未导入标识符是运行期 `ReferenceError`），
+  是补完 import 才成立的。这条与上一轮那条 CRITICAL 是同一族：**语法检查覆盖不到标识符解析**。
+
+**为什么这一轮还在改测试而不只是改产品**：本轮 11 条里 5 条在 `scripts/`（夹具与离线闸门），
+而这 5 条里有 3 条是**假绿灯 / 假红灯**的源头（relay81 漏 msgId 过滤＝补发没建卡也算绿；
+用例 96 缺正向点击＝CRITICAL 的绊线是虚的；`emitCtx` 扇出同一个 next＝产品被冤枉）。
+冒烟跑到 733 条断言，绿灯的可信度取决于**最弱的那条断言**，不取决于总数。
+
+**定版闸门 = N（2026-10-05）**：`output/gate080n.log`（脚本 `output/gate080n.sh`，由 m 版派生）。
+`SMOKE PASS (sentCards=469, sessions=30)`、全文 **733 ✅ / 0 ❌**、用例编号覆盖到 **96**、
+三冷启动变体各 `COLD PASS`、`node --check` ×6、`npm run check`、`check-packaging`、
+`--selftest` 36/0、`test-fold-tables` ALL PASS、`resolve_actor.py` 失败 0 —— **15 步全 `RC=0`**；
+被跑字节 `output/bytes080n.txt`（`index.js 5a3b7842…`／`smoke.mjs b411853a…`／
+`test-fold-tables.mjs 91c0ba8b…`／`collect_bot_roster.mjs 7021a48f…`，另三件与 J 相同），
+STEP0 与 STEP9 两次 `md5sum` 逐字一致。**部署与推送以 N 的字节为准**，
+`step44-deploy-080.sh` 的字节闸门已同步换成 N 清单。
+⚠️ 如实记一条过程中的自伤：N **第一次**跑的时候，我以为前一次 `nohup` 启动失败（启动 8 秒后
+日志文件还不存在）就又用后台任务起了第二个实例 ⇒ 两个实例往同一个日志文件交替写 ⇒
+日志读起来像跑了两遍、`bytes080n.txt` 一度有 14 行。**证据本身没被污染**（两次 STEP0/STEP9
+的 md5 完全相同、且与我单跑冒烟的 733 ✅/0 ❌ 一致），但**日志不可信 ⇒ 全部丢进回收站重跑一遍
+干净记录**。教训并进 A28：判断后台任务"有没有起来"不能只看一次 `ls`，要看日志是否在长。
+
+
+### 第十三轮（门槛第十三次跑：0 critical / 0 high / 4 medium / 6 low，判定 WARN）
+
+报告：`output/code-review/dsh-feishucard-20261005-184828/`（8 文件 · 26,196,991 tokens ·
+13m47s）。**critical/high 连续两轮归零** ⇒ 审批卡那条死路确认闭合。逐条打开对应代码核对，
+**10 条里 9 条核实为真并落实，1 条（L2）判为误报**：
+
+- **MEDIUM#2（`index.js`，真产品缺陷 · 本轮最值钱的一条）**：群里 `@bot /命令` **从来没生效过**。
+  命令解析拿的是**还原后**的正文（`@姓名 /help`），首字符不是 `/` ⇒ `splitCommand` 判不出命令，
+  整串当普通消息处理。更糟的是**当时的注释声称"已在 splitCommand 之前还原"，等于把这条缺陷
+  写成了已修复**（A24 禁无出处断言的反面教材）。修法：新增 `commandAnchor(rawText, mentionList)`
+  —— 从**原始文本**逐个剥掉**前导**的 @ 占位符（容忍其间空白、按整串 token 精确匹配），
+  剩下的部分再交给 `splitCommand`；给 agent 的正文仍用还原后的 `renderMentions` 版本，
+  两个口径各管各的。两个命令站点（事件入口与 `handleInbound`）统一读 `evt.textCommandAnchor`，
+  内部合成事件没有该字段时退回正文本身。
+- **MEDIUM#3（`index.js`＋`identity-inject.mjs`，真产品缺陷）**：出站 `@[名字]` 的 name→id 兜底
+  **只读主表**，而"本机 bot 视角的 ou"按设计就写在 `identity_map.local.json`（每台一份、
+  不参与同步）⇒ 只在增量里的那个人永远查不到，明明认得出却被发成「（未能 @ 出：X）」。
+  内核 `resolveActorJs` 是主表＋增量**合并后**才解析的，两处口径分叉。修法：把 `localMapPath()`
+  从 identity-inject 的私有闭包提成**模块级导出**（闭包版删除，两处共用一个函数，杜绝路径
+  口径漂移），index.js 侧按 mtime＋`badMtime` 缓存增量表，并**严格照内核口径**合并：
+  只按同名补 `open_ids`，**增量里主表没有的名字一律不算数**。
+- **MEDIUM#1（`scripts/test-fold-tables.mjs`）**：函数名单抽取的正则只认 `function NAME(`，
+  不认 `async function` / `function*` ⇒ `fnNames` 少一项，而依赖闭包按名字去抽时**静默抽不到**
+  （正是第十二轮 LOW⑦ 那条"闭包算少了"绊线要防的形状，绊线自己却漏了同一族）。补
+  `^ {2}(?:async\s+)?function\s*\*?\s*NAME\s*\(` 形状，未解析守卫与"切片越界"校验同步放宽；
+  `grab()` 改为按行形状定位并**把 `async ` 前缀补回切片**（否则 `await` 被抽成普通函数，
+  `new Function` 当场 `SyntaxError`）。两个方向都用临时探针验过：新版能编译 async，
+  旧版必报 `await is only valid in async functions…`，验完即删探针。
+- **MEDIUM#4（`scripts/smoke.mjs`）**：8 处 dispose 循环后没清 `effectCleanups` ⇒ 老代次的
+  disposer 每次重载都被再跑一遍（重复清理同一批监听器/定时器）。逐个补 `effectCleanups.length = 0`。
+- **LOW 落实**：① 常量抽取的"悬挂运算符"判据原来只看最后一个字符是否 `)]}`，
+  `=>` / `||` / `&&` / `?` / `*` / `%` 结尾的多行声明会被当单行常量抽走 ⇒ 补字符类；
+  ③ 卡片抠字 walker 的 `at`/`person`/`mention` 分支把 `user_name`/`name` 直接拼串，
+  对象形态时送进会话的是 `@[object Object]` ⇒ 改为**只认字符串**、其余兜底 `@某人`；
+  ④ `mentioned_type` 两处口径不一致（判"是不是同行"认 `bot`/`app`，明细行写 kind 只认 `bot`）
+  ⇒ 统一由 `mentionedTypeIsAgent()` 裁决；⑤ 用例 79 的降级断言只判"有没有"，补"整串里
+  不得出现指路语"；⑥ 冒烟取工具用 `.find(name)`，而 `registeredTools` 跨热重载**累积** ⇒
+  取到的可能是老代次那个（execute 已 dispose），统一走 `toolNow(name)`（`filter().pop()`）。
+- **L2 判为误报**（`scripts/smoke.mjs:87` 一带的 mock 开关残留）：本文件**没有 per-case try/catch**
+  ⇒ 用例中途抛错会直接杀掉整个套件，"老 mock 标志泄漏到下一用例并让它变绿"这条路径不可达。
+  记下判断依据，不为了关门门槛而编造修复。
+
+**🔴 修 M2 时抓出的"假绿灯"，比 M2 本身更值得记**：改完命令锚点，用例 86 立刻红两条 ——
+读代码发现它把「字符串形态 mention 还原」和「`@bot /new` 判成命令」捆在**同一条消息**上。
+修复前那条 `createdSessions === sessionsBefore + 1` 之所以绿，恰恰**因为命令没被识别**、
+整串被当普通消息送进 agent 并建了会话；修复后命令正确短路返回、不再建会话，两条渲染断言
+于是读到了上一轮的残留文本。也就是说：**这条用例一直在用"缺陷存在"作为通过条件**。
+现已拆成两条各判各的：用例 86 只管字符串 id 渲染（加"本轮确实进了会话"的前提断言），
+用例 97 专管命令识别，判据换成可鉴别形式 —— 命令生效 ⇒ `agent.sent` 不增加、不建会话、
+帮助纯文本恰好一条；命令失效 ⇒ `agent.sent` 必然 +1，红。另补用例 98 钉 M3（临时主表只给
+别的应用视角的 ou、增量给本 app 视角 ⇒ 必须 @ 得出来；主表没有的名字必须 @ 不出来），
+并在用例 90 补 L3 的对象形态名字断言。这与第七轮"回执文案判据写错导致空数组假绿"、
+第十二轮"relay81 漏 msgId 过滤"是同一族：**断言的通过条件必须与缺陷互斥**，否则绿的是夹具。
+
+**覆盖面**：用例编号 96 → **98**；本轮改动落在 `index.js`／`identity-inject.mjs`／
+`scripts/smoke.mjs`／`scripts/test-fold-tables.mjs` 四个文件 ⇒ 按功能基线的规矩
+（闸门字母只认"跑完之后字节没再动过"的那一次），本轮之后的定版闸门见第十四轮门槛段 ＝ **Q**。
+
+
+### 第十四轮（CM 真机报障 2026-10-05 · 加急）：`/model` 卡片切换**从来没成功过** ＋「自动视图」整段删掉 ＋ 结果写回同一张卡
+
+CM 原话（三件事一起）：「自动视图的话先把它删掉」「我在这个卡片里面去切换模型，现在切换失败的，
+就是没有切换成功过」「点击了，卡片不懂但是发一条提示，卡片应该更新成已经切换到 XX 模型的提示，
+不是另外发卡片」。
+
+取证一律来自**本机在跑的那个 dsh web 实例**的日志 `output/dsh-install/web.log`
+（CM 测的是本机不是服务器 —— 服务器上所有副本仍是 0.7.21、没有分组代码，journal 里
+`card action event received` / `[fs] /model` **一条都没有**，这条排查本身也纠正了"去服务器找现场"的方向）：
+
+```
+[fs] /model: choices=14 providers=deepseek-official=2,mimo-vision=1,zai-coding-cn-vision=3,
+             deepseek-vision=2,mimo=1,zai-coding-cn=3,zai=1,zai-vision=1 current={"provider":"zai","model":"GLM-4.5-Air"}
+[fs] /model click: zai|GLM-4.5-Air … agent=fs-main-muv8bkcg
+[fs] /model: append(model/selection) zai/GLM-4.5-Air agent=fs-main-muv8bkcg
+```
+
+三个缺陷，各自独立：
+
+1. **「模型名重复两次」的真根因不是排布，是多了一整批影子路由。**
+   第九轮按 provider 分组只把重复**摆整齐**了。卡上那 8 段里后 4 段（`mimo-vision` /
+   `zai-coding-cn-vision` / `deepseek-vision` / `zai-vision`）不是宿主的 provider，是 profile 插件
+   **dsh-vision-router** 给每条真路由再挂的影子路由：`twinRoute = <provider>-vision`
+   （其 `index.js:1249`）、显示名固定拼成 `<源名> + 自动识图`（同文件 1087/1275）、
+   包装路由默认 id `deepseek-vision`（`:166`）⇒ 同一批模型在卡上必然出现两遍。
+   **改法**：`listModelChoices()` 按该插件自己的两条约定过滤 —— provider id 以 `-vision` 结尾，
+   **或**显示名含「自动识图」（包装路由的 id 用户可改，只有字样这条判据兜得住）。
+   判据照抄上游约定、不猜别的形状；服务器那台没装这个插件 ⇒ 过滤是空操作。
+2. **点击后走的是宿主**没有**的方法，然后回了「✅ 已切换」＝假成功。**
+   `ctx.get('sessionController')` 拿到的是**远程服务对象**（typert `service:'sessionController'`），
+   只有 `create / selectModel / modelCatalog / prompt / …`；`selectForNextRequest` 与 `selectionFor`
+   长在**内部**的 `ApiSessionAgentController`（服务的 `this.agents`）上
+   ⇒ `typeof sc.selectForNextRequest === 'function'` 恒为 false ⇒ 三次真实点击**全部**降级成
+   `agent.session.append('model/selection', …)`（上面日志可证）。而 `append` 只写**持久事件**：
+   活 agent 的选择状态在建会话时就被 `installModelSelection` 装好，`selectionFor()` 命中缓存的
+   `this.selections`，只有 `selectForNextRequest` 会改它的 `picked` ⇒ 事件写进去了、
+   下一次请求照用旧模型。**改法**：走宿主 GUI 同一条路
+   `await sc.selectModel({sessionId: agent.id, provider, model})`（内部先 `llm.resolveCallConfig`
+   归一化校验、再 `agents.selectForNextRequest` 真改到活 agent、顺带存默认；不可用则抛
+   `session/model-unavailable`）⇒ 成功失败都**宿主说了算**。**兜底 append 整条删掉** ——
+   留着它就等于留一条永远报喜不报忧的路。
+3. **「当前」恒显示全局默认值。** `currentModelOf()` 读的也是不存在的 `sc.selectionFor(agent)`
+   ⇒ 永远退回 `agentDefaultModel`（日志里三次点击前后 `current` 都是 `zai/GLM-4.5-Air`，
+   与会话实际在用的 `deepseek-official/deepseek-flash` 不符）。**改法**：改读会话投影
+   `ctx.get('sessionProjections').stateOf(session,'modelSelection')` 的 `pending || lastUsed`
+   （与宿主 `selectionFor` 同口径：pending＝待生效、lastUsed＝上一次请求头落定的那条），
+   拿不到再退回全局默认。
+
+点击回执按 CM 的要求**写回被点的那张卡**（`updateInteractive` PATCH 同一个 `open_message_id`），
+终态卡＝`✅ 已切换模型` ＋ `provider/model` ＋ **不带任何按钮**（与 `/switch` 的
+`buildSwitchResultCard` 同口径；要再切就重发 `/model`）；宿主抛错则同一张卡改成
+`⚠️ 没能切换模型` 并把原因原样写进卡面。PATCH 失败才退回一句纯文本（不许因为回执发不出去
+就静默）。形状跟本卡走 **1.0**（`header` + 顶层 `elements`，与审批单卡同源、已在生产验证），
+不套 2.0 的 `body.elements` —— PATCH 是整条 content 替换，拿 2.0 去盖一张 1.0 卡是没验过的形状。
+点击回调用**收到事件的那个 bot**（`evtBot`）去 PATCH：拿别的应用身份改卡必被拒。
+
+**防回归**：新增用例 **99**（21 条断言，覆盖上面三处 ＋ 文字通道 ＋ pending/lastUsed 两态）。
+🔴 夹具同步补了三处，否则用例 99 自己就是假绿灯：
+① 原来 `ctx.get` **根本没有 `sessionController` 这个键** ⇒ 旧实现在冒烟里必然走兜底、
+  而兜底又必然抛错 ⇒「98 个用例里没有一个照到过"回 ✅ 但模型没变"」；
+② 补 `sessionProjections.stateOf` 桩，`modelSelection` 状态可由用例注入；
+③ 🔴 mock `agent.session` 原来**没有 `append`** ⇒「没走兜底」这条断言在旧字节上也是**恒真**的
+  （那句会先抛 `TypeError`）⇒ 挂上记录器 `sessionAppendCalls`，断言才有辨别力。
+另记一处夹具事实：`sendPlainText` 实际发的是 `elements:[{tag:'markdown'}]` 的**卡**
+（不是 `msg_type=text`）⇒「另发一条提示」在夹具里的形状是一条 markdown create，
+用例按这个形状抓，才能真的判出"点击后一条新消息都不发"。
+
+**本机活实例已复验（不是只在冒烟里绿）**：修完热重载后，同一个 dsh web 实例的日志变成
+```
+[fs] /model: 跳过视觉影子路由 mimo-vision / zai-coding-cn-vision / deepseek-account-vision
+             / deepseek-vision / zai-vision
+[fs] /model: choices=7 providers=deepseek-official=2,mimo=1,zai-coding-cn=3,zai=1
+             current={"provider":"deepseek-official","model":"deepseek-flash"}
+```
+14 → **7** 条、8 段 → **4** 段，且「当前」第一次显示出会话真在用的那条（不再是全局默认
+`zai/GLM-4.5-Air`）。⚠️ 点击那一步当时 CM 还没点 ⇒ **真机点击成功的证据仍欠一次**，
+按 A25 记在「已知未完成」里，不以冒烟绿灯代替。
+
+**覆盖面**：用例编号 98 → **99**；本轮改动落在 `index.js`／`scripts/smoke.mjs` 两个文件
+⇒ 定版闸门 **Q**（O 那次是被中断的半截日志；P 跑完后字节又变，见下条门槛段）。
+
+
+#### 第十四轮门槛（ocr WARN：0 critical / 0 high / 2 medium / 4 low）逐条核对与处置
+
+报告 `output/code-review/dsh-feishucard-20261005-231115/`（8 文件 / 25,620,826 tokens / 13m51s）。
+6 条**逐条打开源码核对**，结论：**4 条成立并已修**、1 条部分成立（收窄处理）、1 条是测试缺口（已补）。
+
+| 条目 | 核对结论 | 处置 |
+|---|---|---|
+| **MEDIUM#1** `switchModelForAgent` 把**请求值**当**宿主确认值**回显 | **成立**。宿主 `resolve` 但响应里没有 `selected` 时，旧代码 `sel = res.selected \|\| {provider, model}` ⇒ 日志打 `selectModel ok`、卡片回「✅ 已切换为 …」——正是本轮要消灭的"假成功"形状；宿主若做归一化还会把没生效的名字报成已生效 | 返回值改为 `{provider, model, confirmed}`：**只有宿主回带 `selected` 才算 `confirmed:true`**；未确认时日志打 `ok-but-unconfirmed`、卡片/文字都如实说「宿主没有回带确认…无法保证已生效」，**既不谎报成功也不谎报失败**。两条通道（点击／`/model p/m`）同一口径，用例 99 各钉一条 |
+| **MEDIUM#2** `expandAtTokens` 盲扫全文、不认识代码区 | **成立**（真风险）。`@[名字]`/`@all` 这类字面量在本仓库文档、工具说明、以及 agent 随手贴进卡片的 diff/README 里**原样出现** ⇒ 被展开成**真** `<at id=…>`：①改写作者写的内容（卡上的代码样例与源码不再一致）；②真的通知到人，而**出站 @ 正是唤醒对方 bot 入站事件的扳机**（＝误唤起另一个 agent）。`(?![[(])` 那条链接守卫已证明这一类误命中被考虑过，只是漏了代码区 | 新增 `splitCodeSegments()`：先按**围栏**（``` / ~~~，收栏同字符且不更短）切成代码/非代码段，段内再按**行内 `…`** 切一刀；**只在非代码段跑 @ 展开**，代码区原样保留并留痕 `at tokens 代码区原样保留 n=…`。用例 87 补 4 条（围栏内 `@all`/`@[员工B]` 原样 ＋ 恰好只展开正文那一条 ＋ 行内 `…` 同等待遇） |
+| **LOW#1** 影子路由过滤是**无条件启发式**，真路由命中同样形状会被无声摘掉 | **部分成立**。判据确实只是命名巧合（`-vision` 后缀 / 显示名含「自动识图」），本机实测集合无误伤；但"凭空消失、只有一行日志"的诊断性缺口是真的 | 不上配置开关（加了就等于给"自动视图"留后门，与 CM「先把它删掉」相冲）；改为**把留痕做实**：跳过后同时打印 `id=`／`name=`／**命中哪一条判据**／判据出处（dsh-vision-router 的影子路由）。真被误伤时日志能一眼定位，不再只有一条裸 id |
+| **LOW#2** 明细行标签三处各写字面量（生产者两个函数 + 消费者剥离正则） | **成立**。任一侧改措辞 ⇒ 正则静默失配 ⇒ 明细行跟着短消息泄漏到 `/switch` 卡灰字上，**且不报错**（正是那段注释要避免的事） | 收成 `SENDER_FOOTER_TAG` / `MENTION_FOOTER_TAG`，剥离正则 `FOOTER_STRIP_RE` **由这两个常量拼出来**（不是另写一份），语义与旧正则一字不差 ⇒ 结构上不可能再漂移 |
+| **LOW#3** 用例 99 的写回只按 `msgId` 匹配、不校验身份 | **成立**（本改动最吃紧的假绿灯）。生产是按 `ownerBot = evtBot` 去 PATCH，**因为这张卡属于那个应用**；拿错身份真机会被 API 拒（`update card failed` ⇒ 卡片不动），而夹具照样记成成功 | 补 `patch99.app === APP_ID` 断言（mock 已按 Bearer token 记录 `rec.app`，用例 78 同源） |
+| **LOW#4**「点了没反应」的另两条出口没有用例 | **成立**。生产有三条出口：有 `message_id` 且 PATCH 成功（已钉）／事件**没给** `open_message_id`／PATCH 被拒 —— 后两条**零覆盖** | 各补一次点击：断言窗口内**恰好一条** markdown create（正文含「已切换为 `p/m`」）且**没有成功的 PATCH**（失败的 PATCH 夹具有意不落记录，所以再断"窗口内 update=0"挡重试） |
+
+**覆盖面（门槛后）**：改动仍落在 `index.js`／`scripts/smoke.mjs`（用例数不变 99，断言数见
+闸门 Q 日志 `output/gate080q.log`）；定版闸门 = **Q**，字节清单 `output/bytes080q.txt`。
+
+
+### 已知未完成（本次未做，见交接清单）
+
+- **`/model` 卡片点击的"真机点一次"证据**（第十四轮）：本机活实例已复验到"影子路由已过滤 ＋
+  「当前」读对了会话投影"（`output/dsh-install/web.log` 94031-94036），点击那一步目前只有
+  冒烟证据（用例 99 的 27 条断言）。取证只需在**本机这个 dsh web 实例**上点一次 —— CM
+  2026-10-05 口径：**服务器那台还没公开给用户用，"没人点"是预期，不是缺陷，也不作为部署门槛**；
+  部署后同一判据（日志 `[fs] /model: selectModel ok <provider>/<model> session=…` ＋ 一条对
+  同一 `message_id` 的 PATCH）随用随取。
+- 本包**尚未 commit、未推 GitHub、未发 npm、未上服务器**（清单#1/#4 需维护者确认后执行）。
+- 🔴 **服务器现状已实测纠正（2026-10-05，本会话 SSH 只读侦察）**：交接材料（中台 #18/#20/#21）
+  写的"线上仍是 0.7.19"**不成立**。实测 10 份副本全部为同一字节 —— `index.js md5=a23a235e4055…`
+  ＝本地提交 `bd5421c`（0.7.21 那批）的字节，`helper.cjs 5496e7cddc5c…`、
+  `identity-inject.mjs c1b2f6c6108e…`、`package.json f7c72352e4d0…`（版本号 0.7.21），
+  落盘时间 2026-10-05 00:53。副本清单：`/srv/aiad` ×1、`/opt/dshprof` ×1、`/home/ubuntu` ×1、
+  7 个 `/home/agt*` 私有 profile ×7。⇒ 待部署的差异是 **`bd5421c` → 0.8.0**，不是 0.7.19 → 0.8.0；
+  服务器侧也**已有** `identity-inject.mjs`（step43 补它这一条仍成立 —— 覆盖时不带上就会跑旧内核，
+  但它确实存在）。本包发布时若仍按"从 0.7.19 起跳"写回归预期，会把已经在线上生效的行为
+  当成新行为去验，白占一轮验收位。
+- 服务器至今是**单文件覆盖**的历史做法 —— 本版要求整包覆盖（清单#4）。
+- **整包部署脚本 `step43-deploy-fullpackage.sh` 原批少了 `identity-inject.mjs`**（2026-10-05
+  本机核对时发现并已修正脚本，**未执行、未碰服务器**）：`index.js:29` 在模块加载时
+  `import … from './identity-inject.mjs'`，而该脚本的 `FILES` 只有 `index.js helper.cjs
+  package.json`。四个被引入的符号（`TurnIdentityStore` / `applyActorToArguments` /
+  `decideAction` / `makeResolver` / `pickMapPath`）在旧模块里**都在** ⇒ 漏带**不会** import
+  报错，只会让 0.8.0 的 index.js 悄悄跑在 0.7.x 的旧内核上（旧内核没有"按表签名失效缓存"
+  等改动）＝**不崩但跑错**，比 step42 那种"长连接起不来"更难发现。脚本现改为四文件同批、
+  `PKG_DIR=/tmp/pkg-0.8.0`、备份后缀 `.bak-pre080`、`EXPECT_VERSION=0.8.0`；第 3 步的
+  "共 10 份"预设改为"份数以本次输出为准"（各副本是否都已有 `identity-inject.mjs` 我没有
+  服务器证据）。`scripts/collect_bot_roster.mjs` **不在本批**并写明理由：运行期只读配置目录里的
+  `bot_roster.json`，不 import 该脚本。`bash -n` 语法检查通过。
+- **互认的三档开关默认全关**：`identityGuard` / roster 接入 / `groupRelay`（默认 `self_only`）
+  都要等服务器上**五个回归场景**（单聊 / 群 @ / 无 @ 丢弃 / `/switch` / 审批卡）验过才按取证逐个放开。
+- **群 @ 门禁的真机验证至今无人做过**（中台 #19：群内 8 小时没有一条 @ 消息，缺"真人 @ 能回、
+  不 @ 不回"的实证）。冒烟 77 只证时序，不证真机。
+- 上游收录 `awesome-dsh-plugin#6562` 等维护者合并（2026-10-05 核对：OPEN / MERGEABLE，
+  本包无可动作项）。
+- **仍无专用断言的一条降级入口**：托孤队列**超上界把建卡意图挤掉**时的那次降级
+  （`relayed card push evicted (queue full), degrading`）。要命中它得往队列里灌过
+  `CARD_RELAY_MAX`(=24) 条在飞托孤条目，夹具成本高于该分支本身；而且它调用的就是
+  用例 79/84 已经钉住的那个 `relayCreateFallback`，**差别只在"谁调用它"** —— 判据本体已有覆盖。
+  🔴 **第七轮给这条加了反面证据**：正因为"谁调用它"没被覆盖，M1（一次性闩写在退回守卫之前，
+  `owner` 为 undefined 时把卡永久锁死）**恰好长在这个未覆盖的调用点上** —— 79/84 全绿也拦不住它。
+  所以本条不再是"成本考虑可以缓一缓"，补断言请连 M1 的"没降级成功不占用闩"一起钉。
+- **本文件历史里挂着一段没有版本号的 `[Unreleased]`**（夹在 `[0.4.0]` 与 `[0.3.4]` 之间，
+  内容是 2026-09-23 那次"同群两个会话/目标轮另开一张卡"的修复）。它是**旧遗留**，
+  不是本次新写的条目；本次只把**顶部**那个真正的 `[Unreleased]` 落成了 `[0.8.0]`。
+  没有顺手给它补版本号，是因为**凭推测给它标 0.4.x 等于编造发布历史** —— 留给掌握那段历史的人处理。
 
 ## [0.7.21] - 2026-10-04
 

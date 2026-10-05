@@ -103,6 +103,17 @@ export function pickResolverPath (workspaceRoot) {
   return pickFrom(resolverCandidates(workspaceRoot), DEFAULT_RESOLVER_PATH)
 }
 
+// 🔑 **本地增量表路径**（第十三轮 MEDIUM#3：导出面，别再让"读不读增量"变成两处各自的私事）
+//    每台一份，**放在工作区之外**（`~/.dsh-feishucard/`）⇒ **天然不参与 Syncthing**
+//    ⇒ HOME / CM-OFFICE **各写各的**（两台 bot 的 app_id 不同），**不会互相覆盖**
+//      （主表是共享的、只读；增量只补 `open_ids{本机 bot 的 app_id}`）。
+//    CM 2026-10-04 关切：「表放工作区会同步到公司电脑，那公司和服务器也不会被锁死」——
+//    主表共享解决"读得到"，本地增量解决"各自认得出"。
+export function localMapPath () {
+  if (process.env.MAILBOX_IDENTITY_LOCAL) return process.env.MAILBOX_IDENTITY_LOCAL
+  try { return path.join(os.homedir(), '.dsh-feishucard', 'identity_map.local.json') } catch { return '' }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 1) 本轮上下文：索引 agentId；`(chat_id, message_id)` 作溯源字段
 //    ⚠️ 只活在内存，**不掺进 bot.chats / persistChats**（那是 per-chat 的持久结构）
@@ -205,13 +216,110 @@ export function decideAction ({ hasOwner, actor }) {
 // 4) 跨语言：resolveActor 是 Python，插件是 Node
 //    只在【入站】调一次（不是每次工具调用）＋ 进程内缓存（按 open_id）
 //    失败一律返回 { actor:null, err }，**绝不抛**（一条消息失败不该影响整机）
+//
+//    0.8.0（互认改造 P0-5）：**默认走纯 JS 镜像**（resolveActorJs），只有显式设
+//    `MAILBOX_RESOLVER_FORCE_PY=1` 才 spawnSync Python —— 服务器上 python3 /
+//    resolve_actor.py 只要有一个不在，旧实现就 resolver_missing ⇒ fail-closed 把
+//    所有飞书回合拒掉（认人链路被一台机器的环境卡死）。JS 路径零外部依赖；
+//    两口径由 `--selftest` 的 parity 断言钉住（漂移当场暴露）。
 // ───────────────────────────────────────────────────────────────────────────
+
+const E_MAP_UNAVAILABLE = 'map_unavailable'
+const E_NO_OPEN_ID = 'no_open_id'
+const E_UNKNOWN_PERSON = 'unknown_person'
+const E_DUPLICATE = 'duplicate_open_id'
+const E_MISSING = 'open_id_missing'
+const E_NOT_GRANTED = 'job_not_granted'
+const E_NOT_ACTIVE = 'not_active'
+// 离职三态（与 resolve_actor.py `_INACTIVE_STATUS` 逐字一致；其余状态一律正常 ——
+// 「兼职」「待入职」是 HRM 在册正常人，正向枚举会把它们误拒，2026-10-04 裁决 0225 §四）
+const INACTIVE_STATUS = new Set(['离职', '终止办理', '兼职终止'])
+
+/** 容错读映射表（镜像 py `_load`）：对象直接用；非空字符串按 JSON 解析；其余 = map_unavailable */
+function loadMapJs (raw) {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw
+  if (typeof raw === 'string' && raw.trim()) {
+    try { return JSON.parse(raw.replace(/^\uFEFF/, '')) } catch { throw new Error(E_MAP_UNAVAILABLE) }
+  }
+  throw new Error(E_MAP_UNAVAILABLE)
+}
+const arrCopyJs = (x) => (Array.isArray(x) ? x.slice() : [])
+const objCopyJs = (x) => (x && typeof x === 'object' && !Array.isArray(x) ? { ...x } : {})
+
+/**
+ * resolve_actor.py::resolveActor 的**逐行镜像**（不读文件/不起进程）。
+ * ⚠️ 不是"纯"：会把 `localMap` 的 `open_ids` **就地合并进传进来的 `identityMap.people`**
+ *   （镜像 py 的 setdefault+update 语义）。调用方必须传**当场 parse 出来的**映射，
+ *   不许复用/缓存同一份对象（第六轮门槛 LOW）。
+ * `localMap` 对应 identity_map.local.json 的合并（按 name 匹配、只补 open_ids，
+ * 镜像 makeResolver 内嵌 Python 的 lp 段）。返回 { actor, err }，绝不抛。
+ */
+export function resolveActorJs (openId, identityMap, localMap) {
+  // ① open_id 本身缺失
+  if (!openId || !String(openId).trim()) return { actor: null, err: E_NO_OPEN_ID }
+  // ② 映射表可用性
+  let m
+  try { m = loadMapJs(identityMap) } catch (e) { return { actor: null, err: String(e && e.message || e) } }
+  if (!m || typeof m !== 'object' || !Array.isArray(m.people)) return { actor: null, err: E_MAP_UNAVAILABLE }
+  // 本地增量合并（镜像 py：后出现的同名覆盖 byname；只 setdefault+update open_ids）
+  if (localMap && typeof localMap === 'object' && Array.isArray(localMap.people)) {
+    const byName = new Map()
+    for (const p of m.people) byName.set((p && p.name !== undefined ? p.name : null), p)
+    for (const per of localMap.people) {
+      const tgt = byName.get((per && per.name !== undefined ? per.name : null))
+      if (!tgt) continue
+      if (!tgt.open_ids || typeof tgt.open_ids !== 'object' || Array.isArray(tgt.open_ids)) tgt.open_ids = {}
+      Object.assign(tgt.open_ids, objCopyJs(per && per.open_ids))
+    }
+  }
+  // ③ open_ids 缓存反查（app 无关：扫所有人的所有 app；同一人多 app 命中只算一条）
+  const hits = []
+  for (const person of m.people) {
+    const ids = (person && person.open_ids) || {}
+    for (const ou of Object.values(objCopyJs(ids))) {
+      if (ou === openId) { hits.push(person); break }
+    }
+  }
+  if (hits.length > 1) return { actor: null, err: E_DUPLICATE }   // ≥2 人 ⇒ 判表损坏
+  if (!hits.length) {
+    // pending 里显式列出的人 ⇒ open_id_missing（等补），否则彻底未知
+    for (const p of (Array.isArray(m.pending) ? m.pending : [])) {
+      if (p && p.open_id === openId) return { actor: null, err: E_MISSING }
+    }
+    return { actor: null, err: E_UNKNOWN_PERSON }
+  }
+  const person = hits[0]
+  // ④ 在职校验（反向排除）⑤ 岗位授权
+  if (INACTIVE_STATUS.has(String((person.status || '')).trim())) return { actor: null, err: E_NOT_ACTIVE }
+  if (!person.job_id) return { actor: null, err: E_NOT_GRANTED }
+  // ⑥ 组装 actor（键序与 py 逐字一致，parity 断言直接 stringify 比对）
+  //    🔴 open_id 必须回带：它是内核 IDENTITY_KEYS 成员，不带会被【删除】而非覆写。
+  return {
+    actor: {
+      name: (person.name === undefined || person.name === null) ? '' : person.name,
+      scopes: arrCopyJs(person.scopes),
+      grants: objCopyJs(person.grants),
+      extra_grants: objCopyJs(person.extra_grants),
+      grants_until: objCopyJs(person.grants_until),
+      channels: arrCopyJs(person.channels),
+      open_id: String(openId),
+      person_id: String(person.person_id || ''),
+      source: 'identity_map@v' + String(m.v === undefined || m.v === null ? '?' : m.v),
+    },
+    err: null,
+  }
+}
+
+function readTextNoBom (p) {
+  return fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '')
+}
+
 export function makeResolver ({ mapPath = null,
                               resolverPath = null,
                               workspaceRoot = null,
                               python = null, timeoutMs = 8000 } = {}) {
   const cache = new Map()
-  let cachedTableMtime = null
+  let cachedTableSig = null
 
   // python 解释器也要探测：服务器叫 `python3`，Windows 上通常只有 `python` / `py`
   //（2026-10-04 实测：写死 `python3` ⇒ 本机 `resolver_no_json`）
@@ -242,16 +350,6 @@ export function makeResolver ({ mapPath = null,
     if (process.env.MAILBOX_RESOLVER) return process.env.MAILBOX_RESOLVER
     return pickResolverPath(workspaceRoot)
   }
-  // 🔑 **本地增量**：每台一份，**放在工作区之外**（`~/.dsh-feishucard/`）
-  //    ⇒ **天然不参与 Syncthing** ⇒ HOME / CM-OFFICE **各写各的**（两台 bot 的 app_id 不同），
-  //      **不会互相覆盖**（主表是共享的、只读；增量只补 `open_ids{本机 bot 的 app_id}`）。
-  //    CM 2026-10-04 关切：「表放工作区会同步到公司电脑，那公司和服务器也不会被锁死」——
-  //    主表共享解决"读得到"，本地增量解决"各自认得出"。
-  function currentLocalMapPath () {
-    if (process.env.MAILBOX_IDENTITY_LOCAL) return process.env.MAILBOX_IDENTITY_LOCAL
-    try { return path.join(os.homedir(), '.dsh-feishucard', 'identity_map.local.json') } catch { return '' }
-  }
-
   function tableOk () {
     try { return fs.statSync(currentMapPath()).isFile() } catch { return false }
   }
@@ -263,15 +361,53 @@ export function makeResolver ({ mapPath = null,
       const mp = currentMapPath()
       if (!openId) return { actor: null, err: 'no_open_id', tableOk: tableOk() }
       if (!tableOk()) return { actor: null, err: 'map_unavailable', tableOk: false }
+      const forcePy = process.env.MAILBOX_RESOLVER_FORCE_PY === '1'
       const rp = currentResolverPath()
-      if (!fs.existsSync(rp)) return { actor: null, err: 'resolver_missing', tableOk: true }
+      if (forcePy && !fs.existsSync(rp)) return { actor: null, err: 'resolver_missing', tableOk: true }
       // 表换了（mtime 变）⇒ 清缓存，避免"旧身份"
+      // 输入换了 ⇒ 清缓存，避免"旧身份"。签名要覆盖**三样**：主表 mtime、本地增量 mtime、forcePy。
+      //   0.8.0 起 JS 分支也读本地增量（`localMapPath()`），只盯主表 mtime 会让
+      //   "改了增量表 / 切了 JS↔Python 通道"这两种变更在换表前一直吐旧结果。
       try {
-        const mt = fs.statSync(mp).mtimeMs
-        if (cachedTableMtime !== null && mt !== cachedTableMtime) cache.clear()
-        cachedTableMtime = mt
+        let sig = String(fs.statSync(mp).mtimeMs)
+        const lp0 = localMapPath()
+        if (lp0) {
+          try { if (fs.statSync(lp0).isFile()) sig += '|local=' + fs.statSync(lp0).mtimeMs } catch { /* 无增量表 */ }
+        }
+        sig += '|py=' + (forcePy ? '1' : '0')
+        if (cachedTableSig !== null && sig !== cachedTableSig) cache.clear()
+        cachedTableSig = sig
       } catch { /* 读不到 mtime 就用旧缓存 */ }
       if (cache.has(openId)) return { ...cache.get(openId), tableOk: true }
+      if (!forcePy) {
+        // 0.8.0（P0-5）：默认纯 JS —— 主表 ＋ 本地增量（增量只补 open_ids）解析后直调镜像函数。
+        let res
+        try {
+          const mainMap = loadMapJs(readTextNoBom(mp))
+          let local = null
+          const lp = localMapPath()
+          if (lp) {
+            try { if (fs.statSync(lp).isFile()) local = loadMapJs(readTextNoBom(lp)) } catch { local = null }
+          }
+          const r = resolveActorJs(openId, mainMap, local)
+          res = { actor: r.actor || null, err: r.err || null, tableOk: true }
+        } catch (e) {
+          // 🔴 错误码归一（第十一轮门槛 LOW#2）：`loadMapJs` 抛的就是文档里的
+          //   `map_unavailable`（README「解析接口」错误码清单）。原来无条件加前缀 ⇒
+          //   同一份坏主表，JS 通道吐 `resolver_js_failed:map_unavailable`、
+          //   Python 通道吐 `map_unavailable`，两条通道的口径**不等价**。
+          //   现在：文档内的码原样透出，其它异常才带 `resolver_js_failed:` 前缀（那是"意外"，本来就该可见）。
+          const msg = String(e && e.message || e)
+          res = {
+            actor: null,
+            err: msg === E_MAP_UNAVAILABLE ? E_MAP_UNAVAILABLE
+              : 'resolver_js_failed:' + msg.slice(0, 60),
+            tableOk: true,
+          }
+        }
+        cache.set(openId, res)
+        return res
+      }
       // 主表 ＋ **本地增量** 合并后再解析（增量只补 `open_ids`；其余字段以主表为准）
       const code = [
         'import json,sys,os',
@@ -291,7 +427,7 @@ export function makeResolver ({ mapPath = null,
       ].join('\n')
       let out
       try {
-        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId, currentLocalMapPath()],
+        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId, localMapPath()],
           { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, PYTHONIOENCODING: 'utf-8' } })
         out = String(r.stdout || '').trim()
       } catch (e) {
@@ -362,6 +498,103 @@ export function selftest () {
   const r = makeResolver({ mapPath: '/nonexistent/identity_map.json' })
   ok(r.resolve('ou_x').err === 'map_unavailable', '表不存在 ⇒ map_unavailable（tableOk=false **仅供告警文案**；上层按 fail-closed 拒，不再据此放行）')
   ok(r.resolve('').err === 'no_open_id', '空 open_id ⇒ no_open_id')
+
+  console.log('── 6) resolveActorJs：resolve_actor.py 的纯 JS 镜像（无 python3 也能认人）──')
+  // 夹具与 resolve_actor.py __main__ 的 MAP **逐字段一致** —— 两边同一套题才算镜像。
+  const FIX6 = {
+    v: 1, people: [
+      { union_id: 'on_cm', open_ids: { cli_main: 'ou_cm_main', cli_hr: 'ou_cm_hr' },
+        name: '陈明', job_id: 'CR-POST-20261003-01', channels: ['main'],
+        status: '在职', scopes: ['公司'], grants: { 报表: 'L1' } },
+      { union_id: 'on_wgh', open_ids: { cli_main: 'ou_wgh_main' }, name: '伍国衡', job_id: '', status: '在职' },
+      { union_id: 'on_gone', open_ids: { cli_main: 'ou_gone_main' }, name: '离职者', status: '离职' },
+      { union_id: 'on_pt', open_ids: { cli_main: 'ou_pt_main' }, name: '兼职者', job_id: 'J-PT', status: '兼职' },
+      { union_id: 'on_pre', open_ids: { cli_main: 'ou_pre_main' }, name: '待入职者', job_id: 'J-PRE', status: '待入职' },
+    ],
+    pending: [{ name: '李四', open_id: 'ou_lisi_unk', reason: 'union_id 未取到' }],
+  }
+  const CASES6 = [
+    ['ou_cm_main', 'OK:陈明'], ['ou_cm_hr', 'OK:陈明'],
+    ['ou_pt_main', 'OK:兼职者'], ['ou_pre_main', 'OK:待入职者'],
+    ['ou_unk', 'unknown_person'], ['ou_lisi_unk', 'open_id_missing'],
+    ['', 'no_open_id'], ['ou_wgh_main', 'job_not_granted'],
+    ['ou_gone_main', 'not_active'], ['ou_nobody_main', 'unknown_person'],
+  ]
+  const cloneFix = () => JSON.parse(JSON.stringify(FIX6))
+  for (const [ou, want] of CASES6) {
+    const rr = resolveActorJs(ou, cloneFix(), null)
+    const got = rr.err || ('OK:' + rr.actor.name)
+    ok(got === want, 'JS 镜像：' + (ou || '(空)') + ' → ' + got + (got === want ? '' : '（期望 ' + want + '）'))
+  }
+  {
+    const dup = cloneFix(); dup.people.push(JSON.parse(JSON.stringify(FIX6.people[0])))
+    ok(resolveActorJs('ou_cm_main', dup, null).err === 'duplicate_open_id', 'JS 镜像：两人共用 open_id ⇒ duplicate_open_id（判表损坏）')
+    const withOpenId = resolveActorJs('ou_cm_main', cloneFix(), null)
+    ok(withOpenId.actor.open_id === 'ou_cm_main', 'JS 镜像：🔴 actor 必须回带 open_id（不带会被内核【删除】而非覆写）')
+    ok(resolveActorJs('ou_cm_main', '\uFEFF' + JSON.stringify(FIX6), null).actor.name === '陈明',
+      'JS 镜像：字符串表带 BOM（utf-8-sig 落盘）也能解析')
+    const merged = resolveActorJs('ou_cm_local', cloneFix(),
+      { people: [{ name: '陈明', open_ids: { cli_local2: 'ou_cm_local' } }] })
+    ok(merged.actor && merged.actor.name === '陈明', 'JS 镜像：本地增量按 name 合并 open_ids（本机 bot 的 ou 也能认）')
+    ok(resolveActorJs('ou_cm_local', cloneFix(), null).err === 'unknown_person',
+      'JS 镜像：不合并本地增量时该 ou 仍是 unknown_person（合并没漏判成放行）')
+  }
+
+  console.log('── 7) parity：JS 与 Python 同夹具逐字段一致（漂移当场暴露）──')
+  {
+    const pyScript = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+      'scripts', 'resolve_actor.py')
+    let pyBin = ''
+    for (const c of ['python3', 'python', 'py']) {
+      try {
+        const pr = spawnSync(c, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 5000 })
+        if (String(pr.stdout || '').trim() === '1') { pyBin = c; break }
+      } catch { /* 试下一个 */ }
+    }
+    if (!pyBin || !fs.existsSync(pyScript)) {
+      console.log('  ⚠️ 本机没有可用的 python / resolve_actor.py ⇒ parity 对照**跳过**'
+        + '（JS 夹具断言照常全跑；服务器定版前需在有 python 的机器上补跑一次）')
+    } else {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'identity-parity-'))
+      const mapFile = path.join(tmp, 'identity_map.json')
+      const localFile = path.join(tmp, 'identity_map.local.json')
+      fs.writeFileSync(mapFile, JSON.stringify(FIX6), 'utf8')
+      fs.writeFileSync(localFile, JSON.stringify({ people: [{ name: '陈明', open_ids: { cli_local2: 'ou_cm_local' } }] }), 'utf8')
+      const prevLocal = process.env.MAILBOX_IDENTITY_LOCAL
+      process.env.MAILBOX_IDENTITY_LOCAL = localFile
+      try {
+        const rJs = makeResolver({ mapPath: mapFile, resolverPath: pyScript, python: pyBin })
+        const rPy = makeResolver({ mapPath: mapFile, resolverPath: pyScript, python: pyBin })
+        // ⚠️ FORCE_PY 是**每次 resolve() 调用时**读的 ⇒ 必须逐条切换，不能全程挂着
+        //   （否则 JS 那半边也走了 Python 进程，比对的是「自己 vs 自己」= 假绿灯）。
+        const prevForce = process.env.MAILBOX_RESOLVER_FORCE_PY
+        const restoreForce = () => {
+          if (prevForce) process.env.MAILBOX_RESOLVER_FORCE_PY = prevForce
+          else delete process.env.MAILBOX_RESOLVER_FORCE_PY
+        }
+        const norm = (x) => JSON.stringify(x, (k, v) => (v && typeof v === 'object' && !Array.isArray(v))
+          ? Object.fromEntries(Object.keys(v).sort().map((kk) => [kk, v[kk]])) : v)
+        let drift = 0; let checked = 0
+        for (const ou of ['ou_cm_main', 'ou_cm_hr', 'ou_pt_main', 'ou_unk', 'ou_lisi_unk', 'ou_gone_main', 'ou_wgh_main', 'ou_cm_local']) {
+          delete process.env.MAILBOX_RESOLVER_FORCE_PY
+          const a = rJs.resolve(ou)
+          process.env.MAILBOX_RESOLVER_FORCE_PY = '1'
+          let b
+          try { b = rPy.resolve(ou) } finally { restoreForce() }
+          checked++
+          const same = norm({ actor: a.actor, err: a.err }) === norm({ actor: b.actor, err: b.err })
+          if (!same) { drift++; console.log('    差异 ' + ou + '：JS=' + norm({ actor: a.actor, err: a.err }) + ' PY=' + norm({ actor: b.actor, err: b.err })) }
+        }
+        ok(drift === 0, 'JS/Py 同夹具 ' + checked + ' 条逐字段一致（含本地增量合并的 ou_cm_local）'
+          + (drift ? '：漂移 ' + drift + ' 条' : ''))
+        restoreForce()
+      } finally {
+        if (prevLocal === undefined) delete process.env.MAILBOX_IDENTITY_LOCAL
+        else process.env.MAILBOX_IDENTITY_LOCAL = prevLocal
+        try { fs.rmSync(tmp, { recursive: true, force: true }) } catch { /* 临时目录留给系统回收 */ }
+      }
+    }
+  }
 
   console.log('')
   console.log('自测通过 ' + pass + ' ｜ 失败 ' + fail)
