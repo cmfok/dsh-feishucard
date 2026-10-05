@@ -5,6 +5,206 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-10-06
+
+本版**没有新功能**，是把 0.8.0 定版（闸门 Q）之后连跑的**三道**独立审查门槛（第十五次
+**0 critical / 0 high / 4 medium / 9 low** → WARN；第十六次 **1 medium / 2 low** → WARN；
+第十七次 **4 low** → **PASS**）逐条核对后的处置批次。按 CM 2026-10-05 口径
+「本地修好 → 升版本号 → **先推服务器**」，版本位从 0.8.0 进 0.8.1，与 0.8.0 共用一次服务器重启的
+那批文件（`index.js` + `helper.cjs` + `identity-inject.mjs` + `package.json` + 三个脚本）整包覆盖。
+
+### 修复（第十五轮门槛核实为真的 8 条）
+
+- **MEDIUM#3 `commandAnchor`：命令锚点只认占位符 ⇒ 群里「@机器人 /命令」有两种真实形态根本不生效**。
+  锚点喂的是 `extractText()` 的**输出**，而它并不总是 `@_user_1` 这种占位符形态：
+  ① 手机端纯文本 `content` 自带 `mentions:[{key,denote_text}]` ⇒ 占位符**早被换成 denote_text**
+  （正文长 `张三 /stop`，连 `@` 都没有）；② PC 端 post 富文本的 `at`/`person` 元素**没有 key 字段**
+  ⇒ 还原成 `@名字 /stop`。旧实现 `if (!m || !m.key) continue` 在这两支直接跳过 ⇒ `startsWith(m.key)`
+  永不命中 ⇒ 命令被当成普通消息进会话（用户视角＝"@了机器人说 /stop，它照原样回了一段话"）。
+  **现在按三种 token 依次试**（切法第十七轮改为取最长匹配）：占位符 → `@名字` → **裸名字且紧跟命令**。
+  第三档必须紧跟 `/`，否则名字后面跟正文的普通消息会被剥掉名字；而命令判定还要求剥完之后的**首字符**
+  是 `/`，所以 `说的 /help 那条别跑` 这类句中斜杠不会被读成命令（用例 101 ③ 钉的就是这一条）。
+- **LOW `AT_RE`：`@all` 的右边界漏了 `-` 和 `.` ⇒ 普通文本静默触发一次真·@ 全体**。
+  原右边界只排 `[A-Za-z0-9_]`，而 `@all-hands`、`@all.png` 照样命中并展开成 `<at id=all>所有人</at>`
+  —— 出站 @ 是**唤醒对方 bot 入站事件的扳机**，误触发＝向全群广播。右边界收紧为 `(?![\w.\-])`：
+  `@all` 后面只要还跟着 **ASCII** 字母/数字/点/连字符就不是一个独立 token
+  （⚠️ 本条上一版写的是「字母/数字」，第十七轮 LOW#1 核实：`\w` 不含中文，属过度声称，措辞已改准）。
+  ⚠️ 顺带纠正一处**注释里的假事实**：原注释声称邮箱形态 `foo@all.com` 由右边界挡下，实际由**左边界**
+  `(?<![\w$])` 挡下 ⇒ 当时"右边界已够"的判断依据是错的。
+- **LOW 富文本 `name` 只认字符串**：`extractText` 的 button/action/select_person/overflow/date_picker
+  分支把 `node.name` 原样取用，而**同一函数上方 12 行**已对 `user_name`/`name` 的对象形态做了防护
+  （第十一轮 LOW#3 立的口径）⇒ 这一支漏了，对象形态会拼成 `【按钮/控件】[object Object]` 送进 agent 上下文。
+- **MEDIUM#1 roster 采集：`members_incomplete` 只置位、从不清零 ⇒ 一次瞬时失败永久污染整个群**。
+  `chatRows[c.chat_id]` 在外层 bot 循环里**跨 bot 共享**：同一个群挂了 A、B 两个 bot 时，
+  A 的 union 遍网络抖动置位后，B 成功采集也清不掉 ⇒ 这个群永久走「沿用旧名单」分支，
+  而名单一旦过期，跨群 @ 与互认认人就跟着失效（且没有任何地方说明"为什么明明采到了还是旧名单"）。
+  **成功侧补对称正向标记** `members_collected`，合并条件改为
+  `members_incomplete && !members_collected && 本次有成员` —— 成员名单是**群级**事实，
+  任一遍 union 成功就等于这份名单完整。
+- **MEDIUM#2 roster 采集：`chats` 为空被当成采集失败 `exit 1` ⇒ 新建 bot / 纯单聊 bot 永远采不出名单**。
+  空 `chats` 是**合法状态**（`listChats` 在凭证/权限坏的时候会抛错，抛错已经兜住了；返回空只说明
+  "这个 bot 还没进过任何群"）。现在把两件事分开：`bots` 为空＝真失败（不写文件、保留上一版、`exit 1`），
+  `chats` 为空＝提示（写明"跨群 @ 收窄不可用，单聊互认不受影响"，照常写文件）。
+- **LOW roster：`cfg.bots` 未做 `cfg &&` 防护** ⇒ 配置文件解析成 `null` 时抛裸 `TypeError`，
+  只以「采集失败（不写文件）: …」露出，把"配置是空的"报成像网络问题。
+- **MEDIUM#4 冒烟夹具：`/im/v1/messages` 的 mock 不认 DELETE ⇒ 生产的「✕ 取消」真删卡出口在冒烟里不可达**。
+  这条是**夹具缺陷**，但后果是判据失效：`deleteMessage` 走 `method: 'DELETE'` 且 **body 为 `undefined`**，
+  旧 mock 对它执行 `JSON.parse(undefined)` 直接抛 ⇒ 成功出口永远走不到，"删卡"这件事在 799 条断言里
+  零覆盖。现在 DELETE 分支**排在 create 分支之前**（同一路径前缀，靠 `init.method` 分流），
+  记录 `msgId` 与**发送身份**（`app`），新增用例 **100** 钉三条出口：
+  ① DELETE 的 `msgId` 必须**等于**那张会话切换卡的 `msgId`、`app === APP_ID`（拿别的应用身份删卡必被拒）、
+  之后**零新卡**、日志 `cancelled (message deleted)`、且**不起新回合**；
+  ② 删卡被拒 ⇒ 同一张卡就地 PATCH 成「已取消」+ 日志 `patched to cancelled state`
+  （不许留一张还能点的旧卡）；③ 演示通道（`fs_demo_cancel`，没有 `message_id` 可用）同样删对卡。
+- **LOW 冒烟：用例 92 的一条断言扫全量日志 ⇒ 恒真风险**。
+  同族另一条已经用 `logMark92b` 开窗，这条却 `consoleLines.some(...)` 扫整篇 ——
+  目前恰好没有前序用例 emit `ou_human_85` 才显得是绿的。补 `logMark92` 把窗口收到本用例内。
+
+### 处置（3 条判为不必改 / 2 条明知并接受并写进代码注释）
+
+- **不改**：`collect_bot_roster.mjs` 建议两遍 `listMembers` 并发（不同 `member_id_type` 是**独立**请求，
+  串行确实慢）—— 该脚本是**每天不超过 3 次的 cron**（部署规范硬约束），不在任何用户路径上，
+  并发化要引入失败半边的新状态机，收益不抵风险。
+- **不改**：`collect_bot_roster.mjs` 里 `bots`/`people` 两处合并逻辑逐字相同 ⇒ 建议抽函数 ——
+  这是**第七轮 MEDIUM 已修的行为**（旧为底、本次覆盖），抽函数会改动刚被门槛钉过的字节，
+  且只有两处；按「不过度工程」保留。
+- **不改**：`smoke.mjs` 建议把「热重载 + 拆代」样板抽成 helper（用例 78/81/82/85/88/89/92–97/99–103 各抄一遍）——
+  冒烟夹具的每一处样板都是**按用例的可观察形状**写的，抽公共函数会让"这个用例到底重建了什么"
+  回到需要跳进 helper 才能读的状态；测试文件的可读性优先于重复。
+- **明知并接受**（已写进 `splitCodeSegments` 上方注释）：4 空格/制表符缩进块**不**算代码区 ⇒
+  缩进形态的 `@[名字]` 仍会被展开。卡片 markdown 由飞书渲染，缩进在传输中本就不稳定；
+  把行首 4 空格当代码块会连列表续行/引用正文一起误判 ⇒ **漏展开**（真 @ 出不去）。
+  两害相权：误展开的代价是"多 @ 一次"，漏展开的代价是"功能不生效"，而缩进形态在本仓库真实流量里没出现过。
+- **明知并接受**（已写进 `FOOTER_STRIP_RE` 上方注释）：剥离正则把标签常量**原文插进正则**，
+  前提是标签里没有正则元字符（`【】` 不是）。真改成含 `(` / `+` 的措辞时语义会错 ——
+  但那两个标签是给用户看的中文行首标记，措辞变更必走功能基线，届时按基线补 `escapeRegExp`，
+  不为假想需求先建辅助函数。同一轮的附带风险（用户正文里恰好含「【发送方】」⇒ `/switch` 卡灰字
+  从那里截断）**只影响卡面显示**，不影响送进模型的上下文（另一条路径），故不为此加行首锚定。
+
+### 修复（第十六轮门槛核实为真的 3 条）
+
+- **MEDIUM 真机事件入口：认不出的斜杠文本被静默吞掉**（比那条 finding 的范围更大）。
+  旧写法 `if (cmd) { handleCommand(...); return }` —— 只要锚点文本以 `/` 开头就进命令分支，
+  而分支尾部**无条件 `return`**，`handleCommand` 第一行又是 `if (!resolved) return false`
+  （什么都不做）⇒ 既没有卡、也没有回合、连一句回执都没有。命中形状至少三类：
+  群里命令打错一个字（`@bot /help2`）、手机端 `@张三/李四 今天值班`（名字紧跟斜杠 ⇒
+  锚点第三档剥出 `/李四 …`）、单聊里手打一句路径（`/tmp/x.txt 看一下`）。
+  🔴 **同一个判据内部入口早就有**：`handleInbound`（`index.js:4911-4921`）是
+  `handled` 为假就落回普通消息 ⇒ 「同一条消息走内部有回、走真机没回」，这类两入口口径不一致
+  是静默丢失的温床。修法是在**事件入口**加同步判据 `cmd && resolveCommandName(cmd.name)`
+  （不等 `handleCommand` 回来再决定：未识别文本原样落到下面「提问卡 → 插话 → chain」的普通通道，
+  既不会把已知命令执行两遍，也不改变已知命令的行为），锚点层**不做二次判定**（同一判据放两处必漂移）。
+  新增用例 **102** 三支：①认错命令必须进会话（有回）②第三档剥出的认错名同样有回
+  ③已知命令仍走命令分支（防"修过头把命令也降级成聊天"）。
+- **LOW 冒烟夹具：`Bearer tok_<app>` → `app` 与 URL → `msgId` 的抽取各写了两遍**（建卡分支 / DELETE 分支）。
+  `TOKEN_PREFIX` 上方那条注释警告的正是这种漂移（改了 token 形状 ⇒ 所有 `rec.app` 静默变 `''`
+  ⇒ 归属类断言在错误的理由上变绿或变红）⇒ 收成 `appOf(init)` / `msgIdOf(url)`，两侧不可能不一致。
+- **LOW 冒烟：用例 100「取消不起回合」的 `agent.sent` 基线取在 `/switch` 之前**。
+  同一块里的其余 mark（`cardMark100`/`delMark100`/`logMark100`）都取在点击前，只有这一条取在
+  `/switch` 前 ⇒ 测量窗口是 `[/switch, 取消]` 而不是「取消」。`/switch` 今天不起回合，
+  但命令路径是可以起回合的（代码自己就写了 `/plan <正文>` 起真回合）⇒ 将来任何这类改动都会
+  让这条断言以**与取消无关**的理由变红。基线移到点击前（`sentMark100`）。
+
+### 修复（第十七轮门槛 PASS + 4 low 核实为真的处置）
+
+- **LOW#4 `commandAnchor`：「按名单顺序先命中先切」踩「名字互为前缀」**。
+  正文 `@张三丰 /stop`、mentionList 顺序 `[张三, 张三丰]` 时 `张三` 这一档先命中 ⇒ 切成
+  `丰 /stop` ⇒ 循环里谁都匹配不上 ⇒ 命令判成普通消息（用户视角：说了 `/stop` 没执行，只是多回一句）。
+  占位符同理 —— `@_user_1` 是 `@_user_12` 的前缀，**@ 满 10 人以上的群就会踩**，这不是假想场景。
+  finding 给了两条修法（给 `@名字` 档补右边界 / 取最长匹配），采纳后者：
+  **同一起始位置取最长匹配**，三种 token 一起参加比较。补右边界会把「名字后紧跟正文」的既有
+  剥法一并改掉（那是第十五轮已经钉过的行为），前缀问题在前缀层面解决。新增用例 **103**：
+  post 富文本里 `smoke-bot2` 与 `smoke-bot` 同时 @、且**刻意让短名排在前面**（与正文顺序不一致），
+  断言 `/help` 仍被认成命令且**只起一张卡**。
+- **LOW#2 夹具去重不彻底：抽了 `appOf`/`msgIdOf`，端点字面量还剩三处**
+  （`msgIdOf` 内、DELETE 守卫、create 守卫）⇒ 补 `MESSAGES_PATH` 常量，三处统一由它派生。
+- **LOW#1 `AT_RE` 注释的过度声称**：上一版写「`@all` 后面跟着**字母**/数字…就不是独立 token」，
+  而 JS 的 `\w`（无 `u` 旗标）**不含中文** ⇒ `@all大家安静` 照样展开。核实为真，但**不照建议扩大边界**：
+  本产品是中文-first、多数人在 @ 后不打空格，`@all` 紧邻中文正是「广播指令 + 正文」的常见写法，
+  判成非 token 等于把用户要的全群通知**悄悄取消**；而会误伤的形状（`@all-hands`/`@all.png`/`@all_x`）
+  全是 ASCII 标识符形态 ⇒ 边界只挡 ASCII，残余风险（正文里出现字面 `@all` 且后接中文）写进注释。
+  本轮改动＝**把注释措辞改准**，并把理由从「代价不对称」纠正为「误判频率不对称」
+  （代价其实是不对称的：漏展开看得见可重发、多广播收不回 —— 但决定边界的是哪一类误判更常发生）。
+- **LOW#3 roster：`members_incomplete`/`members_collected` 会随 `bot_roster.json` 落盘**，
+  而文件头部的 `chats{}` 结构说明没列这两个字段 ⇒ 核实为真（确实落盘），但**建议的修法不采纳**：
+  写盘前 `delete` 掉这两个标记，等于抹掉运维唯一能看见「这个群这次名单没采全」的信号
+  （`index.js` 只读本次运行内的 `chatRows`，不受影响 ⇒ 剥离只有坏处）。
+  ⇒ 改的是**文档**：头部结构说明补上两个字段，并写明它们是本脚本内部的合并判据。
+
+### 定版前自查追加的两处注释纠正（行为一字未动，字节从闸门 T 变 U）
+
+- **`AT_RE` 上方那段"为什么只挡 ASCII"的理由，原文的推论与实现相反**：末句写「两种误判的代价
+  也不同：不展开看得见、可重发；多广播唤醒全群、收不回。**故**边界只挡 ASCII」—— 按这个代价
+  比较，结论应当是"**挡得更严**（把中文也挡上）"，因为代价不对称时应当选可恢复的那一侧。
+  真正决定边界的是**误判频率**：紧邻 ASCII 标识符字符才是"这不是个 token"的形状，紧邻中文
+  是本产品「广播指令＋正文」的常态。⇒ 理由改写为频率判据，代价不对称降级为**写在注释里的
+  残余风险**（正文出现字面 `@all` 且后接中文；本仓库真实流量里没出现过）。
+  🔴 这类"注释给实现当证据"的错法本文件已经栽过两次（第十五轮的 `foo@all.com` 左/右边界、
+  第十六轮的 `张三 你好` 无害例），第三次是自查出来的，不是门槛报的。
+- **`commandAnchor` 上方「按三种 token 依次试」与第十七轮的实现（取最长匹配）自相矛盾**
+  ⇒ 改成「三种形态都参加匹配 ＋ 同一起始位置取最长」。
+- ⚠️ **为什么要为两处注释重跑一整道闸门**：定版口径是「闸门字母只认跑完之后字节没再动过的
+  那一次」，而**部署与仓库必须逐字节一致**（step45 的本地字节闸门就是拿 md5 比的）——
+  注释也是字节。带着已知说反话的注释上线，等于给下一个人留一条会把实现改坏的理由。
+
+### 独立审查门槛：第十五~十七轮 → 定版闸门 U（R／S／T 均已被取代）
+
+**闸门 R（2026-10-06，取代 Q；跑完后为处置第十六轮 findings 又动字节 ⇒ 作废）**：15 步全 `RC=0` ——
+`node --check` ×6、`SMOKE PASS (sentCards=501, sessions=32)`、全文 **797 ✅ / 0 ❌**、
+用例编号覆盖到 **101**、`SMOKE_COLD=form-off/notice-off/goal-off` 各 `COLD PASS`、`npm run check`、
+`check-packaging`（打包完整性 ✅）、`identity-inject --selftest`（**通过 36 ｜ 失败 0**）、
+`test-fold-tables`（ALL PASS）、`python scripts/resolve_actor.py`（自测失败 0）；
+首尾两次 `md5sum` 逐项一致 ⇒ 整轮无漂移。被跑字节 `output/bytes080r.txt`
+（`index.js eaceebce…`／`helper.cjs 62ac162d…`／`identity-inject.mjs ccacd1b1…`／
+`package.json b410934c…`／`collect_bot_roster.mjs d2acdf9d…`／`smoke.mjs 26e3e4b6…`／
+`test-fold-tables.mjs f6263f40…`）。
+**当时以 R 为准**（相对 Q 变的是 `index.js`／`package.json`／`collect_bot_roster.mjs`／
+`smoke.mjs` 四件，`helper.cjs`／`identity-inject.mjs`／`test-fold-tables.mjs` 三件逐字节相同）。
+
+🔴 **反面证据（A25，新增断言不是恒真）**：把 `commandAnchor` 退回"只剥占位符"、`AT_RE` 退回
+`(?![A-Za-z0-9_])` 再跑冒烟 ⇒ `SMOKE FAIL: 6 assertion(s) failed`，红的**恰好**是本轮新钉的六条 ——
+用例 87 的 `@all-hands` / `@all.png` 两条（日志 2630/2631）＋ 用例 101 的 denote_text 两条与
+post 两条（3320/3321/3333/3334），**除此之外没有别的红**（`output/smoke-r-negctrl.log`）。
+⚠️ 第一次做反证时把替身函数写成了 `async` ⇒ `evt.textCommandAnchor` 变成 Promise ⇒
+全篇 `drain error: (text || "").trim is not a function` 级联失败、RC=1 却 0 处 ❌ ——
+那是**反证脚本自己的缺陷**，不是被测代码的；改成同步替身后才拿到上面对得上号的 6 条。
+🔴 **本轮另外两处修复没有同级别的反证**，如实挂着：用例 100 的三条出口只证明"新字节下三条都成立"，
+它对夹具的依赖是**可达性**（旧 mock 对 DELETE 直接抛，故旧字节下连分支都进不去 —— 这本身就是证据，
+但没有一次"退回旧字节跑出 100 变红"的记录）；roster 四处改动**没有任何冒烟覆盖**
+（`index.js` 与 `smoke.mjs` 都只在注释里提到该脚本，见功能基线「缺口 #7」同一条理由），
+只由 `node --check` 保证语法 ⇒ 合并语义仍需真机 `--dry-run` 之外的运行期取证。
+
+**Q 已被取代**：Q 跑完之后为处置第十五轮 findings 又动了 `index.js` / `scripts/smoke.mjs` /
+`scripts/collect_bot_roster.mjs`，并为这批修复升版本动了 `package.json` ⇒ 字节再变。
+按口径「闸门字母只认『跑完之后字节没再动过』的那一次」，定版一路改判：R（被第十六轮处置取代）
+→ S（全绿：15 步 `RC=0`、**803 ✅ / 0 ❌**、用例覆盖到 102、STEP0==STEP9，
+`output/gate080s.log`；被第十七轮处置取代）
+→ T（全绿：15 步 `RC=0`、**805 ✅ / 0 ❌**、用例覆盖到 103、STEP0==STEP9，
+`output/gate080t.log`，`index.js febcd88b…`；被定版前自查的两处注释纠正取代）。
+
+**闸门 U = 本批定版字节**：15 步全 `RC=0`、全文 **805 ✅ / 0 ❌**（`cross-mark count: 0`）、
+用例覆盖到 **103**、`SMOKE_COLD=form-off/notice-off/goal-off` 各 `COLD PASS`、`npm run check`、
+`check-packaging`（打包完整性 ✅）、`identity-inject --selftest`（**通过 36 ｜ 失败 0**）、
+`test-fold-tables`（ALL PASS）、`python scripts/resolve_actor.py`（自测失败 0）；
+STEP0 与 STEP9 两次 `md5sum` 逐项一致 ⇒ 整轮无漂移（`output/gate080u.log` / `bytes080u.txt`）。
+被跑字节：`index.js e53bec16…`（589906）／`helper.cjs 62ac162d…`／`identity-inject.mjs ccacd1b1…`／
+`package.json b410934c…`／`collect_bot_roster.mjs a3f21aa2…`／`smoke.mjs 3646ca9d…`／
+`test-fold-tables.mjs f6263f40…`。相对 T **只有 `index.js` 变**（两处注释）。
+🔴 版本位**不是纸面的**：U 的每一步冒烟首行都自报 `plugin apply #1 v0.8.1 md5=e53bec16 bytes=589906`
+（运行期版本从 `package.json` 读，`index.js:123`；接力那次重载打到 `#32` 仍是同一 md5），
+这行同时证明"跑的就是 0.8.1 的那份字节"。
+
+🔴 **冒烟汇总里的 `sentCards` 不是复现判据**（U=506 / T=507，两次同为 0 ❌）：用例 84 的夹具把
+接管到的过程卡拨成 `retryUntil = now + 60000`（`smoke.mjs:5802`），而接力队列的丢弃线是
+`CARD_RELAY_TTL_MS = 60000`（`index.js:192`）——**两个 60 秒从相邻时刻起算**，谁先到期决定这张卡
+是"退避结束后补送成功"还是 `relayed card push dropped (no bot for this chat within 60s)`，
+整套冒烟跑十几分钟、机器负载就能把边界推过任意一边。84 的断言窗口只取 `sentMark84` 之后
+`settle(5)` 那一小段并按结论正文过滤（`smoke.mjs:5816-5824`），几百个用例之后才落地的这张卡
+进不了窗口 ⇒ ±1 不影响任何判定。定版核对项因此是「15 步 `RC=0` ＋ 805 ✅/0 ❌ ＋ cross-mark 0
+＋ STEP0==STEP9 ＋ 插件自报 md5」。⚠️ 同一处暴露的真实风险（非本批字节引入）：下一代在 60 秒内
+始终解析不到该会话的 bot，这张卡的终态就永久丢弃只留一行日志（结论卡会额外打 `CONCLUSION LOST`，
+`index.js:354`）⇒ 已按 A32 投中台跟进，本批不动字节。
+
 ## [0.8.0] - 2026-10-05
 
 本版按 CM 2026-10-05 的裁决成型：把「agent 互认」三档（P0/P1/P2）与**尚未发布的 0.7.22 批次**

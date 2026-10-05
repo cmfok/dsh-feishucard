@@ -94,6 +94,17 @@ const globalFetch = globalThis.fetch
 //   两处各写一遍字面量的话，改了 token 形状 ⇒ 所有 rec.app 静默变成 '' ⇒ 归属类断言
 //   会在错误的理由上变绿或变红（复跑审查 LOW）。
 const TOKEN_PREFIX = 'tok_'
+// 🔴 第十六轮门槛 LOW：`Bearer tok_<app_id>` → `app_id` 的抽取，原来在建卡分支和 DELETE 分支
+//   各写一遍字面量，`/im/v1/messages/<id>` → `id` 的抽取同样写了两遍 —— 上面那条注释警告的
+//   正是这种漂移（改了 token 形状 ⇒ 所有 `rec.app` 静默变 `''` ⇒ 归属类断言在错误的理由上变绿）。
+//   收成一个函数后两侧**不可能不一致**。
+//   🔴 第十七轮门槛 LOW#2（核对为真）：抽了函数但**端点字面量**还剩三处（DELETE 的匹配、
+//   建卡的匹配、`msgIdOf` 里的切分）—— 路径一旦变，这三处照样各改各的。补 `MESSAGES_PATH`
+//   常量，三处统一由它派生。
+const appOf = (init) => String((init && init.headers && init.headers.Authorization) || '')
+  .replace('Bearer ' + TOKEN_PREFIX, '')
+const MESSAGES_PATH = '/im/v1/messages'
+const msgIdOf = (url) => decodeURIComponent(String(url).split(MESSAGES_PATH + '/')[1] || '').split('?')[0]
 // 2026-10-03 F/G 用例要用的 mock 状态
 const imageUploads = []
 const fileUploads = []
@@ -103,6 +114,10 @@ let rejectPatchesBody = null   // 0.7.9：可注入具体错误体（P5 用 1131
 //   按内容锁定而不是按次数：封口/看门狗/降级都可能是 PATCH，按次数会打错目标（用例 82 的靶心
 //   是"结论写回过程卡那一次"，不是封口那一次）。
 let failPatchContaining = ''
+// 0.8.1（第十五轮门槛 MEDIUM#4）：删卡通道。`messageDeletes` 记每次 DELETE 的 message_id 与
+//   发起它的 bot（`app`）；`failDeletes` 让接下来 N 次 DELETE 被**拒绝**（code≠0，走降级分支）。
+const messageDeletes = []
+let failDeletes = 0
 // 0.7.21（用例 77）：群聊"@ 才回复"的判据要先知道"自己是哪个 bot"⇒ bot 身份接口。
 // SMOKE_BOT_OPEN_ID 就是夹具里群消息 mentions 要匹配的那个 open_id。
 const SMOKE_BOT_OPEN_ID = 'ou_smoke_bot_id'
@@ -154,17 +169,32 @@ globalThis.fetch = async (url, init) => {
     fileUploads.push({ url: u })
     return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0, data: { file_key: 'file_v3_smoke_key' } })) }
   }
-  if (u.includes('/im/v1/messages')) {
+  if (u.includes(MESSAGES_PATH + '/') && init.method === 'DELETE') {
+    // 🔴 第十五轮门槛 MEDIUM#4：删卡（「✕ 取消」的实现路径）**没有请求体**，原来直落到
+    //   下面的建卡分支 ⇒ `JSON.parse(init.body)` 在 `undefined` 上抛 ⇒ httpJson 把**夹具自己
+    //   的异常**当成网络失败（status 0）⇒ `deleteMessage` 恒 false ⇒ 「删卡成功」那条分支
+    //   在冒烟里**根本不可达**，能测到的只有降级 PATCH。这里显式接住 DELETE。
+    const msgId = msgIdOf(u)
+    messageDeletes.push({
+      msgId,
+      app: appOf(init),
+    })
+    if (failDeletes > 0) {
+      failDeletes -= 1
+      return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 200001, msg: 'smoke: delete refused' })) }
+    }
+    return { status: 200, text: () => Promise.resolve(JSON.stringify({ code: 0 })) }
+  }
+  if (u.includes(MESSAGES_PATH)) {
     const raw = JSON.parse(init.body)
     const payload = typeof raw.content === 'string' ? JSON.parse(raw.content) : raw
     // 用例 78（双 bot 同群串扰）需要把每次收发**归属到具体 bot**并知道改的是哪张卡：
     //   app    ← Bearer token（上面 tenant_access_token 里带了 app_id）
     //   msgId  ← PATCH 取 URL；create 只有真拿到 message_id 才写（失败分支留空 ⇒ 可判"没建成"）
     const rec = { op: init.method === 'PATCH' ? 'update' : 'create', payload }
-    rec.app = String((init.headers && init.headers.Authorization) || '')
-      .replace('Bearer ' + TOKEN_PREFIX, '')
+    rec.app = appOf(init)
     if (init.method === 'PATCH') {
-      rec.msgId = decodeURIComponent(String(u).split('/im/v1/messages/')[1] || '').split('?')[0]
+      rec.msgId = msgIdOf(u)
       // 失败的那一次**不落 sentCards**：用例判的是"内容有没有真的送达"，
       //   把失败的 PATCH 也记进去会让"降级后仍只送达一次"这类断言失去意义。
       if (failPatchContaining && JSON.stringify(payload).includes(failPatchContaining)) {
@@ -5980,6 +6010,20 @@ console.log('87) ★ 互认·出站 @：roster 命中 ⇒ 真 <at>；查无此�
   ok(winE.includes('<at id=all>所有人</at>') && winE.includes('<at id=ou_empb_85>员工B</at>'),
     '★★★ 边界收紧没误伤正常写法：裸 `@all` 与 `@[姓名]` 照常展开')
 
+  // 🔴 第十五轮门槛 LOW#12（核对为真）：`@all` 的**右边界**原来只排 `[A-Za-z0-9_]` ⇒
+  //   `@all-hands`（会议名）、`@all.png`（截图文件名）里的 `@all` 后面跟的是 `-`/`.`
+  //   ⇒ 照样命中并展开成一次**真·@ 全体**。上面那条 `sales@all.com` 之所以绿，是
+  //   **左边界**（前面有 `s`）挡的，不是右边界 —— 所以那条一直没能鉴别这个缺陷。
+  //   出站 @ 是唤醒对方 bot 入站事件的扳机 ⇒ 误触发＝全组广播，这里必须钉住。
+  const markF15 = sentCards.length
+  await tool87.execute({ text: '会议 @all-hands 与截图 @all.png 都不许 @ 出全组-15L', chatId: GROUP85 })
+  await settle(2)
+  const winF15 = JSON.stringify(sentCards.slice(markF15))
+  ok(winF15.includes('@all-hands') && winF15.includes('@all.png'),
+    '★ `@all-hands` / `@all.png` 原样保留（右边界收紧为 `(?![\\w.\\-])`）')
+  ok(!winF15.includes('<at id=all>'),
+    '★★★ 这一条**一个 @ 都没展开**（旧实现在这里发出一次真·@ 全体）')
+
   // 🔴 第十一轮门槛 LOW#3：`@「」` 这一支**漏了左边界**（另两支都有）⇒
   //   `mail@「员工B」` 里的 `@「员工B」` 照样命中、展开成真 @，和第八轮刚立的
   //   「左右都要边界」自相矛盾。三支一律有左边界才是同一条规则。
@@ -6261,6 +6305,10 @@ console.log('92) ★ 互认·卡片点击者：operator（V3 形状）写回审�
   const tool92 = toolNow('feishu_approval_form')
   armTurn85('92')
   const mark92 = sentCards.length
+  // 🔴 第十五轮门槛 LOW#6：留痕断言要取**本轮窗口**（与兄弟分支 `logMark92b` 同口径）。
+  //   `consoleLines` 是全程缓冲 ⇒ 全量 `some` 今天恰好也只有一条会命中，但它是"靠运气成立"
+  //   的断言：以后任何一条别的用例发出同形状留痕，这里就会在别人没做对时也变绿。
+  const logMark92 = consoleLines.length
   const pending92 = tool92.execute(
     { title: '点击者身份单-92', meta: [{ label: '事项', value: '认人' }], chatId: CHAT_ID },
     { agent, signal: undefined },
@@ -6319,7 +6367,7 @@ console.log('92) ★ 互认·卡片点击者：operator（V3 形状）写回审�
     ok(receipts92.every((c) => !JSON.stringify(c.payload).includes('ou_human_85')),
       '★★ 回执卡面上没有完整 open_id（给 agent 的全量 ≠ 给用户看的全量）')
   }
-  ok(consoleLines.some((l) => l.includes('card action operator: ou=ou_human_85')),
+  ok(consoleLines.slice(logMark92).some((l) => l.includes('card action operator: ou=ou_human_85')),
     '★★★ 每次点击都留痕（认不出名字时至少留 id 前缀，不静默）')
 
   // 🔴 第十一轮门槛 LOW#3：截断分支原来写死 `ou.slice(0, 8)` ⇒ 回调**只带 union_id** 时
@@ -7031,6 +7079,309 @@ console.log('99) ★🔴 /model：视觉影子路由不上卡 ＋ 点击真走�
 
   // 还原：用例 94 的 ▶ 断言靠 agentDefaultModel 生效，modelSelection 挂着会盖掉它
   modelSelectionState = undefined
+  liveAgents.length = 0
+}
+
+console.log('100) ★🔴 「✕ 取消」的真删卡分支必须可达：DELETE 通道打通 + 被拒时降级 PATCH 成「已取消」（第十五轮门槛 MEDIUM#4）')
+{
+  // 为什么这条以前**测不到**：夹具的 `/im/v1/messages` 分支不分方法，DELETE（没有请求体）
+  //   落进建卡分支的 `JSON.parse(init.body)` ⇒ 抛的是**夹具自己的** SyntaxError ⇒
+  //   `httpJson` 把它当成网络失败（status 0）⇒ `deleteMessage` 恒 false ⇒ CM 按「✕ 取消」
+  //   之后的**成功出口**（把消息删掉）在冒烟里从来没被执行过，能绿的只有降级 PATCH。
+  //   按 A25 的口径：被测代码的出口必须用生产的方式跑到，不能由夹具替它决定走哪条。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const mod100 = await import('../index.js')
+  mod100.apply(ctx)
+  await settle(2)
+  liveAgents.push(agent)
+  armTurn85('100')
+  persistedSessions = [
+    { version: 0, id: 'sess-100aaaa1111', createdAt: Date.now() - 3600e3, cwd: WORKSPACE },
+    { version: 0, id: 'sess-100bbbb2222', createdAt: Date.now() - 1800e3, cwd: OTHER_WORKSPACE },
+  ]
+  // ---- ① 成功出口：DELETE 打到这张卡的 message_id，且**不再** PATCH/另发 -------
+  const markWs100 = sentCards.length
+  feedInbound('om_switch100_ws', '/switch')
+  await settle(4)
+  const wsCard100 = lastCardFrom(markWs100)
+  const cancelBtn100 = wsCard100 ? allButtons(wsCard100).find((b) => b.value && b.value.fs_level === 'cancel') : undefined
+  ok(!!wsCard100 && !!wsCard100.msgId && !!cancelBtn100,
+    '（前提）/switch 出卡且卡上有「✕ 取消」（' + JSON.stringify({ card: !!wsCard100, msgId: wsCard100 && wsCard100.msgId, btn: !!cancelBtn100 }) + '）')
+  if (cancelBtn100 && wsCard100) {
+    const delMark100 = messageDeletes.length
+    const cardMark100 = sentCards.length
+    const logMark100 = consoleLines.length
+    // 🔴 第十六轮门槛 LOW（核对为真）：「不起回合」的基线原来在 `/switch` **之前**取，
+    //   测的时间窗是 [/switch, 取消] 两段 ⇒ 断言被 `/switch` 的行为绑住。`/switch` 今天
+    //   恰好不起回合所以看不出来，但命令路径**是能**起回合的（本文件别处就写着 `/plan <正文>`
+    //   会起真回合）⇒ 将来任何让 `/switch` 起回合的改动都会把这条红成"取消有问题"。
+    //   基线和其余三个 mark 同点位取，断言才只归因于这一次点击。
+    const sentMark100 = agent.sent.length
+    await tapValue(cancelBtn100.value)
+    await settle(3)
+    const dels100 = messageDeletes.slice(delMark100)
+    ok(dels100.length === 1 && dels100[0].msgId === wsCard100.msgId,
+      '★★★ 取消真的发出一次 DELETE，删的就是这张卡（msgId=' + dels100.map((d) => d.msgId).join(',')
+        + '，期望 ' + wsCard100.msgId + '）')
+    ok(dels100.length === 1 && dels100[0].app === APP_ID,
+      '★★ 删卡用的是**这张卡的主人**那个应用的身份（跨应用删别人的消息必被拒）｜实得 '
+        + dels100.map((d) => d.app).join(','))
+    const after100 = sentCards.slice(cardMark100)
+    ok(after100.length === 0,
+      '★★ 删成功后不再 PATCH、也不再另发一条提示（CM 的口径是「卡片撤销掉」，不是多一条消息）｜实得 '
+        + after100.map((c) => c.op).join(','))
+    ok(consoleLines.slice(logMark100).some((l) => l.includes('/switch card cancelled (message deleted)')),
+      '★★★ 走的是「消息已删除」那条出口（旧夹具恒 false ⇒ 只能观测到 patched to cancelled state）')
+    ok(agent.sent.length === sentMark100, '★ 取消不起回合（不往会话里写任何东西）')
+
+    // ---- ② 被拒出口：飞书不删（权限/已撤回）⇒ 降级把这张卡改成「已取消」 ---------
+    failDeletes = 1
+    const markWs100b = sentCards.length
+    feedInbound('om_switch100_ws2', '/switch')
+    await settle(4)
+    const wsCard100b = lastCardFrom(markWs100b)
+    const cancelBtn100b = wsCard100b ? allButtons(wsCard100b).find((b) => b.value && b.value.fs_level === 'cancel') : undefined
+    ok(!!wsCard100b && !!cancelBtn100b, '（前提）第二次 /switch 照常出卡（降级分支的靶心）')
+    if (cancelBtn100b && wsCard100b) {
+      const logMark100b = consoleLines.length
+      const delMark100b = messageDeletes.length
+      await tapValue(cancelBtn100b.value)
+      await settle(3)
+      ok(messageDeletes.slice(delMark100b).length === 1, '（前提）这一支确实也试过 DELETE（只是被拒）')
+      const patch100b = cardsSince(markWs100b).find((c) => c.op === 'update' && c.msgId === wsCard100b.msgId)
+      ok(!!patch100b && JSON.stringify(patch100b.payload).includes('已取消'),
+        '★★★ 删不掉 ⇒ 就地 PATCH 成「已取消」，不留一张还能点的旧卡')
+      ok(consoleLines.slice(logMark100b).some((l) => l.includes('cancelled (patched to cancelled state)')),
+        '★★ 降级出口有留痕（可日志复验，不靠读代码）')
+    }
+    failDeletes = 0
+  }
+
+  // ---- ③ 演示/候选卡那条独立通道（fs_demo_cancel）------------------------------
+  const delMark100c = messageDeletes.length
+  await tapValue({ fs_demo_cancel: true },
+    { user_id: '', open_id: 'ou_human_85', union_id: 'on_cm' }, CHAT_ID, 'om_demo_card_100')
+  await settle(3)
+  const dels100c = messageDeletes.slice(delMark100c)
+  ok(dels100c.length === 1 && dels100c[0].msgId === 'om_demo_card_100',
+    '★★ 演示卡的「✕ 取消」删的是**事件里那张**（open_message_id 直传，不查 pendingSwitchCards）'
+      + '｜实得 ' + dels100c.map((d) => d.msgId).join(','))
+  persistedSessions = []
+  liveAgents.length = 0
+}
+
+console.log('101) ★🔴 命令锚点要认**三种**文本形态：占位符 / `@名字` / 裸名字紧跟命令（第十五轮门槛 MEDIUM#3）')
+{
+  // 上一轮只钉住了「占位符形态」（用例 97）。但锚点喂的是 `extractText()` 的**输出**，
+  // 而它在两种已在生产的形态下根本不是占位符：
+  //   ① 手机端纯文本：content 自带 `mentions:[{key,denote_text}]` ⇒ 占位符**先被换成 denote_text**
+  //      （飞书给的名字可以不带 @）⇒ `t.startsWith(m.key)` 永不命中；
+  //   ② PC 端 post 富文本：`at` 元素**没有 key 字段** ⇒ 还原成 `@名字`。
+  // ⇒ 旧实现下这两种形态的群里 `@bot /命令` 仍然当普通消息处理（整串进会话）。
+  // 反面还要钉住「第三档不许误剥」：裸名字后面**不紧跟命令**时不能当成命令
+  // （否则 `张三 说的 /help 那条` 会被读成命令）。
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const mod101 = await import('../index.js')
+  mod101.apply(ctx)
+  await settle(2)
+  liveAgents.push(agent)
+  armTurn85('101')
+  const GROUP101 = 'oc_smoke_group_101'
+  // 直接给**原始事件形状**（feedGroup85 只会造 `{text}` + 根级 mentions，覆盖不到下面两种形态）。
+  const feedGroupRaw101 = (msgId, msgType, contentObj, mentions) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: {
+          message_id: msgId, message_type: msgType, chat_type: 'group', chat_id: GROUP101,
+          content: JSON.stringify(contentObj), ...(mentions ? { mentions } : {}),
+        },
+        sender: { sender_id: { open_id: 'ou_human_85', union_id: 'on_cm' }, sender_type: 'human' },
+      },
+    }) + '\n'
+  }
+  const HELP_MARK = '/compact 压缩上下文'
+  const plainCreates = (mark) => cardsSince(mark)
+    .filter((c) => c.op === 'create' && c.payload && !c.payload.schema)
+    .filter((c) => JSON.stringify(c.payload).includes(HELP_MARK))
+
+  // ① denote_text 形态（手机端）：占位符已被换成**不带 @** 的名字
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    feedGroupRaw101('om_group101_mobile', 'text',
+      { text: '@_user_1 /help', mentions: [{ key: '@_user_1', denote_text: SMOKE_BOT_NAME }] },
+      [MENTION_SELF85])
+    await settle(4)
+    ok(agent.sent.length === sent,
+      '★★★ denote_text 形态的 `名字 /help` 判成了命令（没生效时整串当普通消息进会话 ⇒ sent +1）')
+    ok(plainCreates(mark).length === 1, '★★★ 帮助文本真的发出去了（恰好一条）｜实得 ' + plainCreates(mark).length)
+  }
+  // ② post 富文本形态（PC 端）：at 元素没有 key ⇒ extractText 还原成 `@名字`
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    feedGroupRaw101('om_group101_post', 'post',
+      { title: '', content: [[{ tag: 'at', user_id: SMOKE_BOT_OPEN_ID, name: SMOKE_BOT_NAME },
+        { tag: 'text', text: ' /help' }]] },
+      [MENTION_SELF85])
+    await settle(4)
+    ok(agent.sent.length === sent,
+      '★★★ post 形态的 `@名字 /help` 判成了命令（旧实现两档都不命中：既没占位符也没裸名字）')
+    ok(plainCreates(mark).length === 1, '★★★ post 形态同样只发一条帮助｜实得 ' + plainCreates(mark).length)
+  }
+  // ③ 反面：裸名字后面不紧跟命令 ⇒ 不许剥、不许当成命令
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    feedGroupRaw101('om_group101_falsecmd', 'text',
+      { text: '@_user_1 说的 /help 那条别跑-101L3', mentions: [{ key: '@_user_1', denote_text: SMOKE_BOT_NAME }] },
+      [MENTION_SELF85])
+    await settle(4)
+    ok(agent.sent.length === sent + 1 && lastSentText().includes('说的 /help 那条别跑-101L3'),
+      '★★★ 名字后面不紧跟命令 ⇒ 仍是普通消息（第三档的 `^\\s*\\/` 守卫在起作用，不把正文读成命令）')
+    ok(plainCreates(mark).length === 0, '★★ 这一条没有发出帮助卡（命令没被误判）')
+    ok(!lastSentText().includes('@_user_1'), '★ 占位符仍然不漏进会话（还原通道没被锚点改动带坏）')
+  }
+  liveAgents.length = 0
+}
+
+console.log('102) ★🔴 认不出的斜杠文本**不许静默吞**：命令分支只对 `resolveCommandName` 认得出的名字开放（第十六轮门槛 MEDIUM）')
+{
+  // 真机事件入口旧写法：`splitCommand` 只要首字符是 `/` 就进命令分支，而分支尾部**无条件
+  //   `return`**；`handleCommand` 第一行又是 `if (!resolved) return false`（什么都不做）
+  //   ⇒ 群里 `@bot /help2`（命令打错一个字）这类文本**既没有卡、也没有回合、连回执都没有**，
+  //   用户视角＝"它装没看见"。内部入口 `handleInbound` 早就有正确口径（`handled` 为假就落回
+  //   普通消息），两个入口口径不一致正是这类静默丢失的温床。
+  //   本用例钉住修好后的三条：①认不出的照常进会话；②第三档剥出来的认错名（`名字/李四 …`）
+  //   同样不吞；③认得出的**仍然**走命令分支（判据写反时这条变红）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const mod102 = await import('../index.js')
+  mod102.apply(ctx)
+  await settle(2)
+  liveAgents.push(agent)
+  armTurn85('102')
+  const GROUP102 = 'oc_smoke_group_102'
+  const feedGroupRaw102 = (msgId, contentObj, mentions) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: {
+          message_id: msgId, message_type: 'text', chat_type: 'group', chat_id: GROUP102,
+          content: JSON.stringify(contentObj), ...(mentions ? { mentions } : {}),
+        },
+        sender: { sender_id: { open_id: 'ou_human_85', union_id: 'on_cm' }, sender_type: 'human' },
+      },
+    }) + '\n'
+  }
+  const HELP_MARK102 = '/compact 压缩上下文'
+  const helpCards = (mark) => cardsSince(mark)
+    .filter((c) => c.op === 'create' && c.payload && !c.payload.schema)
+    .filter((c) => JSON.stringify(c.payload).includes(HELP_MARK102))
+
+  // ① 打错一个字的命令 ⇒ 普通消息通道（旧写法在这里 `return`，什么都没发生）
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    feedGroupRaw102('om_group102_typo',
+      { text: '@_user_1 /help2-102A' }, [MENTION_SELF85])
+    await settle(4)
+    ok(agent.sent.length === sent + 1 && lastSentText().includes('/help2-102A'),
+      '★★★ 认不出的 `/help2` 落回普通消息（sent ' + agent.sent.length + '，基线 ' + sent + '）——旧写法静默吞掉')
+    ok(helpCards(mark).length === 0, '★★ 认不出的命令没有错发帮助卡')
+  }
+  // ② 第三档剥出的认错名（手机端 `名字/李四 今天值班`）⇒ 同样不许吞
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    feedGroupRaw102('om_group102_name_slash',
+      { text: '@_user_1/李四 今天值班-102B', mentions: [{ key: '@_user_1', denote_text: SMOKE_BOT_NAME }] },
+      [MENTION_SELF85])
+    await settle(4)
+    ok(agent.sent.length === sent + 1 && lastSentText().includes('今天值班-102B'),
+      '★★★ 名字紧跟斜杠剥出 `/李四 …` 也不当命令（旧写法：锚点第三档命中 ⇒ 整条被吞）')
+    ok(helpCards(mark).length === 0, '★★ 这一条没有发出帮助卡')
+  }
+  // ③ 反面：认得出的命令**仍然**走命令分支，不许因为加了守卫而落进会话
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    feedGroupRaw102('om_group102_known', { text: '@_user_1 /help' }, [MENTION_SELF85])
+    await settle(4)
+    ok(agent.sent.length === sent,
+      '★★★ 已知命令 `/help` 没有落进会话（判据写反成 `!resolveCommandName` 时这条变红）')
+    ok(helpCards(mark).length === 1, '★★★ 已知命令照常执行（恰好一条帮助）｜实得 ' + helpCards(mark).length)
+  }
+  liveAgents.length = 0
+}
+
+console.log('103) ★🔴 命令锚点遇到「名字互为前缀」时要取**最长**匹配（第十七轮门槛 LOW#4）')
+{
+  // 旧实现按 mentionList 顺序**先命中先切**。当排在前面的名字是排在后面的名字的前缀
+  // （`smoke-bot` / `smoke-bot2`、`张三` / `张三丰`）时，正文 `@smoke-bot2 @smoke-bot /help`
+  // 会在第一个 token 上只切掉 10 个字符 ⇒ 剩下 `2 @smoke-bot /help` ⇒ 后面谁也匹配不上
+  // ⇒ 命令判成普通消息（用户视角：说了 `/help` 没执行，只是 agent 多回一句）。
+  // ⚠️ 这个形状能不能在真机出现，取决于飞书给 `mentions` 数组排序是否严格跟随正文顺序 ——
+  //   这一点**无法从接口文档证实**，所以不拿它当依据；锚点按"同一位置取最长"实现，
+  //   不依赖任何排序假设（对不冲突的输入结果与旧写法逐字相同）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true }],
+  }, null, 2))
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const mod103 = await import('../index.js')
+  mod103.apply(ctx)
+  await settle(2)
+  liveAgents.push(agent)
+  armTurn85('103')
+  const MENTION_SB103 = {
+    key: '@_user_2', id: { open_id: 'ou_smoke_bot_2', union_id: 'on_bot_sb2', user_id: '' },
+    name: SMOKE_BOT_NAME + '2', mentioned_type: 'bot',
+  }
+  fakeProc.output += JSON.stringify({
+    type: 'event', eventType: 'im.message.receive_v1',
+    data: {
+      message: {
+        message_id: 'om_group103_prefix', message_type: 'post', chat_type: 'group',
+        chat_id: 'oc_smoke_group_103',
+        content: JSON.stringify({ title: '', content: [[
+          { tag: 'at', user_id: 'ou_smoke_bot_2', name: SMOKE_BOT_NAME + '2' },
+          { tag: 'at', user_id: SMOKE_BOT_OPEN_ID, name: SMOKE_BOT_NAME },
+          { tag: 'text', text: ' /help' },
+        ]] }),
+        // 刻意把**较短**的那个名字排在前面（= 与正文顺序不一致），这才是能踩到旧写法的输入
+        mentions: [MENTION_SELF85, MENTION_SB103],
+      },
+      sender: { sender_id: { open_id: 'ou_human_85', union_id: 'on_cm' }, sender_type: 'human' },
+    },
+  }) + '\n'
+  {
+    const mark = sentCards.length
+    const sent = agent.sent.length
+    await settle(4)
+    ok(agent.sent.length === sent,
+      '★★★ 前缀名字没有把命令切碎（旧写法切 10 个字符 ⇒ 剩 `2 @… /help` ⇒ 判不成命令、整条落进会话）')
+    ok(cardsSince(mark)
+      .filter((c) => c.op === 'create' && c.payload && !c.payload.schema)
+      .filter((c) => JSON.stringify(c.payload).includes('/compact 压缩上下文')).length === 1,
+      '★★★ 最长匹配生效：`/help` 照常执行（恰好一条帮助）')
+  }
   liveAgents.length = 0
 }
 

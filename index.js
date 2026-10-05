@@ -105,6 +105,12 @@ const SENDER_FOOTER_TAG = '【发送方】'
 const MENTION_FOOTER_TAG = '【本条 @ 的对象】'
 // 摘要剥离正则由上面两个常量**拼出来**（不是另写一份字面量）：标签一改，正则同步跟上。
 //   语义与原来一字不差：从明细行起削到「（你在引用这条消息…」之前（那句是有效上下文，保留）。
+// 🔴 第十五轮门槛 LOW（明知并接受，不加转义）：这里把常量直接插进正则，前提是标签里
+//   **没有正则元字符**（【】不是）。真改成含 `(`/`+` 的措辞时，本行的拼接会当场产生
+//   错误语义 —— 但那两个标签是**给用户看的中文行首标记**，措辞变更必走功能基线，
+//   届时按基线补 `escapeRegExp` 而不是现在为假想需求建辅助函数。
+//   同一轮的附带风险（用户正文里恰好含「【发送方】」⇒ 摘要从那里截断）**只影响 /switch 卡片
+//   灰字显示**，不影响送进模型的上下文（那条走的是另一条路径），故不为此加行首锚定。
 const FOOTER_STRIP_RE = new RegExp('\\s*(?:' + SENDER_FOOTER_TAG + '|' + MENTION_FOOTER_TAG
   + ')[\\s\\S]*?(?=\\s*（你在引用这条消息|$)')
 
@@ -3532,16 +3538,47 @@ export function apply(ctx) {
   //   （`@DSH 员工bot /stop`），按非空白截会截掉半截、剩下的正文不再是命令。
   // 只剥开头那几个；正文里的 @ 交回 renderMentions 还原成名字 ⇒ `/plan 请 @某人 介入`
   // 的参数不会把占位符漏给 agent（本文件口径：占位符绝不进 agent 上下文）。
+  // 🔴 第十五轮门槛 MEDIUM#3（核对为真）：锚点喂的是 `extractText()` 的**输出**，而它
+  //   并不总是占位符形态 —— 两种已在生产出现的形态会让 `t.startsWith(m.key)` 永不命中：
+  //     ① 手机端纯文本里 content 自带 `mentions:[{key,denote_text}]` ⇒ 占位符**已被换成
+  //        denote_text**（`张三 /stop`，连 `@` 都没有）；
+  //     ② PC 端 post 富文本的 `at`/`person` 元素没有 key 字段 ⇒ 还原成 `@名字 /stop`。
+  //   ⇒ 三种形态都参加匹配：占位符 / `@名字` / **裸名字且紧跟 `/`**（切法见下面第十七轮
+  //   LOW#4 —— 同一起始位置取**最长**匹配，不是「先命中先切」）。
+  //   第三档为什么要限制紧跟 `/`：不限制就会把 `张三 你好` 这类正文的名字剥掉。
+  //   🔴 但"紧跟 `/`"本身**不足以**保证安全 —— 认不出的命令（`@张三/李四 今天值班`）
+  //   照样会被判成命令，而命令分支过去是**无条件 return** ⇒ 消息被静默吞。那一条由
+  //   第十六轮门槛在**事件入口**统一修（见 `im.message.receive_v1` 里 `cmd && resolveCommandName(...)`
+  //   那条守卫），锚点这层不做二次判定 —— 同一个判据放两处会漂移。
+  //   ⚠️ 本轮同时纠正上一版注释里的一处**不准**：原先写「否则 `张三 你好` 会被误剥、
+  //   把非命令读成命令」，实际 `张三 你好` 剥掉名字后首字符不是 `/`，`splitCommand`
+  //   本来就返回 undefined —— 那一例无论有没有守卫都无害，真正会出事的是紧跟 `/`
+  //   而命令名不认识的那一类（判据要写对，否则后人会照着错的理由加回缺陷）。
+  //   🔴 第十七轮门槛 LOW#4（核对为真）：**按名单顺序先命中先切**会踩「名字互为前缀」——
+  //   正文 `@张三丰 /stop`、mentionList 里 `张三` 排在 `张三丰` 前面时，`张三` 这一档先
+  //   命中 ⇒ 切成 `丰 /stop` ⇒ 后面谁都匹配不上 ⇒ 命令判成普通消息（用户视角：说了没执行，
+  //   只是多回一句）。占位符同理（`@_user_1` 是 `@_user_12` 的前缀，@ 满 10 人以上的群会踩）。
+  //   修法：**同一起始位置取最长匹配** —— 三种 token 一起参加比较，谁切得最多用谁。
+  //   不给 `@名字` 那一档补右边界（补了会把「名字后紧跟正文」的既有剥法改掉），
+  //   前缀问题在前缀层面解决。
   function commandAnchor(rawText, mentionList) {
     let rest = String(rawText || '')
-    let hit = true
-    while (hit) {
-      hit = false
+    for (;;) {
       const t = rest.replace(/^[\s　]+/, '')
+      let cut = 0
       for (const m of mentionList || []) {
-        if (!m || !m.key) continue
-        if (t.startsWith(m.key)) { rest = t.slice(m.key.length); hit = true; break }
+        if (!m) continue
+        // 三个候选档位：占位符 → `@名字` → 裸名字且紧跟命令字符
+        if (m.key && t.startsWith(m.key) && m.key.length > cut) cut = m.key.length
+        if (!m.name) continue
+        const at = '@' + m.name
+        if (t.startsWith(at) && at.length > cut) cut = at.length
+        if (t.startsWith(m.name) && /^[\s　]*\//.test(t.slice(m.name.length)) && m.name.length > cut) {
+          cut = m.name.length
+        }
       }
+      if (!cut) break
+      rest = t.slice(cut)
     }
     return renderMentions(rest.trim(), mentionList)
   }
@@ -4287,6 +4324,11 @@ export function apply(ctx) {
   const INLINE_CODE_RE = /(`+)[^\n]*?\1/g
   // 切成 `{code,text}` 段：围栏（``` / ~~~）整段算代码（含围栏行本身），段内再按行内 `…` 切。
   // 只做「把文本按是否代码分区」，不认识 markdown 的其它语法 —— 够用且不会误伤正文。
+  // 🔴 划定的边界（第十五轮门槛 LOW：4 空格/制表符缩进块不算代码，**明知并接受**）：
+  //   卡片 markdown 是飞书渲染的，缩进在传输中本就不稳定；把"行首 4 空格"当代码块会
+  //   连列表续行/引用正文一起误判成代码 ⇒ **漏展开**（真 @ 出不去，用户看到字面 `@[名字]`）。
+  //   两害相权：误展开的代价是"多 @ 一次"，漏展开的代价是"功能不生效"，而缩进形态在
+  //   本仓库真实流量里没出现过 ⇒ 只认围栏与行内反引号这两种**显式**标记。
   function splitCodeSegments(raw) {
     const segs = []
     const add = (code, text) => {
@@ -4345,7 +4387,20 @@ export function apply(ctx) {
     //   🔴 第十一轮 LOW#4：`@「」` 这一支原来**没有左边界**（另两支都有），
     //     `x@「张三」`/`mail@「张」` 照样命中 ⇒ 和这一轮刚立的"左右都要边界"自相矛盾，
     //     幽灵 @ 的风险只堵掉了两支。三支一律补 `(?<![\w$])`。
-    const AT_RE = /(?<![\w$])@\[([^\]\n]{1,60})\](?![[(])|(?<![\w$])@「([^」\n]{1,60})」|(?<![\w$])@all(?![A-Za-z0-9_])/gi
+    //   🔴 第十五轮门槛 LOW（核对为真）：`@all` 的右边界原来只排 `[A-Za-z0-9_]`，
+    //     而 `-` 和 `.` **不在**其中 ⇒ `@all-hands`、`@all.png` 照样命中并展开成
+    //     **一次真·@ 全体**（出站 @ 是唤醒对方 bot 入站事件的扳机，误触发=群广播）。
+    //     注释里"邮箱 foo@all.com 被右边界挡下"的说法也不准确：那一例其实由**左边界**挡下。
+    //     右边界收紧为 `(?![\w.\-])`：`@all` 后面只要还跟着 **ASCII** 字母/数字/下划线/点/
+    //     连字符就不是一个独立 token（第十七轮 LOW#1 纠正措辞：`\w` 不含中文，原写「字母」
+    //     是过度声称）。**中文相邻刻意不挡**，判据是**哪一类误判更常发生**：紧邻 ASCII 标识符
+    //     字符 ⇒ 这个 `@all` 属于那个标识符（`@all-hands`/`@all.png`/`@all_x`），不是广播指令；
+    //     紧邻中文 ⇒ 是「广播指令 + 正文」的普通写法（本产品中文-first、多数人在 @ 后不打
+    //     空格），判成非 token 等于把用户要的全群通知悄悄取消。
+    //     ⚠️ 别把上面读成"代价比较"：代价其实**不对称** —— 漏展开看得见、可重发，多广播
+    //     唤醒全群、收不回。所以这一档留下的残余风险是「正文里出现字面 `@all` 且后接中文」
+    //     （本仓库真实流量里没出现过），而不是常见的中文广播写法被挡。
+    const AT_RE = /(?<![\w$])@\[([^\]\n]{1,60})\](?![[(])|(?<![\w$])@「([^」\n]{1,60})」|(?<![\w$])@all(?![\w.\-])/gi
     const expandOne = (whole, sq, cn) => {
       if (sq === undefined && cn === undefined) { expanded++; return '<at id=all>所有人</at>' }
       const name = String(sq !== undefined ? sq : cn).trim()
@@ -4575,7 +4630,9 @@ export function apply(ctx) {
       }
       if (tg === 'button' || tg === 'action' || tg === 'select_person' || tg === 'overflow' || tg === 'date_picker') {
         const t = node.text
-        let inner = node.name || ''   // 三元的最后一档才是兜底：先给默认值，再逐条覆盖（不用嵌套三元）
+        // 名字同样只认字符串（第十三轮 LOW#3 的同一族，第十五轮门槛 LOW 补上这一支）：
+        //   富节点偶见 `name` 是对象形态，拼进会话文本就成 `【按钮/控件】[object Object]`。
+        let inner = typeof node.name === 'string' ? node.name : ''   // 三元的最后一档才是兜底：先给默认值，再逐条覆盖（不用嵌套三元）
         if (typeof t === 'string') inner = t
         else if (t && typeof t.content === 'string') inner = t.content
         push('【按钮/控件】' + (inner || tg))
@@ -5878,7 +5935,18 @@ export function apply(ctx) {
       // 改造⑤：登记 CM 这条消息，便于他之后引用自己的消息时也能带上下文
       rememberMessage(evt.message_id, 'CM 的消息：' + String(text || '(非文本消息)'))
       const cmd = evt.textCommandAnchor ? splitCommand(evt.textCommandAnchor) : undefined
-      if (cmd) {
+      // 🔴 第十六轮门槛 MEDIUM（核对为真，而且比那条 finding 的范围更大）：**只有 `resolveCommandName`
+      //   认得出的才进命令分支**。旧写法对任何以 `/` 开头的文本都 `handleCommand(...)` + 无条件
+      //   `return`，而 `handleCommand` 第一行就是 `if (!resolved) return false`（什么都不做）
+      //   ⇒ 认不出的斜杠文本被**静默吞掉**：没有卡、没有回合、连一句回执都没有。
+      //   命中形状：群里 `@bot /help2`（命令打错一个字）、手机端 `@张三/李四 今天值班`
+      //   （名字紧跟斜杠，锚点第三档剥出 `/李四 …`）、单聊里手打一句 `/tmp/x.txt 看一下`。
+      //   内部入口 `handleInbound`（本文件 4914-4924）**早就有正确口径** —— `handled` 为假就
+      //   不 return、继续当普通消息处理；真机事件入口缺同一判据 ⇒ 同一条消息走内部有回、
+      //   走真机没回（这种"两个入口口径不一致"是静默丢失的温床）。
+      //   修法取**同步判据**而不是等 `handleCommand` 回来再决定：未识别的文本原样落到下面
+      //   「提问卡 → 插话 → chain」的普通通道，既不会把已知命令执行两遍，也不改变已知命令的行为。
+      if (cmd && resolveCommandName(cmd.name)) {
         const chatId = evt.chat_id
         const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
         bot.chats.set(chatId, chat)

@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-// V0.1.0-26100503 — bot roster 采集器（dsh-feishucard 0.8.0 P0-4「Agent 互认」）
-// 变更：-26100503 第十二轮门槛 LOW×2 —— ①`--config`/`--out` 必须校验后面真的跟了值，
+// V0.1.0-26100601 — bot roster 采集器（dsh-feishucard 0.8.1 P0-4「Agent 互认」）
+// 变更：-26100601 第十五轮门槛 MEDIUM×2 + LOW×1 —— ①`members_incomplete` 只置位不清零，
+//       而 `chatRows` 条目**跨 bot 共享**：A 失败/B 采全的群里旧名单仍被并回来（已退群的人
+//       重新进收窄集合），补对称正向标记 `members_collected` 并在合并处要求它；
+//       ②`chats` 为空从 `exit 1` 降为**提示**（纯单聊 bot 是合法状态，原来那道闸门让这类
+//       部署永远生成不出 roster）；③`cfg.bots` 读取补 `cfg &&` 空对象防护。
+//       变更：-26100503 第十二轮门槛 LOW×2 —— ①`--config`/`--out` 必须校验后面真的跟了值，
 //       落在末尾时用 `undefined` 静默退回默认路径去读凭证（对读凭证、写 0600 名单的脚本
 //       是「以为指了别处、其实用的默认那份」）；②写盘前 `mkdirSync(dirname(out), {recursive:true})`，
 //       与插件侧写配置的口径一致（原来目录不存在只抛 ENOENT，归因困难）。
@@ -18,7 +23,13 @@
 // 结构：
 //   bots[]   { name, app_id, union_id, views: { <appId>: <open_id> } }
 //   people[] { name, union_id, views: { <appId>: <open_id> } }
-//   chats{}  { <chat_id>: { name, bot_app_ids[], member_unions[] } }
+//   chats{}  { <chat_id>: { name, bot_app_ids[], member_unions[],
+//                           members_incomplete?, members_collected? } }
+//     🔴 后两个字段是**本次运行内部**的合并判据（第十七轮门槛 LOW#3 指出它们会随文件落盘：
+//     核实为真，但**修法不采纳** —— 落盘是有意的：它们记录"这一遍成员名单采全了/没采全"，
+//     是人工核对 roster 可信度的唯一线索；消费点只读同一次运行里的 `chatRows`，
+//     跨运行**不**当契约字段用（下一次的行是重新采集出来的新行）。index.js 也不读它们。
+//     所以这里要改的是**文档**，不是产物。
 //
 // 用法：node scripts/collect_bot_roster.mjs [--config <path>] [--out <path>] [--dry-run]
 // 纪律（沿 build_identity_map.py 的约束）：调用频率 ≤3 次/天（挂服务器 cron）；
@@ -146,7 +157,7 @@ async function main() {
   //   `~/.cc-connect` 抄过来的就是这一份）。原来这里只读 `cfg.bots` ⇒ 那种部署
   //   插件跑得好、采集脚本却报「配置里没有带 appId/appSecret 的 bot」，
   //   互认名单**永远生成不了**（拿旧名单顶着，跨应用 @ 与认人静默失效）。
-  let bots = Array.isArray(cfg.bots) ? cfg.bots : []
+  let bots = (cfg && Array.isArray(cfg.bots)) ? cfg.bots : []
   if (!bots.length && cfg && typeof cfg.appId === 'string' && cfg.appId) bots = [cfg]
   const usable = bots.filter(b => b && b.appId && b.appSecret)
   if (!usable.length) { console.error('配置里没有带 appId/appSecret 的 bot'); process.exit(1) }
@@ -185,13 +196,19 @@ async function main() {
       //   原来任何一遍失败都置位 ⇒ open 遍失败（union 遍**已经采全**）时照样并旧名单，
       //   把**已退群的人**重新请回收窄集合 —— 恰好把这条保险丝本身给削弱了。
       //   open 遍失败的代价是 `views[appId]` 缺一角，那由下面「旧 views 为底」的合并兜，
-      //   不需要这个标记，所以这里不为它设第二个标记。
+      //   **不需要为 open 遍单独设标记**（下面成功侧的 `members_collected` 是同一个 union 遍判断的
+      //   正向对偶，不是 open 遍标记）。
       let membersFailed = false
       try { openPass = await listMembers(token, c.chat_id, 'open_id') }
       catch (e) { console.error('  ! 成员拉取失败(open_id)，本群视角 id 沿用旧目录 ' + c.chat_id + ' @ ' + label + ': ' + e.message) }
       try { unionPass = await listMembers(token, c.chat_id, 'union_id') }
       catch (e) { membersFailed = true; console.error('  ! 成员拉取失败(union_id) ' + c.chat_id + ' @ ' + label + ': ' + e.message) }
+      // 🔴 第十五轮门槛 MEDIUM#1：`rec` 是**跨 bot 共享**的（上面 `chatRows[c.chat_id] ||` 复用它），
+      //   而 `members_incomplete` 只会置位、不会清零 ⇒ bot A 在这个群 union 遍失败、bot B 同一群
+      //   union 遍**已经采全**时，标记仍是 true，下面合并照样把旧名单并回来 —— 把已退群的人
+      //   重新请回收窄集合，正是这条保险丝要防的事。所以成功侧必须有**对称的正向标记**。
       if (membersFailed) rec.members_incomplete = true
+      else rec.members_collected = true
       const byName = new Map()
       for (const m of openPass) {
         const nm = String(m.name || '')
@@ -250,7 +267,12 @@ async function main() {
         if (!chatRows[k]) { chatRows[k] = v; continue }
         // 本次 **union 遍**成员没采全 ⇒ 把旧名单并回来，别让一次接口失败把收窄能力清空
         // （open 遍失败不走这里，理由见上面 `membersFailed` 的注释）
-        if (chatRows[k].members_incomplete && Array.isArray(v.member_unions) && v.member_unions.length) {
+        // 🔴 第十五轮门槛 MEDIUM#1：还要**同时**要求这个群本次没有**任何** bot 采全过。
+        //   名单是**群级**的（`listMembers` 拿到的就是整群的人，与是哪个 bot 调的无关），
+        //   所以只要有一个 bot 的 union 遍成功，本群名单就是全的 ⇒ 再并旧名单只会把
+        //   已退群的人请回来。上面那段注释里的「标记只跟 union 遍」到这里才真正闭环。
+        if (chatRows[k].members_incomplete && !chatRows[k].members_collected
+          && Array.isArray(v.member_unions) && v.member_unions.length) {
           for (const u of v.member_unions) if (!chatRows[k].member_unions.includes(u)) chatRows[k].member_unions.push(u)
         }
       }
@@ -260,9 +282,19 @@ async function main() {
   merged.people = [...peopleRows.values()]
   merged.chats = chatRows
 
-  if (!merged.bots.length || !Object.keys(merged.chats).length) {
-    console.error('采集结果为空（bots 或 chats 缺失），**不写文件**、保留上一版。')
+  // 🔴 第十五轮门槛 MEDIUM#2：原来 `chats` 为空也走 `process.exit(1)`「不写文件」，但空群是
+  //   **合法状态**（纯单聊的 bot、刚装好还没进群的新 bot），于是这类部署永远生成不出 roster，
+  //   互认功能被一个不存在的缺陷锁死。
+  //   只在 **bots 为空**时才硬退出（那才是"采集整个没成功"）；`chats` 为空时，上面的旧目录合并
+  //   已把旧群逐条搬进 `chatRows`（`if (!chatRows[k]) chatRows[k] = v`），所以这里为空
+  //   等于"新旧都没有群"，写文件不会抹掉任何已有名单 ⇒ 降级为提示。
+  if (!merged.bots.length) {
+    console.error('采集结果为空（bots 缺失），**不写文件**、保留上一版。')
     process.exit(1)
+  }
+  if (!Object.keys(merged.chats).length) {
+    console.warn('  ! 本次没有任何群（bots=' + merged.bots.length
+      + '），roster 里 chats 将为空 —— 跨群 @ 收窄不可用，单聊互认不受影响。')
   }
   if (args.dryRun) {
     console.log('[dry-run] bots=' + merged.bots.length + ' people=' + merged.people.length
