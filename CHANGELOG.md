@@ -257,6 +257,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     修法：`catch (e)` 带上 `e.message`，或把 `try` 收窄到 `readFileSync`/`JSON.parse` 两句。
     ⚠️ **如实记**：这条与 LOW#1 一样会动 `collect_bot_roster.mjs` 的字节 ⇒ 动了 Z 就作废，
     所以排 0.8.3 批次一起做，不在本版偷改。
+- **上线后服务器取证又抓到三条运行态问题（中台 **#39** high／**#40** **#41** medium）**：逐条实测、全部核实为真，
+  **都不是本批字节引入、本版均未修**。
+  ① aiad 上 **hr 的状态文件属主是 `ubuntu:ubuntu`**，而单元是 `User=aiad / Group=agtagents` ⇒
+  `sudo -u aiad test -w` 判**不可写**；全天 6 次 `[fs] state save failed: EACCES`（`04:56:03`–`05:42:16`）
+  全部命中这一个文件（同目录另外三个 `state-*.json` 都是 `aiad:agtagents 664` 可写），写手是 04:55 一次以
+  ubuntu 身份执行的 clearsessions（同 mtime 的 `.bak-20261006-clearsessions` 为证）。⚠️
+  **「重启后该错误计数为 0」不得当成已修**——那个窗口里 hr 没有写盘事件（aiad 侧只有 1 条 `plugin apply`），
+  恢复流量即复现。修法一条 `chown`、不改内容不需重启，等 CM 授权后执行。
+  ② aiad 的 `feishu.config.json` 是 `root:root 644`（内含四个 bot 的 `appSecret`），其余 8 份都是
+  「运行用户:agtagents 600」。实测 `www-data`/`nobody`/`agtokr` 读 1 字节一律 `Permission denied`
+  （父目录 `drwx------` 挡住穿越）⇒ **当前不是正在泄露**；但服务读到它靠的是 **others 可读位**，
+  将来谁把它收成 600 而不同步改属主，aiad 下次重启就读不到配置、四个 bot 全失联 ⇒ 修法必须与重启同批，
+  不为它单独重启（红线⑳）。
+  ③ `04:00–05:42` 之间 `dsh-feishu-aiad` 被**其他会话** restart **11 次**（OPS_CHANGELOG 可辨是 G5 插件与
+  G8 feedback 通道的部署），我方 `06:58` 那次是第 12 次，也是 0.8.2 唯一需要的一次。**已复核不影响本次
+  部署判定**：上线后 10 份副本五件 md5 仍等于闸门 Z、两实例自报 `v0.8.2 md5=2d992282`。但它是红线⑳ 与
+  缺口 **#8**／中台 **#22** 的服务器侧形态（多会话并发操作同一台机、互相不知情）⇒ **#41** 里建议约定
+  「动 aiad 服务前先查中台租约」，待 CM 拍板。
+  🔴 这三条共同暴露一个**闸门本身的缺口**（已补进功能基线缺口清单 **#12**）：部署校验从来只盯代码五件的
+  md5 与连接数，**没有一步校验过 `FS_CONFIG_DIR` 里的运行态文件对该 unit 的 `User=` 是否可写** ⇒
+  ①② 这两类问题只能等它们在日志里自己冒出来才看得见。
 
 ## [0.8.1] - 2026-10-06
 
