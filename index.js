@@ -7503,7 +7503,10 @@ export function apply(ctx) {
     if (value.fs_demo_cancel) {
       const chatId = data && data.context && data.context.open_chat_id
       const msgId = data && data.context && data.context.open_message_id
-      const ownerBot = chatId ? findBotForChat(chatId) : undefined
+      // 🔴 同 `fs_switch` / `fs_model` 两条：要删的是**这张被点的卡**那条消息 ⇒ 必须用收到
+      //   事件的连接 bot（`evtBot` 内部已带「按会话猜」的兜底），否则同实例两 bot 时恒取
+      //   配置第一个 ⇒ 跨应用删别人的消息真机必被拒。
+      const ownerBot = evtBot
       console.log('[fs] demo card cancel: chat=' + String(chatId || '') + ' msg=' + String(msgId || ''))
       if (ownerBot && msgId) {
         void deleteMessage(ownerBot, msgId).then((okDel) => {
@@ -7519,7 +7522,13 @@ export function apply(ctx) {
       //   `findBotForChat(chatId)` 只返回该群配置里的第一个 bot（第六轮 LOW／第十一轮 LOW#5 同源形状）。
       //   这次尤其要命 —— 下面要 PATCH 的正是**这个 bot 自己发出去的那条卡片消息**，
       //   拿别的应用身份去 PATCH 必被拒（消息不属于它），表现就是"点了卡片不动"。
-      const ownerBot = evtBot || (chatId ? findBotForChat(chatId) : undefined)
+      // 🔴 第二十轮门槛 LOW（核对为真）：原来这里还挂着 `|| (chatId ? findBotForChat(chatId) : undefined)`，
+      //   与同文件 `fs_switch` 支（第十九轮删掉兜底的那处）是**同一个形状**。它惰性可证：
+      //   本分支的 `chatId` 与上面 `evtChatId` 读的是同一个 `data.context.open_chat_id`，
+      //   而 `evtBot` 内部已经用同一个 id 调过 `findBotForChat` ⇒ `evtBot` 为空时那截兜底必然也为空。
+      //   第十九轮删掉 `fs_switch` 那处时的判据（「按会话猜 ⇒ 恒取第一个 bot，留着更坏」）在这里同样成立，
+      //   ⇒ 同判据不能只落一处，一并删净。
+      const ownerBot = evtBot
       // 被点的这张卡的 message_id：结果直接写回它（与「✕ 取消」删卡用的是同一个字段）。
       const clickedCardId = data && data.context ? String(data.context.open_message_id || '') : ''
       const chat = ownerBot && chatId ? ownerBot.chats.get(chatId) : undefined
@@ -7573,7 +7582,16 @@ export function apply(ctx) {
     // Session/workspace switch buttons (the /switch picker card).
     if (value.fs_switch !== undefined) {
       const chatId = data && data.context && data.context.open_chat_id
-      const ownerBot = chatId ? findBotForChat(chatId) : undefined
+      // 🔴 与上面 `fs_model` 那条**同一条判据**：用收到这条事件的连接自带 bot，不按会话猜。
+      //   原来无条件 `findBotForChat(chatId)` ⇒ 同实例配两个 bot 时恒取配置里第一个，
+      //   而下面 DELETE/PATCH 的都是**这张卡自己**那条消息 ⇒ 真机跨应用改删别人的消息必被拒，
+      //   表现就是「点了「✕ 取消」卡片不动」。（闸门 V 用例 100 实测红：卡挂在第二个 bot 上、
+      //   删卡身份却是 `cli_test123456`；这条判据在第十八轮之前被一处恒真断言盖住了。）
+      // 第十九轮门槛 LOW（核对为真）：这里原来还挂着一截 `|| findBotForChat(chatId)` 兜底 ——
+      //   `chatId` 与 `evtBot` 内部分支用的是同一个 `data.context.open_chat_id`，兜底能命中的时候
+      //   `evtBot` 早已命中，命中不了的时候它自己也返回 undefined ⇒ 死代码。留着更坏：万一哪天
+      //   条件变了让它真跑起来，就正好把本次要删掉的「按会话猜 ⇒ 恒取第一个 bot」放回来。
+      const ownerBot = evtBot
       if (!chatId || !ownerBot) {
         console.log('[fs] /switch click without a resolvable chat/bot (chat=' + String(chatId || '') + ')')
         return
@@ -7596,7 +7614,7 @@ export function apply(ctx) {
           ? '这张审批单已经处理过了（点过即生效，重复点击不会再变）。'
           : '这张审批单已过期或已作废。请看我最新一条卡片，或让 AI 重新发一张。'
         if (chatId) {
-          const ownerBot = findBotForChat(chatId)
+          const ownerBot = evtBot
           if (ownerBot) sendPlainText(ownerBot, chatId, '⚠️ ' + hint).catch(() => {})
         }
         return
@@ -7634,7 +7652,7 @@ export function apply(ctx) {
         console.log('[fs] plan goal button: record not found for chat ' + chatId
           + ' token=' + value.fs_plan_goal)
         if (chatId) {
-          const ownerBot = findBotForChat(chatId)
+          const ownerBot = evtBot   // 🔴 收到事件的连接 bot（同 `fs_switch` 那条判据），不按会话猜
           if (ownerBot) {
             sendPlainText(ownerBot, chatId, '⚠️ 这张计划卡已经处理过了。看我最新一条消息，或直接回我文字。')
               .catch(() => { })
@@ -7657,7 +7675,10 @@ export function apply(ctx) {
         let goalWhy = ''
         try {
           const goals = ctx.get('goals')
-          const bot = findBotForChat(chatId)
+          // 🔴 这一段下面 PATCH 卡片用的是 `record.bot`（卡的主人），而建目标要解析的 agent
+          //   存在**同一个 bot** 的会话表里 ⇒ 两条路径必须同一个身份。原来这里用
+          //   `findBotForChat(chatId)` 猜 ⇒ 同实例两 bot 时会在"另一个 bot"的会话上开目标。
+          const bot = (record && record.bot) || evtBot
           const chat = bot && bot.chats && typeof bot.chats.get === 'function' ? bot.chats.get(chatId) : undefined
           const agent = (bot && chat) ? await resolveAgent(bot, chat) : undefined
           if (!goals || typeof goals.create !== 'function') {
@@ -7675,7 +7696,7 @@ export function apply(ctx) {
         if (!goalOk) {
           console.log('[fs] plan goal failed: ' + goalWhy)
           try {
-            const bot = findBotForChat(chatId)
+            const bot = (record && record.bot) || evtBot   // 🔴 同上：与 PATCH 卡片同一个身份
             if (bot) {
               await sendPlainText(bot, chatId, '✅ 计划已批准；但**目标没建起来**（' + goalWhy
                 + '）—— 回我一句我立刻按这份计划开跑。')
@@ -7728,7 +7749,7 @@ export function apply(ctx) {
           ? '该选项已经处理过了（点过即生效）。请看我最新一条消息，或直接回复文字。'
           : '这张卡片已过期（可能已经回答过）。请看我最新一条卡片，或直接回复文字即可。'
         if (chatId) {
-          const ownerBot = findBotForChat(chatId)
+          const ownerBot = evtBot   // 🔴 收到事件的连接 bot（同 `fs_switch` 那条判据），不按会话猜
           if (ownerBot) {
             sendPlainText(ownerBot, chatId, '⚠️ ' + hint).catch(() => {})
           }
@@ -7742,7 +7763,7 @@ export function apply(ctx) {
       if (!opt) {
         console.log('[fs] question button: bad option index ' + value.fs_option)
         if (chatId) {
-          const ownerBot = findBotForChat(chatId)
+          const ownerBot = evtBot   // 🔴 同上
           if (ownerBot) {
             sendPlainText(ownerBot, chatId, '⚠️ 无法识别该选项，请直接回复文字。').catch(() => {})
           }
