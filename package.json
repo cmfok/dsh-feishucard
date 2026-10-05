@@ -1,6 +1,6 @@
 {
   "name": "dsh-feishucard",
-  "version": "0.7.21",
+  "version": "0.8.0",
   "engines": {
     "node": ">=22.15.0"
   },
@@ -27,6 +27,7 @@
     "cordis.patch.yml",
     "feishu.config.example.json",
     "identity_map.example.json",
+    "scripts/collect_bot_roster.mjs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
