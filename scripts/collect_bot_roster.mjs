@@ -1,6 +1,23 @@
 #!/usr/bin/env node
-// V0.1.0-26100601 — bot roster 采集器（dsh-feishucard 0.8.1 P0-4「Agent 互认」）
-// 变更：-26100601 第十五轮门槛 MEDIUM×2 + LOW×1 —— ①`members_incomplete` 只置位不清零，
+// V0.1.2-26100603 — bot roster 采集器（dsh-feishucard 0.8.1 P0-4「Agent 互认」）
+// 变更：-26100603 第十九轮门槛 MEDIUM×2 —— ①上一轮的 `oldRosterUnreadable` 闸门**嵌在**
+//       `if (!chats 为空)` 里面 ⇒ 只挡得住"一个群也没采到"；而解析失败时合并段整段没跑，
+//       "本次采到 1 个群"照样会把旧文件里其余条目全部丢掉（部分覆盖，同一失效、半径小些）。
+//       闸门提到外面，**不看 chats** —— 至此文件头那句「该形态不写文件、非零退出」才是无条件成立。
+//       ②`main().catch` 与 `bots 为空` 两处出口仍是 `process.exit(1)`（前者是门槛点名那条、
+//       后者是我上一轮"改了文档里那条、漏了同源那条"）⇒ 一并改 `exitCode = 1`。
+//       取证：`scripts/test-collect-roster.mjs` 新增 S4（旧文件坏 + 本次有群 ⇒ 拒写、旧字节不动）
+//       与 S5（发过 HTTP 后接口抛错 ⇒ 干净退 1，不再出现 3221226505 断言中止）。
+// 变更：-26100602 第十八轮门槛 MEDIUM×1 —— 旧 roster **存在但解析失败**时不再走
+//       「chats 为空＝新旧都没有群」那条降级：那种情况下合并段一行都没跑，写盘等于用空名单
+//       覆盖一份可能有效的目录（跨群 @ 收窄静默失效）。新增 `oldRosterUnreadable` 旗 ⇒
+//       该形态**不写文件**、非零退出，日志把两种「空」分开；合法的空群（真没有旧文件）仍按
+//       第十五轮降级为提示。顺带把这条出口从 `process.exit(1)` 改为 `exitCode + return`
+//       （实测：本机在发起过 HTTP 采集之后 `process.exit` 会触发 Windows libuv 断言中止）。
+//       基址改为 `FS_OPEN_API_BASE` 可注入（默认值不变）——本脚本第一次能被桩真跑。
+//       取证：红＝旧判据 rc=0 且旧文件被覆盖成 `chats=0`；绿＝新判据 rc=1 且旧文件字节未动；
+//       另两遍（无旧文件 / 旧文件可读且有群）两版都绿。
+//       变更：-26100601 第十五轮门槛 MEDIUM×2 + LOW×1 —— ①`members_incomplete` 只置位不清零，
 //       而 `chatRows` 条目**跨 bot 共享**：A 失败/B 采全的群里旧名单仍被并回来（已退群的人
 //       重新进收窄集合），补对称正向标记 `members_collected` 并在合并处要求它；
 //       ②`chats` 为空从 `exit 1` 降为**提示**（纯单聊 bot 是合法状态，原来那道闸门让这类
@@ -39,7 +56,10 @@ import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from 'node:fs'
 
-const API = 'https://open.feishu.cn/open-apis'
+// 基址可覆盖：默认打真接口。留这个注入点不是为将来，是**现在就需要** —— 本脚本没有任何冒烟
+//   覆盖（`index.js` 与 `smoke.mjs` 都只在注释里提到它，见功能基线「缺口 #7」），它的写盘判据
+//   （什么时候拒绝覆盖上一版名单）此前只能靠 `node --check` 保证语法、靠人读注释相信。
+const API = process.env.FS_OPEN_API_BASE || 'https://open.feishu.cn/open-apis'
 const PAGE = 100
 
 function parseArgs(argv) {
@@ -242,6 +262,7 @@ async function main() {
 
   // 幂等合并：旧文件里已有、这次没采到的条目**保留**（某 bot 临时不在群里≠它不存在）。
   const merged = { generated_at: new Date().toISOString(), bots: [], people: [], chats: {} }
+  let oldRosterUnreadable = false   // 旧文件存在但读不出（≠「新旧都没有群」）
   if (existsSync(outPath)) {
     try {
       const old = JSON.parse(readFileSync(outPath, 'utf8'))
@@ -276,7 +297,16 @@ async function main() {
           for (const u of v.member_unions) if (!chatRows[k].member_unions.includes(u)) chatRows[k].member_unions.push(u)
         }
       }
-    } catch { console.error('  ! 旧 roster 解析失败，按全新采集覆盖') }
+    } catch {
+      // 🔴 第十八轮门槛（MEDIUM，核对为真）：这里以前只打一句「按全新采集覆盖」就完了，
+      //   于是「旧文件根本不存在」与「旧文件在、但坏了读不出」在下游长得一模一样。
+      //   后者会让下面的 `chatRows` 只剩本次结果（可能是空的），而下面对「chats 为空」的
+      //   降级判据依赖的是「旧群已经逐条并进来了」——旧文件读不出时那个前提**不成立**，
+      //   照样写盘就是拿一份空 chats 覆盖掉一份可能有效的名单（跨群 @ 收窄从此失效，
+      //   且要到下一次「真的采到群」才自愈）。置旗，交给下面那道闸收紧。
+      oldRosterUnreadable = true
+      console.error('  ! 旧 roster 解析失败（文件在但读不出），本次按全新采集')
+    }
   }
   merged.bots = [...botRows.values()]
   merged.people = [...peopleRows.values()]
@@ -288,9 +318,51 @@ async function main() {
   //   只在 **bots 为空**时才硬退出（那才是"采集整个没成功"）；`chats` 为空时，上面的旧目录合并
   //   已把旧群逐条搬进 `chatRows`（`if (!chatRows[k]) chatRows[k] = v`），所以这里为空
   //   等于"新旧都没有群"，写文件不会抹掉任何已有名单 ⇒ 降级为提示。
+  // 🔴 第十八轮门槛（MEDIUM）：上面那句推论**前提不完整**——「旧群已逐条并进来」要求旧文件
+  //   真的被读出来并解析成功。旧文件存在但解析失败时（上面那面旗），合并段一行都没跑，
+  //   此时无法区分"本来就没有群"和"名单在一份坏文件里"，写盘即覆盖。
+  //   ⇒ 那条闸门现在提在这里之外、且不看 chats 是否为空（见下面第十九轮 MEDIUM#1 的注释）。
+  // 🔴 第二十轮门槛 LOW（核对为真）：下面那句「上一版读不出」的诊断原来**排在** `bots 为空`
+  //   这道闸**之后**且各自 `return` ⇒ 两者同时成立时操作员只看见「bots 缺失」，永远看不见
+  //   「旧名单存在但在一份坏文件里」这个真正需要**人工**修复的条件（旧文件确实被保留了，
+  //   可是保留得静默无据）。⇒ 诊断抽成一个函数，两个出口都打，信息不再互相遮蔽。
+  const reportUnreadableOldRoster = () => {
+    console.error('  ! 上一版 roster 存在却读不出来 ⇒ 无法判断旧文件里是否有群/人，'
+      + '本次采集到的条目不足以替代它（旧文件里未被本次采到的条目会全部丢失）。'
+      + '**不写文件**、保留上一版，请人工检查该文件是否损坏：' + outPath)
+  }
   if (!merged.bots.length) {
     console.error('采集结果为空（bots 缺失），**不写文件**、保留上一版。')
-    process.exit(1)
+    // ⚠️ 如实记（第二十轮门槛核对时实测的可达性）：这一处在当前代码里**走不到**——上面第 183 行
+    //   已保证「至少一个带 appId/appSecret 的 bot」，而循环里每个可用 bot 必然落一行（`bot/v3/info`
+    //   没给 open_id 时是抛错走「采集失败」，不是静默跳过）。保留它不是靠它兜住某条真实路径，
+    //   而是把文件头那句判据（「任一 bot 采集失败 ⇒ 明确报错且不写空文件」）实现成**无条件**断言，
+    //   与第十九轮 MEDIUM#1 的收紧方向一致。它与 `index.js` 里那类「按会话猜身份」的死兜底不同：
+    //   那条留着会给错误行为开门，这条留着不改变任何行为。
+    if (oldRosterUnreadable) reportUnreadableOldRoster()
+    // 第十九轮门槛 MEDIUM#2 的同源处（门槛只点到了 `main().catch`，这一行是同一个形状）：
+    //   走到这里时**HTTP 已经发过**（bots 为空是"采集跑完但一个 bot 也没进来"），
+    //   `process.exit(1)` 在 Windows 上会撞 libuv 断言、rc 变 3221226505。
+    process.exitCode = 1
+    return
+  }
+  // 🔴 第十九轮门槛 MEDIUM#1（核对为真）：上面那道旧写法把「拒绝写盘」嵌在
+  //   `if (!Object.keys(merged.chats).length)` 里面 ⇒ 只保护"一个群也没采到"这一种形态。
+  //   但合并段（`for (const [k, v] of Object.entries(old.chats || {}))`）在解析失败时**整段没跑**，
+  //   所以「本次采到了 1 个群」同样不能证明写盘安全：那种情况下写出去的名单里
+  //   **旧文件中除这 1 个群之外的所有条目都不在**（部分覆盖，与全空覆盖是同一个失效，只是半径小些）。
+  //   判据的正文（文件头「任一 bot 采集失败 ⇒ 明确报错且不写空文件」）本来写的就是无条件不写，
+  //   ⇒ 这里把闸门**提到 chats 是否为空之外**，让实现与文档一致。旧文件保持原字节不动
+  //   （不复制、不改名）：留原件才是可核对的取证对象，人工判断完再决定怎么办。
+  if (oldRosterUnreadable) {
+    reportUnreadableOldRoster()
+    // 🔴 第十八轮门槛（MEDIUM）取证副产物：这里用 `process.exitCode = 1; return` 而不是
+    //   `process.exit(1)`。实测（本机 Windows + 桩接口）：在**已经发起过 HTTP 采集**之后
+    //   调 `process.exit(1)` 会触发 libuv 断言中止 `Assertion failed: !(handle->flags &
+    //   UV_HANDLE_CLOSING)`，rc 变成 3221226505；同一份文件只把这一行换成 exitCode 就干净退 1
+    //   （行为完全相同：不写文件、保留上一版）。退出码仍是非零，但日志不再被一句断言污染。
+    process.exitCode = 1
+    return
   }
   if (!Object.keys(merged.chats).length) {
     console.warn('  ! 本次没有任何群（bots=' + merged.bots.length
@@ -315,5 +387,9 @@ async function main() {
 
 main().catch((error) => {
   console.error('采集失败（不写文件）: ' + String(error && error.stack || error))
-  process.exit(1)
+  // 🔴 第十九轮门槛 MEDIUM#2（核对为真）：这里原来还是 `process.exit(1)`。
+  //   能走到这条 catch 的场景（token / bot/v3/info / 会话列表抛错）**必然已经发过 HTTP**，
+  //   正是第十八轮那条取证描述的形态 ⇒ 主失败路径照样会被 libuv 断言中止污染（rc 3221226505）。
+  //   门槛点名的就是这个出口，上一轮只改了我自己新加的那一处，属于"改了文档里那条、漏了同源那条"。
+  process.exitCode = 1
 })

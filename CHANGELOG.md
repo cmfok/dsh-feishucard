@@ -5,6 +5,259 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-10-06
+
+本版同样**没有新功能**，是第十八轮门槛对**已上线的 0.8.1 批次**补审后的处置批次
+（结论 **BLOCK**：`0 critical / 0 high / 1 medium / 1 low`，fail-on medium）。两条都**核对为真**，
+没有误报。⚠️ **一处判级被实测推翻**：那条被判为 "low／测试质量" 的用例 100，把夹具改成双 bot 之后
+**当场跑红、抓出 `index.js` 里一条真实产品缺陷**（见下面第一条修复）。
+⇒ 第十九轮门槛（跑在 X 定版字节上，**WARN**：`0 critical / 0 high / 2 medium / 4 low`）的六条、
+以及第二十轮门槛（跑在 Y 定版字节上，**BLOCK**：`0 critical / 0 high / 1 medium / 2 low`）的三条
+也一并落在本版（详见下面两轮各自的小节，九条同样**逐条核对为真、无误报**）；
+本版改动落在**四个**文件（`index.js` + `scripts/collect_bot_roster.mjs` + `scripts/smoke.mjs` +
+新增守护用例 `scripts/test-collect-roster.mjs`）；`helper.cjs` / `identity-inject.mjs` 仍是闸门 U
+的定版字节、一字未动。
+🔴 **本版定版闸门＝ Z**（`output/gate080z.log`）：第二十轮三条改动之后的终态字节，实测数字见下面
+「定版闸门链」的 Z 条。作废链：X（第十九轮改动前）→ Y（第二十轮改动前，`index.js 018fb384…`）
+⇒ 依同一口径逐轮作废，数字都留在闸门链里。
+
+### 修复（第十八轮门槛核实为真的 2 条 + 由这 2 条牵出的 1 条）
+
+- **🔴 卡片回调「按会话猜 bot」：同一实例配两个 bot 时，`/switch` 的「✕ 取消」点了不动**。
+  这条**不是审查发现的，是闸门 V 的冒烟发现的**（`output/gate080v.log`：`RC=1`、2 处 ❌，
+  删卡实得身份 `cli_test123456`、应为 `cli_second_bot100`）。根因：`handleCardAction` 的 `fs_switch`
+  分派用 `findBotForChat(chatId)`，而这个函数在同实例配多个 bot 时**恒返回配置里第一个** ⇒ 之后的
+  删卡 DELETE、被拒时的降级 PATCH、乃至会话表读写全部挂在**别人的应用**上；真机行为＝飞书拒掉这次
+  改卡请求、卡片一动不动——与 CM 第十四轮报的「点了不动」同一症状、另一条通道。
+  修法不引入新机制：同文件的 `fs_model` 分支（第十一/十四轮钉过）、点击者取名、
+  `cardClickOutsideOriginChat` **早就用「收到这条事件的那个连接对应的 bot」（`evtBot`）**，
+  这里只是漏改落点。并按开发标准 §1.6 做了同类排查——本文件所有 `findBotForChat` 落点逐条分类，
+  凡「改/删这张被点的卡」的出口一律改成同源（`fs_demo_cancel`、四支过期卡回执、坏选项回执、
+  计划卡两处建目标共 6 处）；唯一保留原写法的是 `index.js:9252`（feishu 工具侧没有事件可依，
+  只能按会话找），已在功能基线里写明理由。
+- **MEDIUM `collect_bot_roster.mjs`：旧名单读不出来时，会被一份空的 `chats` 覆盖掉**。
+  第十五轮把「`chats` 为空就硬退出」放宽成提示，理由是「旧群已经逐条并进 `chatRows` 了，
+  这里为空＝新旧都没有群」。审查指出这个前提**不完整**：那段合并只在旧文件**存在且 JSON 解析成功**
+  时才跑，而解析失败被 `catch` 吞掉后 `chatRows` 只剩本次结果 ⇒ 一次接口全空 + 一份坏掉的旧文件
+  ＝拿空名单覆盖掉一份**可能仍然有效**的目录，跨群 @ 收窄从此静默失效，且要等下一次真采到群才自愈。
+  核实后按原样收紧：**新增 `oldRosterUnreadable` 旗**，旧文件在而读不出时**不写文件**、退出码非零，
+  日志把「新旧都没有群」和「旧文件读不出」分开写（前者照旧降级为提示，合法）。
+- **LOW 用例 100：那条「删卡用主人身份」的断言是恒真的**。夹具装的是**单 bot** 配置
+  （`bots:[{appId: APP_ID}]`），于是「这张卡的主人」和「唯一那个已连接 bot」是同一个对象 ⇒
+  真把身份来源写错（例如永远取配置里第一个 bot）也照样绿。按用例 78/81 的双 bot 形态改造：
+  卡挂在**配置里第二个** bot 上、点击也从第二个 bot 的通道进来（这就是真机形状——卡片回调只投给
+  建卡的那个应用），断言改成 `app === 第二个 bot` 且**不得为**第一个 bot ⇒ 现在才真的能分辨。
+  降级 PATCH 那一支同步钉上「写在主人那个 app 身份上」。
+  🔴 **这条的判级偏低了**：审查归为"测试质量／low"，实际半径是产品缺陷——夹具一改造，红的就是
+  `index.js` 而不是用例（见上一条）。教训已写进功能基线：**判据要能辨别"卡的主人"，夹具就必须
+  真的存在第二个主人**，且禁止 `|| fakeProc` 那类降级（降级＝断言退回恒真）。
+
+### 本次取证的两处副产物（不改行为，但值得留痕）
+
+- **给这个脚本开了一个测试缝，并把一次性夹具转正为常驻守护用例**。接口域名从硬编码改为
+  `FS_OPEN_API_BASE` 可注入（默认值不变）。功能基线「缺口 #7」记着这条脚本**零冒烟覆盖**，
+  写盘判据从来没被执行过、只被 `node --check` 过；有了注入点才跑得动桩。
+  新增 `scripts/test-collect-roster.mjs`（进程内桩 + **异步** `spawn` 起真脚本，五格 S1–S5）
+  随每批闸门一起跑，输出 `ROSTER GUARD PASS (5/5 格)`。
+  红/绿两遍都跑了：旧判据在「坏旧文件 + 本次空」下 **rc=0 且把旧文件覆盖成 `chats=0`**（红）；
+  新判据 **rc=1、旧文件字节一字未动**（绿），另外两遍（无旧文件、旧文件可读且有群）在两版里都是绿的 ⇒
+  第十五轮那条合法降级和幂等合并没被这次收紧打死。
+  🔴 这套用例**首版自己也被第十九轮门槛判出不合格**（三条 LOW，全部核实为真）：桩用
+  `u.includes('/im/v1/chats')` 路由会连 `…/chats/<id>/members` 一起吞，且未建模接口回
+  `{code:0}` ⇒ 一旦某格真返回群，成员请求就会拿到一份"群列表"还被判成功（正是本套用例要防的
+  "绿机器"）；三格的群列表恒为空 ⇒「旧文件坏 + 本次有群」这一形态从未被跑过。修法与新增格见下一条。
+- **Windows 退出码坑（实测，非推测）**：在**已经发起过 HTTP 采集**之后调 `process.exit(1)`，
+  本机 Node 会走 libuv 断言中止（`Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`，
+  rc=3221226505）——行为仍然正确（不写文件、非零退出），但日志会被一句断言污染、退出码失真。
+  同一份文件只把这一行换成 `process.exitCode = 1; return` 就干净退 1。第十八轮只改了**新增的那条出口**，
+  第十九轮门槛（MEDIUM#2）指出**主失败路径 `main().catch` 仍是 `process.exit(1)`**——那条恰恰是
+  "发过 HTTP 之后"最常走到的出口，上一轮属于"改了文档里点名那条、漏了同源那条"；现已连同
+  `bots 为空` 那处一并改掉。没发过请求的入口检查（`找不到配置`/`没有带 appId/appSecret 的 bot`）
+  不受影响，保持原样。S5 这一格专门钉它：反证（把 catch 换回 `process.exit(1)`）当场复现
+  `rc=3221226505` + `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76`。
+
+### 第十九轮门槛（独立审查闸，跑在 X 定版字节上）：2 medium / 4 low，逐条核对全部为真
+
+报告 `output/code-review/dsh-feishucard-20261006-052512/REPORT.md`（WARN，fail-on high；5 文件；
+0 critical / 0 high / 2 medium / 4 low）。六条**逐条读源码核对，无一误报**，处置如下：
+
+- **MEDIUM#1 `collect_bot_roster.mjs:322`**——上一轮新加的 `oldRosterUnreadable` 拒写闸门
+  **嵌在** `if (!chats 为空)` 里面 ⇒ 只保护"一个群也没采到"。核对为真且比报告说的更完整：解析失败时
+  合并段（`for (… of Object.entries(old.chats || {}))`）**整段没跑**，所以"本次采到 1 个群"照样会
+  把旧名单里其余条目全部丢掉——与全空覆盖是同一个失效，只是半径小。文件头判据写的本来就是无条件不写
+  ⇒ 把闸门提到外面，实现与文档对齐；旧文件保持原字节（不复制、不改名，留原件才是可核对的取证对象）。
+- **MEDIUM#2 `collect_bot_roster.mjs:332`**——`main().catch` 仍是 `process.exit(1)`，同上一条副产物；
+  顺带把我自己核对出的同源处 `bots 为空`（同一函数里另一条发过请求后的出口）一并改 `exitCode`。
+- **LOW `index.js:7584`**——`fs_switch` 点击处 `evtBot || findBotForChat(chatId)` 的兜底是**死代码**
+  （`chatId` 与 `evtBot` 内部分支读的是同一个 `data.context.open_chat_id`：兜底能命中时 `evtBot` 早已
+  命中，命中不了时它自己也是 undefined）。留着比删掉更坏——条件一旦变化它就把本次刚删掉的
+  "按会话猜 ⇒ 恒取配置里第一个 bot"放回来 ⇒ 删成 `const ownerBot = evtBot`，与 `fs_demo_cancel`
+  等兄弟分支同形。
+- **LOW ×3 `scripts/test-collect-roster.mjs`**——桩的路由用 `includes('/im/v1/chats')`（连 members
+  一起吞）+ 未建模接口回 `{code:0}`（把"调错接口"洗成成功）+ 三格群列表恒空（新契约的另一半没被跑过）；
+  另有生命周期缺清理（`listen` 失败无 reject、`srv.close`/临时目录只在顺路执行）。全部落实：
+  路由改**锚定**正则、未建模接口回 HTTP 404 + 非零 code、`mode` 逐格注入、try/finally 收桩、
+  子进程 30 秒超时护栏，并新增 **S4**（旧文件坏 + 本次采到 1 个群 ⇒ 仍拒写、旧字节不动）与
+  **S5**（发过请求后接口抛错 ⇒ 干净 rc=1 且日志无 libuv 断言）。
+- **两趟字节级反证**（证明 S4/S5 不是空断言）：`output/negctrl-roster1.log` 只把闸门条件退回
+  `&& chats 为空` ⇒ `RC=1`、红的**恰好** S4 三条（`退出码 0（期望 1）`＋写盘后 `chats=1` 的部分覆盖被抓出），
+  S1/S2/S3/S5 照绿；`output/negctrl-roster2.log` 只把 catch 换回 `process.exit(1)` ⇒ `RC=1`、红的
+  **恰好** S5 两条，其余照绿。两趟恢复后 `collect_bot_roster.mjs` md5 与反证前逐字节一致
+  （`712e3b6e…`）。
+
+### 第二十轮门槛（独立审查闸，跑在 Y 定版字节上）：1 medium / 2 low，逐条核对全部为真
+
+报告 `output/code-review/dsh-feishucard-20261006-055056/REPORT.md`（**BLOCK**，fail-on medium；
+5 文件；0 critical / 0 high / 1 medium / 2 low；OCR 7m25s／5,194,701 tokens）。三条**逐条读源码核对，
+无一误报**，全部落在本版：
+
+- **MEDIUM `scripts/smoke.mjs:7145`（用例 100 的解引用没有守卫）**——核对为真。上面那条前置
+  `ok(Boolean(proc100b), …)` 是**软断言**（`ok()` 只记账不中断），而 `owner100 = proc100b` 之后被
+  `feedOn100`/`tapOn100` 无条件解引用做 `proc.output += …` ⇒ 次 bot 的 helper 通道缺失时抛未捕获
+  `TypeError`、**整轮冒烟当场崩**，用例 101–103 不再执行，失败被报成一次与原因无关的崩溃。
+  这一处正是第十八轮**故意**删掉 `|| fakeProc` 降级之后暴露出来的形状（删得对：不许把身份断言
+  洗成恒真；但删完没补"崩"与"红"的区别）。修法按报告建议：`proc100b || { output: '' }`——
+  空壳**没有任何 bot 语义**（不是 `fakeProc`，不接管事件），写进去的事件无人应答 ⇒ 由下面那条
+  「（前提）/switch 出在**第二个** bot 的身份上」报**受控的红**，再往里的断言被既有 `if` 跳过。
+- **LOW `index.js:7525`（`fs_model` 分支那截同形状死兜底）**——核对为真，且推翻了我上一版的推迟。
+  第十九轮把这条记为"本版不动"的理由是「不改行为，为它动 `index.js` 要整道闸门重跑 + 服务器多重启一次」；
+  但本次 MEDIUM 已经**必须**动 `scripts/smoke.mjs` ⇒ 闸门重跑已不可避免 ⇒ 推迟的代价归零，
+  而第十九轮自己写下的纪律（同判据不能只落一处 / 同形状的死兜底一并删净）要求现在就删。
+  惰性同样可证：本分支 `chatId` 与上面 `evtChatId` 读的是同一个 `data.context.open_chat_id`，
+  而 `evtBot` 内部已用同一个 id 调过 `findBotForChat` ⇒ `evtBot` 为空时那截兜底必然也为空。
+- **LOW `scripts/collect_bot_roster.mjs:341`（诊断互相遮蔽）**——核对为真。「上一版 roster 存在却读不出」
+  这句需要**人工**修复，但它排在 `bots 为空` 那道闸**之后**、两个出口各自 `return` ⇒ 两者同时成立时
+  操作员只看见「bots 缺失」，旧文件被静默保留。修法：诊断抽成 `reportUnreadableOldRoster()`，
+  两个出口都打。⚠️ 顺带核到一个报告没说全的事实：`!merged.bots.length` 这整道闸**当前不可达**
+  （配置里没有任何带 appId/appSecret 的 bot 时更早就 `exit(1)` 了，而循环里每个可用 bot 必然落一行
+  ——`bot/v3/info` 没给 open_id 是抛错走「采集失败」，不是静默跳过）。保留它的理由写在代码注释里：把文件头那句判据
+  实现成**无条件**断言，与第十九轮 MEDIUM#1 的收紧方向一致；它与 `index.js` 那类"留着更坏"的死兜底不同，
+  这条留着不改变任何行为。
+- **字节级反证（A25：用生产方式跑，不靠读代码下结论）**：同一处破坏（强行让次 bot 通道缺失）
+  分别跑修复后／修复前两种字节。
+  - **RUN1＝修复后字节**（`output/negctrl-smoke1.log`，3373 行；**单次干净运行**：全文 `SMOKE` 汇总行
+    1 个、用例标记 102 条且 `100)` 只出现 1 次 ⇒ 无并发写手）：`SMOKE FAIL: 4 assertion(s) failed`、
+    未捕获错误计数 **0**（`Cannot read properties of undefined`／`throw err` 均为 0）、
+    用例 **101／102／103 三条标记照常在**（第 3288／3320／3360 行）⇒ 整轮跑完，红是**受控红**。
+    四条红点名的正是被破坏的前置本身：①「（前提）第二个 bot 起了**自己的** helper 通道」（3274）、
+    ②「（前提）/switch 出在**第二个** bot 的身份上且卡上有「✕ 取消」`{"card":false,"btn":false}`」（3275）、
+    ③④演示卡出口两条（3278／3279）⇒ 夹具坏时判据**说得出坏在哪**，不再靠崩开来暴露。
+  - **RUN2＝修复前字节**（去掉 `|| { output: '' }` 守卫、同一处破坏，`output/negctrl-smoke2-clean.log`
+    3283 行、汇总 `output/negctrl-smoke.sum2.txt`）：`run2 rc=1`、未捕获 `Cannot read properties of
+    undefined` **1 次**（`throw err` 0 次）、**全文没有 `SMOKE` 汇总行**、最后一个用例标记停在
+    **100**（第 3261 行）⇒ 崩溃发生在 `feedOn100`（`smoke.mjs:7124`，被 `7154` 调用），
+    **用例 101／102／103 一条都没执行**（`later-case markers: 0`）。与 RUN1 的差别就是「红」与「崩」的
+    差别：**同一处破坏，修复前整轮作废，修复后只红四条且红话说得清楚**。
+    ⚠️ **第一次 RUN2 不作数、已重跑**（诚实记一笔，与闸门 W 同形状的错误在我自己身上复发）：我先前判定
+    "原 wrapper 被 `TaskStop` 杀掉了"是**错的**——它一直活着，RUN1 一结束就自己去打了第二处补丁并起了它自己的
+    RUN2 ⇒ 与我在 22:16 起的 z2 **两个冒烟进程并发写同一份 `negctrl-smoke2.log` 和同一份夹具配置**。
+    两次结果形状一致（都 rc=1、崩在 `feedOn100`、无后续标记），但**分不清哪一行是谁写的**，按闸门 W 的口径
+    等于没有证据 ⇒ 丢弃该 log，改用新文件名 `negctrl-smoke2-clean.log` + 新汇总 `sum2.txt`，
+    起跑前确认「无存活 smoke 进程 + 锁目录已释放」后**只起一次**。
+    🔴 这条也是 A24「看不到输出 ≠ 没在跑」的**第二次**发作（第一次记在闸门 W 那段）——教训没有因为记过就生效，
+    判据要落到机器上：**反证脚本从此自带 `mkdir` 锁 + 起跑前 `md5` 预检**（z2 已实现，RUN1 那份脚本没有）。
+
+### 定版闸门链（V 抓到缺陷 → W 作废 → X 曾定版 → Y 曾定版 → 第二十轮改动后由 **Z** 定版）
+
+- **V**（`output/gate080v.log`）：`RC=1`、2 处 ❌ —— 红的正是上面第一条那个产品缺陷
+  （用例 100 ①② 身份判据，删卡实得 `cli_test123456`、应为 `cli_second_bot100`），其余 12 步全绿。
+  为修 `index.js` 动了字节 ⇒ 依口径作废，但它作为"先红"的证据永久留在功能基线里。
+- **W**（`output/gate080w.log`）：作废理由**不是没跑绿**（`smoke080w.log` 也是 807 ✅ / 0 ❌），
+  而是这份 log 结构上不可信——全文两个 `STEP9`／两个 `DONE`、段序错乱：我先 `nohup` 起了一次
+  （当场读不到日志就误判"没起来"）、又用后台任务起了一次，两个闸门进程并发写同一条 log 与同一份
+  冒烟夹具配置 ⇒ 分不清哪一行是谁写的。**口径加严：闸门判据第一项是「单次干净运行」**。
+- **X**（`output/gate080x.log` / `bytes080x.txt`）：脚本加了 `mkdir` 进程锁
+  （`output/gate.lock.d`，锁在就 `exit 9`），单次干净运行 —— 17 步全 `RC=0`、**807 ✅ / 0 ❌**、
+  `SMOKE PASS (sentCards=507, sessions=33)`、三冷启动 `COLD PASS`、`ROSTER GUARD PASS (3/3 格)`、
+  `--selftest` 36/0、`test-fold-tables` ALL PASS、STEP0==STEP9；用例 100 三支身份断言逐条转绿
+  （实得均 `cli_second_bot100`）。曾据此定版，**第十九轮门槛的六条改动落在它之后 ⇒ 依同一口径作废**
+  （动了 `index.js` + `collect_bot_roster.mjs` + 夹具三处字节）。
+- **Y**（`output/gate080y.log` / `bytes080y.txt`，2026-10-06）：**曾据此定版**，与 X 同一套 17 步、
+  同一把进程锁，只把 roster 守护夹具由三格换成五格。**单次干净运行**（全文 1 个 `STEP9`、
+  1 个 `DONE`、20 个段标记按行号严格递增（`STEP0`→7 次 `node --check`→全量冒烟→三冷启动→
+  `npm run check`→打包→自测→折叠→五格守护→`resolve_actor`→`STEP9`→`DONE`）；锁生效——
+  脚本若发现锁目录已存在会 `exit 9` 拒跑，本次跑到了 `DONE` ⇒ 当时只有这一个闸门进程）。结果：17 步全
+  `RC=0`（`RC` 非 0 计数 0）、**807 ✅ / 0 ❌**（`cross-mark count: 0`）、
+  `SMOKE PASS (sentCards=507, sessions=33)`、三冷启动各 `COLD PASS`（form-off／notice-off／goal-off）、
+  `npm run check` 0、`check-packaging` 0、`--selftest` **36/0**、`test-fold-tables` **ALL PASS**、
+  **`ROSTER GUARD PASS (5/5 格)`**、`resolve_actor.py` 失败 0、**STEP0==STEP9**
+  （`bytes080y.txt` 与 log 第 257-264 行逐字节一致）。用例 100 的三支身份断言在 Y 仍然逐条转绿
+  （`smoke080y.log` 3284／3298／3304 行：DELETE、被拒后的降级 PATCH、`fs_demo_cancel`，
+  实得均 `cli_second_bot100`、且断言里显式写着「不得为 `cli_test123456`」）。
+  终态字节：`index.js 018fb384…`、`collect_bot_roster.mjs 712e3b6e…`、
+  `test-collect-roster.mjs e6451572…`、`package.json 0861efe0…`、`smoke.mjs 61bc7263…`、
+  `test-fold-tables.mjs f6263f40…`，`helper.cjs`／`identity-inject.mjs` 与闸门 U 逐字节一致。
+  ⚠️ `sentCards` 仍按既有口径只作背景（V=506／X=507／Y=507），不作核对项。
+  **第二十轮门槛的三条改动落在它之后 ⇒ 依同一口径作废**（动了 `index.js` + `scripts/smoke.mjs` +
+  `scripts/collect_bot_roster.mjs` 三处字节）。
+- **Z ＝ 0.8.2 定版**（`output/gate080z.log` / `bytes080z.txt`，2026-10-06）：与 Y 同一套 17 步、
+  同一把进程锁，一步没减。
+  - **单次干净运行**：`gate080z.log` 全文 `STEP0`／`STEP9`／`DONE` 各 **1 个**，段标记按行号严格递增
+    （第 2 行 `STEP0` → 4/7/10/13/16/19/22 七个 `node --check` → 25 全量冒烟 → 31/64/89 三冷启动 →
+    113 `npm run check` → 120 打包 → 133 自测 → 181 折叠 → 216 五格守护 → 240 `resolve_actor` →
+    256 `STEP9` → 266 `DONE`）；锁 `output/gate.lock.d/pid`（实测 pid=1274）在跑、跑完自行释放
+    （脚本见锁已存在会 `exit 9` 拒跑 ⇒ 本次只可能有一个闸门进程）。起讫 06:37:03–06:47:19（+0800）。
+  - **17 步全 `RC=0`**（`RC` 非 0 计数 **0**）、全量冒烟 **807 ✅ / 0 ❌**（`output/smoke080z.log`，
+    闸门 log 自身 `❌` 计数也是 0）、`SMOKE PASS (sentCards=507, sessions=33)`、
+    三冷启动各 `COLD PASS`（form-off 第 61 行／notice-off 86／goal-off 110）、`npm run check` ✅、
+    `check-packaging` 打包完整性 ✅（`dsh-feishucard@0.8.2`，递归 4 文件）、
+    `identity-inject --selftest` **36 绿 0 红**、`test-fold-tables` **ALL PASS**、
+    **`ROSTER GUARD PASS (5/5 格)`**、`resolve_actor.py` 自测失败 **0**。
+  - **STEP0 == STEP9**：`diff output/bytes080z.txt`（STEP9 段）逐字节一致，8 个文件全等 ⇒ 跑完之后
+    字节没再动过（这条是"定版"两个字的机器判据）。
+  - 终态字节：`index.js 2d992282…`、`scripts/smoke.mjs f6ca0397…`、
+    `scripts/collect_bot_roster.mjs 7deb957a…`、`helper.cjs 62ac162d…`、
+    `identity-inject.mjs ccacd1b1…`、`package.json 0861efe0…`、`test-fold-tables.mjs f6263f40…`、
+    `test-collect-roster.mjs e6451572…`（后两个与 Y 相同；`helper.cjs`／`identity-inject.mjs` 仍与
+    闸门 U 逐字节一致）。
+  - **用例 100 的"先红后绿"闭环到 Z 为止**：同一支判据在 V（未修字节）红 2 处 ⇒ X 首次转绿 ⇒
+    Y 删掉 `fs_switch` 死兜底后保持绿 ⇒ **Z 删掉 `fs_model` 同形状兜底后仍然绿**，三支身份断言逐条
+    实得 `cli_second_bot100`（`smoke080z.log` 3283／3296／3302 行：DELETE、被拒后的降级 PATCH、
+    `fs_demo_cancel`，3283 那条断言里显式写着「期望 cli_second_bot100 且不得为 cli_test123456」），
+    三条前置也各自在绿（3274「第二个 bot 起了自己的 helper 通道」、3276「卡真挂在第二个 bot 上且按钮在」
+    ＋ 3288「第二次 /switch 照常出在第二个 bot 上」）⇒ 判据辨得出身份，不是恒真。
+  - ⚠️ `sentCards` 仍按既有口径只作背景（V=506／X=507／Y=507／Z=507），不作核对项。
+
+### 本轮发现但**不在本版修**的（如实记，不当已修）
+
+- `fs_plan_goal`（计划卡「设为目标」）那条**点击→建目标**的行为验证仍然缺：它本来就只断言卡片形状
+  （按钮带 `fs_plan_goal`），没有"点下去 ⇒ 目标开在哪个 bot 的会话上"的断言。本版把它的两处
+  `findBotForChat` 统一成 `record.bot || evtBot`（与同分支 PATCH 卡片同一个身份），**判据改了但
+  行为没验过**——补法是复用双 bot 夹具点一次并断 `goals.create` 收到的 agent 属于第二个 bot。
+  已写进功能基线对应行的"未被覆盖的同类落点"，不假装已闭环。
+
+- 托孤队列的 `CARD_RELAY_TTL_MS`（60 秒）与退避窗口 `retryUntil`（夹具里也是 60 秒）两个时限打架，
+  且退避闸门排在两处 TTL 之前 ⇒ 退避中的条目不受 TTL 约束；真正会**丢内容**的只有「下一代在 60 秒内
+  始终解析不到该会话的 bot」那一条出口。已逐行核对到出口、写进功能基线**缺口 #10**（含 A/B 两个
+  修法与所需的先红后绿用例），并投中台 **#31** 待 CM 裁决终态语义——按 0.8.1 的口径这不值得为它
+  再动 `index.js` 一次（动一次就要重跑一整道闸门 + 一次服务器重启）。
+
+- **第二十一轮门槛（`output/code-review/dsh-feishucard-20261006-064810/`，**PASS**：0 critical /
+  0 high / 0 medium / **5 low**，fail-on medium）在闸门 Z 之后抓到的 5 条**逐条核对结果**——
+  按既有口径 low 不作废定版（medium+ 才动字节），全部记在这里不当已修：
+  - **LOW#1 `collect_bot_roster.mjs:62`（核对为真，安全类）**：`FS_OPEN_API_BASE` 这个注入点决定
+    `appId`/`appSecret` 被 POST 到**哪台主机**，而覆盖时**没有任何提示**——共享 shell 配置、CI
+    包装或误配置都会把凭证静默发走。修法：基址不等于默认值时打一行警告（或要求显式 opt-in 才允许
+    覆盖）。**不修的理由不是"不会发生"，是"修它要动这 8 个字节里的一个"** ⇒ 排 0.8.3。
+  - **LOW#2 `collect_bot_roster.mjs:342`（核对为真，但本局已裁决过）**：`!merged.bots.length`
+    这道闸在当前代码里走不到——这一条**我自己已经写在 336-341 行的注释里**（连同"为什么仍保留：
+    把文件头那句判据实现成无条件断言"的理由）。门槛建议"删掉或改成显式断言"，与已有裁决冲突，
+    **维持现状**，不再动。
+  - **LOW#3 `test-collect-roster.mjs:153`（核对为真）**：`3221226505` 裸魔数写在断言里，含义只活在
+    相邻注释。修法：提一个具名常量。
+  - **LOW#4 `test-collect-roster.mjs:148`（核对为真，但方向要反过来看）**：断言抄的是采集器里的整句
+    中文诊断，改措辞即假红。这一条**是第二十轮 LOW 要求的对偶产物**——那次要求"两个出口的诊断都要
+    看得见"，而看得见只能靠匹配文案。门槛说的"退出码 + 字节比对已经钉住行为"没错，但钉不住
+    "诊断有没有互相遮蔽"。修法：文案换成一个刻意稳定的短标记（如 `[roster-old-unreadable]`），
+    既不被措辞绑架也不丢判据。
+  - **LOW#5 `collect_bot_roster.mjs:300`（核对为真，这一条最该修）**：`catch {` 不带参数，而 `try`
+    的范围**不只是读+解析**——从 267 行一路包到 299 行的三个合并循环。所以"文件读出来了、但内容
+    不是预期形状"（如 `old.bots` 是个数字 ⇒ `for...of` 抛 TypeError）会被打上**「解析失败（文件在但
+    读不出）」**这个错标签，真异常因为没绑定而直接丢掉。这正是本轮想把"诊断"做成可信物的那件事本身。
+    修法：`catch (e)` 带上 `e.message`，或把 `try` 收窄到 `readFileSync`/`JSON.parse` 两句。
+    ⚠️ **如实记**：这条与 LOW#1 一样会动 `collect_bot_roster.mjs` 的字节 ⇒ 动了 Z 就作废，
+    所以排 0.8.3 批次一起做，不在本版偷改。
+
 ## [0.8.1] - 2026-10-06
 
 本版**没有新功能**，是把 0.8.0 定版（闸门 Q）之后连跑的**三道**独立审查门槛（第十五次

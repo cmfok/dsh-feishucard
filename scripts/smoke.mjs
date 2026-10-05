@@ -7089,9 +7089,21 @@ console.log('100) ★🔴 「✕ 取消」的真删卡分支必须可达：DELET
   //   `httpJson` 把它当成网络失败（status 0）⇒ `deleteMessage` 恒 false ⇒ CM 按「✕ 取消」
   //   之后的**成功出口**（把消息删掉）在冒烟里从来没被执行过，能绿的只有降级 PATCH。
   //   按 A25 的口径：被测代码的出口必须用生产的方式跑到，不能由夹具替它决定走哪条。
-  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
-    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
-             reactionEmoji: 'GLANCE', approvalForm: true }],
+  // 🔴 第十八轮门槛（LOW，核对为真）：**单 bot** 配置下 `dels[0].app === APP_ID` 是恒真的——
+  //   「这张卡的主人」和「唯一那个已连接 bot」在夹具里是同一个对象 ⇒ 真把身份来源写错
+  //   （比如永远取配置里第一个 bot）照样绿。改按用例 78/81 的双 bot 形态：卡挂在**第二个**
+  //   bot 上、点击也从**第二个** bot 的通道进来（这就是真机形状：卡片回调只投给建卡的那个应用），
+  //   `app` 才真的能分辨身份来源。第一个 bot 仍在配置里且排在前面，所以"取第一个"这种
+  //   错误实现会被断言抓红。
+  const CFG100 = join(process.env.FS_CONFIG_DIR, 'feishu.config.json')
+  const APP2_100 = 'cli_second_bot100'
+  writeFileSync(CFG100, JSON.stringify({
+    bots: [
+      { name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+        reactionEmoji: 'GLANCE', approvalForm: true },
+      { name: 'smoke2', workspace: WORKSPACE, appId: APP2_100, appSecret: 'secret-100b',
+        reactionEmoji: 'GLANCE', approvalForm: true },
+    ],
   }, null, 2))
   for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
   effectCleanups.length = 0
@@ -7105,14 +7117,48 @@ console.log('100) ★🔴 「✕ 取消」的真删卡分支必须可达：DELET
     { version: 0, id: 'sess-100aaaa1111', createdAt: Date.now() - 3600e3, cwd: WORKSPACE },
     { version: 0, id: 'sess-100bbbb2222', createdAt: Date.now() - 1800e3, cwd: OTHER_WORKSPACE },
   ]
+  const proc100b = extraProcs.get(APP2_100)
+  ok(Boolean(proc100b), '（前提）第二个 bot 起了**自己的** helper 通道（否则"卡主人"与"唯一已连接 bot"仍是同一个，身份断言会退回恒真）')
+  // 指到**指定 bot 的连接**上收发（`feedInbound`/`tapValue` 只认 fakeProc＝配置里的第一个 bot）
+  const feedOn100 = (proc, msgId, text) => {
+    proc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: { message_id: msgId, message_type: 'text', chat_id: CHAT_ID, chat_type: 'p2p',
+          content: JSON.stringify({ text }) },
+        sender: { sender_id: { open_id: 'ou_test' } },
+      },
+    }) + '\n'
+  }
+  const tapOn100 = async (proc, value, msgId) => {
+    proc.output += JSON.stringify({
+      type: 'event', eventType: 'card.action.trigger',
+      data: {
+        action: { tag: 'button', value },
+        context: { open_chat_id: CHAT_ID, ...(msgId ? { open_message_id: msgId } : {}) },
+      },
+    }) + '\n'
+    await drain()
+  }
+  // 🔴 故意**不**做 `|| fakeProc` 的降级：次 bot 通道没起来时这条用例应当报红，
+  //   而不是静默退回单 bot 形态把身份断言重新变成恒真。
+  // 🔴 第二十轮门槛 MEDIUM（核对为真）：但上面那条前置是**软断言**（`ok()` 不中断执行），
+  //   原来这里直接解引用 `proc100b` ⇒ 通道缺失时 `proc.output += …` 抛未捕获 TypeError、
+  //   **整个冒烟当场崩**，用例 101–103 不再执行，失败被报成一次无关崩溃而不是受控的红。
+  //   ⇒ 空壳只补「取不到就崩」这一个洞：它是 `{ output: '' }`，**没有**任何 bot 语义，
+  //   事件写进去不会有人应答 ⇒ 下面那条「（前提）/switch 出在**第二个** bot 的身份上」
+  //   自然报红、后续断言被 `if (cancelBtn100 && wsCard100)` 跳过 = 受控红，不是恒真。
+  const owner100 = proc100b || { output: '' }
   // ---- ① 成功出口：DELETE 打到这张卡的 message_id，且**不再** PATCH/另发 -------
   const markWs100 = sentCards.length
-  feedInbound('om_switch100_ws', '/switch')
+  feedOn100(owner100, 'om_switch100_ws', '/switch')
   await settle(4)
   const wsCard100 = lastCardFrom(markWs100)
   const cancelBtn100 = wsCard100 ? allButtons(wsCard100).find((b) => b.value && b.value.fs_level === 'cancel') : undefined
-  ok(!!wsCard100 && !!wsCard100.msgId && !!cancelBtn100,
-    '（前提）/switch 出卡且卡上有「✕ 取消」（' + JSON.stringify({ card: !!wsCard100, msgId: wsCard100 && wsCard100.msgId, btn: !!cancelBtn100 }) + '）')
+  ok(!!wsCard100 && !!wsCard100.msgId && !!cancelBtn100 && wsCard100.app === APP2_100,
+    '（前提）/switch 出在**第二个** bot 的身份上且卡上有「✕ 取消」（'
+      + JSON.stringify({ card: !!wsCard100, app: wsCard100 && wsCard100.app,
+        msgId: wsCard100 && wsCard100.msgId, btn: !!cancelBtn100 }) + '）')
   if (cancelBtn100 && wsCard100) {
     const delMark100 = messageDeletes.length
     const cardMark100 = sentCards.length
@@ -7123,15 +7169,16 @@ console.log('100) ★🔴 「✕ 取消」的真删卡分支必须可达：DELET
     //   会起真回合）⇒ 将来任何让 `/switch` 起回合的改动都会把这条红成"取消有问题"。
     //   基线和其余三个 mark 同点位取，断言才只归因于这一次点击。
     const sentMark100 = agent.sent.length
-    await tapValue(cancelBtn100.value)
+    await tapOn100(owner100, cancelBtn100.value)
     await settle(3)
     const dels100 = messageDeletes.slice(delMark100)
     ok(dels100.length === 1 && dels100[0].msgId === wsCard100.msgId,
       '★★★ 取消真的发出一次 DELETE，删的就是这张卡（msgId=' + dels100.map((d) => d.msgId).join(',')
         + '，期望 ' + wsCard100.msgId + '）')
-    ok(dels100.length === 1 && dels100[0].app === APP_ID,
-      '★★ 删卡用的是**这张卡的主人**那个应用的身份（跨应用删别人的消息必被拒）｜实得 '
-        + dels100.map((d) => d.app).join(','))
+    ok(dels100.length === 1 && dels100[0].app === APP2_100,
+      '★★★ 删卡用的是**这张卡的主人**（挂在配置里第二个 bot 上）那个应用的身份，'
+        + '不是"取配置里第一个 bot"（跨应用删别人的消息必被拒）｜实得 '
+        + dels100.map((d) => d.app).join(',') + '，期望 ' + APP2_100 + ' 且不得为 ' + APP_ID)
     const after100 = sentCards.slice(cardMark100)
     ok(after100.length === 0,
       '★★ 删成功后不再 PATCH、也不再另发一条提示（CM 的口径是「卡片撤销掉」，不是多一条消息）｜实得 '
@@ -7143,20 +7190,24 @@ console.log('100) ★🔴 「✕ 取消」的真删卡分支必须可达：DELET
     // ---- ② 被拒出口：飞书不删（权限/已撤回）⇒ 降级把这张卡改成「已取消」 ---------
     failDeletes = 1
     const markWs100b = sentCards.length
-    feedInbound('om_switch100_ws2', '/switch')
+    feedOn100(owner100, 'om_switch100_ws2', '/switch')
     await settle(4)
     const wsCard100b = lastCardFrom(markWs100b)
     const cancelBtn100b = wsCard100b ? allButtons(wsCard100b).find((b) => b.value && b.value.fs_level === 'cancel') : undefined
-    ok(!!wsCard100b && !!cancelBtn100b, '（前提）第二次 /switch 照常出卡（降级分支的靶心）')
+    ok(!!wsCard100b && !!cancelBtn100b && wsCard100b.app === APP2_100,
+      '（前提）第二次 /switch 照常出在第二个 bot 上（降级分支的靶心）｜app='
+        + (wsCard100b && wsCard100b.app))
     if (cancelBtn100b && wsCard100b) {
       const logMark100b = consoleLines.length
       const delMark100b = messageDeletes.length
-      await tapValue(cancelBtn100b.value)
+      await tapOn100(owner100, cancelBtn100b.value)
       await settle(3)
       ok(messageDeletes.slice(delMark100b).length === 1, '（前提）这一支确实也试过 DELETE（只是被拒）')
       const patch100b = cardsSince(markWs100b).find((c) => c.op === 'update' && c.msgId === wsCard100b.msgId)
-      ok(!!patch100b && JSON.stringify(patch100b.payload).includes('已取消'),
-        '★★★ 删不掉 ⇒ 就地 PATCH 成「已取消」，不留一张还能点的旧卡')
+      ok(!!patch100b && JSON.stringify(patch100b.payload).includes('已取消')
+        && patch100b.app === APP2_100,
+        '★★★ 删不掉 ⇒ 就地 PATCH 成「已取消」，不留一张还能点的旧卡（PATCH 也走在**主人**'
+          + '那个 app 上｜实得 ' + (patch100b && patch100b.app) + '）')
       ok(consoleLines.slice(logMark100b).some((l) => l.includes('cancelled (patched to cancelled state)')),
         '★★ 降级出口有留痕（可日志复验，不靠读代码）')
     }
@@ -7164,16 +7215,36 @@ console.log('100) ★🔴 「✕ 取消」的真删卡分支必须可达：DELET
   }
 
   // ---- ③ 演示/候选卡那条独立通道（fs_demo_cancel）------------------------------
+  // 🔴 同样从**第二个 bot** 的通道点进来：这条分支删的是事件里 `open_message_id` 直传的那条
+  //   消息（不查 pendingSwitchCards ⇒ 没有 `record.bot` 可用），身份判据只能来自连接自带的 bot
+  //   —— 第十八轮同类排查发现这里也写着 `findBotForChat(chatId)`（同 `fs_switch` 那条同源缺陷），
+  //   改成 `evtBot` 后必须有这条断言，否则又是"改了就算好"。
   const delMark100c = messageDeletes.length
-  await tapValue({ fs_demo_cancel: true },
-    { user_id: '', open_id: 'ou_human_85', union_id: 'on_cm' }, CHAT_ID, 'om_demo_card_100')
+  await tapOn100(owner100, { fs_demo_cancel: true }, 'om_demo_card_100')
   await settle(3)
   const dels100c = messageDeletes.slice(delMark100c)
   ok(dels100c.length === 1 && dels100c[0].msgId === 'om_demo_card_100',
     '★★ 演示卡的「✕ 取消」删的是**事件里那张**（open_message_id 直传，不查 pendingSwitchCards）'
       + '｜实得 ' + dels100c.map((d) => d.msgId).join(','))
+  ok(dels100c.length === 1 && dels100c[0].app === APP2_100,
+    '★★★ 演示卡那条出口也用**收到事件的连接 bot**（不是按会话猜 ⇒ 恒取配置第一个）'
+      + '｜实得 ' + dels100c.map((d) => d.app).join(','))
   persistedSessions = []
   liveAgents.length = 0
+  // 收尾：回到单 bot 配置 + 清掉次 bot 通道（用例 78/81 同口径），后面的用例不受本次换代影响
+  writeFileSync(CFG100, JSON.stringify({
+    bots: [{
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: true,
+    }],
+  }, null, 2))
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const mod100b = await import('../index.js')
+  mod100b.apply(ctx)
+  await settle(2)
+  extraProcs.clear()
 }
 
 console.log('101) ★🔴 命令锚点要认**三种**文本形态：占位符 / `@名字` / 裸名字紧跟命令（第十五轮门槛 MEDIUM#3）')
