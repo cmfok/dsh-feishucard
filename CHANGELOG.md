@@ -882,6 +882,34 @@ CM 原话（三件事一起）：「自动视图的话先把它删掉」「我�
 闸门 Q 日志 `output/gate080q.log`）；定版闸门 = **Q**，字节清单 `output/bytes080q.txt`。
 
 
+### 部署记录（2026-10-06 01:04 UTC · 清单#4 已完成，全部为实测输出）
+
+执行 `output/server-inspect-20261004/step44-deploy-080.sh`（日志 `output/step44-deploy-080.log`）：
+
+- **第 0 步字节闸门**：本地 5 个运行态文件 md5 逐项等于闸门 Q 清单（`output/bytes080q.txt`）⇒ 放行。
+- **覆盖**：10 份副本（`/srv/aiad` ×1、`/opt/dshprof` ×1、`/home/ubuntu` ×1、`/home/agt*` ×7），
+  每类文件**只剩一个 md5**（`index.js e183c3e8`／`helper.cjs 62ac162d`／`identity-inject.mjs ccacd1b1`／
+  `package.json 0f3826c2`／`collect_bot_roster.mjs 7021a48f`），每份 `package.json` 版本号 10 × `0.8.0`；
+  旧字节各自留 `.bak-pre080`。`scripts/collect_bot_roster.mjs` 在 8 份旧副本里原本不存在，由第 2b 步补建。
+- **重启**：`systemctl restart dsh-feishu-aiad dsh-feishu` 一次（改动攒批），两实例 `active`；
+  两边同刻打出 `[fs] plugin apply #1 v0.8.0 md5=e183c3e8 bytes=582560` ⇒ **真跑的是 Q 的字节**（A25）。
+- **上线校验**：长连接 aiad **4/4**、main **1/1**；`drain error` 0；重启后 `error|throw|unhandled|ENOENT`
+  行数 0；helper 5 条命令行**全部** `--cred <文件>` 形态、明文凭证行数 0 ⇒ 0.7.22 的 appSecret 止血
+  这次才真正在线上生效。
+  🔴 **长连接基数纠正**：交接材料（中台 #18/#20/#21）写的"aiad 7 bot"不成立 —— 服务器上
+  `/srv/aiad/.dsh-feishucard/feishu.config.json` 实测 `bots` 长度 **4**（hr / analyst / okr / knowledge），
+  凭证文件与 `state-*.json` 也各 4 份，且与 4 条长连接的 app id 一一对应。以后按 4 判"齐全"。
+- **留痕**：`/root/OPS_CHANGELOG.md` 已追加一行（UTC 时间 + 版本 + 五个文件 md5 + 操作者 `HOME#Qoder`）。
+- **本次实测暴露并修掉的 2 处脚本判据缺陷**（都属于"判据写错 ⇒ 绿的是夹具"同族）：
+  ① 第 3 步用 `[ -f "$d/identity-inject.mjs" ]` 以 **ubuntu 身份**去 stat 别人的 profile 目录，
+  权限不足时判据为假 ⇒ 8 份副本被误报「identity-inject.mjs 缺失」（实际 `sudo test -f` 全部存在、
+  `sudo node --check` 四个文件全 OK）。改为 `sudo -n test -f`。
+  ② 第 4 步用 `pgrep -u <user> -f helper.cjs | wc -l` 计数，打出 main=3 而 `ps` 实数 1 ⇒ 计数不可信。
+  改为逐条打印 `pid/user/lstart/args`，判据变成"每个 bot 一条且启动时间都在本次重启之后"
+  （旧时点残留＝restart 没收回，一眼可见）。
+- **仍未做**：五个回归场景（单聊/群 @/无 @ 丢弃/`/switch`/审批卡）要真人发消息；
+  互认三档开关（`identityGuard` / roster / `groupRelay`）保持默认关，等取证再逐个放开。
+
 ### 已知未完成（本次未做，见交接清单）
 
 - **`/model` 卡片点击的"真机点一次"证据**（第十四轮）：本机活实例已复验到"影子路由已过滤 ＋
@@ -890,7 +918,10 @@ CM 原话（三件事一起）：「自动视图的话先把它删掉」「我�
   2026-10-05 口径：**服务器那台还没公开给用户用，"没人点"是预期，不是缺陷，也不作为部署门槛**；
   部署后同一判据（日志 `[fs] /model: selectModel ok <provider>/<model> session=…` ＋ 一条对
   同一 `message_id` 的 PATCH）随用随取。
-- 本包**尚未 commit、未推 GitHub、未发 npm、未上服务器**（清单#1/#4 需维护者确认后执行）。
+- ✅ **已 commit、已推 GitHub、已整包上服务器（2026-10-06，清单#1/#4 均已完成）**：
+  commit `d16fc22` ＋ tag **`v0.8.0`** 已推到 `origin/master`（`git ls-remote` 复核两处指向同一
+  commit）；**未发 npm**（本轮无此要求，服务器走整包文件覆盖，不依赖 registry）。
+  部署执行与取证见下一节「部署记录」。
 - 🔴 **服务器现状已实测纠正（2026-10-05，本会话 SSH 只读侦察）**：交接材料（中台 #18/#20/#21）
   写的"线上仍是 0.7.19"**不成立**。实测 10 份副本全部为同一字节 —— `index.js md5=a23a235e4055…`
   ＝本地提交 `bd5421c`（0.7.21 那批）的字节，`helper.cjs 5496e7cddc5c…`、
@@ -900,7 +931,9 @@ CM 原话（三件事一起）：「自动视图的话先把它删掉」「我�
   服务器侧也**已有** `identity-inject.mjs`（step43 补它这一条仍成立 —— 覆盖时不带上就会跑旧内核，
   但它确实存在）。本包发布时若仍按"从 0.7.19 起跳"写回归预期，会把已经在线上生效的行为
   当成新行为去验，白占一轮验收位。
-- 服务器至今是**单文件覆盖**的历史做法 —— 本版要求整包覆盖（清单#4）。
+- **整包覆盖已落地（2026-10-06）**：历史上服务器是**单文件覆盖**的做法，本版由
+  `step44-deploy-080.sh` 一次把五个运行态文件同批覆盖到 10 份副本 ⇒ 每类文件只剩一个 md5
+  （取证见下一节「部署记录」）。
 - **整包部署脚本 `step43-deploy-fullpackage.sh` 原批少了 `identity-inject.mjs`**（2026-10-05
   本机核对时发现并已修正脚本，**未执行、未碰服务器**）：`index.js:29` 在模块加载时
   `import … from './identity-inject.mjs'`，而该脚本的 `FILES` 只有 `index.js helper.cjs
