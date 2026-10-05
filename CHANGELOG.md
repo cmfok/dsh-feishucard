@@ -205,6 +205,36 @@ STEP0 与 STEP9 两次 `md5sum` 逐项一致 ⇒ 整轮无漂移（`output/gate0
 始终解析不到该会话的 bot，这张卡的终态就永久丢弃只留一行日志（结论卡会额外打 `CONCLUSION LOST`，
 `index.js:354`）⇒ 已按 A32 投中台跟进，本批不动字节。
 
+### 部署记录（2026-10-06 04:02 服务器本地时间 = 20:02 UTC · 清单#4 已完成，全部为实测输出）
+
+执行 `output/server-inspect-20261004/step45-deploy-081.sh`（日志 `output/step45-deploy-081.log`）：
+
+- **第 0 步字节闸门**：本地 5 个运行态文件 md5 逐项等于闸门 U 清单 ⇒ 放行；上传后服务器
+  `/tmp/pkg-0.8.1` 里五件 md5 与本地逐项一致（整 32 位可见）。
+- **覆盖**：10 份副本（`/srv/aiad` ×1、`/opt/dshprof` ×1、`/home/ubuntu` ×1、`/home/agt*` ×7），
+  每类文件**只剩一个 md5**（`index.js e53bec16`／`helper.cjs 62ac162d`／`identity-inject.mjs ccacd1b1`／
+  `package.json b410934c`／`collect_bot_roster.mjs a3f21aa2`），每份 `package.json` 版本号 10 × `0.8.1`，
+  各副本 `node --check` 全 OK 且 `identity-inject.mjs` 十份全在；旧字节各自留 `.bak-pre081`
+  （🔴 后缀必须换：`.bak-pre080` 已在服务器上，旧写法会因文件已存在而**跳过备份** ⇒ 服务器上
+  0.8.0 那份字节一个字都不留底，回滚只能靠重新上传）。`scripts/collect_bot_roster.mjs` 由第 2b 步
+  在 8 份私有 profile 里补建。
+- **重启**：`systemctl restart dsh-feishu-aiad dsh-feishu` 一次（改动攒批、不逐个 bot 重启），
+  两实例 `active`；helper 5 条进程启动时间**全部**在本次重启之后（04:02:34）⇒ 没有旧时点残留。
+- 🔴 **运行期字节证明（A25「用生产的方式跑」）**：两个实例同刻打出
+  `[fs] plugin apply #1 v0.8.1 md5=e53bec16 bytes=589906` ⇒ 服务器真跑的就是 U 那份字节，
+  不是"上传了但没加载"。这是本批唯一能把"仓库=本地=线上"钉死的证据链。
+- **上线校验**：长连接 aiad **4/4**、main **1/1**；`drain error` 两边各 **0**；helper 命令行
+  **全部** `--cred <文件>` 形态、明文凭证行数 **0**（0.7.22 的 appSecret 止血在线上持续生效）。
+- **留痕**：`/root/OPS_CHANGELOG.md` 已追加一行（`2026-10-05 20:03 UTC | dsh-feishucard 整包覆盖
+  0.8.1 + 重启 dsh-feishu-aiad/dsh-feishu | 操作者=HOME#Qoder | 本地字节: 五件 md5`）。
+- **三方字节一致（本轮实测，不是推定）**：Git 仓库 blob（`git show :index.js` 的 md5）＝工作树＝
+  闸门 U 清单＝服务器十份副本＝运行期自报，全部 `e53bec16`；commit `627d009` ＋ tag **`v0.8.1`**
+  已推 `origin/master`（`git ls-remote` 复核 `refs/heads/master` 与 `refs/tags/v0.8.1` 指向同一 commit）。
+- **仍未做**：五个回归场景（单聊/群 @/无 @ 丢弃/`/switch`/审批卡）要真人发消息；互认三档开关
+  （`identityGuard` / roster / `groupRelay`）保持默认关。CM 2026-10-06 口径：**服务器还没公开给用户用，
+  "没人点"是预期而非缺陷，不作为部署门槛**。中台挂账：#27（identityGuard 线上全关）、
+  #28（服务器 AIAD 桥 bot 摘除）、#29（裁决回写纪律）、**#31**（本轮新发现的两个 60 秒互相打架）。
+
 ## [0.8.0] - 2026-10-05
 
 本版按 CM 2026-10-05 的裁决成型：把「agent 互认」三档（P0/P1/P2）与**尚未发布的 0.7.22 批次**
