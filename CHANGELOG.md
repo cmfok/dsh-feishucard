@@ -282,7 +282,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ——逐单元取 `User=`、按 unit 注入的 `FS_CONFIG_DIR` 遍历运行态文件，四条约查（可写／config 组外不可读／
   目录无组外穿越位／**运行态文件对同机其他用户实测不可达**）。第④条特意用 `sudo -u <probe> test -r` **实测**
   而不是读权限位。首跑存档 `output/step47-perms.log`：**违规 3 处／偏松告警 14 处，退出码 1**。
-  14 处告警逐一试读后**温为不可达**（`/home/ubuntu` 是 `drwxr-x---` 750、aiad 侧目录 700）⇒ 按"只看位就报泄露"
+  14 处告警逐一试读后**实测全部不可达**（`/home/ubuntu` 是 `drwxr-x---` 750、aiad 侧目录 700）⇒ 按「只看位就报泄露」
   会虚报 14 条真泄露，这正是第④条必须实测的理由。首跑同时抓到**第三条 #39/#40 未覆盖的新事实**：main 单元
   配置目录 **775**、其下 9 个 `state-*.json` 与 `message-index.json` 全 **644**（会话内容对 others 全开，
   形态与 #40 同族——靠上一层目录挡着）⇒ 已投中台 **#42**（medium）；修法一条 `chmod 700/600`，
