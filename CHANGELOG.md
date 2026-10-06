@@ -13,8 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 `/root/OPS_CHANGELOG.md`，事后已把线上模型状态复原。
 
 ⚠️ **先说清楚"切换失败"的真实形状**，因为症状和根因不是一回事：
-**切换主干在 0.8.2 已经修好并生产验证过**（点击 → 真调宿主 `sessionController.selectModel`
-→ 结果 PATCH 回同一张卡；0.8.1 那条 `session.append('model/selection')` 假成功路径已删）。
+**切换主干在 0.8.2 已经修好**（真调宿主 `sessionController.selectModel` → 结果 PATCH 回同一张卡；
+0.8.1 那条 `session.append('model/selection')` 假成功路径已删）。🔴 **但"生产验证过"这句话按出口分开算，不能整条盖**
+（2026-10-06 16:4x 复核自己写的这句话后更正）：**文字档入口有生产实证**（`/model provider/model`
+→ 服务器日志 `selectModel ok`、`current` 随之变化，本次 0.8.3 复验再次拿到）；**点击入口至今零实证**——
+服务器 journal 里 `/model click` 计数 **0**（线上没人点过），本机活实例最后一条 `/model click`
+（`web.log:93879`）走的还是**旧字节的假成功路径**（下一行就是 `append(model/selection)`），那之后实例
+已重载到 v0.8.3（`plugin apply #40 md5=c73d76f2`）但再没有点击事件发生过。⇒ 点击⇒同卡 PATCH
+只有冒烟用例 99/104 的本地证据 + 反证非恒真，**如实记为未取证**，不冒充"生产验证过"。
 CM 看到的"从来没切换成功"，剩下的是**三个边界缺陷**——三个都会让用户以为"点了没反应"，
 但没有一个在切换主干上。本版修的就是这三个。
 
