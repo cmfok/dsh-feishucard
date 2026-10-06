@@ -33,7 +33,7 @@ CM 看到的"从来没切换成功"，剩下的是**三个边界缺陷**——�
 - **③ 失败回执是宿主的英文原文**：宿主抛的是 `Select an available model before sending a message.`，
   旧行为把这句话直接甩进卡面 ⇒ 用户既看不懂也不知道下一步；而且**文字档分支一行日志都不打**
   ⇒ 服务器侧无法取证。新增 `modelSwitchFailureText()`：可识别的宿主报错翻成中文并给下一步，
-  英文原文**只进日志**（`[fs] /model 切换失败(文字档): …`）；认不出的错误**原样透出**，
+  英文原文**只进日志**（终态标签 `[fs] /model 文字档无法解析: arg=…`，改名理由见下面第二十一轮那条）；认不出的错误**原样透出**，
   不编造话术（不假装知道）。
 
 ### 验证
@@ -153,6 +153,36 @@ verdict＝**PASS**（0 critical / 0 high / 0 medium / **1 low**；报告
   （log 停在冒烟段、无 `SMOKE` 行）⇒ 那次不作数；改用 `Start-Process` 脱离进程会话重跑才拿到上面这份。
   这正是 A28「长任务必须脱离进程启动」的反面教材，记下来防再犯。
 - **部署脚本 `step49` 的期望值读 `bytes083ab.txt`**（默认值已从 `bytes083aa.txt` 改过来，不硬抄 md5）。
+
+### 上线与真机复验（2026-10-06 16:09 部署，16:15–16:17 真机取证）
+
+- **部署 `step49-deploy-083.sh` 单次 `DEPLOY_RC=0`**（日志 `output/deploy083-step49.log`）：10 份副本 × 5 件
+  运行文件全部落在 AB md5（每份先存 `.bak-pre083`）、逐份 `node --check` OK；中台 **#40** 同批收口
+  （`/srv/aiad/.dsh-feishucard/feishu.config.json` `root:root 644` → `aiad:agtagents 600`，改前改后各实测一次
+  「服务用户 aiad 仍可读写自己的配置」）；一次 `systemctl restart dsh-feishu-aiad dsh-feishu` ⇒ 两单元 `active`、
+  长连接 **aiad=4 / main=1**、`drain error` 各 0、5 个 helper 启动时间全为 `16:09:51`、`ps` 里明文凭证行数 0；
+  两个实例 `[fs] plugin apply` 自报 **`v0.8.3 md5=c73d76f2 bytes=598909`**（A25：由线上进程自己开口）。
+  🔴 **预检第一次报红**：`MISMATCH index.js 本地=c73d76f2 闸门=9a837813`——根因是 `step49` 的 `MANIFEST`
+  默认值仍指向**已作废的 AA 清单**（我"上一轮已经改过了"的记忆是错的）；改默认值后预检 `rc=0`。
+- **真机三条复验（沿用 CM 的破例授权「用现有机器人发」，仅限本次回归；例外声明与三条消息 id 已记
+  `/root/OPS_CHANGELOG.md` 16:15–16:18 段）**。发信方式＝`lark-cli im +messages-send --as user`，走的是**生产入站
+  入口**（不是替被测代码铺路）；会话＝analyst 单聊 `oc_809f7c00ed97c0a2fcb41926642553bb`：
+  - **① 尖括号（缺陷 B）**：发 `/model`（`om_x100b637eacbffca4c345a5c0a54eebb`）⇒ 回卡尾行
+    「点一下即切换；也可发文字：`/model provider/model`（例：`/model deepseek-official/deepseek-flash`）」
+    ——**真例路径完整可见**，0.8.2 的「/model /」消失。日志 `[fs] /model: choices=2 providers=deepseek-official=2`。
+  - **② 裸模型名（缺陷 C）**：发 `/model deepseek-flash`（`om_x100b637eab2cb8a4c29bd80ffac4ea5`）⇒
+    「✅ 模型已切换为 `deepseek-official/deepseek-flash`（下一次请求开始用）」，日志
+    `[fs] /model: selectModel ok deepseek-official/deepseek-flash session=fs-main-muvrahja`；
+    **同窗口没有第二张卡**（0.8.2 在这里是 0 次调用 + 静默重发选择卡）。
+  - **③ 失败话术 + 留痕（缺陷 A）**：发 `/model nosuchmodel-xyz`（`om_x100b637ea6bb40a8de2a63db917a457`）⇒
+    中文「没找到模型 `nosuchmodel-xyz`（宿主可用清单里没有这个名字）…」，**卡面没有宿主英文原文**；
+    日志新落一行 `[fs] /model 文字档无法解析: arg=nosuchmodel-xyz → 没找到模型…`（0.8.2 同一场景 **0 行**）。
+  - **线上模型状态**：测试前后均为 `deepseek-official/deepseek-flash`（＝宿主清单内的值），无需复原。
+- 🔴 **本批唯一未取证项，不记为通过**：**点卡上按钮 ⇒ 同一张卡原地 PATCH 成「✅ 已切换模型」**
+  （`index.js:7447-7458`）。飞书的 `card.action.trigger` 只能由**真人点击**产生，程序无法伪造，
+  所以这一条只有本地证据（用例 104/99 的「同卡 `update`、零按钮、窗口内 create 数为 0」+ 反证非恒真）。
+  真人判据一句话：**点一次卡上的模型按钮，卡片原地变成「✅ 已切换模型」，聊天里不出现第二张卡**。
+  按 CM 口径（「服务器上我都还没公开给他们用，怎么有可能有人去点呢」）**不作为部署门槛**。
 
 
 
