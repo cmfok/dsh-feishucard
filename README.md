@@ -4,6 +4,9 @@
 
 A self-developed (not a fork) bridge between Feishu (Lark) chats and DeepSeek Harness agent sessions: official-SDK long connection (no public URL needed), dedicated per-chat sessions, `/new /switch /list /help` commands, a typing reaction, and a **streaming reply card** — inline agent notes, collapsible tool-call panels with status symbols, and rate-limit / backoff / circuit-breaker / plain-text fallback reliability.
 
+> 📌 **需求与功能状态的唯一登记处 = `需求与功能清单.md`**（CM 2026-10-06 裁决建立：「所有的功能清单放在那里，我提需求就在里面补一句，完成了就打个勾」）。
+> 接手前先读它：☐=没做，🔴=**已裁决但没实现**（漂移，优先做），✅ 才有证据。本 README 只放门面与部署现状，`CHANGELOG.md` 记"哪版改了什么"，`功能基线.md` 记"哪条判据由哪个用例钉住"。
+
 ## 功能矩阵 / Feature matrix
 
 | 功能 | 说明 |
