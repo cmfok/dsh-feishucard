@@ -5,6 +5,167 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-10-06
+
+本版**没有新功能**，是 CM 2026-10-05 点名「**这个比较急**」的那条 /model 缺陷的处置批次
+（中台 **#47**）。三条都来自**真机复现 + 日志取证**，不是推测——验证过程用了 CM 的**破例授权**
+（「破例允许，用现有机器人发」，仅限本次回归验证），逐条消息 id 与例外声明已记入
+`/root/OPS_CHANGELOG.md`，事后已把线上模型状态复原。
+
+⚠️ **先说清楚"切换失败"的真实形状**，因为症状和根因不是一回事：
+**切换主干在 0.8.2 已经修好并生产验证过**（点击 → 真调宿主 `sessionController.selectModel`
+→ 结果 PATCH 回同一张卡；0.8.1 那条 `session.append('model/selection')` 假成功路径已删）。
+CM 看到的"从来没切换成功"，剩下的是**三个边界缺陷**——三个都会让用户以为"点了没反应"，
+但没有一个在切换主干上。本版修的就是这三个。
+
+### 修复（中台 #47 三条）
+
+- **① 卡面提示被飞书吞掉一半**：提示行写的是 `` `/model <provider>/<model>` ``，而飞书 markdown
+  把 `<...>` 当 HTML 标签**整段吞掉** ⇒ 用户在卡上看到的是 `/model /`（等于没给语法）。
+  真机截图外推的证据：本机日志与卡 payload 里尖括号确实存在，而渲染端只剩 `/model /`。
+  修法：去尖括号，并且**不给占位符、给一条从当前可用清单里取的真例路径**
+  （新函数 `sampleChoicePath()`）——看得见语法才知道怎么发。
+- **② 文字档 `/model 模型名` 不带 provider 时被原样塞给宿主**：旧写法那条正则要求
+  `provider/model` 两段，只发模型名 ⇒ **0 次 `selectModel` 调用**，代码走到"重发一张选择卡"分支，
+  用户视角就是"发了没反应"。新增 `resolveModelTarget()`：bare 名在宿主清单里**唯一命中**才反查
+  provider 后真切；**多 provider 同名** ⇒ 把候选路径原样念回去、不猜、不切；**查无此名** ⇒
+  明说"没找到模型"并给出可用的发法。三种情形都有断言。
+- **③ 失败回执是宿主的英文原文**：宿主抛的是 `Select an available model before sending a message.`，
+  旧行为把这句话直接甩进卡面 ⇒ 用户既看不懂也不知道下一步；而且**文字档分支一行日志都不打**
+  ⇒ 服务器侧无法取证。新增 `modelSwitchFailureText()`：可识别的宿主报错翻成中文并给下一步，
+  英文原文**只进日志**（`[fs] /model 切换失败(文字档): …`）；认不出的错误**原样透出**，
+  不编造话术（不假装知道）。
+
+### 验证
+
+- **用例 104（`scripts/smoke.mjs`，**24 条断言**＝第一档 16 条 + 第二十一轮 8 条）** 钉死这三条，
+  并把"点卡后**一条新消息都不发**"的既有口径一起守住（CM：「卡片应该更新成已经切换到XX模型的提示，
+  不是另外发卡片」）。
+- **反证（A25）**：把 `index.js` 换成**上一版（闸门 Z）的冻结字节**跑同一套冒烟，用例 104 必须当场变红。
+  - 第一趟 `output/negctrl104-20261006.log`：红 **11** 条、绿 5 条 ⇒ 三条缺陷各自的断言全部落红
+    （尖括号占位符仍在／bare 名 0 次 `selectModel` 调用且回执为空、候选与"没找到"两分支一句话不说、
+    宿主英文原文直转用户、文字档 0 行日志），其余用例照跑完（`SMOKE FAIL: 11 assertion(s) failed`）。
+  - 🔴 **这一趟顺手抓到我自己写的一条弱断言**：那 5 条绿的里，「日志留的是宿主原文」只要求
+    "**任意一行**日志含原文"，而旧字节根本不打失败日志也能满足——出站消息正文本身会被打进日志。
+    已收紧成「原文落在那条失败日志的**同一行**」，并重跑反证（第二趟）。
+  - **第二趟实测（收紧后的断言，同一批 0.8.2 冻结字节）**：存档在工作区
+    `P:/Qoder/work/output/negctrl104-20261006-run2.log`（第一趟在**仓库自己**的 `output/`，两处同名前缀、
+    别混）⇒ 全量 **12 ❌ / 811 ✅**、`SMOKE FAIL: 12 assertion(s) failed`、其余用例照跑完。
+    与第一趟的差**恰好一条**，就是被收紧的那条（`11→12`、`812→811`）⇒ 证明这条现在真的能钉住旧字节。
+  - 🔴 **用例 104 的 16 条断言在两版之间的完整分布**（按标题行 `104)` 切段核对，不是"看着绿就当护栏"）：
+    旧字节 **12 红 / 4 绿**；4 条绿分别是 ①前提断言「`/model` 出了一张带按钮的选择卡」（两版都该绿，
+    它绿是后面 12 条有意义的前提）②「没有退回只写事件的 `append` 兜底」（守的是别的批次已修的口径）
+    ③「同名挂两条路由时**不猜**」（旧字节因正则不匹配＝0 次调用而**空洞成立**，真正的正向钉法由红掉的
+    ④「把两条候选路径原样念回去」承担）④「映射只认确知含义的那一条，其余原文照抄」（反编造护栏，
+    旧字节整段透出原文 ⇒ 天然满足）。⇒ **12 条钉缺陷、4 条口径护栏，无一条是恒真装饰**。
+  - ⚠️ 因此 **AA 的第一次闸门运行（跑到 567 ✅）被主动中止**——改的是 `scripts/smoke.mjs` 字节，
+    该次不作数（口径同 V/W/X/Y 逐轮作废链），本条记的 AA 实测数字来自重跑那一次。
+- **定版闸门＝ AA**（存档在工作区 `P:/Qoder/work/output/gate083aa.log` ＋
+  `P:/Qoder/work/output/bytes083aa.txt`，2026-10-06 14:39:33 起跑、14:51 前收工）：
+  **单次干净运行**（`STEP0`/`STEP9`/`DONE` 各 1 个、进程锁在场，无 exit 9）；**17 步全部 RC=0**
+  （7 个 `node --check` → 全量冒烟 → `SMOKE_COLD=form-off/notice-off/goal-off` 三变体 → `npm run check`
+  → `check-packaging` → `identity-inject --selftest` → `test-fold-tables` → `test-collect-roster`
+  → `resolve_actor.py`）；全量冒烟 **823 ✅ / 0 ❌**、`SMOKE PASS (sentCards=515, sessions=33)`；
+  五格 roster 守护（S1/S4「旧文件读不出 ⇒ 拒绝写盘、旧字节不动」）与话术 selftest 全绿；
+  **STEP0==STEP9**（8 个文件逐字节相等），且**跑完之后字节没再动过**（事后用当前工作区字节再核一遍，8/8 OK）。
+  🔴 **口径**：`823` 相对 0.8.2 定版的 `807` 多出 **16** 条＝用例 104 的断言数，正好对上（不是"数错了绿"）。
+  闸门终态字节（`bytes083aa.txt`，部署脚本 `step49` 从此文件读取期望值，不再硬编码）：
+  `index.js 9a837813417f4b5b1047799fc46bd0e7` · `helper.cjs 62ac162d0bb398a5f376697f7b901785`
+  · `identity-inject.mjs ccacd1b19d21d13b072d7bec339c4c07` · `package.json ba0b033ab3b42b333ed9aa7e1a4cf851`
+  · `scripts/collect_bot_roster.mjs 7deb957af270cd7d21f053d96ecc9450`
+  · `scripts/smoke.mjs d1a12d958c80d4464002dcce2b9ae904`（收紧断言后的新字节；作废的首趟闸门里是 `7a26fe66…`）
+  · `scripts/test-fold-tables.mjs f6263f40031dc1a2a6dc5432547d39fd`
+  · `scripts/test-collect-roster.mjs e6451572c843ebd56531d6de2852b4a7`。
+  🔴 **但 AA 作为"定版"已作废**（不是质疑它那次运行不干净——它干净；是它**之后**又动了字节）：
+  第二十一轮门槛在 AA 之后落出四条新修复 ⇒ `index.js`/`scripts/smoke.mjs` 变了 ⇒ 定版字母顺推到 **AB**
+  （口径同 V/W/X/Y 的逐轮作废链：闸门只认"单次干净运行 + 跑完后字节没再动"）。
+
+### 第二十一轮门槛（对 AA 字节的独立审查）→ 4 条落实 / 1 条不落实
+
+verdict＝**WARN**（0 critical / 0 high / **2 medium** / 3 low；报告
+`P:/Qoder/work/output/code-review/dsh-feishucard-20261006-145545/REPORT.md`）。逐条对着代码核过（不照抄结论）：
+
+- **MEDIUM#1（核实为真，最重的一条）**：`resolveModelTarget()` 的两个 error 文案会把**用户原样输入的串**
+  拼进出站消息，而这条消息走 `sendPlainText` ⇒ 出站前会过 `expandAtTokens`（`index.js:900`），
+  而 `@all` 的展开**不需要通讯录命中**（`expandOne` 对 `@all` 直接返回 `<at id=all>所有人</at>`）
+  ⇒ 群里任何人发 `/model @all` 就能**借桥做一次真·@ 全体**（唤醒全群、收不回）。
+  修法：新增 `echoSafe()`——回显前剥掉 lark_md 元字符与 `@`、折行、限长 60；**日志仍留消毒前的原文**
+  （面向取证），只有面向用户的那一份被消毒。
+- **MEDIUM#2（核实为真）**：`listModelChoices()` 把"整表失败"和"逐个 provider 失败"都**吞成空数组**
+  ⇒ 空清单时那句"宿主可用清单里没有这个名字"是**无出处的断言**（A24：我没查过清单，凭什么说没有）。
+  修法：`resolveModelTarget` 里对 `choices.length === 0` 单开一支，明说「当前拿不到模型清单」
+  ＋给可操作的下一步，不冒充查过。
+- **LOW#1（核实为真）**：`sendModelPicker` 的空清单补句里还写着 `/model <provider>/<model>`——
+  这正是 #47B 要消灭的**第二处**尖括号站点（同一个"被飞书吞掉"的判据不能只钉一处）。去尖括号改反引号段。
+- **LOW#3（核实为真）**：日志标签「文字档**没这个名字**」在"拿不到清单"的情形下是**假结论**，
+  服务器侧读日志会被带偏 ⇒ 改名「文字档无法解析」。
+- **LOW#2（不落实，写明理由）**：把 `{ok}/{error}` 手搓联合类型改成判别式联合——纯风格，
+  不改行为、不加断言能力；按"不为假想的未来重构"的纪律**不做**。
+
+新增断言 8 条（104f/104g），其中 **104f 的夹具形状**记一条仓库纪律：反证要"只红自己那一格"，
+夹具必须做成**旧字节真的会破**的形状——第一版写成 `` `@all`zz ``（两端都带反引号），两个反引号能自己
+配成对、`@all` 反而被代码区保护 ⇒ 那种夹具在旧字节上**也是绿的＝假钉**；改成**单个前导反引号**
+`` `@all `` 才能破出代码区。
+
+### 反证第三轮（A25，证明上面 8 条不是恒真）
+
+把 `index.js` 换成 **AA 的冻结字节**（第二十一轮修复**之前**）跑同一套全量冒烟，存档
+`P:/Qoder/work/output/negctrl104f-20261006.log` ⇒ 全量 **5 ❌ / 826 ✅**、`SMOKE FAIL: 5 assertion(s) failed`。
+- 🔴 **口径：反证不要求"全红"，要求"缺陷钉红"**，且绿的每一条都要点名性质——
+  红掉的 5 条正好对应四个缺陷各有所钉（`@all` 被展开成真·@／解析失败日志无消毒前原文／
+  空清单补句仍有尖括号／"拿不到清单"的正面与反面各一条）；
+  仍绿的 3 条＝1 条**前提断言**（零命中这条给了回执文本）+ 2 条**护栏**
+  （「出站正文不回显 `@`」：旧字节把 `@all` 展开成 `<at id=all>` 后正文里也没有 `@`；
+  「消毒不吞整个名字」：旧字节展开后正文含 `id=all`）⇒ 这两条**不是缺陷钉**，是防 `echoSafe`
+  剥过头的回归护栏，真正的钉是红掉的那条「`@all` 没有被展开成真·@ 全体」。
+- 跑完由脚本的 `trap EXIT` 放回当前字节并**当场核 md5**（`RESTORE-OK：c73d76f2…`），
+  确认反证没把仓库留在旧字节上。
+
+### 第二十二轮门槛（对 AB 字节的复跑）
+
+verdict＝**PASS**（0 critical / 0 high / 0 medium / **1 low**；报告
+`P:/Qoder/work/output/code-review/dsh-feishucard-20261006-152149/REPORT.md`）。
+这 1 条 low 核对后**不落实**，理由写清：`sampleChoicePath()` 的空清单回退串 `'provider/model'`
+在当前两个调用点**都不可达**（`index.js:7365` 与 `7425` 各有一道 `choices.length === 0` 早退），
+且该串**没有尖括号**、不会被飞书吞 ⇒ 不构成 #47B 回归。为不可达分支改文案＝没有可断言的可达行为，
+只会造出一条测不到的改动（仓库纪律：不为不会发生的场景加处理）。
+
+### 定版闸门＝ AB
+
+存档 `P:/Qoder/work/output/gate083ab.log` ＋ `P:/Qoder/work/output/bytes083ab.txt`
+（2026-10-06 15:52:34 起跑、16:02 前收工，脱离进程启动＝不被会话超时杀）：
+- **单次干净运行**：`STEP0`/`STEP9`/`DONE` 各出现 **1** 次、20 个段标记行号严格递增、进程锁在场并在结束时
+  自动释放（`output/gate.lock.d` 现已不存在）。
+- **17 步全部 `RC=0`**：7 个 `node --check` → 全量冒烟 → `SMOKE_COLD=form-off/notice-off/goal-off` 三变体
+  → `npm run check` → `check-packaging` → `identity-inject --selftest` → `test-fold-tables`
+  → `test-collect-roster` → `resolve_actor.py`。
+- **全量冒烟 831 ✅ / 0 ❌**、`SMOKE PASS (sentCards=519, sessions=33)`。
+  🔴 **口径核对**：相对 AA 定版的 `823` 正好多出 **8** 条＝第二十一轮新增的 104f/104g 断言数（不是数错绿）；
+  ⚠️ `sentCards=519` 与 AA 的 `515` 不同——按仓库纪律**不能**拿 `sentCards` 当复现指纹（两个 60 秒在打架），
+  可复现的判据只有 `RC=0` ＋ ✅/❌ 计数 ＋ cross-mark 0 ＋ STEP0==STEP9 ＋ 插件自报 md5。
+- **STEP0==STEP9 且跑完后字节未再动**：把 manifest、闸门结尾 STEP9 段、**当前工作区实际字节**三方对了一遍，
+  8 个文件全部一致（`index.js c73d76f209dac25c106b57ed6ce09633`、`scripts/smoke.mjs ee4f10feeff783a716dc44d655c6b541`、
+  `helper.cjs 62ac162d0bb398a5f376697f7b901785`、`identity-inject.mjs ccacd1b19d21d13b072d7bec339c4c07`、
+  `package.json ba0b033ab3b42b333ed9aa7e1a4cf851`、`scripts/collect_bot_roster.mjs 7deb957af270cd7d21f053d96ecc9450`、
+  `scripts/test-fold-tables.mjs f6263f40031dc1a2a6dc5432547d39fd`、
+  `scripts/test-collect-roster.mjs e6451572c843ebd56531d6de2852b4a7`）。
+- ⚠️ **本次踩到并纠正的一条自身纪律**：AB 的**第一次**运行是用后台任务直起的，被工具的 10 分钟上限**中途杀掉**
+  （log 停在冒烟段、无 `SMOKE` 行）⇒ 那次不作数；改用 `Start-Process` 脱离进程会话重跑才拿到上面这份。
+  这正是 A28「长任务必须脱离进程启动」的反面教材，记下来防再犯。
+- **部署脚本 `step49` 的期望值读 `bytes083ab.txt`**（默认值已从 `bytes083aa.txt` 改过来，不硬抄 md5）。
+
+
+
+### 未修的部分（如实挂着，不假装做完）
+
+- **宿主清单里根本没有的模型名**（例：会话上原来挂着 `deepseek-v4-flash`，而服务器 provider
+  `deepseek-official` 只给 `deepseek-flash` / `deepseek-v4-pro`）⇒ 任何指向它的切换都会被宿主拒。
+  本版只保证**拒得清楚**（①②③），**没保证切得过去**——真正该修的是"配置里写了宿主不认的名字"
+  这件事本身，属**配置校验**，与缺口 **#40** 同族，排入 0.8.4。
+- **0.8.4 批次**（已裁决另起，见 README §缺口清单与本仓 `功能基线.md`）：K3-GAP fail-closed
+  （#36/#27）、per-bot 预设（#35）、托孤队列 TTL×退避（#31/#10）、`fs_plan_goal` 点击断言、
+  M1+M3 `views` 断言、K10 机器守护、以及上面那条配置校验。
+
 ## [0.8.2] - 2026-10-06
 
 本版同样**没有新功能**，是第十八轮门槛对**已上线的 0.8.1 批次**补审后的处置批次

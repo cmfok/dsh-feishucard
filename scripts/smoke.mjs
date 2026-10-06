@@ -7456,6 +7456,181 @@ console.log('103) ★🔴 命令锚点遇到「名字互为前缀」时要取**�
   liveAgents.length = 0
 }
 
+console.log('104) ★🔴 /model 文字档：bare 模型名不许静默重发卡、卡面语法不许被飞书吞掉、失败必须留日志并说中文（中台 #47，2026-10-06 生产取证）')
+{
+  // 取证出处（生产 dsh-feishu-aiad.service／0.8.2／analyst 会话 fs-main-muvrahja，2026-10-06 13:50-13:54）：
+  //   B 卡面提示写 `/model <provider>/<model>` ⇒ 飞书把尖括号当 HTML 标签**整段吞掉**，
+  //     实得消息 om_x100b637c8462c0a4c12356ad128bbe4 渲染成「/model /」＝语法看不见。
+  //   C 于是用户按猜的写法发不带 provider 的 `/model deepseek-v4-pro`（实得消息
+  //     om_x100b637ce2a0b0acc4ccb7f2e2324b5）⇒ 旧正则不匹配 ⇒ **静默重发一张选择卡、一句解释都没有**；
+  //     同一条 catch 分支还**不打日志**（那两条失败在 journal 里 0 行，只能翻聊天才拿到报错原文）。
+  //   A 切到宿主清单外的名字时抛英文原文 `Select an available model before sending a message.`
+  //     （实得消息 om_x100b637c8762b0a0c4c4df07432b66b），桥原样拼进「切换失败：」转给用户。
+  // 三条拼起来就是 CM 说的「切换从来没成功过／点了没反应」；0.8.2 的 selectModel 本身是好的
+  //   （实测切 deepseek-official/deepseek-v4-pro ⇒ 日志 selectModel ok、随后 current 跟着变）。
+  const md104 = (c) => {
+    const els = c && c.payload && Array.isArray(c.payload.elements) ? c.payload.elements : []
+    return els.length && els[0] && els[0].tag === 'markdown' ? String(els[0].content) : null
+  }
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const mod104 = await import('../index.js')
+  mod104.apply(ctx)
+  await settle(2)
+  liveAgents.push(agent)
+  armTurn85('104-pre')
+  feedInbound('om_bind104', '先绑定单聊-104')
+  await settle(4)
+
+  const twoRoutes = {
+    listProviders: () => [{ id: 'test', name: 'T 官方' }, { id: 'mirror', name: 'M 镜像' }],
+    listModels: async (pid) => [{ id: 'm-' + pid, name: 'Model ' + pid }],
+  }
+  llmOverride = twoRoutes
+  const mk104 = sentCards.length
+  feedInbound('om_104p', '/model')
+  await drain()
+  const picker104 = cardsSince(mk104).filter((c) => c.op === 'create' && allButtons(c).length > 0).pop()
+  ok(!!picker104, '（前提）/model 出了一张带按钮的选择卡（否则下面全是恒真）')
+  const pj104 = JSON.stringify((picker104 && picker104.payload) || {})
+  ok(pj104.indexOf('<provider>') === -1 && pj104.indexOf('<model>') === -1,
+    '★★★ 卡面上不再出现尖括号占位符（飞书把 `<...>` 当标签吞掉 ⇒ 实得只剩「/model /」）'
+    + '｜实得 ' + JSON.stringify(pj104.includes('<provider>') || pj104.includes('<model>')))
+  ok(pj104.indexOf('/model test/m-test') >= 0,
+    '★★★ 语法提示给的是清单里真实存在的一条路径（看得见语法才知道怎么发）')
+
+  // ---- C：bare 模型名按清单补全，唯一命中直接切 -------------------------------
+  selectModelCalls = []
+  sessionAppendCalls.length = 0
+  const mk104a = sentCards.length
+  feedInbound('om_104a', '/model m-mirror')
+  await settle(2)
+  ok(selectModelCalls.length === 1 && selectModelCalls[0].provider === 'mirror'
+    && selectModelCalls[0].model === 'm-mirror',
+    '★★★ 不带 provider 的模型名：唯一命中 ⇒ 补全 provider 后真的调了宿主 selectModel'
+    + '（旧写法正则不匹配＝0 次调用、只重发一张卡）｜实得 ' + JSON.stringify(selectModelCalls))
+  ok(sessionAppendCalls.length === 0, '★★ 没有退回只写事件的 append 兜底')
+  const win104a = cardsSince(mk104a)
+  const txt104a = win104a.map(md104).filter(Boolean).join(' | ')
+  ok(txt104a.indexOf('模型已切换为 `mirror/m-mirror`') >= 0,
+    '★★★ 回执写清切到了哪条路由｜实得 ' + JSON.stringify(txt104a))
+  ok(win104a.filter((c) => c.op === 'create' && allButtons(c).length > 0).length === 0,
+    '★★★ 认得出的名字不再「静默重发一张选择卡」（用户视角的「发了没反应」正是这条）')
+
+  // ---- C：同名挂多条路由 ⇒ 不许猜，把候选念回去 -------------------------------
+  llmOverride = {
+    listProviders: () => [{ id: 'test', name: 'T 官方' }, { id: 'mirror', name: 'M 镜像' }],
+    listModels: async () => [{ id: 'dup', name: 'Dup' }],
+  }
+  selectModelCalls = []
+  const mk104b = sentCards.length
+  feedInbound('om_104b', '/model dup')
+  await settle(2)
+  const txt104b = cardsSince(mk104b).map(md104).filter(Boolean).join(' | ')
+  ok(selectModelCalls.length === 0,
+    '★★★ 同名挂两条路由时**不猜**（猜错＝切到用户没点的那条）｜实得 ' + selectModelCalls.length)
+  ok(txt104b.indexOf('test/dup') >= 0 && txt104b.indexOf('mirror/dup') >= 0,
+    '★★★ 把两条候选路径原样念回去，让用户自己带 provider｜实得 ' + JSON.stringify(txt104b))
+
+  // ---- C：清单里没这个名字 ⇒ 明说没有（旧：静默重发卡） ----------------------
+  const mk104c = sentCards.length
+  feedInbound('om_104c', '/model not-a-model')
+  await settle(2)
+  const txt104c = cardsSince(mk104c).map(md104).filter(Boolean).join(' | ')
+  ok(txt104c.indexOf('没找到模型') >= 0,
+    '★★★ 认不出的名字给出中文说明（旧写法这句话都不说）｜实得 ' + JSON.stringify(txt104c))
+  ok(cardsSince(mk104c).filter((c) => c.op === 'create' && allButtons(c).length > 0).length === 0,
+    '★★ 认不出的名字不再重发一张同样的选择卡')
+
+  // ---- A：宿主英文报错 → 中文一句＋下一步动作，且必须留日志 ------------------
+  llmOverride = twoRoutes
+  selectModelImpl = () => { throw new Error('Select an available model before sending a message.') }
+  const log104 = consoleLines.length
+  const mk104d = sentCards.length
+  feedInbound('om_104d', '/model test/m-test')
+  await settle(2)
+  selectModelImpl = null
+  const txt104d = cardsSince(mk104d).map(md104).filter(Boolean).join(' | ')
+  ok(txt104d.indexOf('宿主不认') >= 0,
+    '★★★ 宿主的「模型不可用」翻译成中文并给下一步（原文是英文，用户看不懂也不知道怎么办）'
+    + '｜实得 ' + JSON.stringify(txt104d))
+  ok(txt104d.indexOf('available model') === -1, '★★ 不把宿主英文原文转给用户')
+  ok(consoleLines.slice(log104).some((l) => l.indexOf('/model 切换失败(文字档)') >= 0),
+    '★★★ 文字档失败**必须留日志**（旧写法只发文本、journal 里 0 行 ⇒ 服务器侧无法取证）')
+  // 🔴 这条**原来是个弱断言**：只要求"任意一行日志里含宿主原文"。反证跑在 0.8.2 冻结字节上时
+  //   它照样是绿的 ⇒ 因为出站消息正文本身也会被打进日志，旧字节的失败路径一行失败日志都没有
+  //   也能满足。收紧成「原文必须落在那条失败日志的**同一行**」——0.8.2 字节上这条必红（实测已验）。
+  ok(consoleLines.slice(log104).some((l) => l.indexOf('/model 切换失败(文字档)') >= 0
+    && l.indexOf('Select an available model') >= 0),
+    '★★ 宿主原文落在那条失败日志的同一行（翻译只面向用户，取证不能被翻译污染）')
+
+  // ---- A：认不出的错误不许编造原因 -------------------------------------------
+  selectModelImpl = () => { throw new Error('session/model-unavailable: 没有这条路由') }
+  const mk104e = sentCards.length
+  feedInbound('om_104e', '/model mirror/m-mirror')
+  await settle(2)
+  selectModelImpl = null
+  const txt104e = cardsSince(mk104e).map(md104).filter(Boolean).join(' | ')
+  ok(txt104e.indexOf('session/model-unavailable') >= 0,
+    '★★ 映射只认确知含义的那一条，其余原文照抄（A24 禁编造解释）｜实得 ' + JSON.stringify(txt104e))
+
+  // ---- 回声消毒：出站正文里的 `@all` 必须展不开（第二十一轮门槛 MEDIUM#1） --------
+  // 为什么单独钉：这两条 error 文案走 sendPlainText ⇒ 出站前过 expandAtTokens，而 `@all`
+  //   的展开**不需要通讯录命中**（直接返回 <at id=all>所有人</at>）⇒ 群成员发一句
+  //   `/model `@all` 就能借桥广播全群、且收不回。
+  // 🔴 触发形状必须是**单个**前导反引号：我们的模板是「…模型名 `+arg+`…」，arg 自带一个 `` ` ``
+  //   时，`INLINE_CODE_RE = /(`+)[^\n]*?\1/` 会把开头那串两个反引号**回退成一个**、代码串在 arg
+  //   的第一个字符就闭合 ⇒ 剩下的 `@all` 落在代码区**外面**被展开。
+  //   ⚠️ 若 arg 写成 `` `@all`zz ``（两端都带反引号）则两个反引号能自己配成对、`@all` 反而被保护
+  //   ⇒ 那种夹具在旧字节上也是绿的（＝假钉，见本仓「断言要在旧字节上必红」的口径）。
+  {
+    const log104f = consoleLines.length
+    const mk104f = sentCards.length
+    feedInbound('om_104f', '/model `@all')
+    await settle(2)
+    const win104f = cardsSince(mk104f)
+    const txt104f = win104f.map(md104).filter(Boolean).join(' | ')
+    ok(txt104f.length > 0, '（前提）零命中这条给了回执文本（否则下面全是恒真）｜实得长度 ' + txt104f.length)
+    ok(txt104f.indexOf('<at') === -1 && txt104f.indexOf('所有人') === -1,
+      '★★★ 用户输入的 `@all` 没有被展开成真·@ 全体（唤醒全群、收不回）'
+      + '｜实得 ' + JSON.stringify(txt104f))
+    ok(txt104f.indexOf('@') === -1,
+      '★★ 出站正文不回显 `@` 字符（消毒后不可能再被任何 @ 语法命中）｜实得 ' + JSON.stringify(txt104f))
+    ok(txt104f.indexOf('all') >= 0,
+      '★★ 消毒只剥元字符、不吞掉整个名字（用户仍认得出自己发的是什么）｜实得 ' + JSON.stringify(txt104f))
+    // L1：两种失败共用一条日志支路 ⇒ 标签必须能同时成立，且 arg 在日志里留**原文**（取证不被消毒污染）
+    ok(consoleLines.slice(log104f).some((l) => l.indexOf('/model 文字档无法解析') >= 0
+      && l.indexOf('`@all') >= 0),
+      '★★ 解析失败留日志，且日志里是**消毒前**的原文（面向取证，不是面向用户）')
+  }
+
+  // ---- 清单为空：不许断言"清单里没有"，也不许给占位符当示例（门槛 LOW#3＋MEDIUM#2） --
+  {
+    llmOverride = {
+      listProviders: () => [{ id: 'test', name: 'T 官方' }],
+      listModels: async () => { throw new Error('catalog down') },
+    }
+    const mk104g = sentCards.length
+    feedInbound('om_104g0', '/model')
+    await settle(2)
+    const txt104g0 = cardsSince(mk104g).map(md104).filter(Boolean).join(' | ')
+    ok(txt104g0.indexOf('<provider>') === -1 && txt104g0.indexOf('<model>') === -1,
+      '★★★ 空清单的补充说明里也没有尖括号（同一个"被飞书吞掉"的判据不能只落一处）'
+      + '｜实得 ' + JSON.stringify(txt104g0))
+    const mk104g1 = sentCards.length
+    feedInbound('om_104g1', '/model some-name')
+    await settle(2)
+    const txt104g1 = cardsSince(mk104g1).map(md104).filter(Boolean).join(' | ')
+    ok(txt104g1.indexOf('拿不到模型清单') >= 0,
+      '★★★ 清单读不出时明说"拿不到清单"，不假装查过｜实得 ' + JSON.stringify(txt104g1))
+    ok(txt104g1.indexOf('没有这个名字') === -1,
+      '★★ 不据空清单断言"宿主清单里没有这个名字"（那是无出处断言，A24）｜实得 ' + JSON.stringify(txt104g1))
+  }
+  llmOverride = null
+  liveAgents.length = 0
+}
+
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
   process.exit(0)

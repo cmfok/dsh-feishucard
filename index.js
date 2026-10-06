@@ -3650,10 +3650,19 @@ export function apply(ctx) {
         return true
       }
       const arg = String(cmd.arg || '').trim()
-      const direct = /^([\w.-]+)\/([\w.:-]+)$/.exec(arg)
-      if (direct) {
+      const target = await resolveModelTarget(arg)
+      if (target && target.error) {
+        // 🔴 这一条日志服务**两种**失败（多命中＝名字有但含糊／零命中＝名字不在清单／
+        //   清单为空＝无从判断），原来只写「没这个名字」⇒ 按它筛 journal 会把含糊事件
+        //   误判成"名字不存在"（第二十一轮门槛 LOW#1，核对为真）。arg 留**原文**不消毒：
+        //   消毒只面向出站正文，取证不能被消毒污染（与「日志留宿主原文」同一条口径）。
+        console.log('[fs] /model 文字档无法解析: arg=' + arg + ' → ' + target.error.replace(/\n/g, ' | '))
+        await sendPlainText(bot, chatId, target.error)
+        return true
+      }
+      if (target) {
         try {
-          const sel = await switchModelForAgent(agent, direct[1], direct[2])
+          const sel = await switchModelForAgent(agent, target.provider, target.model)
           if (sel.confirmed) {
             await sendPlainText(bot, chatId, '✅ 模型已切换为 `' + sel.provider + '/' + sel.model
               + '`（下一次请求开始用）')
@@ -3662,7 +3671,12 @@ export function apply(ctx) {
               + '`），但宿主没有回带确认，无法保证已生效。发 `/model` 看「当前」是不是这条。')
           }
         } catch (error) {
-          await sendPlainText(bot, chatId, '切换失败：' + String(error && error.message || error))
+          // 中台 #47C：点击档有 `[fs] /model 切换失败: +stack`，文字档原来**一行都不留**
+          //   ⇒ 实测两条失败消息在 journal 里查无痕迹，只能靠翻聊天消息才拿到报错原文。
+          //   同一条判据不能只落一处，补成同规格留痕。
+          console.log('[fs] /model 切换失败(文字档): ' + String(error && error.stack || error))
+          await sendPlainText(bot, chatId,
+            '切换失败：' + modelSwitchFailureText(error) + '\n要重试就发 `/model`。')
         }
         return true
       }
@@ -7303,6 +7317,77 @@ export function apply(ctx) {
     return out
   }
 
+  // 卡面/文案里给用户的「带 provider 的写法」示例（中台 #47B）。
+  // 原来这里写的是占位符 `<provider>/<model>` —— 飞书把它当 HTML 标签**整段吞掉**，
+  // 卡上渲染成「/model /」，用户看不到语法就按猜的写法发（不带 provider），
+  // 正好撞进 #47C 那条静默分支 ⇒ 表现就是「发了没反应」。改成念一条清单里真实存在的路径。
+  function sampleChoicePath(choices) {
+    const c = Array.isArray(choices) && choices.length ? choices[0] : null
+    return c ? c.provider + '/' + c.model : 'provider/model'
+  }
+
+  // 回声消毒（第二十一轮门槛 MEDIUM#1，核对为真）：下面两个 error 文案会把**用户原样输入的串**
+  // 拼进消息，而这条消息走 sendPlainText ⇒ 出站前会过 expandAtTokens（见 index.js:900）。
+  //   · `@all` 的展开**不需要通讯录命中**（`expandOne` 对 `@all` 直接返回 `<at id=all>所有人</at>`）
+  //     ⇒ 群里任何人发 `/model @all` 就能借桥做一次**真·@ 全体**（唤醒全群、收不回）。
+  //   · 反引号同理有害：`INLINE_CODE_RE = /(`+)[^\n]*?\1/` 会把开头的反引号串回退成 1 个，
+  //     用户自带一个 `` ` `` 就能让代码串提前闭合、后半段按普通 markdown 渲染。
+  // 模型名里不可能出现这些字符 ⇒ 一律换成空格再折叠，并按上限截断（清单文本进卡片，不许无限长）。
+  // 口径与 groupChoicesByProvider 的 label() 同源（那一处第八轮门槛 LOW 已经这么防了），
+  // 差别只在**这里多剥 `@`**：段标题不会被 expandAtTokens 处理，而出站正文会。
+  function echoSafe(s, max) {
+    const limit = typeof max === 'number' ? max : 60
+    const cleaned = String(s == null ? '' : s)
+      .replace(/[*_~`<>\r\n@]/g, ' ').replace(/\s+/g, ' ').trim()
+    return cleaned.length > limit ? cleaned.slice(0, limit) + '…' : cleaned
+  }
+
+  // 文字档的模型名解析（中台 #47B）：不带 provider 时**不许静默重发选择卡**。
+  // 按宿主清单补全——唯一命中即切；多命中把候选路径念回去；零命中明说没这个名字＋给示例。
+  async function resolveModelTarget(arg) {
+    const direct = /^([\w.-]+)\/([\w.:-]+)$/.exec(arg)
+    if (direct) return { provider: direct[1], model: direct[2] }
+    if (!arg) return null
+    const choices = await listModelChoices()
+    const want = arg.toLowerCase()
+    const hits = choices.filter((c) => String(c.model).toLowerCase() === want)
+    if (hits.length === 1) return { provider: hits[0].provider, model: hits[0].model }
+    if (hits.length > 1) {
+      return {
+        error: '「' + echoSafe(arg) + '」同时挂在多个 provider 下，请带上 provider：\n'
+          + hits.slice(0, 8).map((c) => '/model ' + c.provider + '/' + c.model).join('\n'),
+      }
+    }
+    // 🔴 零命中要再分一刀（第二十一轮门槛 LOW#3，核对为真）：`listModelChoices()` 把
+    //   「整表失败」和「逐个 provider 失败」都吞成空数组 ⇒ 空清单时的"没找到"是**无依据的断言**
+    //   （A24：我没查过清单，凭什么说清单里没有），而且 `sampleChoicePath([])` 会给出
+    //   字面量 `provider/model` 当示例——那正是本批 #47B 要消灭的占位符。
+    if (choices.length === 0) {
+      return {
+        error: '没找到模型 `' + echoSafe(arg) + '`，而且**当前拿不到模型清单**（宿主的模型列表服务不可用），'
+          + '所以我无法判断这个名字到底在不在清单里。等清单恢复可以发 `/model` 点卡上的按钮；'
+          + '要直切就按 `provider/model` 两段都写全（provider 和模型名都取你实际路由里的真名字）。',
+      }
+    }
+    return {
+      error: '没找到模型 `' + echoSafe(arg) + '`（宿主可用清单里没有这个名字）。发 `/model` 点卡上的按钮，'
+        + '或按带 provider 的写法直切，例如 `/model ' + sampleChoicePath(choices) + '`。',
+    }
+  }
+
+  // 切换失败的中文文案（中台 #47A）：宿主对「不在可用清单里的模型名」一律抛英文原文
+  //   （实测 `Select an available model before sending a message.`），
+  // 原来直接拼进「切换失败：」转给用户 ⇒ 看不懂、也不知道下一步该做什么。
+  // 只映射确知含义的那一条，其余原文照抄——不编造原因（A24）。
+  function modelSwitchFailureText(error) {
+    const raw = String(error && error.message || error)
+    if (/available model/i.test(raw)) {
+      return '这个模型名宿主不认（不在当前可用清单里）。发 `/model` 点卡上的按钮最稳，'
+        + '或按带 provider 的写法直切。'
+    }
+    return raw
+  }
+
   // 🔴 分组不是装饰，是**语义**：宿主允许同一条 model id 挂在多条 provider 路由上
   // （`dsh-llm` 只在**单个 provider 内**去重并抛 INVALID_CATALOG，跨 provider 不去重），
   // 宿主 GUI 因此按 provider 分组渲染（`dsh-api-session-controller/lib/types/catalog.js`
@@ -7338,7 +7423,7 @@ export function apply(ctx) {
       text: { tag: 'lark_md', content: '🧠 **切换模型**（按会话生效，从下一次请求开始用）\n当前：`' + cur + '`' },
     }]
     if (choices.length === 0) {
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: '拿不到模型清单（宿主没暴露 `llm` 服务）。可以直接发：`/model <provider>/<model>`' } })
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: '拿不到模型清单（宿主没暴露 `llm` 服务）。可以直接发：`/model provider/model`' } })
       return { config: { wide_screen_mode: true }, elements }
     }
     for (const g of groupChoicesByProvider(choices)) {
@@ -7355,7 +7440,7 @@ export function apply(ctx) {
       for (let i = 0; i < actions.length; i += 2) elements.push({ tag: 'action', actions: actions.slice(i, i + 2) })
     }
     elements.push({ tag: 'hr' })
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: '点一下即切换；也可发文字：`/model <provider>/<model>`' } })
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: '点一下即切换；也可发文字：`/model provider/model`（例：`/model ' + sampleChoicePath(choices) + '`）' } })
     return { config: { wide_screen_mode: true }, elements }
   }
 
@@ -7387,7 +7472,12 @@ export function apply(ctx) {
       + ' current=' + JSON.stringify(current))
     await sendInteractive(bot, chatId, modelCardPayload(choices, current))
     if (choices.length === 0) {
-      await sendPlainText(bot, chatId, '（模型清单为空 —— 见上一条卡的说明；仍可用 /model <provider>/<model> 直切）')
+      // 🔴 第二十一轮门槛 MEDIUM#2（核对为真）：本批修的是「尖括号被飞书当 HTML 标签吞掉」，
+      //   而这一句和主卡走的是**同一个** `{'tag':'markdown'}` 载荷形态 ⇒ 原来写
+      //   `/model <provider>/<model>` 的用户实得还是「/model /」——同一个判据不能只落一处。
+      await sendPlainText(bot, chatId,
+        '（模型清单为空 —— 见上一条卡的说明；要直切就按 `provider/model` 两段都写全，'
+        + 'provider 和模型名都取你实际路由里的真名字）')
     }
     return choices
   }
@@ -7572,7 +7662,7 @@ export function apply(ctx) {
           }
         } catch (error) {
           console.log('[fs] /model 切换失败: ' + String(error && error.stack || error))
-          await replyInCard('warn', String(error && error.message || error) + '\n要重试就发 `/model`。')
+          await replyInCard('warn', modelSwitchFailureText(error) + '\n要重试就发 `/model`。')
         }
       })().catch((error) => {
         console.log('[fs] /model 点击处理异常: ' + String(error && error.message || error))
