@@ -258,13 +258,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ⚠️ **如实记**：这条与 LOW#1 一样会动 `collect_bot_roster.mjs` 的字节 ⇒ 动了 Z 就作废，
     所以排 0.8.3 批次一起做，不在本版偷改。
 - **上线后服务器取证又抓到三条运行态问题（中台 **#39** high／**#40** **#41** medium）**：逐条实测、全部核实为真，
-  **都不是本批字节引入、本版均未修**。
+  **都不是本批字节引入、0.8.2 版内未修**（后续处置：同日 CM 授权「三件都做」后 **#39 已修**、**#40 待重启**、**#41 是事实记录不是可修项**，取证与复测见本文件「三件已授权的服务器修正落地」条）。
   ① aiad 上 **hr 的状态文件属主是 `ubuntu:ubuntu`**，而单元是 `User=aiad / Group=agtagents` ⇒
   `sudo -u aiad test -w` 判**不可写**；全天 6 次 `[fs] state save failed: EACCES`（`04:56:03`–`05:42:16`）
   全部命中这一个文件（同目录另外三个 `state-*.json` 都是 `aiad:agtagents 664` 可写），写手是 04:55 一次以
   ubuntu 身份执行的 clearsessions（同 mtime 的 `.bak-20261006-clearsessions` 为证）。⚠️
   **「重启后该错误计数为 0」不得当成已修**——那个窗口里 hr 没有写盘事件（aiad 侧只有 1 条 `plugin apply`），
-  恢复流量即复现。修法一条 `chown`、不改内容不需重启，等 CM 授权后执行。
+  恢复流量即复现。修法一条 `chown`、不改内容不需重启 ⇒ **同日 CM 授权后已执行，复测 `sudo -u aiad test -w` 可写**（见「三件已授权的服务器修正落地」条）。
   ② aiad 的 `feishu.config.json` 是 `root:root 644`（内含四个 bot 的 `appSecret`），其余 8 份都是
   「运行用户:agtagents 600」。实测 `www-data`/`nobody`/`agtokr` 读 1 字节一律 `Permission denied`
   （父目录 `drwx------` 挡住穿越）⇒ **当前不是正在泄露**；但服务读到它靠的是 **others 可读位**，
@@ -296,23 +296,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     16 个**全部查不到**采集条目，`index.js` 只读名单不生成，10 份部署副本里的采集脚本无人调用 ⇒ 互认依赖的
     这张表只会**静默变旧**。且线上名单在 `07:00:41` 被重写过一次（mtime=ctime，符合脚本"写临时再 rename"形态），
     但三份 shell history 与 `/root/OPS_CHANGELOG.md` **都没有这次操作**⇒ 谁跑的查不出来，与 **#41** 同族。
-    修法（挂 `cron.d/dsh-roster`，按脚本头部纪律 ≤3 次/天取每天 1 次 ＋ 采集计数落日志）**属服务器基础设施变更，等 CM 授权**，
-    我没有擅自挂 cron。
+    修法（挂 `cron.d/dsh-roster`，按脚本头部纪律 ≤3 次/天取每天 1 次 ＋ 采集计数落日志）**属服务器基础设施变更，发现时未授权所以没有擅自挂**；
+    同日 CM 授权「三件都做」后已落地 ⇒ 见下条「三件已授权的服务器修正」。
   - ✅ 另一条**加固了 #39 的判断**：重启后 40 多分钟里 `message-index.json`（最后写 `05:42:20`）与四个 `state-*.json`
     （最后写 `05:26:40`）**没有任何一个被写过** ⇒ "重启后 EACCES 计数为 0"确实**只是没有写盘事件**，不是自愈；
-    那条 `chown` 该做还是要做（ **#39** 维持待授权，未因日志安静而降级）。
+    那条 `chown` 该做还是要做（未因日志安静而降级 ⇒ **同日已按授权落地，见下条**）。
+- **✅ 2026-10-06 三件已授权的服务器修正落地（CM 答复「三件都做（推荐）」；#39 / #42 / #44）**：执行器
+  `output/server-inspect-20261004/step48-apply-perm-fixes.sh`（只 chown/chmod/挂 cron，**不 restart、不动任何字节文件**）一次跑完 `rc=0`。
+  - **#39**：`chown aiad:agtagents` 那个被 `ubuntu` 抢走属主的 hr 会话状态文件 ⇒ 决定性复测 `sudo -u aiad test -w` 返回**可写**（原来的判定口径，不是换一把尺子）。
+  - **#42**：`/home/ubuntu/.dsh-feishucard` 由 `775→700`、其下 9 个运行态文件由 `644→600`（属主未动 ⇒ 不需重启、可逆）；
+    复测**两个方向都要成立**——`sudo -u ubuntu test -w` 对全部运行态文件**仍可写**（服务没被打断，这是收紧最容易踩坏的地方）、
+    `www-data` **读不到** `message-index.json`（收紧真的生效）。同批把 aiad 侧 5 个 `664` 的运行态文件**追加收成 `660`**
+    （同类问题同类处理，对 CM 最小化总则 **#36** 的直接落实），复测仍可写。
+  - **#44**：新增 `/etc/cron.d/dsh-roster`（`root:root 644`、含末尾换行）——每天 **1 次** `30 4` 以 `aiad` 身份跑采集，
+    `--config/--out` 用**绝对路径**指 aiad 那份，输出追加 `/var/log/dsh-roster.log`（`aiad:aiad 640`）。**必须显式带路径**：
+    cron 不继承 unit 的 `Environment=`（`HOME`/`FS_CONFIG_DIR` 在 cron 里都不存在），沿用默认路径的 cron 会天天非零退出。
+    挂前逐条验前提：`cron` active、node 对 aiad 可执行、脚本可读、日志可写。**没有预跑**——当天已 2 次采集（`07:00:41` 来源不明 ＋ `07:41` 取证探针），
+    上限是 ≤3 次/天，第 3 次留给调度本身。**未闭环声明**：这条 cron 的首次真实执行结果还没取证（要等下一个 `04:30`）。
+  - **复测用同一把只读闸门**（`step47`，存档 `output/step47-perms-postfix.log`）：**违规 2→1／偏松告警 14→0**，剩下那条就是 **#40**
+    （`feishu.config.json` 属主是 `root`，服务靠 others 可读位读到它；改属主必须与重启同批 ⇒ 排下一次合法重启，本批**没有**顺手改，
+    因为改错＝aiad 四个 bot 直接失联）。全程两单元 `active`、5 个长连接 helper 未断。
+  - 🔴 **本批自查踩到两个"量错了"而不是"东西不存在"的坑**（同族于 A25 的假绿灯）：
+    ① 首跑里 **#39/#44 被静默跳过**并谎报「文件不在预期位置」——根因是判据写成不带 sudo 的 `[ -f "$HR" ]`，
+    而这条命令以 `ubuntu` 身份执行，目标在 `drwx------ aiad` 的目录里 ⇒ **非特权账号对"存在但进不去"的路径一律 false**；改 `sudo -n test -f` 后两项正常执行。
+    ② 前置快照用 `find -printf '%a'` 取到的是**访问时间**而非权限位（应为 `%m`）⇒ 首跑那份快照里根本没有权限形态，
+    重跑前先把首跑快照另存为 `step48-perm-before-run1.txt`，避免把"改后状态"覆盖成"改前基线"。
 - **缺口 #12 已落成可运行闸门（不是判据文字）**：新增只读巡检 `output/server-inspect-20261004/step47-check-runtime-perms.sh`
   ——逐单元取 `User=`、按 unit 注入的 `FS_CONFIG_DIR` 遍历运行态文件，四条判据（①运行用户可写／②config 可读
   且非"只靠 others 位读到"／③目录与文件对他人**实测**不可达／④**实测本身失败一律记违规**）。
   第③条特意用 `sudo -u <probe> test -r` 真去读而不是看权限位；第④条是独立审查逼出来的（见下）。
-  **终跑存档 `output/step47-perms.log`：违规 2 处／偏松告警 14 处／未落运行态的单元 0 个，退出码 1**——
+  **首跑（修前基线）存档 `output/step47-perms.log`：违规 2 处／偏松告警 14 处／未落运行态的单元 0 个，退出码 1**；
+  **修后复跑存档 `output/step47-perms-postfix.log`：违规 1 处／偏松告警 0 处，退出码 1（只剩 #40）**——
   两处违规就是 **#39**（hr state 属 `ubuntu:ubuntu` ⇒ 运行用户 `aiad` 实测不可写）与 **#40**
   （config `root:root 644`、属主非运行用户 ⇒ 服务只靠 others 可读位读到它，真正的风险是**下次重启失联**而非泄露）；
   14 处告警＝main 目录 **775** 与其下 9 个 `state-*.json`/`message-index.json` **644**、aiad 侧 4 个运行态文件 **664**，
   逐一试读后**实测全部不可达**（`/home/ubuntu` 是 `drwxr-x---` 750、aiad 侧目录 700）⇒ 按「只看位就报泄露」
   会虚报 14 条真泄露，这正是第③条必须实测的理由。首跑同时抓到 **#39/#40 未覆盖的新事实**：main 单元那条
   775＋644 形态（与 #40 同族——靠上一层目录挡着）⇒ 已投中台 **#42**（medium，修法一条 `chmod 700/600`，
-  **属主不变 ⇒ 不需重启、可逆**）。
+  **属主不变 ⇒ 不需重启、可逆**；**同日已按 CM 授权落地，复测见「三件已授权的服务器修正落地」条**）。
   🔴 **本闸门经过一次独立审查、判定 BLOCK 后重写**（三条 critical 全是**假绿**通路）：①`sudo -u <probe> test -r`
   把「sudo runas 被拒」和「读不到」混成同一个非 0 ⇒ 真泄露会被静默降级成告警，others 位为 0 时更是一条不报；
   ②`systemctl show` 失败被 `2>/dev/null` 吞掉 ⇒ 运行用户兜底成 `root` ⇒ 目录推导入 `/root/...` ⇒ 报「目录不存在」
