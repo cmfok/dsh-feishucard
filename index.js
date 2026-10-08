@@ -15,7 +15,7 @@
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import {
-  closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, statSync, writeFileSync,
+  closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, statSync, writeFileSync,
   chmodSync, unlinkSync,
 } from 'node:fs'
 import { zstdDecompressSync } from 'node:zlib'
@@ -26,6 +26,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 //    规格：NODE1 v3 §2.5 ＋ `P1.5-身份注入-按人判-施工任务书-v1.md` D5（归属：HOME）
 import {
   TurnIdentityStore, applyActorToArguments, decideAction, makeResolver, pickMapPath, localMapPath,
+  IDENTITY_KEYS,
 } from './identity-inject.mjs'
 
 // D5：进程内单例 —— 「本轮上下文」按 agent.id 存，所以多 bot 实例共享一个 store 也不会串号。
@@ -323,6 +324,13 @@ export function apply(ctx) {
         cardRelay.splice(i, 1)
         continue
       }
+      // 🔴 中台 #61/#62（第三十五轮）：**重试退避**与**丢弃线**原来等长（都是 60 秒）、
+      //   从相邻时刻各自起算 ⇒ 托孤卡在 `retryUntil` 里被下面的 continue 挂着的同时，
+      //   按 `it.at` 计的 TTL 也走满了——退避到期后第一拍直接判「过期」丢弃，
+      //   卡片终态唯一一次补送机会变成边界运气（冒烟 sentCards ±1 抖动＝闸门 T/U
+      //   的 507/506 差的就是用例 84 这张卡）。改从「首次可重推时刻」起算：退避结束后
+      //   再给一个完整 TTL 宽限。挂起期内没人再推 ⇒ retryUntil 不会被自己推高，到期可判。
+      const relayTtlFrom = Math.max(it.at, Number(it.card.retryUntil || 0))
       // 没有 token ⇒ 这是旧代 dispose **之后**才新建的卡（会话里根本不存在它）。
       //   0.7.22（交接清单#2）：分两种，不再一刀切丢弃 ——
       //   · `createOnRelay`（结论卡这类"内容必须出现"的卡）⇒ 交给下面**真建**（POST）。
@@ -330,7 +338,12 @@ export function apply(ctx) {
       //   · 其余无 token 卡 ⇒ 绝不补发（那等于凭空多塞一张野卡）。
       const createIntent = !it.card.token && it.card.createOnRelay === true
       if (!it.card.token && !createIntent) {
-        if (now - it.at > CARD_RELAY_TTL_MS) {
+        // 🔒 C2：TTL 检查跳过正在退避的条目 —— 退避窗口内不该被 TTL 误杀。
+        // 🔴 中台 #61/#62（第三十五轮）：起算口径同步改为 relayTtlFrom（首次可重推时刻），
+        //   否则退避一到期的第一拍仍会因「it.at 起算已超 60s」当场丢弃＝边界对撞没修干净。
+        //   （第三十五轮门槛 LOW#3：在 relayTtlFrom 之下这个前置合取在数学上已被包含，
+        //   保留它是把 C2 的口径**显式**钉住——relayTtlFrom 定义若漂移，这道闸不会静默失效。）
+        if (now >= Number(it.card.retryUntil || 0) && now - relayTtlFrom > CARD_RELAY_TTL_MS) {
           console.log('[fs] relayed card push dropped (card never existed in this chat): chat=' + it.chatId)
           cardRelay.splice(i, 1)
         }
@@ -348,7 +361,11 @@ export function apply(ctx) {
         // 本代解析不到这个会话的 bot ⇒ 通道是真坏着：不许把后面的卡继续硬塞，整批停下等下一拍。
         //   0.7.22（独立审查 HIGH）：这里**不做降级** —— 连 bot 都拿不到就没有任何发送通道，
         //   降级照样发不出去；能救结论的是下面"有 bot 但这次建卡失败"那条路。
-        if (now - it.at > CARD_RELAY_TTL_MS) {
+        // 🔒 C2（第二十六轮门槛 LOW#7 纠偏）：原来这里补的 `now >= retryUntil` 子句是**恒真死码**——
+        //   上面 344 行退避闸门已把仍在退避窗口的条目整条 continue 掉，能走到本分支的条目
+        //   必然已过退避。保护由 344 给，不在这里重复表达"保险"（上面 334 行那处不同：
+        //   无 token 无建卡意图的条目**到不了** 344，那处的子句是有效判据，保留）。
+        if (now - relayTtlFrom > CARD_RELAY_TTL_MS) {
           console.log('[fs] relayed card push dropped (no bot for this chat within '
             + Math.round(CARD_RELAY_TTL_MS / 1000) + 's): card=' + String(it.card.token || '-').slice(-8)
             + (createIntent ? ' CONCLUSION LOST (no bot channel)' : ''))
@@ -669,6 +686,19 @@ export function apply(ctx) {
         //        拿不到身份则拒绝执行（fail-closed）。
         // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
         identityGuard: typeof bot.identityGuard === 'boolean' ? bot.identityGuard : undefined,
+        // 0.8.4（A5/A6 能力审批表）：**默认关**（CM 2026-10-06「身份闸先全关，验证时挑一个账号」）。
+        // 打开后：切模型/目标模式/计划模式/答复审批单这四类动作先查 `capability_grants.json`，
+        //        无有效授权 ⇒ 拒 + 向审批人私聊发申请卡（有效期三档由审批人选）。
+        // 审批人 open_id 不写则回落 `ownerOpenId`。⚠️ 白名单坑同 splitConclusionMinMs。
+        capabilityGuard: typeof bot.capabilityGuard === 'boolean' ? bot.capabilityGuard : undefined,
+        capabilityApproverOpenId: typeof bot.capabilityApproverOpenId === 'string'
+          && bot.capabilityApproverOpenId ? bot.capabilityApproverOpenId : undefined,
+        // 0.8.4（A2/A3 两模式独立开关，CM 中台 #7「三个独立开关，默认全关」＋ #53「plan/goal
+        // 至今没有真开关」）：**默认关** —— 不写就是关。关 ⇒ `/plan`、`/goal` 不受理（可见回执），
+        // 加上 approvalForm 共三个正交开关。开 ⇒ 还要过能力闸（按人查表，A5）。
+        // ⚠️ 白名单坑同 splitConclusionMinMs。
+        planEnabled: typeof bot.planEnabled === 'boolean' ? bot.planEnabled : undefined,
+        goalEnabled: typeof bot.goalEnabled === 'boolean' ? bot.goalEnabled : undefined,
         // 0.8.0（P0-6 可选接力）：**默认 self_only = 现状门一字不动**（CM 2026-10-04 防互刷裁决）。
         // mentions_any=转"@了任意其它 bot"的消息；all=全部群消息转发；off=全部丢弃。
         // groupRelayChats 按群覆盖（oc_x -> 模式）。⚠️ 白名单坑同 splitConclusionMinMs。
@@ -735,10 +765,28 @@ export function apply(ctx) {
   }
 
   function writeState(appId, state) {
+    // 🔴 第三十五轮门槛 MEDIUM（核对为真）：`p`/`tmp` 原来声明在 try **块内**，块级作用域 ⇒
+    //   下面 catch 里的清理引用不到，ReferenceError 被内层空 catch 静默吞掉——第 34 轮那次
+    //   「清理口径对齐」的修复实际**从未生效**。提到函数作用域（writeGrants 本来就是这个形状）。
+    const p = statePathFor(appId)
+    const tmp = p + '.tmp-' + process.pid
     try {
       mkdirSync(configDir(), { recursive: true })
-      writeFileSync(statePathFor(appId), JSON.stringify(state, null, 2))
+      // 🔴 第二十四轮门槛 LOW#7：state 现在带 `peer`/`peerUnion`（按人身份），与同批的
+      //   capability_grants.json 同口径收到 0600（同机多账号共存，见 README 账号台账）。
+      // 🔴 第三十三轮门槛 MEDIUM#1（核对为真）：直写**先截断再写满**——中间断电/SIGKILL 会留
+      //   半截 JSON ⇒ 下次 readState 走 catch 返回 `{ chats:{} }`，**该 bot 的全部会话与身份
+      //   映射一起丢**（不只这一次写入失败）。改与 writeGrants 同款原子写：tmp → chmod → rename。
+      writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 })
+      try { chmodSync(tmp, 0o600) } catch { /* 某些文件系统不支持，忽略 */ }
+      renameSync(tmp, p)
+      try { chmodSync(p, 0o600) } catch { /* 同上 */ }
     } catch (error) {
+      // 🔴 第三十四轮门槛 LOW#1（核对为真）：writeGrants 失败时清 tmp，writeState 原来只记日志
+      //   ——半截 `*.tmp-<pid>` 留在配置目录里（同形状已发生漂移）。清理口径对齐。
+      //   抽公共 atomicWriteJson 判**不修**：两处载荷形状不同（裸对象 vs version 包装）、返回契约
+      //   不同（writeGrants 要 ok 旗标供调用方拒写），两处各自有冒烟流水兜行为，合并的反证成本大于收益。
+      try { if (existsSync(tmp)) unlinkSync(tmp) } catch { /* 清理失败不掩盖原错误 */ }
       console.log('[fs] state save failed: ' + String(error && error.message || error))
     }
   }
@@ -913,7 +961,7 @@ export function apply(ctx) {
       }
     }
     const card = {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       elements: [{ tag: 'markdown', content: body }],
     }
     const res = await httpJson(
@@ -948,7 +996,7 @@ export function apply(ctx) {
             'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=' + receiveIdType,
             'POST',
             { 'Content-Type': 'application/json', Authorization: 'Bearer ' + await tenantAccessToken(bot, cfg.appId, cfg.appSecret) },
-            { receive_id: target || cfg.ownerOpenId, msg_type: 'interactive', content: JSON.stringify({ config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: bare }] }) },
+            { receive_id: target || cfg.ownerOpenId, msg_type: 'interactive', content: JSON.stringify({ config: { wide_screen_mode: true, update_multi: true }, elements: [{ tag: 'markdown', content: bare }] }) },
           )
           parsedRes = parseJson(retry.text)
           const okRetry = retry.status >= 200 && retry.status < 300 && parsedRes && parsedRes.code === 0
@@ -1902,7 +1950,7 @@ export function apply(ctx) {
     if (!footerDrawn) elements.push({ tag: 'markdown', content: statusTextFor(card) })
     // P1-5：出卡前**最后一道清洗**（接在表格降级/长文切块之后，见 sanitizeCardElements 注释）
     sanitizeCardElements(elements, bot, chatId)
-    return { schema: '2.0', config: { wide_screen_mode: true }, body: { elements } }
+    return { schema: '2.0', config: { wide_screen_mode: true, update_multi: true }, body: { elements } }
   }
 
   // ---- G · 本地图片/文件上传（2026-10-03）--------------------------------------
@@ -3452,6 +3500,18 @@ export function apply(ctx) {
         if (!bot.chatKinds) bot.chatKinds = new Map()
         bot.chatKinds.set(chatId, String(kind))
       }
+      // 0.8.4：会话↔发言人的对应关系同样要跨重启恢复（否则重启后审批卡找不到审批人的私聊）。
+      const peer = record && record.peer
+      if (typeof peer === 'string' && peer) {
+        if (!bot.chatPeers) bot.chatPeers = new Map()
+        bot.chatPeers.set(chatId, peer)
+      }
+      // C7：union 腿同样跨重启恢复（缺省＝旧 state 没有该字段 ⇒ 不写，与 kind/peer 同规则）。
+      const peerUnion = record && record.peerUnion
+      if (typeof peerUnion === 'string' && peerUnion) {
+        if (!bot.chatPeerUnions) bot.chatPeerUnions = new Map()
+        bot.chatPeerUnions.set(chatId, peerUnion)
+      }
     }
     return chats
   }
@@ -3472,6 +3532,12 @@ export function apply(ctx) {
         // 都传 bot ⇒ 这里直接读。用例 68 锚这个字段。
         kind: bot.chatKinds && bot.chatKinds.get(chatId)
           ? String(bot.chatKinds.get(chatId)) : undefined,
+        // 0.8.4（能力审批）：这条会话最近一次说话的人 ⇒ 重启后还能找到审批人的私聊会话。
+        peer: bot.chatPeers && bot.chatPeers.get(chatId)
+          ? String(bot.chatPeers.get(chatId)) : undefined,
+        // C7（中台 #49）：union 腿（跨应用稳定 id）随 peer 一起落盘。
+        peerUnion: bot.chatPeerUnions && bot.chatPeerUnions.get(chatId)
+          ? String(bot.chatPeerUnions.get(chatId)) : undefined,
       }
     }
     writeState(bot.cfg.appId, state)
@@ -3591,6 +3657,18 @@ export function apply(ctx) {
     return prefix
   }
 
+  // 🔴 第四十九轮 LOW#1（核对为真）：**刹车清单必须有唯一来源**。入站派发尾队列（#65 附件下载
+  //   排队）原来只豁免 `/stop`，而 handleCommand 的 `isManageCmd` 认 `/plan off`、`/goal`（无参＝
+  //   查状态）、`/goal pause` 同为"随叫随到"——两套判据并存＝目标跑着、附件正挂在下载里时
+  //   `/goal pause` 排在它后面，锁车论证（第三十六/三十四轮）当场失效。判据收成这一个函数，
+  //   两处共用；`stop` 只在调用方按名判（它无子命令，不属"管理类子命令"语义）。
+  //   ⚠️ 大小写口径与第二十七轮 MEDIUM#2 一致：只认原样小写子命令，大写一律先过闸门。
+  function isBrakeSubcommand(resolved, rawArg) {
+    if (resolved === 'plan') return rawArg === 'off'
+    if (resolved === 'goal') return !rawArg || /^pause(\s|$)/.test(rawArg)
+    return false
+  }
+
   // `/goal` 的正文由 harness 的 command-goal 实现渲染（英文标签：Goal created /
   // Status / Objective / Rounds）。这里只在"刚启动一轮目标"时补一句中文说明，
   // 让 CM 知道接下来飞书上会发生什么 —— 每轮一张进度卡，不需要他催。
@@ -3634,12 +3712,122 @@ export function apply(ctx) {
     }
   }
 
+  // 🔴 第二十七轮门槛 LOW#8（核对为真）：p2p 白名单判据此前在**四处**各抄一份写法
+  //   （handleCommand 私聊边界 / askApprovalCard / approverChatFor / exit_plan_mode 接管），
+  //   口径同一、字面各异——连审六轮每次都在担心漂移，这次收成唯一入口。
+  //   语义＝**fail-closed 白名单**：只有 bot 的 chatKinds 里**明确记为 p2p** 的会话才算私聊；
+  //   bot 缺失、chatKinds 未建、类型未知（group/没有记录）一律 ⇒ false（不许当私聊放行）。
+  //   同批教训：黑名单判法（只认 kind==='group'）把"未知"洗成合法，22/25 轮已两次判红。
+  function isP2pChat(bot, chatId) {
+    return Boolean(bot) && Boolean(bot.chatKinds)
+      && bot.chatKinds.get(String(chatId)) === 'p2p'
+  }
+
+  // 🔒 第二十八轮门槛 LOW#6：私聊边界受理范围的**唯一清单**。
+  // 🔴 第四十二轮门槛 LOW#5（核对为真，口径更正）：本表判据不是"会产出可点卡片"——
+  //   /switch 也渲染可点卡（工作区/会话卡）却不在表中（confirmed 群里 stable 模式对它是
+  //   纯文本拒答，卡泄漏不可达，维持不收编）。真口径＝**会改动本会话模型/计划/目标**的
+  //   动作才进这张表。
+  // 🔴 第三十三轮门槛 LOW#2（注释口径修正，维持不合并的裁决）：受闸命令的"名册"实际分散在
+  //   **四处**（本表 · MODE_SWITCH 开关位 · COMMAND_CAPABILITY 能力名映射 · CAPABILITY_KEYS
+  //   总闸白名单）＋CAPABILITY_LABELS 一处文案表——旧注释写"三处"少报了一处，本身就是
+  //   注释漂移。为什么不合并成单张注册表：四张表的**维度不同**（是否发卡/开关键名/能力名/
+  //   可批能力全集），强行合一会把"闸只拦进入不拦刹车"这类分支语义挤进一个布尔；
+  //   一致性目前由冒烟逐命令钉死（用例 106/107/108/111 按命令×闸门矩阵断言，漏接线会红）。
+  //   新增"要点卡"的命令时**四处都要看**，边界闸这一维度至少不再靠内联枚举各写各的。
+  const P2P_GATE_COMMANDS = ['model', 'goal', 'plan']
+
   async function handleCommand(bot, chat, chatId, cmd) {
     const resolved = resolveCommandName(cmd.name)
     if (!resolved) return false
+    // 🔒 私聊边界（CM 2026-10-06：「卡片只在私聊去做审核、切换模型这些动作」）：
+    //   需要**真人点按钮**的动作（切模型／目标模式／计划审批卡）不在群聊发卡 —— 这一条同时把
+    //   "谁能点"的身份问题从根上关掉：群里随便一个人翻到卡就能替会话主人切模型/批计划。
+    // 🔴 第二十五轮门槛 MEDIUM#1（核对为真）：原来是**黑名单**（只拒确认过的群）⇒ 类型未知的
+    //   会话会被当成合法私聊放行这三条命令，与同批 `approverChatFor`/`askApprovalCard` 的
+    //   p2p 白名单口径不一致。改成：**只认已确认为 p2p 的会话**（fail-closed）。
+    // 🔴 同轮 MEDIUM#3（核对为真）：管理/刹车子命令不吃开关与能力闸——群会话被 GUI 拖进
+    //   计划模式后，唯一退出入口就是 /plan off；拒它＝锁车。只有"进入/退出运行"才上闸。
+    //   （isManageCmd 判据见下方私聊边界处。）
+    // 🔴 第三十六轮门槛 MEDIUM（核对为真，**收窄**上面第二十五轮的分类）：`/goal clear`、
+    //   `/goal edit <文>` 是**改动目标本体**的动作，不是刹车——留在豁免清单＝群里任何人
+    //   @ 一下就能清空/劫持会话主人的目标，正是本批次到处收紧的授权边界。
+    //   豁免只保留真刹车与只读：pause（停火车）、无参数（查状态）；
+    //   锁车论证对它们成立（跑着的目标在花钱，pause 必须随叫随到），clear/edit 不在此列。
+    // 🔴 第四十轮门槛 MEDIUM（核对为真）：`resume` 原来混在豁免里＝**三道闸全跳**——群里
+    //   任何人 @ 一下就能把暂停的目标重新点跑（恢复烧钱），和第三十六轮收 clear/edit 是
+    //   同一个洞。**resume 是"开车"不是"刹车"**：它不该有锁车论证（火车已停，拦着不亏），
+    //   收回后与建目标同规——私聊边界+开关+能力闸逐一过（卡片口 8572 早就在 goalEnabled
+    //   之后，命令/卡片两通道口径就此对齐）。
+    // 🔴 第二十六轮门槛 LOW#3：嵌套三元改 if/else。
+    // 🔴 第二十七轮门槛 MEDIUM#2（核对为真）：**分类判据必须钉"原样大小写"，不是 lowercase**——
+    //   执行侧 `cmd.arg !== 'off'` / `cmd.arg === 'off'`（3837/3853）是**大小写敏感**的，
+    //   旧写法 `/plan OFF` 会被我判成刹车而绕过私聊边界+开关+能力闸，落进执行侧却按
+    //   「带正文 ⇒ 进计划模式并起回合」处理＝绕过整批闸门去**开车**。goal 侧 harness 的
+    //   大小写语义本机不可证（命令包不在本地），同口径从严：只认原样小写子命令是刹车，
+    //   大写形式一律先过闸门（群里想刹车就好好打小写——刹车入口不丢，只是不惯着大小写漂移）。
+    //   第二十八轮 LOW#5：同因删掉了 lowercase 化的 `cmdWord` 死声明——留着它，下一个改这段的人
+    //   很可能把它当活判据接回去，大小写绕闸当场复发。
+    const rawArg = String(cmd.arg || '').trim()
+    // 🔴 第三十六轮门槛 MEDIUM：豁免面收窄——clear/edit 已移出（改动目标本体＝受闸动作）。
+    // 🔴 第四十轮门槛 MEDIUM：resume 也已移出（重新开跑＝开车，不是刹车，见上方判据注）。
+    // 🔴 第四十九轮 LOW#1：判据本体移到 `isBrakeSubcommand`（与入站尾队列共用，见其注释）。
+    const isManageCmd = isBrakeSubcommand(resolved, rawArg)
+    // 🔴 第四十二轮门槛 LOW#4（核对为真）：原来 `Boolean(bot) &&` 把 bot 缺失洗成
+    //   "notP2p=false ⇒ 闸整个跳过"＝与本函数头注释立的 fail-closed 口径**相反**
+    //   （isP2pChat 对 falsy bot 本就返回 false，五个兄弟消费点都是裸用法）。去掉包装。
+    const notP2p = !isP2pChat(bot, chatId)
+    // 🔴 第二十八轮门槛 LOW#6：受这道边界的命令清单收**唯一来源**——原来内联枚举、
+    //   MODE_SWITCH、COMMAND_CAPABILITY 三处各写各的，加减开关位时漏改一处就静默少一道闸。
+    if (!isManageCmd && notP2p && P2P_GATE_COMMANDS.indexOf(resolved) >= 0) {
+      console.log('[fs] 私聊边界拒绝: /' + resolved + ' 非确认私聊不受理（群或类型未知都不发卡） chat=' + String(chatId))
+      await sendPlainText(bot, chatId,
+        '/' + resolved + ' 需要在**私聊**里进行（这类操作会改动这个会话的模型/计划/目标，'
+        + '群里人人可点不合适）。直接私聊我发同样一条即可。')
+      return true
+    }
+    // 🔒 A2/A3 两模式独立开关（CM 中台 #7「三个独立开关，默认全关」＋ #53「plan/goal 至今
+    //   没有真开关」）：**bot 级总闸，默认关** —— 关着时 /plan、/goal 直接不受理（可见回执+留痕），
+    //   连能力闸都不必走（表里批了也不放行：开关是"这个 bot 有没有这项功能"，表是"这个人有没有"）。
+    // 🔴 第二十四轮门槛 MEDIUM#7（核对为真）：**"退出/刹车"类子命令不吃开关与能力闸**——
+    //   开关关 ≠ 会话没停在计划模式里（GUI 起的计划模式桥管不着），目标状态又跨重启存活；
+    //   拦住 `/plan off`、`/goal pause` ＝把用户锁在正在跑的火车上（目标模式还在花钱
+    //   却按不下暂停）。只有"进入/创建"与"改动本体"（clear/edit，第三十六轮 MEDIUM 归位；
+    //   resume，第四十轮 MEDIUM 归位——恢复续跑＝重新开车花钱，无锁车论证）才上闸。
+    //   （isManageCmd 判据见上方私聊边界处。）
+    const MODE_SWITCH = { plan: 'planEnabled', goal: 'goalEnabled' }
+    const switchKey = MODE_SWITCH[resolved]
+    if (switchKey && !isManageCmd && !(bot && bot.cfg && bot.cfg[switchKey] === true)) {
+      console.log('[fs] 开关拒绝: /' + resolved + ' 未启用（bot=' + String(bot && bot.cfg && bot.cfg.name)
+        + ' 需配置 ' + switchKey + '=true）chat=' + String(chatId))
+      await sendPlainText(bot, chatId,
+        '/' + resolved + ' 功能当前未启用（本 bot 的' + (resolved === 'plan' ? '计划' : '目标')
+        + '模式开关是关的）。需要启用请让管理员在飞书桥配置里打开 `' + switchKey + '`，'
+        + '启用后本人还需通过能力审批。')
+      return true
+    }
+    // 🔒 能力闸（CM 2026-10-06：「所有的功能开关我来批准，批准以后就入表」）：
+    //   这四类动作按**人**查 `capability_grants.json`，没有有效授权＝拒 + 发起申请。
+    //   总闸 `capabilityGuard` 关时 `requireCapability` 直接放行（＝与今日行为一字不差）。
+    //   命令路径拿不到 `evt`（两个调用点都在事件链上分流走了），所以发言人在入站时已记进
+    //   `chatPeers`（＝这条会话最近一次说话的人），命令就是这个人发的。
+    const COMMAND_CAPABILITY = { model: 'model', goal: 'goal', plan: 'plan' }
+    const wantCap = COMMAND_CAPABILITY[resolved]
+    if (wantCap && !isManageCmd) {
+      // 🔴 第四十轮门槛 LOW#5（核对为真）：写入侧 noteChatPeer 与 isP2pChat 都用 String(chatId)
+      //   归一，这里却拿原值查——非串 chatId 一旦流到 ⇒ 静默查空 ⇒ 把有授权的人误拒成
+      //   "认不出你的身份"。读取侧同口径归一。
+      const peerKey = String(chatId)
+      const peerOu = String((bot && bot.chatPeers && bot.chatPeers.get(peerKey)) || '')
+      const peerUnion = String((bot && bot.chatPeerUnions && bot.chatPeerUnions.get(peerKey)) || '')
+      // 🔴 第三十六轮门槛 LOW#4：传 getter，roster 解析推迟到总闸判开之后（关＝零 I/O 零新日志）。
+      if (requireCapability(bot, chatId,
+        () => ({ open_id: peerOu, union_id: peerUnion, name: rosterNameFor(bot, peerOu, peerUnion) }),
+        wantCap, 'cmd:/' + resolved)) return true
+    }
     if (resolved === 'help') {
       await sendPlainText(bot, chatId,
-        '/new [名称] 新建会话\n/switch 选工作区（第一步）→ 点进去再选该工作区的会话\n/switch <工作区序号> 看该工作区的会话 ｜ /switch <工作区序号> new 在该工作区新建 ｜ /switch <工作区序号> <会话序号> 接管\n/list 列出当前工作区的会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause|resume|clear|edit <目标>\n/compact 压缩上下文（agent 空闲时才可用）\n/model 切换模型（发一张卡，点一下即切）\n/stop 停止当前任务\n/help 帮助')
+        '/new [名称] 新建会话\n/switch 选工作区（第一步）→ 点进去再选该工作区的会话\n/switch <工作区序号> 看该工作区的会话 ｜ /switch <工作区序号> new 在该工作区新建 ｜ /switch <工作区序号> <会话序号> 接管\n/list 列出当前工作区的会话\n/plan [off] 计划模式开关\n/goal <目标> 目标模式（自动续轮，每轮进度发到飞书）\n/goal (无参数) 查看目标状态 ｜ /goal pause（刹车随叫随到）｜ /goal resume|clear|edit（改动运行＝需开关开启+本人获批+私聊）\n/compact 压缩上下文（agent 空闲时才可用）\n/model 切换模型（发一张卡，点一下即切）\n/stop 停止当前任务\n/help 帮助')
       return true
     }
     if (resolved === 'model') {
@@ -3663,13 +3851,11 @@ export function apply(ctx) {
       if (target) {
         try {
           const sel = await switchModelForAgent(agent, target.provider, target.model)
-          if (sel.confirmed) {
-            await sendPlainText(bot, chatId, '✅ 模型已切换为 `' + sel.provider + '/' + sel.model
-              + '`（下一次请求开始用）')
-          } else {
-            await sendPlainText(bot, chatId, '⚠️ 切换请求已发给宿主（`' + sel.provider + '/' + sel.model
-              + '`），但宿主没有回带确认，无法保证已生效。发 `/model` 看「当前」是不是这条。')
-          }
+          // 🔴 中台 #124：回执四分支——**「✅ 已切换」只允许出现在"默认值落地已验证"的场合**
+          //   （验收标准 D）；未落地就明说「只对下一条生效、默认值未写入」并给下一步。
+          // 🔴 第四十七轮 LOW#3：四分支判据树收进 modelSwitchReceipt（文案见该函数注释）。
+          const rcText = modelSwitchReceipt(sel)
+          await sendPlainText(bot, chatId, rcText.text)
         } catch (error) {
           // 中台 #47C：点击档有 `[fs] /model 切换失败: +stack`，文字档原来**一行都不留**
           //   ⇒ 实测两条失败消息在 journal 里查无痕迹，只能靠翻聊天消息才拿到报错原文。
@@ -3799,7 +3985,9 @@ export function apply(ctx) {
         return true
       }
       if (!cmd.arg || /^(pause|resume|clear|edit)(\s|$)/iu.test(cmd.arg)) {
-        await sendPlainText(bot, chatId, '用法：/goal <目标> ｜ /goal（查看状态）｜ /goal pause ｜ /goal resume ｜ /goal clear ｜ /goal edit <新目标>')
+        // 🔴 第四十一轮门槛 LOW#7（措辞跟上归闸）：pause 是刹车随叫随到；resume/clear/edit
+        //   改动运行（第四十轮 MEDIUM 起与建目标同规），提示里讲清前提，别把人引进取缔路径。
+        await sendPlainText(bot, chatId, '用法：/goal <目标> ｜ /goal（查看状态）｜ /goal pause ｜ /goal resume ｜ /goal clear ｜ /goal edit <新目标>（resume/clear/edit 需目标开关开启、本人获批且在私聊进行）')
         return true
       }
       try {
@@ -4201,6 +4389,233 @@ export function apply(ctx) {
       console.log('[fs] roster miss (id not in bot_roster.json): ' + missKey.slice(0, 12) + '…')
     }
     return ''
+  }
+
+  // ==== 0.8.4 A5/A6：能力审批表 `capability_grants.json` ================================
+  // CM 2026-10-06 原话：「这个身份他有没有获得审批。可能去读一个表，如果他有这一个能力的
+  //   审批的情况下，他就有这个功能。**如果现在不是这么实现的话，就不行**」
+  //   ＋「所有的功能开关我来批准，批准以后就入表，批准的有效期我可以在卡片上面选，
+  //     默认是今天/1个月/6个月」＋「审批有效期完了之后，就发个提醒告诉这个人『审批已过期』，
+  //     他要再申请的话，就让他再发起申请」。
+  // 表位置 = `configDir()`（与 `bot_roster.json` 同目录）⇒ 服务器上那份是**权威源**，
+  //   本地开发机各有一份同结构副本；路径全部由 `FS_CONFIG_DIR`/`configDir()` 驱动（A17）。
+  // 🔒 总闸 `capabilityGuard` **默认关**（CM：「身份闸先全关，我要验证的时候挑一个账号来做验证」）：
+  //   关＝不查表（与今日行为一致，部署 0.8.4 不会把任何人锁在外面）；
+  //   开＝查表，**查不到 / 已过期 / 表读不出 ⇒ 一律拒**（fail-closed，CM 2026-10-04「宁愿拒绝」）。
+  const CAPABILITY_KEYS = ['model', 'goal', 'plan', 'approval']
+  const CAPABILITY_LABELS = { model: '切换模型', goal: '目标模式', plan: '计划模式', approval: '答复审批单' }
+  // 有效期三档（CM 指定的三档，默认 `today`）。`today` 按**服务器本地时区**的当天 23:59:59 到期。
+  const GRANT_TERMS = { today: '今天', month: '1 个月', halfyear: '6 个月' }
+  const GRANT_TERM_KEYS = ['today', 'month', 'halfyear']
+
+  function grantsPath() { return join(configDir(), 'capability_grants.json') }
+
+  // 为什么这里**不做 mtime 缓存**（与 roster/identity_map 相反）：写表要走 read-modify-write，
+  // 缓存会让两次批准互相覆盖；而本函数只在"被闸拦下/被批准/到期扫描"这三条低频路径上调用，
+  // 不在每条入站消息路径上，读一次盘的代价可接受。
+  function loadGrants() {
+    let raw
+    try {
+      raw = readFileSync(grantsPath(), 'utf8').replace(/^\uFEFF/, '')
+    } catch (error) {
+      // 🔴 第三十二轮门槛 MEDIUM#1（核对为真）：读失败必须**分型**——ENOENT＝文件还没建＝
+      //   正常初始态（谁都没被批过）；其余（EACCES/EMFILE/瞬时不可读）＝**读不到**，
+      //   调用方拿这个标志中止"读-改-写"，否则整表覆盖会把临时 I/O 错误放大成永久丢授权。
+      if (error && error.code === 'ENOENT') return { rows: [], readFailed: false }
+      console.log('[fs] capability table read failed（按未获授权读，但写回方必须中止）: '
+        + String(error && error.message || error))
+      return { rows: [], readFailed: true }
+    }
+    try {
+      const d = JSON.parse(raw)
+      return { rows: Array.isArray(d && d.grants) ? d.grants : [], readFailed: false }
+    } catch (error) {
+      // 表坏了＝**谁都没有授权**（fail-closed），但必须喊出来，否则表现是"批了却没生效"。
+      // 🔴 同轮 MEDIUM#1：坏表同样置 readFailed——"按未获授权读"是给判定用的，
+      //   绝不能反过来成为"把整表重写成空/单行"的许可。
+      console.log('[fs] capability table unreadable ⇒ 按未获授权处理: '
+        + String(error && error.message || error))
+      return { rows: [], readFailed: true }
+    }
+  }
+
+  function writeGrants(rows) {
+    const p = grantsPath()
+    const tmp = p + '.tmp-' + process.pid
+    try {
+      mkdirSync(configDir(), { recursive: true })
+      writeFileSync(tmp, JSON.stringify({ version: 1, grants: rows }, null, 2), { mode: 0o600 })
+      // 表里存的是"谁在什么时间被批了什么能力"＝人员授权记录 ⇒ 明确收到 0600，
+      // 不让同机其他账号读到（`mode` 在文件已存在时不生效，故再 chmod 一次）。
+      try { chmodSync(tmp, 0o600) } catch { /* 某些文件系统不支持，忽略 */ }
+      renameSync(tmp, p)
+      try { chmodSync(p, 0o600) } catch { /* 同上 */ }
+      return { ok: true }
+    } catch (error) {
+      try { if (existsSync(tmp)) unlinkSync(tmp) } catch { /* 清理失败不掩盖原错误 */ }
+      console.log('[fs] capability table write failed: ' + String(error && error.message || error))
+      return { ok: false, error: String(error && error.message || error) }
+    }
+  }
+
+  function endOfLocalDay(atMs) {
+    const d = new Date(atMs)
+    d.setHours(23, 59, 59, 999)
+    return d
+  }
+  function addMonths(atMs, months) {
+    const d = new Date(atMs)
+    const day = d.getDate()
+    d.setDate(1)
+    d.setMonth(d.getMonth() + months)
+    // 1/31 + 1 个月不能变成 3/3：钳到该月最后一天
+    const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()
+    d.setDate(Math.min(day, last))
+    return d
+  }
+  function grantExpiryIso(term, atMs) {
+    if (term === 'halfyear') return addMonths(atMs, 6).toISOString()
+    if (term === 'month') return addMonths(atMs, 1).toISOString()
+    return endOfLocalDay(atMs).toISOString()
+  }
+  function grantExpired(row, atMs) {
+    const exp = Date.parse(String((row && row.expires_at) || ''))
+    // 🔴 第二十四轮门槛 LOW#5：漏传时基的调用点会让 `exp <= undefined`（NaN 比较）恒假 ⇒
+    //   过期判定被**静默关闭**（fail-open）——正是上一轮 sweep 踩过的坑，从签名上堵死。
+    const now = Number.isFinite(atMs) ? atMs : Date.now()
+    return !Number.isFinite(exp) || exp <= now   // 没有可用到期时间＝视为已过期（fail-closed）
+  }
+  // 人怎么算同一个人：`union_id` 优先（跨应用稳定），否则比 `open_id`（本应用视角）。
+  // **两个都拿不到＝不匹配**（不许按名字猜 ⇒ 改名/重名会把权限发给错的人）。
+  function grantMatchesPerson(row, person) {
+    if (!row || !person) return false
+    if (person.union_id && row.union_id && person.union_id === row.union_id) return true
+    if (person.open_id && row.open_id && person.open_id === row.open_id) return true
+    return false
+  }
+  function findActiveGrant(person, capability, atMs) {
+    // 🔴 第四十二轮门槛 LOW#6（核对为真，**判不修**——人级口径正是本批裁决原文）：匹配
+    //   不带 app_id ＝ 有意为之。开关与表的分工在 handleCommand 开关闸注释里写死：
+    //   开关问"这个 bot 有没有这项功能"，表问"**这个人**有没有"（CM 2026-10-06：
+    //   「所有的功能开关我来批准，批准以后就入表」）。同租户 union_id 跨应用稳定、审批
+    //   出口同一人 ⇒ 人在 A bot 获批在 B bot 同效是**预期行为**，逐 bot 收紧属口径变更
+    //   （要改先改裁决），不是漏洞。row.app_id 只作审批来源留痕，不参与判权。
+    // 🔴 第四十三轮门槛 LOW#3（核对为真）：原来把 loadGrants 的 readFailed 丢掉——瞬时
+    //   读失败（EACCES/EMFILE）被当成"没批过"：既给申请人发"还没获批"，又向审批人**新起
+    //   一张批了也存不进去**的申请卡（recordCapabilityGrant 在 readFailed 时中止入库）。
+    //   把标志带给判定方，读失败单立拒因、不发申请。
+    const now = atMs || Date.now()
+    const { rows, readFailed } = loadGrants()
+    for (const row of rows) {
+      if (!row || String(row.capability) !== String(capability)) continue
+      if (!grantMatchesPerson(row, person)) continue
+      if (grantExpired(row, now)) continue
+      return { grant: row, readFailed: Boolean(readFailed) }
+    }
+    return { grant: undefined, readFailed: Boolean(readFailed) }
+  }
+
+  // 卡片点击一侧的人（`data.operator` 三件套都是本应用视角值）。
+  function personFromOperator(bot, data) {
+    const op = data && data.operator ? data.operator : {}
+    const openId = String(op.open_id || '')
+    const unionId = String(op.union_id || '')
+    return { open_id: openId, union_id: unionId, name: rosterNameFor(bot, openId, unionId) }
+  }
+
+  function localTimeOf(iso) {
+    const ms = Date.parse(String(iso || ''))
+    if (!Number.isFinite(ms)) return String(iso || '（无到期时间）')
+    try {
+      return new Date(ms).toLocaleString('zh-CN', { hour12: false })
+    } catch { return new Date(ms).toISOString() }
+  }
+
+  // 到期提醒的去重：同一行只提醒一次 —— 🔴 第二十四轮门槛 MEDIUM#4（核对为真）后，
+  //   标记从内存 Set 改存**行本身**（`notified` 字段随表持久化）：过期行永不从表里删，
+  //   内存集合要么无限涨、要么（全清/逐出）让被丢的 id 每 30 分钟被再提醒一遍——契约照样破。
+  //   存行里 ⇒ 集合与表同界、重启后也不重发（比原口径「重启后最多再提醒一次」更严），逐出逻辑整个不需要了。
+  // 🔴 第二十五轮门槛 LOW#1（核对为真）：标记时机再收紧一步——**发送 resolve 之后**才写行并落盘。
+  //   发送是异步的：网络/接口瞬失也先标＝提醒被永久吞掉（24 轮修的同步形态在异步支路的残留）。
+  //   `inFlightNotices` 只圈住"在途"窗口防并发重发（代内闭包，重启自然清空）。
+  const inFlightNotices = new Set()
+  function sweepExpiredGrants(nowMs) {
+    // 🔴 第五十二轮 LOW#3（核对后**不加守卫**，理由写在这里）：本行故意只取 `rows`。
+    //   门槛建议补 `if (readFailed) return`，但那条**危害链在本函数里不成立**：顶快照
+    //   `rows` 只用于**遍历**，打标落盘走的是 then 内 `const fresh = loadGrants()` 重读
+    //   ＋`fresh.readFailed` 守卫（第三十二轮 MEDIUM#1 已钉，见本函数 then 内那段注释）⇒ 即使
+    //   将来 `loadGrants` 改成"读失败也返回部分行"，被落盘的仍是重读快照，**不会**
+    //   用这里的空/残表整表覆盖。读失败时 `rows` 为空 ⇒ 本窗白扫一拍，下一窗自愈。
+    //   补一条当前不可达的分支既无判别格可钉（无可观测差异），又会让人误以为"这里在防覆盖"。
+    const { rows } = loadGrants()
+    for (const row of rows) {
+      if (!row || !row.id || !grantExpired(row, nowMs)) continue
+      if (row.notified || inFlightNotices.has(row.id)) continue
+      const bot = bots.get(String(row.app_id || ''))
+      const chatId = String(row.requester_chat_id || '')
+      if (!bot || !chatId) {   // 发不出去（该 bot/会话不在了）＝跳过，但**必须留痕**，
+        console.log('[fs] capability expired notice skipped: bot=' + (bot ? 'ok' : 'missing('
+          + String(row.app_id || '') + ')') + ' chat=' + (chatId || 'missing'))
+        continue               // 🔴 且**不打标记**：标记写在发送之前＝通知被这一拍吃掉（r10 实测：
+      }                          //   apply 期注册定时器的即时一拍 bots 表还没建好，行被标 notified 后
+                                 //   提醒永远发不出去）。发得出去才算"提醒过"，发不出去留给下一窗。
+      const label = CAPABILITY_LABELS[row.capability] || String(row.capability)
+      inFlightNotices.add(row.id)
+      sendPlainText(bot, chatId,
+        '⌛ 你的「' + label + '」审批**已过期**（有效期到 ' + localTimeOf(row.expires_at) + '）。'
+        + '需要用就再发一次指令，我会重新向审批人发起申请。')
+        .then((res) => {
+          // 🔴 第三十轮门槛 MEDIUM#1（核对为真）：sendPlainText **从不因投递失败而 reject**——
+          //   httpJson 把网络错误吞成 `{status:0}`，降级重试也只是"再试一次后照样 resolve"。
+          //   所以 resolve 出来≠送达：不判返回值就打标＝"没送到"也被记成"提醒过"，
+          //   过期通知被永久吞掉（r10 的异步残留形态，25/26 轮只修了 reject 侧）。
+          //   判据与 sendPlainText 内部同款：**2xx 且 code=0** 才算送达。
+          const parsed = parseJson(res && res.text)
+          const okSent = res && res.status >= 200 && res.status < 300 && parsed && parsed.code === 0
+          if (!okSent) {
+            console.log('[fs] capability expired notice send failed（不打标，留给下一窗重发）: status='
+              + String(res && res.status) + ' body=' + String(res && res.text || '').slice(0, 120))
+            return
+          }
+          // 🔴 第二十六轮门槛 MEDIUM#2（核对为真）：不许回写 sweep 顶部的**陈旧快照**——
+          //   发送窗口里审批点击会走 recordCapabilityGrant（读表→加行→落盘），整表回写旧快照
+          //   会把刚获批的新行**静默吞掉**（回执"已批准"，表里却没有这条授权）。
+          //   改法：then 内**重读表**、按 id 翻标记——读-改-写落在同一个同步片内，不留交错窗口。
+          // 🔴 第三十二轮门槛 MEDIUM#1（核对为真）：重读**失败**（readFailed）时表内容是假的空 ⇒
+          //   继续 writeGrants 等于"一次瞬时 I/O 错误清空全部授权"。中止本次打标，留给下一窗。
+          //   行查无同理：本表只增不删（第二十七轮 LOW#6 口径），"读成功但没有这行"＝异常，
+          //   宁可不写也不把来路不明的快照落盘。
+          const fresh = loadGrants()
+          if (fresh.readFailed) {
+            console.log('[fs] capability expired notice: 重读授权表失败 ⇒ 跳过打标（不整表回写，下一窗重发）')
+            return
+          }
+          const target = fresh.rows.find((r) => r && r.id === row.id)
+          if (!target) {
+            console.log('[fs] capability expired notice: 表里找不到该行（id=' + String(row.id)
+              + '）⇒ 跳过回写（表只增不删，查无＝异常，不拿空快照覆盖）')
+            return
+          }
+          target.notified = true
+          if (!writeGrants(fresh.rows).ok) {
+            // 🔴 第三十六轮门槛 LOW#2（核对为真）：原来写「重启后重发一次」**低估了自己**——
+            //   标记没落盘＝盘上还是 notified:false，而**每一拍** sweep（30 分钟定时器 + 能力
+            //   拒绝时的惰性清扫）都从盘上重读 ⇒ 提醒会**逐窗重发**，直到某次写成功为止。
+            //   行为本身是对的（送达优先、宁重发不漏发），错的是注释；按真实语义改写。
+            console.log('[fs] capability expiry-notified write failed（提醒已送达，标记没落盘 ⇒ 每个清扫窗口都会重发，直到写成功）')
+          }
+          console.log('[fs] capability expired notice: cap=' + row.capability + ' person='
+            + String(row.name || row.open_id || '').slice(0, 20) + ' chat=' + chatId)
+        })
+        .catch((error) => {
+          console.log('[fs] capability expired notice send failed（不打标，留给下一窗重发）: '
+            + String(error && error.message || error))
+        })
+        .finally(() => { inFlightNotices.delete(row.id) })
+    }
+    // 第二十七轮 LOW#3：原来的 `sent` 计数是死码——两处调用点（requireCapability 顺带扫、
+    //   30 分钟定时器）都不看返回值；"发了几条"的观测价值已经由每行一条
+    //   `capability expired notice: …` 留痕承担。删。
   }
 
   // P2（0.8.0 agent 互认）：卡片**点击者**身份。
@@ -4697,35 +5112,58 @@ export function apply(ctx) {
     return '.bin'
   }
 
-  async function downloadInboundFile(bot, evt) {
+  // 🔴 中台 #65（CM 2026-10-08 拍板「赶紧修，这功能不能坏」）：post 富文本（PC 端"文字+文件
+  //   同一条消息"）里的 file/img/media 元素带 file_key/image_key，旧链只认整条消息是
+  //   file/image/audio/media ⇒ 有文字时**附件整段静默丢**（员工发考勤表+一句说明＝agent 只见字）。
+  //   这个函数把 post 内容树里的附件抠出来（按出现顺序），交 handleInbound 逐个走既有下载链。
+  function extractPostAttachments(contentJson) {
+    const out = []
     try {
-      const msgType = String(evt.msg_type || evt.message_type || '')
-      const parsed = JSON.parse(evt.content || '{}')
-      let key = ''
-      let type = ''
-      let fileName = ''
-      if (msgType === 'file') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || '' }
-      else if (msgType === 'image') { type = 'image'; key = parsed.image_key || ''; fileName = 'image' }
-      else if (msgType === 'audio') { type = 'file'; key = parsed.file_key || parsed.audio_key || ''; fileName = parsed.file_name || 'audio' }
-      else if (msgType === 'media') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || 'media' }
-      if (!key || !type) {
-        // 不支持的附件类型（sticker / share_chat / 系统消息…）也要留痕：旧实现直接
-        // `return ''`，日志里与"插件根本没收到"完全无法区分 —— 正是 CM 说的那种盲区。
-        console.log('[fs] inbound non-text ignored: type=' + (msgType || '?') + ' hasKey=' + Boolean(key))
-        return ''
+      const parsed = JSON.parse(contentJson || '{}')
+      const paras = Array.isArray(parsed.content) ? parsed.content : []
+      for (const para of paras) {
+        if (!Array.isArray(para)) continue
+        for (const el of para) {
+          if (!el || typeof el !== 'object') continue
+          if (el.tag === 'file' && typeof el.file_key === 'string' && el.file_key) {
+            out.push({ type: 'file', key: el.file_key, fileName: String(el.file_name || '') })
+          } else if (el.tag === 'img' && typeof el.image_key === 'string' && el.image_key) {
+            out.push({ type: 'image', key: el.image_key, fileName: 'image' })
+          } else if (el.tag === 'media' && typeof el.file_key === 'string' && el.file_key) {
+            out.push({ type: 'file', key: el.file_key, fileName: String(el.file_name || 'media') })
+          }
+        }
       }
+    } catch { /* 非 JSON ⇒ 按无附件处理（正文链照常走） */ }
+    return out
+  }
+
+  // 🔴 第五十一轮 LOW#5（核对为真）：落盘说明的**行前缀**是生产者（downloadAndSaveResource /
+  //   withDownloadBail / downloadInboundFile）与消费者（commandAttachmentReceipt 按前缀筛
+  //   "哪些行要发给 CM 看"）之间的**隐式契约**——措辞一改，消费者就静默丢行（最坏全丢），
+  //   等于 #65 那条"命令口看不见附件"从文案漂移里复发。前缀在这里单源，两边都用它拼。
+  //   ⚠️ 文案主体（历史轮钉过的断言字面）逐字不动，只把行首这三段抽成常量。
+  const FILE_NOTE_PREFIX = '📎 收到文件：'
+  const FILE_PATH_PREFIX = '已保存到：'
+  const FILE_WARN_PREFIX = '⚠️'
+
+  // 下载并落盘**一个**消息资源（file_key/image_key）⇒ 返回给 agent 的可见说明。
+  // downloadInboundFile（整条附件消息）与 post 内嵌附件（#65）共用这一条核：
+  // 同一口径只留一处实现，防止两条通道又漂（A18：改共享函数前先列全调用方）。
+  async function downloadAndSaveResource(bot, messageId, key, type, fileName) {
+    try {
       const ws = bot.cfg.workspace && String(bot.cfg.workspace).trim() ? String(bot.cfg.workspace).trim() : ''
       const base = (bot.cfg.fileInbox && String(bot.cfg.fileInbox).trim())
         || (ws ? join(ws, 'downloaded_files') : join(homedir(), 'downloaded_files'))
       mkdirSync(base, { recursive: true })
       const token = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
-      const url = 'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(evt.message_id)
+      const url = 'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(messageId)
         + '/resources/' + encodeURIComponent(key) + '?type=' + type
       const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } })
       if (!res.ok) {
         console.log('[fs] inbound file download failed: HTTP ' + res.status + ' (' + fileName + ')')
         // 失败必须**可见**（否则又回到"我不知道你发了文件"）：回一条文本，让插件照常起轮告诉 CM。
-        return '⚠️ 收到文件「' + (fileName || '(无文件名)') + '」但下载失败（HTTP ' + res.status + '）。'
+        return FILE_WARN_PREFIX + ' 收到文件「' + (fileName || '(无文件名)') + '」但下载失败（HTTP ' + res.status + '）。'
           + '（多为该应用缺 `im:resource` 权限 —— 见 dsh 日志）'
       }
       const buf = Buffer.from(await res.arrayBuffer())
@@ -4739,16 +5177,80 @@ export function apply(ctx) {
       const p2 = (n) => String(n).padStart(2, '0')
       const stamp = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
         + '-' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds())
-      const path = join(base, stamp + '_' + withExt)
+      const path0 = join(base, stamp + '_' + withExt)
+      // 🔴 第四十六轮 MEDIUM#1（核对为真）：时间戳只有**秒级**，图片文件名又恒为 'image' ⇒
+      //   同一条 post 连发两个同类附件会算出**同一个路径**，后写的把先写的静默覆盖，
+      //   而两条落盘说明各自声称有文件＝agent 读到的内容和回执对不上。撞名就加序号，
+      //   首个文件命名不变（既有用例口径不动）。
+      let path = path0
+      for (let dup = 2; existsSync(path); dup++) {
+        path = join(base, stamp + '_' + String(withExt).replace(/(\.[A-Za-z0-9]{1,8})?$/, '-' + dup + '$1'))
+      }
       writeFileSync(path, buf)
       console.log('[fs] inbound file saved: ' + path + ' (' + buf.length + ' bytes)')
-      return '📎 收到文件：' + (fileName || withExt) + '\n已保存到：' + path
+      return FILE_NOTE_PREFIX + (fileName || withExt) + '\n' + FILE_PATH_PREFIX + path
         + '\n（先只回我一句确认收到即可，等我说要做什么再动它；要读就用文件工具读上面这个路径）'
     } catch (e) {
       console.log('[fs] inbound file handler error: ' + String(e && e.message || e))
       // 同样不许无声：解析/写盘炸了也要让 CM 看到（否则他只会以为"你又不知道"）。
-      return '⚠️ 收到一个我没能处理的附件消息：' + String(e && e.message || e)
+      return FILE_WARN_PREFIX + ' 收到一个我没能处理的附件消息：' + String(e && e.message || e)
     }
+  }
+
+  // 🔴 第四十九轮 MEDIUM#3（核对为真）：`downloadAndSaveResource` 里的换 token + 拉资源两次
+  //   fetch **都没有自带超时**（undici 默认要几分钟）。0.8.4 把入站派发排成尾队列之后，
+  //   一次挂死的下载会把该 bot 后续所有消息（普通消息/提问回答/插话/除刹车外的全部命令）
+  //   全堵在队列头——这是本轮新增的头阻塞路径。修法：给**排队里**的下载套一个有界窗口，
+  //   超时不假装成功、回一条诚实的⚠️说明，文字照常放行、队列照常往下走。
+  //   （只罩排队这条路：附件消息本体走 handleInbound，本来就串行在会话链里，不是新增阻塞。）
+  //   窗口可按 DSH_FEISHU_ATT_DOWNLOAD_MS 调（与 DSH_FEISHU_SPLIT_MIN_MS 同款口径）——
+  //   同款"运营可调 + 用例驱动"的先例：不在调用时读 env 的话，这条超时支路在冒烟里就没格子能演。
+  const ATTACHMENT_DOWNLOAD_DEFAULT_TIMEOUT_MS = 15000
+  function attachmentDownloadTimeoutMs() {
+    const raw = Number(process.env.DSH_FEISHU_ATT_DOWNLOAD_MS)
+    return Number.isFinite(raw) && raw > 0 ? raw : ATTACHMENT_DOWNLOAD_DEFAULT_TIMEOUT_MS
+  }
+  function withDownloadBail(promise, fileName) {
+    const ms = attachmentDownloadTimeoutMs()
+    let timer
+    const bail = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        console.log('[fs] inbound file download timed out: ' + ms + 'ms (' + (fileName || '(无文件名)') + ')')
+        resolve(FILE_WARN_PREFIX + ' 收到文件「' + (fileName || '(无文件名)') + '」但下载 '
+          + Math.round(ms / 1000) + ' 秒没有返回（网络/飞书接口卡住）。'
+          + '这条消息先放行；若稍后才落盘成功，文件会在这个 bot 的附件目录里，需要时重发一次更稳。')
+      }, ms)
+    })
+    return Promise.race([promise, bail]).finally(() => clearTimeout(timer))
+  }
+
+  async function downloadInboundFile(bot, evt) {
+    // 🔴 第四十八轮 LOW#2（核对为真）：原来整个函数套一层 catch，文案与
+    //   downloadAndSaveResource 自己的 catch **逐字相同**——而那个核已自护（下载/写盘
+    //   失败自己回⚠️说明），外层唯一可达的异常只有 `JSON.parse(evt.content)`。
+    //   按真实故障面收窄到解析这一步：两份同字面的兜底文案并成一处，将来改一处不会漏另一处。
+    let key = ''
+    let type = ''
+    let fileName = ''
+    const msgType = String(evt.msg_type || evt.message_type || '')
+    try {
+      const parsed = JSON.parse(evt.content || '{}')
+      if (msgType === 'file') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || '' }
+      else if (msgType === 'image') { type = 'image'; key = parsed.image_key || ''; fileName = 'image' }
+      else if (msgType === 'audio') { type = 'file'; key = parsed.file_key || parsed.audio_key || ''; fileName = parsed.file_name || 'audio' }
+      else if (msgType === 'media') { type = 'file'; key = parsed.file_key || ''; fileName = parsed.file_name || 'media' }
+    } catch (e) {
+      console.log('[fs] inbound file handler error: ' + String(e && e.message || e))
+      // 同样不许无声：解析炸了也要让 CM 看到（否则他只会以为"你又不知道"）。
+      return FILE_WARN_PREFIX + ' 收到一个我没能处理的附件消息：' + String(e && e.message || e)
+    }
+    if (!key || !type) {
+      // 不支持的附件类型（sticker / share_chat / 系统消息…）也要留痕：旧实现直接
+      // `return ''`，日志里与"插件根本没收到"完全无法区分 —— 正是 CM 说的那种盲区。
+      console.log('[fs] inbound non-text ignored: type=' + (msgType || '?') + ' hasKey=' + Boolean(key))
+      return ''
+    }
+    return await downloadAndSaveResource(bot, evt.message_id, key, type, fileName)
   }
 
   // ---- inbound dedup (2026-09-15；2026-10-05 修「多 bot 互相误判重投」) ----------
@@ -4773,6 +5275,8 @@ export function apply(ctx) {
     if (!id) return false
     if (seenInboundIds.has(id)) return true
     seenInboundIds.add(id)
+    // 🔴 第五十一轮 MEDIUM#2：认领落地的这一刻就是"在飞"的终点——标记跟着认领撤。
+    releaseInboundInFlight(id)
     if (seenInboundIds.size > SEEN_INBOUND_MAX) {
       // Set 保序：删掉最早的一个，维持 LRU 窗口
       const oldest = seenInboundIds.values().next().value
@@ -4786,6 +5290,48 @@ export function apply(ctx) {
   function inboundAlreadySeen(bot, messageId) {
     const id = inboundKey(bot, messageId)
     return id ? seenInboundIds.has(id) : false
+  }
+
+  // 🔴 第五十轮 LOW#5（核对为真）：上面的窥探**只认"已经认领过的"**，而认领发生在下游
+  //   handleInbound/steer（5342/5382）。0.8.4 把 post 附件改成"先下载完再派发"之后，认领被推到
+  //   下载完成**之后**（最长可达整个有界窗口）⇒ 重投的第二份落在"第一份还在下载"这个窗口里，
+  //   窥到的是 false、照样再下一遍（多一份 -2 重复文件＋误导的 `inbound file saved` 日志），
+  //   正是第四十七轮 LOW#5 要消灭的形状（那条修法只在"下载完才派发"之前有效）。
+  //   补一个**在飞标记**：入队即登记，与只读窥探并联判定。
+  // 🔴 第五十一轮 MEDIUM#2（核对为真）：原来在任务 `finally` 里"派发完就释放"是**错的**——
+  //   `dispatchParsedInbound` 只把 handleInbound **排进** bot.chain（命令支/提问支甚至根本不排），
+  //   真正认领在更晚才发生 ⇒ 释放到认领之间这段窗口里来的重投，`inboundBusy` 两头都看不见，
+  //   照样再下一遍（本标记要消灭的 -2 重复文件原样复发）。旧注释那句"残余窗口仍由下游判重兜住"
+  //   也不成立：下游判重丢的是**第二次派发**，第二次**下载**早就发生在它上游了。
+  //   改法：标记**跟着认领走**——`isDuplicateInbound` 真认领时才撤；派发支自己抛错才撤
+  //   （那条没走通，得留给下一份重试）。再加 **TTL 兜底**：命令支根本不认领、或进程被换，
+  //   标记不许把这条 id 永久占住（超窗即视为不在飞），并同 SEEN_INBOUND_MAX 一样设 LRU 上限。
+  //   ⚠️ 标记仍**不是**永久认领（2026-10-01 事故口径：派发没成就必须能被下一份接管）。
+  const INBOUND_INFLIGHT_TTL_MS = 5 * 60 * 1000
+  const inboundInFlight = new Map()      // key -> 入队时刻（ms）
+  function markInboundInFlight(bot, messageId) {
+    const id = inboundKey(bot, messageId)
+    if (!id) return ''
+    inboundInFlight.set(id, Date.now())
+    if (inboundInFlight.size > SEEN_INBOUND_MAX) {
+      inboundInFlight.delete(inboundInFlight.keys().next().value)
+    }
+    return id
+  }
+  function releaseInboundInFlight(id) {
+    if (id) inboundInFlight.delete(id)
+  }
+  function inboundBusy(bot, messageId) {
+    const id = inboundKey(bot, messageId)
+    if (!id) return false
+    if (seenInboundIds.has(id)) return true
+    const at = inboundInFlight.get(id)
+    if (at === undefined) return false
+    if (Date.now() - at > INBOUND_INFLIGHT_TTL_MS) {
+      inboundInFlight.delete(id)
+      return false
+    }
+    return true
   }
 
   // ---- 回合进行中的插话（steer）------------------------------------------------
@@ -4905,11 +5451,32 @@ export function apply(ctx) {
     // ⇒ 过程叙述暴露给群里的员工（用例 66 实测红）。
     if (!bot.chatKinds) bot.chatKinds = new Map()
     if (evt && evt.chat_type) bot.chatKinds.set(chatId, String(evt.chat_type))
+    noteChatPeer(bot, chatId, evt)
 
     const messageId = evt.message_id
     // P0-2：事件入口已还原过 mentions 的话直接用还原结果（内部合成事件没有该字段，兜底走老路径）。
     let text = typeof evt.textRendered === 'string' ? evt.textRendered : extractText(evt.content)
-    if (!text.trim()) {
+    const inboundType = String(evt.msg_type || evt.message_type || '')
+    // 🔴 第四十六轮 MEDIUM#2：真机入口已把该事件的附件下载并拼进 textRendered
+    //   （postAttachmentsApplied 旗）⇒ 这里再抠＝**同一附件下载第二遍**。只有直接喂进
+    //   handleInbound 的 post（内部重放等）才由本支兜住。
+    if (inboundType === 'post' && !evt.postAttachmentsApplied) {
+      // 🔴 中台 #65（CM 2026-10-08「赶紧修，这功能不能坏」）：PC 端**文字+文件同一条消息**是
+      //   post 富文本，旧实现只在正文为空时才走附件下载 ⇒ 有文字时内嵌 file/img/media 静默丢
+      //   （员工发考勤表带一句说明＝agent 只见字不见表）。post 一律抠附件（有无文字都抠），
+      //   逐个走整条附件消息的同一条下载链（downloadAndSaveResource），落盘说明拼进正文。
+      //   🔴 第四十八轮 LOW#3：这条落盘说明同时记进 evt.postAttachmentNotes —— 内部入口的
+      //   命令分支也要能补可见回执（与真机入口同一个字段、同一个函数）。
+      let internalAttNotes = ''
+      for (const att of extractPostAttachments(evt.content)) {
+        const noteAtt = await downloadAndSaveResource(bot, evt.message_id, att.key, att.type, att.fileName)
+        if (noteAtt) {
+          text += (text.trim() ? '\n' : '') + noteAtt
+          internalAttNotes += (internalAttNotes ? '\n' : '') + noteAtt
+        }
+      }
+      if (internalAttNotes) evt.postAttachmentNotes = internalAttNotes
+    } else if (!text.trim()) {
       const note = await downloadInboundFile(bot, evt)
       if (note) text = note
     }
@@ -4941,8 +5508,13 @@ export function apply(ctx) {
     //（否则 /plan 会被跑两遍），直接接着建卡。
     let commandHold = holdFromEvent || null
     if (cmd && !commandHold) {
-      const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
-      bot.chats.set(chatId, chat)
+      // 🔴 第四十八轮 LOW#3（同上）：内部入口的命令分支同样不消费带附件的正文 ⇒ 同一条
+      //   可见回执在这里也补一次（真机入口的命令分支由 dispatchParsedInbound 那份负责；
+      //   命令起回合时 commandHold 已置位 ⇒ 不会双发）。
+      commandAttachmentReceipt(bot, chatId, evt)
+      // 🔴 第五十轮 LOW#3：占位 chat + 当场落盘**收成单源** ensureCommandChat（与真机事件
+      //   入口共用同一条实现，判据/留痕口径见函数头注释）。
+      const chat = ensureCommandChat(bot, chatId, 'command')
       const handled = await handleCommand(bot, chat, chatId, cmd).catch((error) => {
         console.log('[fs] command error: ' + String(error && error.message || error))
         return false
@@ -5783,6 +6355,113 @@ export function apply(ctx) {
     }
   }
 
+  // 🔴 第四十六轮 MEDIUM#2 的抽取：真机事件入口「命令 → 提问回答 → 插话 → 串行链」四分流
+  //   尾段。普通路径与 post 附件下载完成后的续派发**共用同一实现**——两条腿一旦各写一份，
+  //   就是第 16 轮那条"两个入口口径不一致"温床的本体复制。text 在此重算：优先取
+  //   evt.textRendered（mention 还原/post 落盘说明都由调用方写进这个字段）。
+  // 🔴 第四十八轮 LOW#3（核对为真，两入口共用）：命令通道**不消费 evt.textRendered**
+  //   （只吃锚点剥出的 cmd），/plan、/goal 起回合时还走 skipSend 连正文都不重投 ⇒
+  //   post 内嵌附件的落盘说明在命令通道两头都不露＝#65 的"静默丢附件"从命令口复发。
+  //   补一条可见文字回执；没附件时整条跳过（不给普通命令加噪声）。
+  function commandAttachmentReceipt(bot, chatId, evt) {
+    const notes = typeof evt.postAttachmentNotes === 'string' ? evt.postAttachmentNotes : ''
+    if (!notes) return
+    const lines = notes.split('\n')
+      .filter((l) => l.startsWith(FILE_NOTE_PREFIX) || l.startsWith(FILE_PATH_PREFIX) || l.startsWith(FILE_WARN_PREFIX))
+    if (!lines.length) return
+    console.log('[fs] post attachment receipt (command channel): ' + String(chatId))
+    sendPlainText(bot, chatId, lines.join('\n')).catch((error) => {
+      console.log('[fs] post attachment receipt failed: ' + String(error && error.message || error))
+    })
+  }
+
+  // 🔴 第五十轮 LOW#3（核对为真）：两个命令入口（内部 handleInbound / 真机事件
+  //   dispatchParsedInbound）原来**各抄一份**「占位 chat 建出来 + 当场落盘」，只差局部变量名
+  //   和日志串——正是本批次到处在消灭的"两个入口口径不一致"温床（第四十五轮 LOW#1 当时就是
+  //   分别补在两处的）。收成单源：以后改一处不会漏另一处。
+  //   为什么必须当场落盘：审批人**第一条消息就是 /help 这类不起回合的命令**时，noteChatPeer
+  //   的即时 flush 发生在 chat 建出来之前 ⇒ peer 只在内存、重启即丢、审批卡找不回私聊。
+  //   附带口径（同轮 finding 副点，判不修）：群会话换发言人同样会触发 flush——peer/union 两腿
+  //   是 C7 认名（中台 #49）的数据源、不分通道都读，按"跨重启恢复一致"统一落盘比按 isP2pChat
+  //   过滤更稳，过滤反而制造"群里认名重启后漂移"。
+  function ensureCommandChat(bot, chatId, where) {
+    const isNew = !bot.chats.has(chatId)
+    const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
+    bot.chats.set(chatId, chat)
+    if (isNew) {
+      try {
+        persistChats(bot, bot.chats)
+      } catch (error) {
+        console.log('[fs] ' + where + ' chat placeholder persist failed: ' + String(error && error.message || error))
+      }
+    }
+    return chat
+  }
+
+  function dispatchParsedInbound(bot, evt) {
+    const text = typeof evt.textRendered === 'string' ? evt.textRendered : extractText(evt.content)
+    const cmd = evt.textCommandAnchor ? splitCommand(evt.textCommandAnchor) : undefined
+    // 🔴 第十六轮门槛 MEDIUM（核对为真，而且比那条 finding 的范围更大）：**只有 `resolveCommandName`
+    //   认得出的才进命令分支**。旧写法对任何以 `/` 开头的文本都 `handleCommand(...)` + 无条件
+    //   `return`，而 `handleCommand` 第一行就是 `if (!resolved) return false`（什么都不做）
+    //   ⇒ 认不出的斜杠文本被**静默吞掉**：没有卡、没有回合、连一句回执都没有。
+    //   命中形状：群里 `@bot /help2`（命令打错一个字）、手机端 `@张三/李四 今天值班`
+    //   （名字紧跟斜杠，锚点第三档剥出 `/李四 …`）、单聊里手打一句 `/tmp/x.txt 看一下`。
+    //   内部入口 `handleInbound` 早就有正确口径 —— `handled` 为假就不 return、继续当普通消息处理；
+    //   真机事件入口缺同一判据 ⇒ 同一条消息走内部有回、走真机没回（静默丢失的温床）。
+    //   修法取**同步判据**而不是等 `handleCommand` 回来再决定：未识别的文本原样落到下面
+    //   「提问卡 → 插话 → chain」的普通通道，既不会把已知命令执行两遍，也不改变已知命令的行为。
+    if (cmd && resolveCommandName(cmd.name)) {
+      const chatId = evt.chat_id
+      // 🔴 第四十八轮 LOW#3（核对为真）：命令分支**不消费 textRendered**（它只吃锚点剥出的 cmd），
+      //   /plan、/goal 起回合时更是走 skipSend 连正文都不重投 ⇒ post 的落盘说明在命令通道
+      //   两头都不露＝#65 要消灭的"静默丢附件"从命令口复发。补一条**可见文字回执**，
+      //   两个入口（真机事件 / 内部 handleInbound）各调同一个函数，口径单源。
+      commandAttachmentReceipt(bot, chatId, evt)
+      // 🔴 第五十轮 LOW#3：与内部入口**同一条**实现（原来两处逐字节重复，只差日志串）。
+      const chat = ensureCommandChat(bot, chatId, 'event')
+      // 2026-10-01 修复①（真实入口）：命令**可能在会话里起一个真回合**（/plan <正文>）。
+      // 那种情况绝不能在这里 return —— 要落回 handleInbound 走「建卡 → 等回合 → 封口」，
+      // 否则那一整轮没有任何卡片持有它（CM 报障「飞书上没有看到卡片」的根因）。
+      handleCommand(bot, chat, chatId, cmd).then((outcome) => {
+        if (!outcome || !outcome.turnStarted) return
+        bot.chain = bot.chain.then(() => handleInbound(bot, evt, outcome.turnStarted)).catch((error) => {
+          console.log('[fs] handler error: ' + String(error && error.stack || error))
+        })
+      }).catch((error) => {
+        console.log('[fs] command error: ' + String(error && error.stack || error))
+      })
+      return
+    }
+    // A pending user-question (ask_user_question) is answered by the next
+    // plain message. This MUST bypass the chain too: the chain is held by
+    // the turn waiting for the answer, so a queued reply would never be
+    // processed and the question would hang forever (2026-08-16).
+    const chatId = evt.chat_id
+    const pendingQ = pendingQuestions.get(qKey(chatId, bot))
+    if (pendingQ && text) {
+      dropQuestion(pendingQ)
+      // 2026-10-02 代码审查 medium#3：这条是**文字回答的主路径**（飞书每条纯文本都走这里），
+      // 原来漏了 splitLiveCardAfterAnswer ⇒ 回了"批准"之后，上面那张流式卡不被冻结，
+      // 整轮后续内容继续堆到他已经划过去的那张卡上（＝"我答了，它却没动"那次回归）。
+      // 顺序与 handleInbound 的文字路径一致：先换卡，再改「已收到」态，最后 resolve。
+      splitLiveCardAfterAnswer(pendingQ.agentId)
+      // 2026-10-02：卡片要跟着变成「✅ 已收到」态（否则按钮仍可点、点了报 record not found）
+      finalizeQuestionCard(pendingQ, text)
+      pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
+      console.log('[fs] question answered via chat: ' + chatId)
+      sendPlainText(bot, chatId, '✅ 已收到你的回答。').catch(() => {})
+      return
+    }
+    // 回合进行中 ⇒ 直接插话（steer），不再排到 bot.chain 后面等整轮跑完。
+    // 见 steerActiveTurn：只有「活跃回合 + 普通消息」才走这条，其余（含无活跃回合）
+    // 一律落回原来的串行链，行为不变。
+    if (steerActiveTurn(bot, evt, text)) return
+    bot.chain = bot.chain.then(() => handleInbound(bot, evt)).catch((error) => {
+      console.log('[fs] handler error: ' + String(error && error.stack || error))
+    })
+  }
+
   function handleHelperMessage(bot, msg) {
 
   // 身份未解析期间最多扣住多少条群消息（防"永远取不到 open_id"时无界堆积）
@@ -5928,6 +6607,11 @@ export function apply(ctx) {
         if (!bot.chatKinds) bot.chatKinds = new Map()
         bot.chatKinds.set(evt.chat_id, String(evt.chat_type))
       }
+      // 🔴 第五十一轮 MEDIUM#1（核对为真）：peer 登记**不吃 chat_type**（noteChatPeer 只要
+      //   evt.sender.sender_id），原来却嵌在上面那个 if 里 ⇒ 内部入口（handleInbound:5416）
+      //   无条件记、真机入口不带 chat_type 就不记＝本批次到处在消灭的"两个入口口径不一致"，
+      //   而 chatPeers 正是 approverChatFor（重启后审批卡找得到人）与命令路径认人的数据源。
+      noteChatPeer(bot, evt.chat_id, evt)
       // Control commands (/stop etc.) bypass the serial chain so they can
       // interrupt a running turn immediately — queuing them behind the turn
       // makes /stop arrive only after the turn finished (2026-08-15).
@@ -5948,62 +6632,87 @@ export function apply(ctx) {
       evt.textCommandAnchor = commandAnchor(rawText, mentionList)
       // 改造⑤：登记 CM 这条消息，便于他之后引用自己的消息时也能带上下文
       rememberMessage(evt.message_id, 'CM 的消息：' + String(text || '(非文本消息)'))
-      const cmd = evt.textCommandAnchor ? splitCommand(evt.textCommandAnchor) : undefined
-      // 🔴 第十六轮门槛 MEDIUM（核对为真，而且比那条 finding 的范围更大）：**只有 `resolveCommandName`
-      //   认得出的才进命令分支**。旧写法对任何以 `/` 开头的文本都 `handleCommand(...)` + 无条件
-      //   `return`，而 `handleCommand` 第一行就是 `if (!resolved) return false`（什么都不做）
-      //   ⇒ 认不出的斜杠文本被**静默吞掉**：没有卡、没有回合、连一句回执都没有。
-      //   命中形状：群里 `@bot /help2`（命令打错一个字）、手机端 `@张三/李四 今天值班`
-      //   （名字紧跟斜杠，锚点第三档剥出 `/李四 …`）、单聊里手打一句 `/tmp/x.txt 看一下`。
-      //   内部入口 `handleInbound`（本文件 4914-4924）**早就有正确口径** —— `handled` 为假就
-      //   不 return、继续当普通消息处理；真机事件入口缺同一判据 ⇒ 同一条消息走内部有回、
-      //   走真机没回（这种"两个入口口径不一致"是静默丢失的温床）。
-      //   修法取**同步判据**而不是等 `handleCommand` 回来再决定：未识别的文本原样落到下面
-      //   「提问卡 → 插话 → chain」的普通通道，既不会把已知命令执行两遍，也不改变已知命令的行为。
-      if (cmd && resolveCommandName(cmd.name)) {
-        const chatId = evt.chat_id
-        const chat = bot.chats.get(chatId) || { sessions: [], activeIndex: 0 }
-        bot.chats.set(chatId, chat)
-        // 2026-10-01 修复①（真实入口）：命令**可能在会话里起一个真回合**（/plan <正文>）。
-        // 那种情况绝不能在这里 return —— 要落回 handleInbound 走「建卡 → 等回合 → 封口」，
-        // 否则那一整轮没有任何卡片持有它（CM 报障「飞书上没有看到卡片」的根因）。
-        handleCommand(bot, chat, chatId, cmd).then((outcome) => {
-          if (!outcome || !outcome.turnStarted) return
-          bot.chain = bot.chain.then(() => handleInbound(bot, evt, outcome.turnStarted)).catch((error) => {
-            console.log('[fs] handler error: ' + String(error && error.stack || error))
+      // 🔴 第四十六轮 MEDIUM#2（核对为真）：handleHelperMessage 是**同步函数**，而 post 附件抠取
+      //   只落在 handleInbound ⇒ 入口「提问回答」（6469 一带）与「回合进行中插话」（steer）两支
+      //   在它之前 return ⇒ 回合/提问挂着时收到「文字+文件」的 post，附件照样静默丢——正是 #65
+      //   要消灭的形状。修法：post 带附件先**串行**下载（按出现顺序），落盘说明拼进
+      //   evt.textRendered，再交 dispatchParsedInbound **原样走原分流**——绕链语义不变，只晚一次下载。
+      const evPostAtts = String(evt.msg_type || evt.message_type || '') === 'post'
+        ? extractPostAttachments(evt.content) : []
+      // 🔴 第四十八轮 LOW#1（核对为真）：post 附件把派发推到了异步（下载完才 dispatch），
+      //   而同一拍 drain 里**后到的普通消息仍是同步先派发** ⇒ 提问挂着时，带附件的那条真回答
+      //   会被后到的普通文字抢先消费（答案错挂到人头上）。修法：入站派发按 bot 排一条
+      //   **到达顺序尾队列**。豁免＝刹车/管理类命令（`/stop`、`/plan off`、`/goal`、
+      //   `/goal pause`）——它们必须随时可达，绝不许排在一条正在下载的附件之后（与上方
+      //   「Control commands bypass the serial chain」以及 handleCommand 的闸门豁免同一口径）。
+      const anchorCmd = evt.textCommandAnchor ? splitCommand(evt.textCommandAnchor) : undefined
+      const anchorName = anchorCmd ? resolveCommandName(anchorCmd.name) : undefined
+      const anchorArg = anchorCmd ? String(anchorCmd.arg || '').trim() : ''
+      const isBrake = anchorName === 'stop' || isBrakeSubcommand(anchorName, anchorArg)
+      const enqueueInbound = (task) => {
+        if (isBrake) {
+          Promise.resolve().then(task).catch((error) => {
+            console.log('[fs] inbound dispatch failed: ' + String(error && error.message || error))
           })
-        }).catch((error) => {
-          console.log('[fs] command error: ' + String(error && error.stack || error))
+          return
+        }
+        const prev = bot.inboundDispatchTail || Promise.resolve()
+        const next = prev.then(task, task).catch((error) => {
+          console.log('[fs] inbound dispatch failed: ' + String(error && error.message || error))
+        })
+        bot.inboundDispatchTail = next
+      }
+      if (evPostAtts.length) {
+        // 🔴 第四十七轮 LOW#5（核对为真）：飞书长连接是 at-least-once（同 app 还可能两 helper 并订），
+        //   去重的"认领"发生在下游 handleInbound/steer ⇒ 重投的 post 事件原来会**先重复下载一遍**
+        //   （落一份 -2 重复文件＋误导的 inbound file saved 日志）才被下游判重丢。用**无副作用**的
+        //   窥探先判：见过就地整条丢（与下游判重同一判据、同一留痕口径）。
+        // 🔴 第五十轮 LOW#5（核对为真）：认领被本轮的"先下载再派发"推到了下载**之后** ⇒ 光窥探
+        //   "已认领"盖不住"第一份还在下载"这个窗口，判据换成 `inboundBusy`（已认领 ∪ 在飞）。
+        if (inboundBusy(bot, evt.message_id)) {
+          console.log('[fs] duplicate inbound skipped (pre-download): ' + String(evt.message_id || ''))
+          return
+        }
+        evt.postAttachmentsApplied = true
+        // 入队即登记在飞；任务收尾释放（不许永久认领——派发没成时要能被下一份接管，
+        //   口径同 2026-10-01「steer 只窥探不认领」那条事故）。
+        const inFlightKey = markInboundInFlight(bot, evt.message_id)
+        let augmented = text
+        let attNotes = ''
+        // 🔴 第四十八轮 LOW#1：派发点在尾队列任务里**只出现一次**（第四十七轮 MEDIUM#2 的
+        //   dispatchedOnce 旗标随之删除——排队后不存在"catch 罩住 dispatch 再补一刀"的形状）。
+        //   下载链自己包 try：断链只丢落盘说明，文字照常放行。
+        enqueueInbound(async () => {
+          try {
+            for (const att of evPostAtts) {
+              try {
+                const note = await withDownloadBail(
+                  downloadAndSaveResource(bot, evt.message_id, att.key, att.type, att.fileName), att.fileName)
+                if (note) {
+                  augmented += (augmented.trim() ? '\n' : '') + note
+                  attNotes += (attNotes ? '\n' : '') + note
+                }
+              } catch (error) {
+                console.log('[fs] post attachment chain failed: ' + String(error && error.message || error))
+              }
+            }
+            evt.textRendered = augmented
+            // 🔴 第四十八轮 LOW#3（核对为真）：命令分支只吃锚点剥出的 cmd，**不消费 textRendered** ⇒
+            //   落盘说明在命令通道两头都不露（agent 没收到、CM 也看不到；/plan <正文>+附件 更明显：
+            //   起回合走 skipSend，正文里的"已保存到"永远不会送进会话）。单列一个字段供命令支补回执。
+            evt.postAttachmentNotes = attNotes
+            dispatchParsedInbound(bot, evt)
+          } catch (error) {
+            // 派发这一步真抛了＝这条走不通（永远不会被认领）⇒ 撤掉标记，留给重投一次机会；
+            // 正常路径**不在这里撤**——标记由下游 isDuplicateInbound 认领时撤
+            //（第五十一轮 MEDIUM#2：早撤会在"排进链→真认领"之间开出重复下载的窗口）。
+            releaseInboundInFlight(inFlightKey)
+            throw error
+          }
         })
         return
       }
-      // A pending user-question (ask_user_question) is answered by the next
-      // plain message. This MUST bypass the chain too: the chain is held by
-      // the turn waiting for the answer, so a queued reply would never be
-      // processed and the question would hang forever (2026-08-16).
-      const chatId = evt.chat_id
-      const pendingQ = pendingQuestions.get(qKey(chatId, bot))
-      if (pendingQ && text) {
-        dropQuestion(pendingQ)
-        // 2026-10-02 代码审查 medium#3：这条是**文字回答的主路径**（飞书每条纯文本都走这里），
-        // 原来漏了 splitLiveCardAfterAnswer ⇒ 回了"批准"之后，上面那张流式卡不被冻结，
-        // 整轮后续内容继续堆到他已经划过去的那张卡上（＝"我答了，它却没动"那次回归）。
-        // 顺序与 handleInbound 的文字路径一致：先换卡，再改「已收到」态，最后 resolve。
-        splitLiveCardAfterAnswer(pendingQ.agentId)
-        // 2026-10-02：卡片要跟着变成「✅ 已收到」态（否则按钮仍可点、点了报 record not found）
-        finalizeQuestionCard(pendingQ, text)
-        pendingQ.resolve(buildQuestionAnswer(pendingQ.questions, text))
-        console.log('[fs] question answered via chat: ' + chatId)
-        sendPlainText(bot, chatId, '✅ 已收到你的回答。').catch(() => {})
-        return
-      }
-      // 回合进行中 ⇒ 直接插话（steer），不再排到 bot.chain 后面等整轮跑完。
-      // 见 steerActiveTurn：只有「活跃回合 + 普通消息」才走这条，其余（含无活跃回合）
-      // 一律落回原来的串行链，行为不变。
-      if (steerActiveTurn(bot, evt, text)) return
-      bot.chain = bot.chain.then(() => handleInbound(bot, evt)).catch((error) => {
-        console.log('[fs] handler error: ' + String(error && error.stack || error))
-      })
+      enqueueInbound(() => dispatchParsedInbound(bot, evt))
       return
     }
     if (msg.type === 'event' && msg.eventType === 'card.action.trigger') {
@@ -6130,7 +6839,7 @@ export function apply(ctx) {
 
   function approvalCardPayload(toolName, reason, token) {
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'orange' },
       elements: [
           {
@@ -6157,13 +6866,13 @@ export function apply(ctx) {
     if (Array.isArray(originalElements) && originalElements.length) {
       // J：正文留着，只换按钮行（CM 2026-10-03）
       return {
-        config: { wide_screen_mode: true },
+        config: { wide_screen_mode: true, update_multi: true },
         header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'blue' },
         elements: settledActionElements(originalElements, status),
       }
     }
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'blue' },
       elements: [
         {
@@ -6202,6 +6911,26 @@ export function apply(ctx) {
   }
 
   function askApprovalCard(bot, chatId, request) {
+    // 🔒 审批单只在私聊（CM 2026-10-06：「审批单只能私聊，不能发群。这就直接解决了身份的问题了」）：
+    //   群里的审批卡＝任何翻到这条消息的人都能点"允许一次"，等于把审批权发给全群。
+    //   判据只认入站事件带回来的 `chat_type`（拿不到＝不按会话猜，与两模式那处同源）。
+    // 🔴 第二十三轮门槛 MEDIUM#5（核对为真）：原来是**黑名单**（只拒确认过的群）⇒ 类型未知
+    //   的会话（kind 没记过/旧状态恢复时没有该字段）会被当成合法私聊，审批卡进群。与本批
+    //   `approverChatFor` 的白名单同口径：**只认已确认为 p2p 的会话**（fail-closed）。
+    //   第二十七轮 LOW#8：判据收进唯一入口 `isP2pChat`（本函数是四处消费点之一）。
+    if (!isP2pChat(bot, chatId)) {
+      console.log('[fs] approval refused (chat not known p2p): kind='
+        + String((bot && bot.chatKinds && bot.chatKinds.get(String(chatId))) || '未知')
+        + ' tool=' + String(request.toolName) + ' chat=' + String(chatId) + ' ⇒ 审批单只在私聊发')
+      void sendPlainText(bot, chatId,
+        '⚠️ 这一步需要审批，但**审批单只发在已确认的私聊会话**（群里谁都能点；会话类型没确认过＝不敢发）。请在私聊里继续这个操作。').catch(() => {})
+      // 🔴 第三十轮门槛 LOW#3（核对为真）：这里原来回 'rejected'，与**真人点拒绝**同一个值 ⇒
+      //   预执行审批钩子把"没发过卡"误报成"用户在飞书拒绝"（8906 的映射按 'rejected' 判拒绝）。
+      //   改用框架词表内的 'unavailable'：dsh-user-approval/lib/index.js 文档口径「an answerer that
+      //   cannot produce a decision yields 'unavailable' (fail closed)」——拒绝语义不变（仍不放行），
+      //   但审计/回执能分清"渠道不可用（未发卡）"与"用户拒绝"。
+      return Promise.resolve('unavailable')
+    }
     const token = randomUUID()
     const record = {
       bot, chatId, request,
@@ -6249,6 +6978,403 @@ export function apply(ctx) {
           settle('rejected')
         })
     })
+  }
+
+  // ==== 0.8.4 A5/A6：能力闸的"申请—批准"通道 ==========================================
+  // 当事人没有某能力的有效授权 ⇒ ①当场给一句可见回执（绝不静默吞）②向**审批人私聊**发一张
+  // 带有效期三档（今天/1 个月/6 个月）的申请卡；批了才**入表**，表就是那把开关。
+  // 审批卡只走私聊（与 B1 同一条边界：群里的卡谁翻到都能点＝把审批权发给全群）。
+  const CAP_REQUEST_TIMEOUT_MS = 30 * 60 * 1000
+  const pendingCapRequests = new Map()   // token -> record { bot, capability, person, requesterChatId, cardId, timer }
+
+  // 审批人在哪：只认「本 bot 已经记得的**私聊**会话」里 open_id 等于审批人的那一条。
+  // 没聊过 ⇒ 找不到会话，发不出去（`sendInteractive` 只吃 chat_id，不能凭 open_id 发）。
+  function approverChatFor(bot) {
+    const cfg = (bot && bot.cfg) || {}
+    const want = String(cfg.capabilityApproverOpenId || cfg.ownerOpenId || '')
+    if (!want || !bot.chatPeers) return ''
+    for (const [chatId, ou] of bot.chatPeers) {
+      if (ou !== want) continue
+      // 🔴 第二十二轮门槛 MEDIUM#5（核对为真）：判据必须是**白名单**不是黑名单 ——
+      //   原来只排 `kind==='group'`，kind 未知（会话从没带 chat_type 入站过）的会话会被当私聊，
+      //   审批卡（申请人＋能力＋批准按钮）就可能整张发进群，正撞 B1「审批只私聊」的裁决反面。
+      if (!isP2pChat(bot, chatId)) continue   // 第二十七轮 LOW#8：同走唯一入口
+      return chatId
+    }
+    return ''
+  }
+  function approverOpenId(bot) {
+    const cfg = (bot && bot.cfg) || {}
+    return String(cfg.capabilityApproverOpenId || cfg.ownerOpenId || '')
+  }
+
+  // 记住「这条会话最近一次是谁在说话」——审批卡只能发到**会话**（`sendInteractive` 吃 chat_id，
+  // 不能凭 open_id 发），所以要先有一条他私聊过本 bot 的记录才找得到那条会话。
+  // 只记 open_id（服务端事件自带，伪造不了），不记名字。
+  function noteChatPeer(bot, chatId, evt) {
+    if (!bot || !chatId || !evt) return
+    const sid = evt.sender && evt.sender.sender_id
+    const ou = sid && sid.open_id
+    if (!ou) return
+    if (!bot.chatPeers) bot.chatPeers = new Map()
+    const peerKey = String(chatId)
+    const prevOu = bot.chatPeers.get(peerKey)
+    bot.chatPeers.set(peerKey, String(ou))
+    // C7（中台 #49）：同一条入站事件也带 union_id（跨应用稳定值）——命令路径按人认名时
+    //   `rosterNameFor(bot, ou, '')` 只有 people.views[本 bot 视角] 一条命中路径，员工在
+    //   别的 bot 视角发的 ou 就查不到 ⇒ 名字退化成"未署名"（纯显示降级）。补记 union 作第二条腿。
+    // 🔴 第二十二轮门槛 MEDIUM#3（核对为真）：union 腿必须与 ou 腿**成对写**（无值写空串）。
+    //   原来只在有 union_id 时写 ⇒ 同会话后来者不带 union_id 时，`chatPeers` 换到新发言人、
+    //   `chatPeerUnions` 还留着**上一个人**的 union ⇒ 命令路径拼出的 person 混两个人，
+    //   而 grantMatchesPerson 优先比 union ⇒ 会用前一个人的授权判后一个人的请求。
+    const un = sid && sid.union_id
+    if (!bot.chatPeerUnions) bot.chatPeerUnions = new Map()
+    const prevUn = bot.chatPeerUnions.get(peerKey)
+    bot.chatPeerUnions.set(peerKey, String(un || ''))
+    // 🔴 第四十四轮 MEDIUM#4（核对为真）：peer 只在内存更新、`persistChats` 不在这条入站
+    //   常规路径上 ⇒ 「重启后找不到审批人私聊」的契约对**已存在会话**不成立（state 文件
+    //   里始终没有 peer 字段，approverChatFor 重启后返回空串、审批卡发不出去）。
+    //   修法：值**真的变了**（首次观测/换发言人）才落盘 —— 同会话同人发消息不重复写文件，
+    //   无需节流；会话尚未建立时这次 flush 只刷别的 chat，本 chat 由建会话路径的
+    //   persistChats 带上 peer（届时 map 里已有值）。
+    if (prevOu !== String(ou) || prevUn !== String(un || '')) {
+      // 🔴 第四十七轮 LOW#4（核对为真）：persistChats 是**同步全量写盘**——群里发言人交替
+      //   ⇒ 旧写法每条消息一次阻塞写。按消费方分档：p2p 是审批人契约（approverChatFor）的
+      //   消费侧，必须即时落盘；群侧 peer/union 只服务 C7 重启后显示名（越早越好、非硬契约），
+      //   合并成旗标由既有节拍**一拍一次**统一刷（正确性不变，写盘次数封顶）。
+      if (isP2pChat(bot, peerKey)) {
+        try {
+          persistChats(bot, bot.chats)
+        } catch (error) {
+          console.log('[fs] peer flush failed: ' + String(error && error.message || error))
+        }
+      } else {
+        bot.peerFlushPending = true
+      }
+    }
+  }
+
+  // 🔴 第四十九轮 LOW（index.js:10395，核对为真）：群侧 peer 合并落盘的**消费方必须有两个**——
+  //   周期节拍（正常路径）与生命周期清理（热重载/停机）。原来只有前者 ⇒ 最后一次节拍之后、
+  //   dispose 之前换的发言人会被静默丢弃（`peerFlushPending` 挂在被丢弃的 bot 对象上），
+  //   C7 重启后显示名就停在旧人。清理里补一刷，写盘失败按节拍同口径留痕、不阻塞停机。
+  // 🔴 第五十轮 LOW#4（核对为真）：旗标**只在写成功之后**才清——原来先清后写，写盘一抛就
+  //   "旗标已落、盘上没变"，节拍路径还有下一拍可补，停机路径没有下一拍＝那份 peer 永久丢，
+  //   与上面立的契约正相反。留着的代价是"写盘恒失败时每拍重刷一次并刷日志"，这是
+  //   宁可吵、不可默默丢（与 persistChats 失败必须留痕的既有口径同源）。
+  function flushPendingPeerChanges() {
+    for (const bot of bots.values()) {
+      if (!bot.peerFlushPending || !bot.chats) continue
+      try {
+        persistChats(bot, bot.chats)
+        bot.peerFlushPending = false
+      } catch (error) {
+        console.log('[fs] peer coalesced flush failed: ' + String(error && error.message || error))
+      }
+    }
+  }
+
+  function capRequestCardPayload(person, capability, requesterLabel, token) {
+    const label = CAPABILITY_LABELS[capability] || String(capability)
+    const who = String(person.name || (person.open_id || '').slice(0, 12) + '…')
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { title: { tag: 'plain_text', content: '🔑 能力审批申请' }, template: 'orange' },
+      elements: [
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: '**申请人**：' + who + '\n**能力**：' + label + '（`' + capability + '）'
+              + (requesterLabel ? '\n**在哪要用的**：' + requesterLabel : '')
+              + '\n\n点下面任一档＝批准该能力并**写入审批表**（到期自动失效，需要重新申请）。\n⏰ '
+              + Math.round(CAP_REQUEST_TIMEOUT_MS / 60000) + ' 分钟内未操作自动拒绝。',
+          },
+        },
+        {
+          tag: 'action',
+          actions: GRANT_TERM_KEYS.map((term, i) => ({
+            tag: 'button',
+            text: { tag: 'plain_text', content: '✅ 批准：' + GRANT_TERMS[term] },
+            type: i === 0 ? 'primary' : 'default',
+            value: { fs_cap_grant: token, fs_cap_action: term },
+          })).concat([{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '❌ 拒绝' },
+            type: 'danger',
+            value: { fs_cap_grant: token, fs_cap_action: 'deny' },
+          }]),
+        },
+      ],
+    }
+  }
+  function capResultCardPayload(person, capability, statusLine) {
+    const label = CAPABILITY_LABELS[capability] || String(capability)
+    // 🔴 第二十九轮门槛 LOW#8（核对为真）：`person` 此前是**收了不渲染**的死参数——
+    //   审批人连办几单分不清这张结果卡对应谁的申请；申请卡打了**申请人**，两张卡同口径
+    //   （截断规则照抄申请卡：名字优先，ou_ 只上前 12 位）。
+    const who = String((person && person.name)
+      || ((person && person.open_id ? String(person.open_id).slice(0, 12) : '') + '…'))
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { title: { tag: 'plain_text', content: '🔑 能力审批申请' }, template: 'blue' },
+      elements: [{
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: '**申请人**：' + who + '\n**能力**：' + label + '（`' + capability + '）\n**结果**：'
+            + statusLine + '\n_' + settledStamp() + '_',
+        },
+      }],
+    }
+  }
+
+  // 把一次批准写进表（read-modify-write 在 `writeGrants` 里做）。返回行或 null。
+  function recordCapabilityGrant(bot, record, term) {
+    const now = Date.now()
+    const row = {
+      id: randomUUID(),
+      capability: String(record.capability),
+      open_id: String(record.person.open_id || ''),
+      union_id: String(record.person.union_id || ''),
+      name: String(record.person.name || ''),
+      app_id: String((bot && bot.cfg && bot.cfg.appId) || ''),
+      requester_chat_id: String(record.requesterChatId || ''),
+      term: String(term),
+      granted_at: new Date(now).toISOString(),
+      expires_at: grantExpiryIso(term, now),
+      granted_by: String(record.approverOpenId || ''),
+    }
+    // 🔴 第三十二轮门槛 MEDIUM#1（核对为真）：同 sweep——读失败时 rows 是**假的空表**，
+    //   push 后整表回写＝只留这一行、抹掉全部历史授权。中止入库，批卡侧给可见失败。
+    const { rows, readFailed } = loadGrants()
+    if (readFailed) {
+      console.log('[fs] capability grant NOT recorded：授权表读失败 ⇒ 拒绝整表回写（防一次瞬时错误清空全表）cap='
+        + row.capability + ' person=' + String(row.open_id || row.union_id || '').slice(0, 20))
+      return null
+    }
+    rows.push(row)
+    if (!writeGrants(rows).ok) return null
+    return row
+  }
+
+  // 返回 true＝申请卡**已发出或已在途**（受理成功）；false＝投递不出去。
+  // 🔴 第二十二轮门槛 MEDIUM#6/#8（核对为真）：调用方（requireCapability）按这个返回值决定
+  //   回执措辞——原来这里发不出去也照发"已发起申请"，用户收到两条互相矛盾的回执。
+  // 🔴 同轮 LOW（dedup）：同一人+同一能力重复点指令会在审批人那里叠多张卡，各带各的 30 分钟
+  //   定时器，批一张不撤其它 ⇒ 这里改为复用已在途的申请（只把通知落点更新为最新一次请求的会话）。
+  function askCapabilityGrant(bot, requesterChatId, person, capability, source) {
+    const samePerson = (a, b) => Boolean(a && b && (
+      (a.open_id && b.open_id && a.open_id === b.open_id)
+      || (a.union_id && b.union_id && a.union_id === b.union_id)))
+    for (const rec of pendingCapRequests.values()) {
+      if (rec.bot !== bot || rec.capability !== capability) continue
+      if (!samePerson(rec.person, person)) continue
+      if (requesterChatId) rec.requesterChatId = String(requesterChatId)
+      console.log('[fs] capability request already pending ⇒ 复用（不重复发审批卡）: cap=' + capability)
+      return true
+    }
+    const approverChat = approverChatFor(bot)
+    if (!approverChat) {
+      // 发不出去也要让当事人知道"为什么没下文"，不要让他以为点了没用。
+      console.log('[fs] capability request cannot be delivered: no p2p chat on record for approver'
+        + ' cap=' + capability)
+      sendPlainText(bot, requesterChatId,
+        '🔑 已记下你的「' + (CAPABILITY_LABELS[capability] || capability) + '」申请，'
+        + '但我这边**还没找到审批人的私聊会话**（审批卡只能走私聊）。'
+        + '请让审批人先私聊本 bot 一次，再重发这条指令。').catch(() => {})
+      return false
+    }
+    const token = randomUUID()
+    const record = {
+      bot, capability, person, requesterChatId,
+      approverChat, approverOpenId: approverOpenId(bot),
+      cardId: '', timer: undefined,
+    }
+    record.timer = setTimeout(() => {
+      if (!pendingCapRequests.has(token)) return
+      pendingCapRequests.delete(token)
+      console.log('[fs] capability request timed out: cap=' + capability)
+      if (record.cardId) {
+        updateInteractive(bot, record.cardId,
+          capResultCardPayload(person, capability, '⏰ 已超时（自动拒绝）')).catch(() => {})
+      }
+      // 🔴 第二十九轮门槛 LOW#7（核对为真）：超时是全批**唯一没给申请人交代**的出口——
+      //   拒绝/批准/投递失败/找不到审批人四条都回了可见回执，唯独这里申请人被告知
+      //   "批了我会通知你"后就无限等。同口径补一条超时回执（不作答≠不吭声）。
+      if (record.requesterChatId) {
+        sendPlainText(bot, record.requesterChatId,
+          '⌛ 你的「' + (CAPABILITY_LABELS[capability] || capability)
+          + '」申请超时未处理（自动拒绝）。需要的话再发一次指令重新申请。').catch(() => {})
+      }
+    }, CAP_REQUEST_TIMEOUT_MS)
+    pendingCapRequests.set(token, record)
+    sendInteractive(bot, approverChat, capRequestCardPayload(person, capability, source, token))
+      .then((msgId) => {
+        record.cardId = msgId
+        console.log('[fs] capability request card sent: cap=' + capability
+          + ' to_approver_chat=' + String(approverChat).slice(-8) + ' token=' + token)
+      })
+      .catch((error) => {
+        if (record.timer) clearTimeout(record.timer)
+        pendingCapRequests.delete(token)
+        console.log('[fs] capability request card send failed: ' + String(error && error.message || error))
+        sendPlainText(bot, requesterChatId,
+          '⚠️ 能力申请发不出去（审批卡投递失败），本次按**未批准**处理。').catch(() => {})
+      })
+    return true
+  }
+
+  // 闸口本身：**同步**返回 true＝已拦下（回执与申请卡异步发出），false＝放行。
+  // 为什么不做成 async：`fs_plan_goal` 那条点击分支是同步代码，为了一个闸门去重构整段
+  // （把同步流改成 IIFE）不值得，而且同步判完立刻返回才是这里要的语义。
+  // 🔴 第三十六轮门槛 LOW#4（核对为真）：`person` 允许传 **getter**——名字解析要读
+  //   bot_roster（文件系统 I/O＋查无时一条 roster miss 日志），总闸关的通道原来在
+  //   **调用方参数里**就把这些做完了，违反「总闸关＝今日行为一字不差」（本函数 6839 行
+  //   口径）。改成总闸判过之后才解析，off 路径零 I/O、零新日志。
+  function requireCapability(bot, chatId, person, capability, source) {
+    const deny = (receipt) => {
+      if (receipt) void sendPlainText(bot, chatId, receipt).catch(() => {})
+      return true
+    }
+    if (!(bot && bot.cfg && bot.cfg.capabilityGuard === true)) return false   // 总闸关＝今日行为
+    if (typeof person === 'function') person = person()
+    if (CAPABILITY_KEYS.indexOf(capability) < 0) {
+      // 未知能力名＝代码写错了；宁可不放行也不给一个"查不到但放行"的口子
+      console.log('[fs] capability UNKNOWN key=' + String(capability) + ' ⇒ 按未获授权处理')
+      return deny('⚠️ 这一步要查的能力名不在登记表里（桥的内部错误），本次不放行。')
+    }
+    const now = Date.now()
+    const who = String((person && (person.name || person.open_id || person.union_id)) || '')
+    if (!person || (!person.open_id && !person.union_id)) {
+      // 认不出是谁 ⇒ 拒（fail-closed，与 identityGuard 同口径：宁可拒绝也不放行）
+      console.log('[fs] capability DENY(no_identity): cap=' + capability + ' src=' + String(source))
+      return deny('🔒 这一步需要能力审批，但我认不出你的身份（事件里没有可用的 open_id），因此不能放行。')
+    }
+    const { grant, readFailed } = findActiveGrant(person, capability, now)
+    if (grant) {
+      console.log('[fs] capability OK: cap=' + capability + ' who=' + who.slice(0, 20)
+        + ' 到期=' + localTimeOf(grant.expires_at) + ' src=' + String(source))
+      return false
+    }
+    // 🔴 第四十三轮门槛 LOW#3（核对为真）：表**读不到**≠没批过——不能按"没获批"走发起
+    //   申请的老路（那张卡批了也存不进去：recordCapabilityGrant 在 readFailed 时中止入库），
+    //   更不能让审批人吃一张注定失败的卡。单立拒因：只喊重试/修表，不发申请。
+    if (readFailed) {
+      console.log('[fs] capability DENY(table_unreadable): cap=' + capability + ' who=' + who.slice(0, 20)
+        + ' src=' + String(source) + ' ⇒ 不发起申请（存不进去的申请卡只会制造第二次"批了没生效"）')
+      return deny('🔒 能力登记表此刻**读不出来**（I/O 或格式错误），按未获授权处理但不发起申请——'
+        + '稍后重试；持续如此请管理员检查 capability_grants.json。')
+    }
+    sweepExpiredGrants(now)
+    console.log('[fs] capability DENY(no_grant): cap=' + capability + ' who=' + who.slice(0, 20)
+      + ' src=' + String(source) + ' ⇒ 向审批人发起申请')
+    // 🔴 第二十二轮门槛 MEDIUM#8（核对为真）：回执必须反映**真实投递结果**——
+    //   askCapabilityGrant 投不出去时自己已发过解释性回执，这里不能再谎报"已发起申请"。
+    const delivered = askCapabilityGrant(bot, chatId, person, capability, source)
+    if (!delivered) return true
+    // 🔴 第二十五轮门槛 MEDIUM#2（核对为真）：**同步回执不许承诺"已发给审批人"**——
+    //   卡片投递是异步的，sendInteractive 失败时 catch 会再发一条"发不出去"，两条并排＝自相矛盾
+    //   （上一轮只修了同步的"找不到审批人"支路，异步支路漏了）。"申请已受理"不承诺送达；
+    //   **成功侧不发追加回执**（第二十七轮 LOW#7 判决：审查核实 .then 实际只落日志、
+    //   旧注释却许诺"补一条已发到审批人私聊"——按现状修注释。不加回执：再发一条会让申请人
+    //   连着吃「受理回执＋送达回执＋批准通知」三条，噪音大于价值；失败侧 catch 已有
+    //   "发不出去"可见兜底，语义闭环在"批了我会通知你"上）。
+    return deny('🔒 「' + (CAPABILITY_LABELS[capability] || capability) + '」这个能力你还没有获批。'
+      + '已受理你的申请并转交审批（批准时当场选有效期：今天/1 个月/6 个月），批了我会通知你。')
+  }
+
+  // 审批卡点击：点的人必须是**审批人本人**（私聊 + open_id 相等），否则不作答。
+  function handleCapabilityGrantClick(value, data, evtBot, evtChatId) {
+    const token = value.fs_cap_grant
+    const record = pendingCapRequests.get(token)
+    if (!record) {
+      console.log('[fs] capability click ignored (no pending request for token): ' + String(token).slice(0, 8))
+      // 🔴 第二十六轮门槛 LOW#8（核对为真）：失效卡的点击不许**只留日志**——30 分钟超时清理
+      //   只在 PATCH 成功时才把卡改灰，PATCH 失败 ⇒ 卡还在、记录已没，审批人点「批准」
+      //   毫无反应。与 fs_question/fs_plan_goal 同一口径：给点击者可见回执（不作答≠不吭声）。
+      if (evtBot && evtChatId) {
+        sendPlainText(evtBot, evtChatId,
+          '⚠️ 这张能力审批卡已失效（已处理或已超时）。需要的话让本人重发一次指令，我会重新发起申请。').catch(() => {})
+      }
+      return true
+    }
+    const clicker = personFromOperator(evtBot || record.bot, data)
+    const want = String(record.approverOpenId || '')
+    // 审批人身份只认配置里写的那个 open_id（本应用视角值）——配置没写＝谁都不认（fail-closed）。
+    const isApprover = Boolean(want && clicker.open_id && clicker.open_id === want)
+    if (!isApprover) {
+      // 转发的卡/群里点的/别人点的 —— 一律不作答（作答＝把审批权送给点击的人）
+      console.log('[fs] capability click NOT the approver: click='
+        + String(clicker.open_id || '').slice(0, 12) + '… ⇒ 不作答')
+      if (evtBot && evtChatId) {
+        sendPlainText(evtBot, evtChatId,
+          '⚠️ 这张能力审批卡不是发给你本人的，点了不作答。').catch(() => {})
+      }
+      return true
+    }
+    if (record.approverChat && evtChatId && evtChatId !== record.approverChat) {
+      console.log('[fs] capability click outside approver chat ⇒ 不作答')
+      // 🔴 第二十八轮门槛 LOW#9（核对为真）：能走到这里说明点击者**就是**审批人本人
+      //   （卡被转发到别的会话）——兄弟分支全给可见回执，唯独这条静默吞。不作答≠不吭声。
+      if (evtBot || record.bot) {
+        sendPlainText(evtBot || record.bot, evtChatId,
+          '⚠️ 这张能力审批卡要在它原本的会话里点才作答（转发/换会话的点击不作答）。').catch(() => {})
+      }
+      return true
+    }
+    const action = String(value.fs_cap_action || '')
+    // 🔴 第二十二轮门槛 LOW#7（核对为真）：原来先删记录再校验 action ⇒ 不认识的动作
+    //   会让卡片永久停在 pending（记录已没了下文，再点只会"no pending request"）。
+    //   把校验提到删除之前：不认识的动作＝不作答也不销账，30 分钟超时兜底照常生效。
+    if (action !== 'deny' && GRANT_TERM_KEYS.indexOf(action) < 0) {
+      console.log('[fs] capability click with unknown action: ' + action)
+      return true
+    }
+    pendingCapRequests.delete(token)
+    if (record.timer) clearTimeout(record.timer)
+    const bot = evtBot || record.bot
+    const finish = (statusLine, patched) => {
+      // 🔴 第四十三轮门槛 LOW#5（核对为真）：PATCH 失败原来**只打一行日志**——此时记录已删、
+      //   批准其实已生效，审批人再点只会走 no pending 支路，这一次点击表现为「点了没反应」；
+      //   与同文件兄弟站点（updateApprovalCard、fs_question、/model 点击）「改不动就退回纯文本」
+      //   一律口径不一致，也违反本批「不作答≠不吭声」。补同款降级。
+      if (record.cardId) {
+        updateInteractive(bot, record.cardId, patched).catch((error) => {
+          console.log('[fs] capability card patch failed: ' + String(error && error.message || error))
+          sendPlainText(bot, record.approverChat, statusLine).catch(() => {})
+        })
+      }
+      else sendPlainText(bot, record.approverChat, statusLine).catch(() => {})
+    }
+    if (action === 'deny') {
+      console.log('[fs] capability denied by approver: cap=' + record.capability)
+      finish('❌ 已拒绝', capResultCardPayload(record.person, record.capability, '❌ 审批人已拒绝'))
+      if (record.requesterChatId) {
+        sendPlainText(bot, record.requesterChatId,
+          '🚫 你的「' + (CAPABILITY_LABELS[record.capability] || record.capability)
+          + '」申请已被拒绝。需要的话再发一次指令重新申请。').catch(() => {})
+      }
+      return true
+    }
+    const row = recordCapabilityGrant(bot, record, action)
+    if (!row) {
+      // 写表失败 ⇒ 明确告诉审批人"没落成"，不能让他以为点了就生效（0.8.3 缺陷 A 的同形状）
+      finish('⚠️ 批准未落表（写入失败，见日志）',
+        capResultCardPayload(record.person, record.capability, '⚠️ 批准未落表（写入失败）'))
+      return true
+    }
+    console.log('[fs] capability granted: cap=' + row.capability + ' who=' + (row.name || row.open_id).slice(0, 20)
+      + ' term=' + row.term + ' 到期=' + localTimeOf(row.expires_at))
+    finish('✅ 已批准', capResultCardPayload(record.person, record.capability,
+      '✅ 已批准「' + (CAPABILITY_LABELS[row.capability] || row.capability) + '」，有效期至 '
+      + localTimeOf(row.expires_at)))
+    if (record.requesterChatId) {
+      sendPlainText(bot, record.requesterChatId,
+        '✅ 你的「' + (CAPABILITY_LABELS[row.capability] || row.capability) + '」已获批，'
+        + '有效期至 ' + localTimeOf(row.expires_at) + '。现在重发一次指令就能用了。').catch(() => {})
+    }
+    return true
   }
 
   // ─── 工作区 / 会话 两级切换（CM 2026-10-02 定稿 A 方案，与 GUI 同源）────────────
@@ -6861,7 +7987,7 @@ export function apply(ctx) {
     ]))
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '🗂 选择工作区' }, template: 'blue' },
       body: { elements },
     }
@@ -6942,7 +8068,7 @@ export function apply(ctx) {
     ], 'bisect'))
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '💬 ' + ws.title + ' 的会话' }, template: 'turquoise' },
       body: { elements },
     }
@@ -7003,7 +8129,7 @@ export function apply(ctx) {
     const ok = kind === 'ok'
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: { tag: 'plain_text', content: ok ? '✅ 已切换' : '⚠️ 没能切换' },
         template: ok ? 'green' : 'orange',
@@ -7317,6 +8443,63 @@ export function apply(ctx) {
     return out
   }
 
+  // 🔒 C6 配置校验（0.8.4；CHANGELOG 0.8.3「未修的部分」那条转正）：
+  //   配置/默认值指向**宿主清单里根本没有的模型** ⇒ 任何切换都会被宿主拒。此前只保证
+  //   "拒得清楚"，不在启动时报告"切不过去"。现在每代启动后**首次**拿到清单时校验一次：
+  //   默认选择不在清单 ⇒ 显眼日志（不改行为、不拦启动——清单可能暂时拉不到，拉不到就下一拍再试）。
+  let defaultModelChecked = false
+  let defaultModelNoCurLogged = false
+  let defaultModelEmptyTries = 0
+  // 空清单重试封顶：按 DRAIN_INTERVAL(500ms) 一拍 ≈ 30 秒；到点落旗不再 hammer 宿主。
+  const C6_EMPTY_CATALOG_MAX_TRIES = 60
+  // 🔴 第三十轮门槛 LOW#4（核对为真）：本函数挂在 DRAIN_INTERVAL(500ms) 每拍上，而
+  //   `defaultModelChecked` 要等 `listModelChoices()`（网络）**之后**才落旗——宿主一慢，
+  //   多个调用就会重叠、并发打 listModelChoices。加 in-flight 闸：上一拍没回来就跳过。
+  //   （`!cur` 分支维持不封顶＝第二十七轮 LOW#5 裁决：它只读本地状态、不发网络请求，
+  //   每拍 O(1)；加上面的闸后重叠请求也不可能发生，无需再为它设 latch——latch 反而
+  //   会重新引入第二十二轮 MEDIUM#7 的"服务晚就绪⇒校验永久关闭"问题。）
+  let defaultModelInFlight = false
+  async function checkDefaultModelAgainstCatalog() {
+    if (defaultModelChecked || defaultModelInFlight) return
+    defaultModelInFlight = true
+    try {
+      const cur = currentModelOf(null)
+      // 🔴 第二十二轮门槛 MEDIUM#7（核对为真）：`!cur` 不能当"确实没有默认选择"直接锁死——
+      //   agentDefaultModel 服务在头几拍可能还没就绪，那时 latching 会把 C6 校验**永久静默关闭**。
+      //   与下面 `!choices.length` 分支同口径：留着下一拍，只首拍留痕。
+      if (!cur) {
+        if (!defaultModelNoCurLogged) {
+          defaultModelNoCurLogged = true
+          console.log('[fs] C6: 本拍跳过默认模型校验（暂无可读的默认选择，服务可能未就绪 ⇒ 下一拍再试）')
+        }
+        return
+      }
+      const choices = await listModelChoices()
+      if (!choices.length) {
+        // 🔴 第二十四轮门槛 MEDIUM#5：清单恒空（llm 服务缺失/listModels 恒失败）时原来
+        //   **每 500ms 拍**永久重试并刷失败日志 ⇒ 设尝试上限：到点落旗并留一条解释。
+        defaultModelEmptyTries += 1
+        if (defaultModelEmptyTries >= C6_EMPTY_CATALOG_MAX_TRIES) {
+          defaultModelChecked = true
+          console.log('[fs] C6: 模型清单连续 ' + defaultModelEmptyTries
+            + ' 拍拿不到 ⇒ 本代放弃默认模型校验（宿主 llm 服务可能缺失，见同窗口 /model 列表失败日志）')
+        }
+        return
+      }
+      defaultModelChecked = true
+      const hit = choices.some((c) => c.provider === cur.provider && c.model === cur.model)
+      if (!hit) {
+        console.log('[fs] ⚠️ 配置校验：默认模型 `' + cur.provider + '/' + cur.model
+          + '` 不在宿主清单里 ⇒ 指向它的切换都会被宿主拒（请改宿主 agentDefaultModel 配置；'
+          + '发 /model 可看可用清单）')
+      } else {
+        console.log('[fs] 配置校验：默认模型 `' + cur.provider + '/' + cur.model + '` 在宿主清单内 ✓')
+      }
+    } finally {
+      defaultModelInFlight = false
+    }
+  }
+
   // 卡面/文案里给用户的「带 provider 的写法」示例（中台 #47B）。
   // 原来这里写的是占位符 `<provider>/<model>` —— 飞书把它当 HTML 标签**整段吞掉**，
   // 卡上渲染成「/model /」，用户看不到语法就按猜的写法发（不带 provider），
@@ -7420,11 +8603,11 @@ export function apply(ctx) {
     const cur = current ? current.provider + '/' + current.model : '未知'
     const elements = [{
       tag: 'div',
-      text: { tag: 'lark_md', content: '🧠 **切换模型**（按会话生效，从下一次请求开始用）\n当前：`' + cur + '`' },
+      text: { tag: 'lark_md', content: '🧠 **切换模型**（点一下即切；落地校验通过会记为默认，后续每条消息/重连都按它走·中台#124）\n当前：`' + cur + '`' },
     }]
     if (choices.length === 0) {
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: '拿不到模型清单（宿主没暴露 `llm` 服务）。可以直接发：`/model provider/model`' } })
-      return { config: { wide_screen_mode: true }, elements }
+      return { config: { wide_screen_mode: true, update_multi: true }, elements }
     }
     for (const g of groupChoicesByProvider(choices)) {
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: '**' + g.name + '**' } })
@@ -7441,7 +8624,7 @@ export function apply(ctx) {
     }
     elements.push({ tag: 'hr' })
     elements.push({ tag: 'div', text: { tag: 'lark_md', content: '点一下即切换；也可发文字：`/model provider/model`（例：`/model ' + sampleChoicePath(choices) + '`）' } })
-    return { config: { wide_screen_mode: true }, elements }
+    return { config: { wide_screen_mode: true, update_multi: true }, elements }
   }
 
   // 切换结果**写回同一张卡**（CM 2026-10-05：「点击了，卡片不懂但是发一条提示，卡片应该更新成
@@ -7453,7 +8636,7 @@ export function apply(ctx) {
   function modelResultCardPayload(kind, message) {
     const ok = kind === 'ok'
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: { tag: 'plain_text', content: ok ? '✅ 已切换模型' : '⚠️ 没能切换模型' },
         template: ok ? 'green' : 'orange',
@@ -7501,6 +8684,16 @@ export function apply(ctx) {
   //   真正改到活 agent 上、顺带存默认；不可用时抛 `session/model-unavailable`
   //   ⇒ 成功/失败都是**宿主说了算**，本函数不再有"看起来成功了"的分支。
   //   兜底 append 直接删掉：留着它就等于留一条永远报喜不报忧的路（A25／假绿灯）。
+  // 🔴 中台 #124（CM 2026-10-07 裁决：**桥必须保证切换落地持续生效，不许推给宿主线**）：
+  //   宿主 selectModel 内部分两半（dsh-api-session-controller/lib/index.js:720-748）——
+  //   ① selectForNextRequest（改"下一条请求"，会话级一次性）② agentDefaultModel.saveSelection
+  //   （写 profile 默认值，这半才是"永久"）。本机取证：②会**静默不执行**（3 次切换 profile
+  //   一次没写；dsh-agent-default-model/lib/index.js:53-66 两处 early-return 不打字）。
+  //   ⇒ 光信 selectModel 的返回，就是"下一条生效、之后跳回默认"的 #124 现象本身。
+  //   桥侧兜底闭环：selectModel 返回后**回读** `currentSelection()`（读的是配置引用，写完
+  //   热更跟上才算落地）；短轮询没等到 ⇒ 桥**直存** `saveSelection`（宿主同款入口，有界 4 秒）
+  //   再回读；仍未落地 ⇒ 回执**如实**「只对下一条生效、默认值未写入」＋留痕（验收标准 D），
+  //   禁止回「✅ 已切换」。
   async function switchModelForAgent(agent, provider, model) {
     const sc = ctx.get('sessionController')
     if (!sc || typeof sc.selectModel !== 'function') {
@@ -7522,7 +8715,113 @@ export function apply(ctx) {
       + ' ' + String(out.provider) + '/' + String(out.model)
       + ' session=' + String(agent.id)
       + (out.confirmed ? '' : '（宿主响应里没有 selected，回显的是请求值）'))
-    return out
+    // #124 落地校验（回读→直存→再回读），结果并进返回值供两条通道回执分支使用。
+    const pf = await verifyDefaultModelLanded(out.provider, out.model)
+    console.log('[fs] /model: 默认值落地 ' + (pf.persisted ? 'ok' : 'FAIL')
+      + ' ' + String(out.provider) + '/' + String(out.model) + '：' + pf.persistDetail)
+    return {
+      provider: out.provider, model: out.model, confirmed: out.confirmed,
+      persisted: pf.persisted, persistDetail: pf.persistDetail,
+    }
+  }
+
+  // #124 落地校验的参数：宿主自己的 ② 半写完后 profile 热更要一点时间 ⇒ 先短轮询；
+  //   等不到才桥直存（写同值幂等无害）；直存给 4 秒上界（保存队列疑似卡死时不无限悬回执）。
+  //   最坏 ~0.6s + 4s + 1s，全部有界（A19）。
+  const DM_LAND_POLL_TRIES = 3
+  const DM_LAND_POLL_MS = 200
+  const DM_LAND_RETRY_TRIES = 5
+  const DM_DIRECT_SAVE_TIMEOUT_MS = 4000
+  function defaultSelectionMatches(dm, provider, model) {
+    try {
+      const cur = dm.currentSelection()
+      return Boolean(cur) && cur.provider === provider && cur.model === model
+    } catch { return false }
+  }
+  async function verifyDefaultModelLanded(provider, model) {
+    try {
+      const dm = ctx.get('agentDefaultModel')
+      if (!dm || typeof dm.currentSelection !== 'function') {
+        return { persisted: false, persistDetail: '宿主没暴露 agentDefaultModel 读回口' }
+      }
+      for (let i = 0; ; i++) {
+        if (defaultSelectionMatches(dm, provider, model)) {
+          return { persisted: true, persistDetail: i === 0 ? '宿主即时落地' : '宿主半拍后落地（第 ' + i + ' 拍读到）' }
+        }
+        if (i >= DM_LAND_POLL_TRIES) break
+        await new Promise((r) => setTimeout(r, DM_LAND_POLL_MS))
+      }
+      if (typeof dm.saveSelection !== 'function') {
+        return { persisted: false, persistDetail: 'agentDefaultModel 没暴露 saveSelection，桥直存无门' }
+      }
+      // 桥直存：宿主 ② 半静默没跑 ⇒ 桥自己调同一个服务把它写上。
+      const saved = await Promise.race([
+        (async () => {
+          try { await dm.saveSelection({ provider, model }); return 'saved' } catch (error) {
+            return 'error:' + String((error && error.message) || error)
+          }
+        })(),
+        new Promise((r) => setTimeout(() => r('timeout'), DM_DIRECT_SAVE_TIMEOUT_MS)),
+      ])
+      if (saved !== 'saved') {
+        return {
+          persisted: false, persistDetail: saved === 'timeout'
+            ? '桥直存 ' + (DM_DIRECT_SAVE_TIMEOUT_MS / 1000) + ' 秒未返回（宿主保存队列疑似卡死）'
+            : '桥直存报错：' + String(saved).slice('error:'.length)
+        }
+      }
+      for (let i = 0; ; i++) {
+        if (defaultSelectionMatches(dm, provider, model)) {
+          return { persisted: true, persistDetail: '桥直存后落地' }
+        }
+        if (i >= DM_LAND_RETRY_TRIES) break
+        await new Promise((r) => setTimeout(r, DM_LAND_POLL_MS))
+      }
+      return { persisted: false, persistDetail: '桥直存写完但读回仍非目标（配置热更没跟上）' }
+    } catch (error) {
+      return { persisted: false, persistDetail: '落地校验异常：' + String((error && error.message) || error) }
+    }
+  }
+
+  // 🔴 第四十七轮 LOW#3（核对为真）：confirmed×persisted 四分支回执原来文字档/卡片档**各抄一份**，
+  //   且尾巴已开始分叉（重试引导一句两处措辞不同）——本批反复修的"两入口口径不一致"同款。
+  //   收成一个判据树：kind/text＝文字档（自含、带 ✅/⚠️ 前缀），card＝卡片档（终态卡标题已带灯，
+  //   正文不带前缀）。文案逐字照搬现状，只挪位置不改字面（历史轮钉过的断言字面不动）。
+  function modelSwitchReceipt(sel) {
+    const route = '`' + sel.provider + '/' + sel.model + '`'
+    if (sel.confirmed && sel.persisted) {
+      return {
+        kind: 'ok',
+        text: '✅ 模型已切换为 ' + route + ' 并记为默认（后续每条消息、重连/恢复都按它走）',
+        card: '已切换为 ' + route + ' 并记为默认（后续每条消息、重连/恢复都按它走）。要再切就发 `/model`。',
+      }
+    }
+    if (sel.confirmed && !sel.persisted) {
+      return {
+        kind: 'warn',
+        text: '⚠️ 下一条请求会用 ' + route + '，但默认值未写入（' + sel.persistDetail + '）⇒ 重连/恢复后可能跳回旧默认。'
+          + '再发一次 `/model` 重试；持续如此就把 ' + sel.provider + '/' + sel.model + ' 直接改进 profile 的默认模型。',
+        card: '下一条请求会用 ' + route + '，但默认值未写入（' + sel.persistDetail
+          + '）⇒ 重连/恢复后可能跳回旧默认。再发 `/model` 重试，或把这条直接改进 profile 默认模型。',
+      }
+    }
+    if (!sel.confirmed && sel.persisted) {
+      return {
+        kind: 'warn',
+        text: '⚠️ 宿主没有回带确认（无法证明下一条就在用这条），但默认值读回已是 ' + route
+          + '（落地已验证）。发 `/model` 看「当前」核对。',
+        card: '宿主没有回带确认（无法证明下一条就在用这条），但默认值读回已是 ' + route
+          + '（落地已验证）。发 `/model` 看「当前」核对。',
+      }
+    }
+    // 宿主收了请求但**没回带确认**且没落地 ⇒ 不拿请求值冒充已生效（第十四轮门槛 MEDIUM）。
+    return {
+      kind: 'warn',
+      text: '⚠️ 切换请求已发给宿主（' + route + '），但宿主没有回带确认，且默认值未写入（' + sel.persistDetail
+        + '）。发 `/model` 看「当前」是不是这条。',
+      card: '切换请求已发给宿主（' + route + '），但宿主没有回带确认，且默认值未写入（' + sel.persistDetail
+        + '）。发 `/model` 看「当前」是不是这条。',
+    }
   }
 
   // 命令通道取 agent（2026-10-02 CM：「隔一段时间没说话，发 /goal /plan /model 都回我
@@ -7626,6 +8925,18 @@ export function apply(ctx) {
       const provider = parts[0]
       const model = parts[1]
       if (!chatId || !ownerBot) return
+      // 🔒 第二十八轮门槛 MEDIUM#1（核对为真）：fs_model 是**唯一没做来源守卫**的点击口——
+      //   兄弟口全查（fs_question/fs_plan_goal/fs_approval 走 cardClickOutsideOriginChat，
+      //   审批发卡/approverChatFor/exit_plan_mode/命令边界走 isP2pChat），而卡被人转发进群后
+      //   群里任何成员点一下就把这个会话的模型切了（capabilityGuard 默认关＝此路无闸）。
+      //   与 /model **文字命令**同一判据收口：只认已确认 p2p 的会话（fail-closed）。
+      if (!isP2pChat(ownerBot, chatId)) {
+        console.log('[fs] /model 点击不作答：非确认私聊（转发的卡不作答） chat=' + String(chatId))
+        // 本分支外层是**同步**监听器（真正的 await 序列都排在下面的 async IIFE 里）⇒ 回执走 fire-and-forget。
+        void sendPlainText(ownerBot, chatId,
+          '⚠️ 切换模型只应答**私聊**里这张卡的点击（群里/类型没确认过的会话不作答）。卡若被转发过，请回原私聊操作。').catch(() => {})
+        return
+      }
       // CM 2026-10-05：「卡片应该更新成已经切换到XX模型的提示，不是另外发卡片」
       //   ⇒ 成功/失败都 PATCH 这一张；只有拿不到 message_id 或 PATCH 被拒时才退回发文本
       //   （绝不允许"点了没反应"）。
@@ -7633,6 +8944,10 @@ export function apply(ctx) {
         if (clickedCardId) {
           try {
             await updateInteractive(ownerBot, clickedCardId, modelResultCardPayload(kind, message))
+            // 0.8.4（CM 报"点完过一会儿卡面回退"）：改卡**成功**也要留痕 —— 旧实现只在失败时打日志，
+            //   于是"到底有没有改成、后来是谁又写回去的"只能靠反证 + 去调飞书 GET 接口才钉得死。
+            console.log('[fs] /model card patched in place: card=' + clickedCardId.slice(-8)
+              + ' kind=' + kind + ' 有按钮=否')
             return
           } catch (error) {
             console.log('[fs] /model card patch failed, falling back to a text reply: '
@@ -7643,6 +8958,16 @@ export function apply(ctx) {
       }
       // 2026-10-02：卡片点击也走 commandAgent（活会话 → resume），空闲久了点击同样生效。
       void (async () => {
+        // 🔒 能力闸：点卡切模型与发 `/model` 是**同一件事**，不能因为走了回调通道就绕开闸
+        //   （中台 #53 的原始症状就是"卡上谁点都算数"）。
+        if (requireCapability(ownerBot, chatId, () => personFromOperator(ownerBot, data),
+          'model', 'card:fs_model')) {
+          // 🔴 第三十七轮门槛 LOW#6（核对为真）：requireCapability 的 deny() 内部已给本会话
+          //   发**同义文字回执**，这里再补一张 warn 卡＝一次点击两条可见消息，且四条兄弟
+          //   卡片通道（fs_form/fs_plan_goal/fs_approval）都只 return——口径独此一处歪。
+          //   对齐兄弟：拦下＝不作答，理由以文字回执为准（回执文案里本来就写了原因）。
+          return
+        }
         const agent = await commandAgent(ownerBot, chat)
         console.log('[fs] /model click: ' + String(value.fs_model) + ' chat=' + String(chatId)
           + ' agent=' + String(agent && agent.id || 'none') + ' card=' + (clickedCardId || '（事件没给 message_id）'))
@@ -7652,14 +8977,11 @@ export function apply(ctx) {
         }
         try {
           const sel = await switchModelForAgent(agent, provider, model)
-          if (sel.confirmed) {
-            await replyInCard('ok', '已切换为 `' + sel.provider + '/' + sel.model
-              + '`（按会话生效，下一次请求开始用）。要再切就发 `/model`。')
-          } else {
-            // 宿主收了请求但**没回带确认** ⇒ 不拿请求值冒充已生效（第十四轮门槛 MEDIUM）。
-            await replyInCard('warn', '切换请求已发给宿主（`' + sel.provider + '/' + sel.model
-              + '`），但宿主没有回带确认，我无法保证它已生效。发 `/model` 看「当前」是不是这条。')
-          }
+          // 🔴 中台 #124：卡片通道与文字通道**同一套四分支口径**——终态卡标题的 ✅
+          //   （replyInCard 'ok'）只允许出现在"默认值落地已验证"的场合。
+          //   🔴 第四十七轮 LOW#3：判据树与文字档共用 modelSwitchReceipt，不再各抄一份。
+          const rcCard = modelSwitchReceipt(sel)
+          await replyInCard(rcCard.kind, rcCard.card)
         } catch (error) {
           console.log('[fs] /model 切换失败: ' + String(error && error.stack || error))
           await replyInCard('warn', modelSwitchFailureText(error) + '\n要重试就发 `/model`。')
@@ -7710,6 +9032,12 @@ export function apply(ctx) {
         return
       }
       if (cardClickOutsideOriginChat(record, chatId, evtBot)) return
+      // 🔴 第三十三轮门槛 MEDIUM#3（核对为真）：`approval` 能力闸此前**只接了 fs_approval 一条口**
+      //   （8695 处），兄弟通道——审批单卡（fs_form/fs_choice，代码自述「审批单卡」）——漏接：
+      //   总闸开着时，点审批单＝替别人拍板一次权限决定，与答复审批单是同一种权力。同口径补闸，
+      //   source 用 `card:fs_form` 留痕（capabilityGuard 默认关时 requireCapability 直接放行）。
+      if (requireCapability(evtBot || record.bot, chatId,
+        () => personFromOperator(evtBot || record.bot, data), 'approval', 'card:fs_form')) return
       const choice = String(value.fs_choice)
       pendingForms.delete(record.token)
       if (record.timer) clearTimeout(record.timer)
@@ -7751,6 +9079,24 @@ export function apply(ctx) {
         return
       }
       if (cardClickOutsideOriginChat(record, chatId, evtBot)) return
+      // 🔴 第二十二轮门槛 MEDIUM#4（核对为真）：这张卡**不止 /plan 命令会产**（GUI 驱动的
+      //   plan mode 同样出卡），点「🎯 以目标模式跑」＝进目标模式 ⇒ 必须先过 A3 的 bot 级
+      //   `goalEnabled` 总闸，否则开关关着也能从卡面绕进去（capabilityGuard 默认关时下面
+      //   requireCapability 是直接放行的）。
+      const goalBot = evtBot || record.bot
+      if (!(goalBot && goalBot.cfg && goalBot.cfg.goalEnabled === true)) {
+        console.log('[fs] 开关拒绝: card:fs_plan_goal 未启用（bot=' + String(goalBot && goalBot.cfg && goalBot.cfg.name)
+          + ' 需配置 goalEnabled=true）chat=' + String(chatId))
+        if (goalBot) {
+          sendPlainText(goalBot, chatId,
+            '目标模式开关（goalEnabled）当前未启用，这张卡的「🎯 以目标模式跑」不受理。'
+            + '需要启用请让管理员在飞书桥配置里打开 `goalEnabled`。').catch(() => { })
+        }
+        return
+      }
+      // 🔒 能力闸：点「批准计划」＝立刻进目标模式（连开多轮、真花钱）⇒ 与 `/goal` 同一条闸、同一个能力名。
+      if (requireCapability(goalBot, chatId,
+        () => personFromOperator(goalBot, data), 'goal', 'card:fs_plan_goal')) return
       const q = (record.questions && record.questions[0]) || {}
       const approve = String(planApproveLabel(q) || '')
       dropQuestion(record)
@@ -7801,7 +9147,7 @@ export function apply(ctx) {
           try {
             await updateInteractive(record.bot, record.cardId, {
               schema: '2.0',
-              config: { wide_screen_mode: true },
+              config: { wide_screen_mode: true, update_multi: true },
               header: {
                 title: { tag: 'plain_text', content: goalOk ? '🎯 已进入目标模式' : '📋 计划已批准' },
                 template: goalOk ? 'green' : 'orange',
@@ -7891,6 +9237,11 @@ export function apply(ctx) {
       }
       return
     }
+    // 0.8.4（A5/A6）：能力审批卡的回执（审批人在私聊点「批准：今天/1 个月/6 个月」或「拒绝」）。
+    if (value.fs_cap_grant) {
+      handleCapabilityGrantClick(value, data, evtBot, evtChatId)
+      return
+    }
     const token = value.fs_approval
     if (!token) {
       console.log('[fs] card action: no fs_approval token in value, ignoring')
@@ -7908,6 +9259,10 @@ export function apply(ctx) {
     //   ReferenceError，被调用方 try/catch 吞掉后 `record.settle()` 永不执行
     //   ＝**所有**审批卡点击失效（2026-10-05 门槛第九次跑抓出，冒烟结构上碰不到这条通道，见用例 96）。
     if (cardClickOutsideOriginChat(record, evtChatId, evtBot)) return
+    // 🔒 能力闸（A5）：答复审批单＝把一次工具权限放出去，按 CM 口径「这些都需要我审批」——
+    //   总闸开着时，点卡的人必须在表里持有 `approval` 这条授权，否则这张卡对他不作答。
+    if (requireCapability(evtBot || record.bot, evtChatId,
+      () => personFromOperator(evtBot || record.bot, data), 'approval', 'card:fs_approval')) return
     if (value.fs_action === 'allow') {
       console.log('[fs] approval allowed (once): ' + record.request.toolName + ' by ' + (clickerTag || '未知点击者'))
       record.settle('allowed-once')
@@ -8166,7 +9521,10 @@ export function apply(ctx) {
         return pass()
       }
       console.log('[fs] approval ' + outcome + ' on Feishu — denying: ' + String(exec && exec.name))
-      return { kind: 'deny', reason: '用户在飞书' + (outcome === 'rejected' ? '拒绝' : '未在时限内确认') + '：' + reason }
+      // 🔴 第三十轮门槛 LOW#3：'unavailable'＝**根本没发卡**（非确认私聊被拒发，上面已自发说明），
+      //   不得误报成"用户在飞书拒绝"；真拒绝才是 'rejected'。
+      const denyWho = { rejected: '拒绝', unavailable: '的会话不是已确认的私聊（审批单没发出去）' }
+      return { kind: 'deny', reason: '用户在飞书' + (denyWho[String(outcome)] || '未在时限内确认') + '：' + reason }
     } catch (error) {
       // 出错一律放行（保持原有行为，绝不因审批自身故障把 agent 卡死）；但记日志
       console.log('[fs] approval hook error (passing through): ' + String(error && error.message || error))
@@ -8426,7 +9784,7 @@ export function apply(ctx) {
     const planButtons = plan ? planReviewButtonsRow(q, token) : null
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: {
           tag: 'plain_text',
@@ -8454,7 +9812,7 @@ export function apply(ctx) {
   function questionResultCardPayload(q, label) {
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: {
           tag: 'plain_text',
@@ -8604,7 +9962,7 @@ export function apply(ctx) {
     })
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
         template: 'blue',
@@ -8625,7 +9983,7 @@ export function apply(ctx) {
     if (Array.isArray(originalElements) && originalElements.length) {
       return {
         schema: '2.0',
-        config: { wide_screen_mode: true },
+        config: { wide_screen_mode: true, update_multi: true },
         header: {
           title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
           template,
@@ -8635,7 +9993,7 @@ export function apply(ctx) {
     }
     return {
       schema: '2.0',
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: { tag: 'plain_text', content: '📋 ' + String(f.title || '审批单') },
         template,
@@ -8657,6 +10015,21 @@ export function apply(ctx) {
   // 发一张审批单卡并**等他点选**（Promise 模式仿 askUserQuestion；30 分钟定时器）。
   // 超时/中止都**可见**：既把卡改成回执/超时态，也发一条纯文本说明（硬要求：不许静默）。
   function askApprovalForm(bot, chatId, form, signal) {
+    // 🔴 第三十三轮门槛 MEDIUM#3（核对为真）：审批单是 `askApprovalCard` 的**兄弟通道**，
+    //   CM 裁决口径「审批单只发在已确认的私聊会话，群里谁都能点」——fs_approval 那条有
+    //   isP2pChat 闸，这条一直漏着：群里触发 / 工具指定群 chatId 时整张审批单卡（采纳/驳回）
+    //   发进群，任何群成员一点就替会话主人拍板。同判据（fail-closed）补闸，且不作答≠不吭声：
+    //   给该会话一句可见回执。返回带 refused 标记，工具落点据此给 agent 明确拒绝理由。
+    if (!isP2pChat(bot, chatId)) {
+      console.log('[fs] approval form refused (chat not known p2p): kind='
+        + String((bot && bot.chatKinds && bot.chatKinds.get(String(chatId))) || '未知')
+        + ' title=' + String((form && form.title) || '') + ' chat=' + String(chatId)
+        + ' ⇒ 审批单只在私聊发')
+      void sendPlainText(bot, chatId,
+        '⚠️ 有一张审批单「' + String((form && form.title) || '') + '」要发，但**审批单只发在已确认的私聊会话**'
+        + '（群里谁翻到都能点＝把拍板权发给全群）。请在私聊里继续这个操作。').catch(() => {})
+      return Promise.resolve({ choice: '', timedOut: false, refused: 'non-p2p' })
+    }
     return new Promise((resolve, reject) => {
       const record = {
         resolve, reject, form, timer: undefined, token: randomUUID(), cardId: undefined, bot, chatId,
@@ -8740,11 +10113,20 @@ export function apply(ctx) {
       const q0 = questions[0]
       return askApprovalForm(bot, chatId, qCard, signal).then((out) => {
         const choice = out && out.choice ? String(out.choice) : ''
-        console.log('[fs] approval form answered: ' + String(q0.id || '') + ' -> ' + (choice || '（未操作）'))
+        // 🔴 第三十三轮门槛 MEDIUM#3：入口 p2p 边界拒发时（`refused:'non-p2p'`）措辞必须如实
+        //   ——不能报成"未操作"（那会让 agent 以为卡发出去了只是没人点）。
+        console.log('[fs] approval form answered: ' + String(q0.id || '') + ' -> '
+          + (choice || (out && out.refused ? '（非确认私聊拒发）' : '（未操作）')))
+        // 🔴 第三十四轮门槛 LOW#2（核对为真）：嵌套三元违反仓规（「嵌套三元改 if/else」），
+        //   先把无点击时的兜底措辞摊平（文案逐字不变，111/113 断言钉的是值）。
+        let fallbackNote = '（未操作）'
+        if (out && out.refused) fallbackNote = '（审批单只在已确认私聊发，这张卡没发出去）'
+        else if (out && out.timedOut) fallbackNote = '（超时未操作）'
         return {
           answers: [choice
             ? { id: q0.id, selected: [choice] }
-            : { id: q0.id, selected: [], custom: out && out.timedOut ? '（超时未操作）' : '（未操作）' }],
+            : { id: q0.id, selected: [], custom: fallbackNote }],
+          ...(out && out.refused ? { refused: out.refused } : {}),
           // P2（0.8.0 互认）：点击者随答案回给 agent（顶层新键，既有判据不看它）。
           ...(out && out.clicker ? { clicker: out.clicker } : {}),
         }
@@ -8836,21 +10218,53 @@ export function apply(ctx) {
       if (!(owner && owner.bot && owner.bot.cfg && owner.bot.cfg.identityGuard)) return next()
       // ⚠️ 此处作用域里没有 `bot`（全局注册）⇒ 只能给 `workspaceRoot()`；内核有多级兜底，给 undefined 也不怕。
       const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
-      // 🔴 2026-10-04 复核发现的**口径偏差**（先只观测，**不改行为**）：
-      //    内核给 `decideAction` 的定义是「hasOwner=true ＋ 无 actor（**表在不在都一样**）⇒ deny」。
-      //    而代码走到这里时 **owner 必定存在**（上面那行已经 `return next()`）⇒ 按理应传 `hasOwner: true`。
-      //    现在的写法用 `!rec` 当"这不是飞书回合"的替身 ⇒ **有 owner、但 store 里没有这一轮的记录 ⇒ 放行**。
-      //    可达路径（**逻辑成立、真机尚未实证**）：`/switch` 把 handle 挂到新 session id、而 store 记的是旧 id；
-      //    卡片回调起的轮次也不经过入站注入。
-      //    ⇒ 先打点把"实际有多少这种轮次"量出来，**再决定是否收紧成 deny** ——
-      //      收紧会波及卡片交互与 `/switch` 之后的正常使用，不该拍脑袋改。
+      // 🔒 K3-GAP（C1）：有 owner 但 store 无记录 ⇒ **fail-closed**（拒绝），不再放行。
+      //    原逻辑（2026-10-04 复核）："这不是飞书回合"的替身 ⇒ 放行；可达路径：/switch 换 session id、卡片回调不起入站注入。
+      //    现口径（CM 2026-10-06 裁）：宁可误杀正常轮次，也不让无身份记录的请求带参执行。
       if (!rec) {
-        console.log('[fs] identity NOTE[no-record-allow]: tool=' + exec.name + ' agent=' + exec.agent.id
-          + ' ⇒ 飞书回合但无身份记录，按当前实现放行（口径偏差·待裁；见冒烟用例 70 的注释）')
+        // 🔴 第四十三轮门槛 MEDIUM（核对为真）：无记录硬拒原来**波及一切工具调用**——
+        //   store.set 只在入站/steer 两处写，TTL 默认 30 分钟 ⇒ goal 自动续轮/超过半小时的
+        //   合法轮记录过期后被连 read 一起误杀。CM 裁决（2026-10-06）的边界是不让无身份记录
+        //   的请求「**带参**执行」：本钩子只碰 IDENTITY_KEYS，一个身份字段都不带的调用没有
+        //   冒充面，拒它零安全收益、只有误伤。收窄为：带身份键 ⇒ 拒（原样返回形状，
+        //   第二十二轮 HIGH#2 的教训——next(值) 不被采纳），不带键 ⇒ 放行但留痕。
+        const keysPresent = IDENTITY_KEYS.some((k) => exec.arguments
+          && Object.prototype.hasOwnProperty.call(exec.arguments, k))
+        // 🔴 第四十四轮 MEDIUM#2（判不修，留此理由）：finding 指出 IDENTITY_KEYS 含
+        //   `name`/`source`/`level`/`category` 这类通用参数名 ⇒ 无记录轮里恰好带这些键的
+        //   普通工具调用会被误拒。维持现口径，三点理由：
+        //   ① **拒集必须等于覆写白名单**——本钩子有记录时覆写的就是这套键；若为"拒"另立
+        //     一套更紧的"冒充键"，会出现"有记录可被覆写、无记录却放行不覆写"的口径漂移，
+        //     冒充面反而在无记录（更危险）的一侧变大。
+        //   ② 无法区分"这个 name 是身份名"还是"这个 name 是工具自己的参数"——按键名判
+        //     据本就到此为界，收紧也只是把误拒面挪个位置。
+        //   ③ CM 2026-10-06 裁决明文："宁可误杀正常轮次，也不让无身份记录的请求带参执行"
+        //     ——通用键带来的误拒面正是该裁决**自愿付的代价**，且只影响"无记录+带键"
+        //     这一窄路径（有记录轮完全不受影响；无键调用上一轮已放行）。
+        if (keysPresent) {
+          console.log('[fs] identity DENY[no-record]: tool=' + exec.name + ' agent=' + exec.agent.id
+            + ' ⇒ 飞书回合但无身份记录且调用带身份参数，按 fail-closed 拒绝（K3-GAP 收口）')
+          // 🔴 第二十二轮门槛 HIGH#2（核对为真，比 finding 说的更严重）：本监听器的**拒绝契约**
+          //   是 `return 结果对象`（见下方 identity_unresolved 支路）；`next(值)` 的参数**不会被采纳**
+          //   ⇒ 瀑布继续走到真正的工具执行 ⇒ 我原来的写法实际是 **fail-open**，C1 白收紧了。
+          //   必须与既有 deny 支路同形状返回（error 字段不能少：harness 在 isError 时无条件读它）。
+          return {
+            isError: true,
+            error: 'identity_record_missing',
+            value: { error: 'identity_record_missing' },
+            content: [{ type: 'text', text: '本轮缺少飞书身份记录，已按 fail-closed 拒绝执行本次工具调用'
+              + '（identity_record_missing；K3-GAP）。' }],
+          }
+        }
+        console.log('[fs] identity pass[no-record-keyless]: tool=' + exec.name
+          + ' agent=' + exec.agent.id + ' ⇒ 无记录但调用不含身份字段，无冒充面，放行')
+        // 🔴 第四十四轮门槛 MEDIUM#1（核对为真）：这支原来**漏了 return**——直落到下面
+        //   `rec.actor`（rec===null）抛 TypeError，被外层 catch 吞掉再 next()：放行是放行了，
+        //   但每笔无记录 keyless 调用都刷一条误导性的 ALERT[internal_error]，且控制流靠异常
+        //   兜路＝下一处改动很容易把它"修"成静默拒。显式短路。
+        return next()
       }
-      const action = !rec
-        ? 'pass-through'                                  // 非飞书回合 ⇒ 不要求飞书身份
-        : decideAction({ hasOwner: true, actor: rec.actor })
+      const action = decideAction({ hasOwner: true, actor: rec.actor })
       if (action === 'overwrite') {
         const r = applyActorToArguments(exec.arguments, rec.actor)
         if (r.overwritten.length || r.dropped.length) {
@@ -8886,6 +10300,16 @@ export function apply(ctx) {
     if (exec.name !== 'exit_plan_mode') return next()
     const owner = findChatForAgent(exec.agent)
     if (!owner) return next()
+    // 🔴 第二十五轮门槛 MEDIUM#4（核对为真）：计划审查卡＝「批准/继续计划」+「🎯 以目标模式跑」
+    //   这类**真人点按钮**的卡，与 askApprovalCard/approverChatFor/命令边界同一条 B1 口径——
+    //   只进**已确认为 p2p** 的会话。GUI 把群会话拖进计划模式时不接管（next() 走原生通道），
+    //   否则群里任何成员都能替会话主人批计划/开目标（capabilityGuard 默认关时更是无闸）。
+    //   第二十七轮 LOW#8：判据同走唯一入口 `isP2pChat`。
+    if (!isP2pChat(owner.bot, owner.chatId)) {
+      console.log('[fs] exit_plan_mode 不接管：会话非确认私聊（不往群里投可点审批卡） chat='
+        + String(owner.chatId))
+      return next()
+    }
     const plan = String((exec.arguments && exec.arguments.plan) || '')
     if (!plan.trim()) return next()
     console.log('[fs] exit_plan_mode intercepted for ' + exec.agent.id + ' plan_len=' + plan.length)
@@ -9008,6 +10432,23 @@ export function apply(ctx) {
     }
     console.log('[fs] user-questions/request[' + hop + ']: owner found, asking via card'
       + (kind === 'plan-review' ? ' (plan review)' : ''))
+    // 🔴 第三十二轮门槛 MEDIUM#2（核对为真）：群会话的 exit_plan_mode 在工具层被闸住 next() 后，
+    //   原生通道**照样会发一条 plan-review 提问**进这条水位线——本服务层入口当时没判 p2p，
+    //   计划审批卡（Approve/继续修改）还是会渲染进群，"不往群里投可点审批卡"只在半条路上成立。
+    //   闸必须落在这个**唯一收口点**：工具层与这里的 plan-review 卡出自同一个 questionCardPayload
+    //   （词面「计划已写好」），判据也必须是同一个 isP2pChat。
+    //   ⚠️ 只闸 plan-review 这一种：普通提问卡是群协作的既有功能（用例 85/88/89 的转交提问），
+    //   全量设闸会把群里合法的提问一并打死。
+    // 🔴 第四十二轮门槛 LOW#6（核对为真）：局部布尔原来叫 `isPlanReview`，把 9104 的
+    //   同名 helper **遮蔽**整段函数体——今天没调用点所以不是活 bug，但下一个在这里
+    //   想用 helper 的人会拿到布尔当场 TypeError。局部改名，helper 名让出来。
+    const planReviewGate = kind === 'plan-review'
+      || String((questions[0] && questions[0].id) || '') === 'plan-review'
+    if (planReviewGate && !isP2pChat(owner.bot, owner.chatId)) {
+      console.log('[fs] plan-review 卡不作答：会话非确认私聊（群原生通道的计划审批也不发卡，转交原生 next） chat='
+        + String(owner.chatId))
+      return next()
+    }
     return askUserQuestion(owner.bot, owner.chatId, questions, request.signal, agent.id)
   }
 
@@ -9083,15 +10524,47 @@ export function apply(ctx) {
       try { drainCardRelay() } catch (error) {
         console.log('[fs] card relay drain failed: ' + String(error && error.message || error))
       }
+      // C6：默认模型 vs 宿主清单的一次性校验（清单就绪前每拍重试，就绪即定旗不再查）。
+      // 🔴 第四十五轮 LOW#2（核对为真）：原来空 catch 吞掉**一切**异常——本函数只自护
+      //   try/finally，若 currentModelOf/listModelChoices 将来抛错会**静默**每拍重跑、
+      //   校验永远不落地且日志无痕。与上方兄弟 drainCardRelay 同口径：失败要留痕。
+      checkDefaultModelAgainstCatalog().catch((error) => {
+        console.log('[fs] default-model catalog check failed: ' + String(error && error.message || error))
+      })
+      // 🔴 第四十七轮 LOW#4（核对为真）：群侧 peer 变化只置旗标（见 noteChatPeer），
+      //   消费方就是这一拍——一拍一次合并写，替代原来「换发言人即全量同步写盘」。
+      flushPendingPeerChanges()
     }, DRAIN_INTERVAL)
     // 改造①：子代理回执轮询（1s）——必须在**回合状态之外**独立跑，
     // 否则又回到"只在回合启动那一拍判定"的老毛病。
     const stopNoticeTimer = ctx.interval(() => {
       void pollSubagentNotices().catch(() => {})
     }, NOTICE_POLL_MS)
+    // 🔒 能力闸：每 30 分钟扫一次过期授权（懒触发之外的兜底）。
+    const stopSweepTimer = ctx.interval(() => {
+      // 🔴 第二十二轮门槛 HIGH#1（核对为真）：必须**显式传时间戳** ——
+      //   `grantExpired(row, undefined)` 里 `exp <= undefined` 即与 NaN 比较、恒 false ⇒
+      //   可解析的到期时间**永远判不过期**，这条主动提醒支路整体形同虚设（只有闸内懒触发还活着）。
+      try { sweepExpiredGrants(Date.now()) } catch (error) {
+        console.log('[fs] grant sweep failed: ' + String(error && error.message || error))
+      }
+    }, 30 * 60 * 1000)
     return () => {
       stopping = true
       stopNoticeTimer()
+      stopSweepTimer()
+      // 🔴 第四十九轮 LOW（核对为真）：停机/热重载前补最后一刷群侧 peer，
+      //   否则「最后一拍之后换的发言人」随 bots.clear() 一起丢（见 flushPendingPeerChanges 注）。
+      flushPendingPeerChanges()
+      // 🔴 第五十二轮 LOW#4（核对后**不清** `pendingCapRequests`，理由写在这里）：那批 30 分钟
+      //   一次性定时器跨代仍会触发，但它做的是**终态交代**——把审批卡改成「已超时（自动拒绝）」
+      //   并给申请人发一条超时回执（第二十九轮 LOW#7 钉的就是"超时不许吭声消失"这条契约）。
+      //   清掉它 ⇒ 申请人无限等待、卡停在"还能点"的样子；不清 ⇒ 卡被标成超时，而新代收到
+      //   同一张卡的点击本来就走"卡已过期"分支（批不进去），旧 `bot` 对象走 HTTP 改卡/发消息
+      //   仍然有效（`proc.kill()` 杀的是宿主进程，不影响飞书 OpenAPI 调用）。
+      //   内存侧同样有界：每条记录在定时器触发或点击处理时就 `delete`，不累积。
+      //   口径同本文件对 `pendingQuestions`/`pendingApprovals` 的处理：**闸只拦"进入"，
+      //   不拦"刹车与终态"**——代际清理不许吃掉用户已经等到的那一句交代。
       for (const bot of bots.values()) {
         try { if (bot.proc) bot.proc.kill() } catch { /* ignore */ }
       }
@@ -9391,6 +10864,15 @@ export function apply(ctx) {
       }
       try {
         const out = await askApprovalForm(bot, target, form, exec && exec.signal)
+        // 🔴 第三十三轮门槛 MEDIUM#3：`askApprovalForm` 入口的 p2p 边界拒发（见该函数注释）
+        //   以 `refused:'non-p2p'` 返回——工具必须把"没发卡"如实报给 agent，不许伪装成功。
+        if (out && out.refused === 'non-p2p') {
+          return {
+            ok: false, choice: '', timedOut: false, cardId: '',
+            detail: '审批单只发在**已确认的私聊会话**（该会话是群或类型未确认，卡没发出去；'
+              + '会话里已给过可见说明）。请让用户在私聊里继续这个操作。',
+          }
+        }
         const choice = out && out.choice ? String(out.choice) : ''
         return {
           ok: true,
@@ -9969,7 +11451,10 @@ export function apply(ctx) {
     }
   })
 
-  console.log('[fs] bridge active. config: ' + configPath())
+  // 🔴 第三十轮门槛 LOW#5（核对为真）：字段名由 config 冒号形式改为 cfg_path。旧写法让冒烟 105a 的
+  //   「非卡站点白名单」必须锚定这行日志的**字面文本**——这行任何改写/拆行都会联动假红。
+  //   改名后本行不再含该词，105a 交叉核对回归纯行为判据，与启动日志解耦。
+  console.log('[fs] bridge active. cfg_path: ' + configPath())
   // 上一代若因热重载打断了回合，这里立刻在**该会话里**说明白（见 announceReloadInterrupts）。
   announceReloadInterrupts(0)
   void ensureHelpers()
