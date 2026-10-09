@@ -527,6 +527,26 @@ function resetDmFixtures() {
   selectModelImpl = null
 }
 let modelSelectionState                   // sessionProjections.stateOf(session,'modelSelection')
+// 🔴 中台 #171（per-bot 预设的夹具面）：mount 桩从「无参吞掉」升级为**有状态**——
+//   presetMountCalls 记录每次 presets.mount 的第二参（undefined＝未指定 ⇒ registry 回落默认）；
+//   presetMountImpl 非空 ⇒ 用它（可抛 agent-preset/not-found，钉「id 写错必须走失败日志、不得静默回落」）；
+//   resume 路径同样演练 setup（生产 resume 也走 mount，旧夹具不调＝那一支零覆盖）。
+//   presetMountSkipResumeOn=true 时 resume 不调 setup（对照格，钉旧行为边界）。
+let presetMountCalls = []
+let presetMountImpl = null
+let presetMountSkipResumeOn = false
+const mountPresetAgentCtx = () => ({ get: () => ({
+  mount: async (_agentCtx, id) => {
+    presetMountCalls.push(id)
+    if (presetMountImpl) return presetMountImpl(_agentCtx, id)
+    return { id: id || 'default' }
+  },
+}) })
+function resetPresetMountFixtures() {
+  presetMountCalls = []
+  presetMountImpl = null
+  presetMountSkipResumeOn = false
+}
 function makeRegistryEntity(path, title, id) {
   const entityId = id || ('ws-' + (++registryIdSeq))
   return {
@@ -562,7 +582,7 @@ const ctx = {
           createdSessions += 1
           createdSessionIds.push(opts.sessionId)
           agent.session.header.cwd = opts.meta && opts.meta.cwd
-          if (opts.setup) await opts.setup({ get: () => ({ mount: async () => {} }) })
+          if (opts.setup) await opts.setup(mountPresetAgentCtx())
           return { agent }
         },
         resume: async (opts) => {
@@ -571,6 +591,8 @@ const ctx = {
           // mock 原来不改 cwd ⇒ "接管别的工作区的会话"在测试里看起来还在原目录，cwd 相关断言失真。
           const meta = persistedSessions.find((s) => s.id === (opts && opts.resumeSessionId))
           if (meta && meta.cwd) agent.session.header.cwd = meta.cwd
+          // #171：resume 也走 setup⇒mount（生产同形）；旗标仅对照格用。
+          if (opts.setup && !presetMountSkipResumeOn) await opts.setup(mountPresetAgentCtx())
           return { agent }
         },
         list: () => liveAgents,
@@ -7644,6 +7666,97 @@ console.log('99) ★🔴 /model：视觉影子路由不上卡 ＋ 点击真走�
       '★★ 宿主自己半拍跟上了 ⇒ 桥**不代劳直存**（dmSaveCalls 零增长）｜实增 '
       + (dmSaveCalls.length - saveCallsBefore124g))
   } finally { resetDmFixtures() }
+
+  // 🔴 中台 #171（per-bot 预设，0.8.5）：default 预设＝全员可见的暴露面（HR 工具被任何 bot
+  //   摸到，中台 #171 真机实锤）。桥必须把 bot 配置 `agentPreset` 递到 registry `mount(ctx, id)`：
+  //   ①主夹具 bot 不写该字段 ⇒ mount 第二参＝undefined（registry `id ?? defaultId` 回落默认，
+  //     现行为一字不动——基线格；create/resume 两腿都要演，resume 漏挂＝#156 同族死灰）；
+  //   ②配置写 `agentPreset: 'preset-hr'` + 10 秒热读 ⇒ 新 chat 的 create/resume 都把该 id 递到 registry；
+  //   ③id 查无 ⇒ registry 抛 not-found ⇒ 失败日志**可见**（含请求 id 与 bot 名），**禁静默回落**
+  //     （回落＝把配置错误捂成正常，与本仓「拒得清楚」口径一致）；
+  //   ④带空白的 id ⇒ normalizeConfig trim 后生效（若白名单丢字段 ⇒ mount 收 undefined ⇒ 本格红）。
+  // 🔴 会话生命周期（第一/二版用例踩过）：mount 只发生在**建/复会**——live 会话或 entry.handle
+  //   命中即复用、不再 mount ⇒ 每格用**新 chat** 演 create 腿；resume 腿＝模拟重启：重新
+  //   import+apply 重建桥内存（entry.handle 随之清零，先例：热重载提示用例）＋清 liveAgents，
+  //   下一条消息即走 resume 分支，演完恢复。
+  const writeBotCfg = (extra) => writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'),
+    JSON.stringify({ bots: [Object.assign({
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: true, planEnabled: true, goalEnabled: true,
+    }, extra)] }, null, 2))
+  const simulateRestart = async () => {
+    const mod = await import('../index.js')
+    mod.apply(ctx)
+    await drain()
+    liveAgents.length = 0
+  }
+  try {
+    resetPresetMountFixtures()
+    // ① 基线：新 chat 首条建会话（create 腿）⇒ 模拟重启 ⇒ 次条走 resume 腿
+    const markP1 = presetMountCalls.length
+    feedInbound('om_preset_a171', '预设基线第一条', { chatId: 'oc_preset_base171' })
+    await settle(3)
+    await simulateRestart()
+    feedInbound('om_preset_b171', '预设基线第二条', { chatId: 'oc_preset_base171' })
+    await settle(3)
+    liveAgents.push(agent)
+    const legP1 = presetMountCalls.slice(markP1)
+    ok(legP1.length === 2 && legP1[0] === undefined && legP1[1] === undefined,
+      '★★★ #171① 未写 agentPreset ⇒ create/resume 两腿 mount 第二参都是 undefined'
+      + '（registry 回落默认＝现行为不变；resume 腿同样挂载，不许再出「会话没工具」死灰）'
+      + '｜实得 ' + JSON.stringify(legP1))
+    // ② 写 agentPreset + 热读 ⇒ 新 chat 两腿按 id 挂载
+    writeBotCfg({ agentPreset: 'preset-hr' })
+    await new Promise((r) => setTimeout(r, 11000))   // 等过热读节拍（bot.cfg 每 10 秒重读）
+    await drain()
+    const markP2 = presetMountCalls.length
+    feedInbound('om_preset_c171', '预设专用 chat 第一条', { chatId: 'oc_preset_hr171' })
+    await settle(3)
+    await simulateRestart()
+    feedInbound('om_preset_d171', '预设专用 chat 第二条', { chatId: 'oc_preset_hr171' })
+    await settle(3)
+    liveAgents.push(agent)
+    const legP2 = presetMountCalls.slice(markP2)
+    ok(legP2.length === 2 && legP2[0] === 'preset-hr' && legP2[1] === 'preset-hr',
+      '★★★ #171② 配置写 agentPreset ⇒ 新 chat 的 create/resume 两腿都把 id 递到 registry'
+      + '（per-bot 挂载通道通——#171 的收口机制本体）｜实得 ' + JSON.stringify(legP2))
+    // ③ id 查无 ⇒ 失败日志可见，禁静默回落（新 chat 逼 create 腿；挂载失败**不拒服务**）
+    presetMountImpl = () => {
+      const e = new Error('Unknown agent preset: preset-hr')
+      e.code = 'agent-preset/not-found'
+      throw e
+    }
+    const logP3 = consoleLines.length
+    const markP3 = sentCards.length
+    feedInbound('om_preset_e171', '预设查无此名', { chatId: 'oc_preset_bad171' })
+    await settle(3)
+    presetMountImpl = null
+    const p3Logs = consoleLines.slice(logP3).map(String).filter((l) => l.includes('preset'))
+    ok(p3Logs.some((l) => l.includes('[fs] preset mount failed') && l.includes('preset-hr') && l.includes('smoke')),
+      '★★★ #171③ id 查无 ⇒ mount 失败日志可见（含请求 id 与 bot 名），**不静默回落**'
+      + '｜实得 ' + JSON.stringify(p3Logs.slice(0, 2)))
+    ok(cardsSince(markP3).length > 0,
+      '★★ 挂载失败**不拒服务**：卡片链路照常走（fail-soft 在工具层、不在消息层）'
+      + '｜卡片动作 ' + cardsSince(markP3).length)
+    // ④ 带空白的 id ⇒ trim 通道（写法容错；白名单丢字段的话这里收 undefined ⇒ 红）
+    writeBotCfg({ agentPreset: '  preset-hr  ' })
+    await new Promise((r) => setTimeout(r, 11000))
+    await drain()
+    const markP4 = presetMountCalls.length
+    feedInbound('om_preset_f171', '空白预设等同未写', { chatId: 'oc_preset_trim171' })
+    await settle(3)
+    const legP4 = presetMountCalls.slice(markP4)
+    ok(legP4.length === 1 && legP4[0] === 'preset-hr',
+      '★★ #171④ 带空白的 agentPreset ⇒ trim 后仍生效（normalizeConfig 白名单 trim 通道通）'
+      + '｜实得 ' + JSON.stringify(legP4))
+  } finally {
+    // 还原主夹具（无 agentPreset）——后续用例不受本块污染
+    writeBotCfg(undefined)
+    await new Promise((r) => setTimeout(r, 11000))
+    await drain()
+    liveAgents.push(agent)
+    resetPresetMountFixtures()
+  }
 
   // 🔴 第四十四轮 MEDIUM#4（核对为真）：peer **变更即落盘**。persistChats 不在常规入站路径上
   //   （只有 /new/switch/建会话/标题变化会调），旧行为 = noteChatPeer 只写内存 ⇒ 已存在的会话

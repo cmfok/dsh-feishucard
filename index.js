@@ -709,6 +709,14 @@ export function apply(ctx) {
             .filter(([, v]) => ['mentions_any', 'all', 'off', 'self_only'].includes(String(v)))
             .map(([k, v]) => [String(k), String(v)]))
           : undefined,
+        // 0.8.5（中台 #171 per-bot 预设）：**默认不写＝挂全局默认预设（现行为一字不动）**。
+        // 写了 ⇒ 该 bot 的 create/resume 会话按 id 挂载指定 agent 预设（registry `mount(ctx, id?)`
+        // 官方通道）；id 不存在 ⇒ registry 抛 agent-preset/not-found ⇒ mount 失败日志可见，
+        // **不做静默回落**（回落＝把配置错误捂成正常）。用途：把第三方工具只挂进专用预设、
+        // 各 bot 指定各自预设，收掉「default 预设＝全员可见」的跨 bot 暴露面。
+        // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
+        agentPreset: (typeof bot.agentPreset === 'string' && bot.agentPreset.trim())
+          ? bot.agentPreset.trim() : undefined,
       })
     }
     return cleaned
@@ -3434,14 +3442,23 @@ export function apply(ctx) {
   // context — sessions created/resumed without it only expose plugin-owned
   // tools (feishu_send): the "飞书新会话没有工具" failure (2026-09-08, dsh
   // 0.1.2-rc.1). Mirrors the GUI session factory (presets.mount from setup).
-  async function mountStandardPreset(agentCtx) {
+  async function mountStandardPreset(bot, agentCtx) {
     const presets = agentCtx.get('agentPresets')
     if (!presets) return
+    // 0.8.5（中台 #171 per-bot 预设）：bot 配置 `agentPreset` ⇒ 按 id 挂载；
+    // 不写 ⇒ undefined ⇒ registry 回落全局默认（registry `mount(ctx, id?)` 官方通道，
+    // `id ?? defaultId`——行为与旧版一字不动）。id 不存在 ⇒ registry 抛
+    // agent-preset/not-found ⇒ 走下方 catch：日志可见、**不静默回落**（回落会把
+    // 错配置捂成「看起来正常」，与本仓「拒得清楚」口径一致）。
+    const wanted = (bot && bot.cfg && bot.cfg.agentPreset) || undefined
+    const tag = wanted
+      ? ' (bot=' + String(bot.cfg.name || bot.cfg.appId) + ', agentPreset=' + wanted + ')'
+      : ''
     try {
-      const preset = await presets.mount(agentCtx)
-      console.log('[fs] standard agent preset mounted: ' + String(preset && preset.id || 'default'))
+      const preset = await presets.mount(agentCtx, wanted)
+      console.log('[fs] standard agent preset mounted: ' + String(preset && preset.id || 'default') + tag)
     } catch (error) {
-      console.log('[fs] preset mount failed: ' + String(error && error.message || error))
+      console.log('[fs] preset mount failed: ' + String(error && error.message || error) + tag)
     }
   }
 
@@ -3454,7 +3471,7 @@ export function apply(ctx) {
       meta: { cwd: (cwdOverride && String(cwdOverride).trim())
         || (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined },
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
-      setup: mountStandardPreset,
+      setup: (agentCtx) => mountStandardPreset(bot, agentCtx),
     })
   }
 
@@ -3464,7 +3481,7 @@ export function apply(ctx) {
     return agents.resume({
       resumeSessionId: sessionId,
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
-      setup: mountStandardPreset,
+      setup: (agentCtx) => mountStandardPreset(bot, agentCtx),
     })
   }
 
