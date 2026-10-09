@@ -5,6 +5,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-10-09
+
+**状态：已上线 aiad 侧（2026-10-09 15:38，`plugin apply #1 v0.8.5 md5=4181bfd4`，4 helper 长连接
+ready；备份 `index.js.bak-20261009-pre-agentpreset`／`package.json.bak-20261009-pre-agentpreset`）。
+⚠️ 本版只上线**通道**——4 bot 尚无一份写 `agentPreset`（＝行为与 0.8.4 一字不动，#171 的实际
+收口要等 patch 建 `preset-hr`，两案待 CM 拍板，见下「收口应用」）。**
+本版只有一个主题：**中台 #171 的收口机制——per-bot agent 预设**（0.8.2「未修清单」排进 0.8.4
+后被 CM 点名的急事挤掉的那条，本版补上）。
+
+### Added（中台 #171：`agentPreset` per-bot 预设通道）
+
+- **bot 配置新增 `agentPreset` 字段**（normalizeConfig 白名单 + `createDedicated`/`resumeDedicated`
+  两条 setup 腿）：写了 ⇒ 该 bot 的所有会话（新建与复用）按 id 挂载指定的 agent 预设，走的是
+  registry `mount(ctx, id?)` 的**官方通道**（`id ?? defaultId`）；**不写 ⇒ undefined ⇒ 回落全局
+  默认，行为与 0.8.4 一字不动**（向后兼容硬保证）。用途：把第三方工具（如 G5 的 hr-analyzer）
+  只留在专用预设里，其余 bot 显式挂基础预设，收掉「工具挂 default ⇒ 实例内全员可见」的跨 bot
+  暴露面（#171 实锤：员工借「搞钱搭子」bot 能摸到 `analyze_resume` 并读候选人 PII）。
+- **id 查无 ⇒ 失败日志可见，不静默回落**：registry 抛 `agent-preset/not-found` ⇒ 走既有
+  `preset mount failed` 日志支，且日志**追加 `(bot=<名>, agentPreset=<id>)` 后缀**——配置错误
+  要显式失败（回落＝把错误捂成正常，与本仓「拒得清楚」口径一致）；mounted 日志同样带后缀，
+  真机取证时按 bot 名即可核对「谁挂了哪个预设」。旧日志前缀 `standard agent preset mounted`
+  保持不变（DSH/G5 侧的 grep 不受影响）。
+- **部署配套（aiad 侧 feishu.config.json，非本仓代码）**：**未执行，两案待 CM 拍板**。
+  拍板前的新事实（2026-10-09 部署时核实）：宿主只有两个预设——`standard`（**含** bash/pwsh）
+  与 `employee`（＝standard 去 shell 的员工收权版，**同时**被 G5 插入了 hr-analyzer 等第三方
+  工具，且是全局 default）⇒ 0.8.2 当年设想的「非 HR bot 写 standard」是**反向陷阱**（会把
+  shell 发还给业务 bot）；而 4 bot 不写字段则全部留在 employee、继续互相可见第三方工具。
+  ⇒ **实际收口必须动 patch**（共享件，涉 G5/DSH 协作面）：
+  **案 A**（推荐）：patch 新增 `preset-hr`（复制 employee 声明、第三方工具只留在此预设），
+  `employee` 摘净第三方工具；HR bot（觅人小友）config 写 `agentPreset: hr`，其余 3 bot 不写
+  （＝employee，回归干净的员工预设）。与 #156 的工具下发口径**耦合**——建议 #156 口径定了一起动。
+  **案 B**：不动 patch，桥侧另做 per-bot 工具白名单（调用入口按 bot 拒）——机制快但模型仍见
+  工具名，且是第二个并行机制；除非 CM 要「今天就收口」，否则不推荐。
+  单 bot 实例（/home/agt*×7、/home/ubuntu 3099 桥）无暴露面问题，本版不动。
+
+### 验证
+
+- **全量冒烟 SMOKE PASS**（`output-smoke-171-r3.log`，2026-10-09，0 ❌）：新增 #171 四格——
+  ①未写 ⇒ create/resume 两腿 mount 第二参都是 `undefined`（`[null,null]`，registry 回落默认＝
+  现行为不变基线）；②写了 `preset-hr` ⇒ 两腿都把 id 递到 registry（`["preset-hr","preset-hr"]`，
+  收口机制本体）；③id 查无 ⇒ 失败日志可见（`[fs] preset mount failed: Unknown agent preset:
+  preset-hr (bot=smoke, agentPreset=preset-hr)`）且消息照常回卡（fail-soft 在工具层不在消息层）；
+  ④带空白 `'  preset-hr  '` ⇒ trim 后仍生效（白名单 trim 通道）。
+- **夹具升级**：mount 桩从「无参吞掉」改**有状态记录**（`presetMountCalls`/`presetMountImpl`），
+  resume 腿从「mock 不调 setup」改为与生产同形（重启模拟＝重新 `import+apply` 清 entry.handle，
+  先例＝热重载提示用例）——旧夹具下 resume 挂载是**零覆盖盲区**（0.2.0 修「会话没工具」时
+  只演了 create 腿）。
+- **判别力说明（为什么本轮不做变异反证轮）**：改动面＝一处字段读取（`bot.cfg.agentPreset`）
+  ＋一处传参；②③④三格的判别字符串（日志后缀 `(bot=…, agentPreset=…)`、registry 收到的 id）
+  与读取点**同源**，旧字节上三者必红（normalizeConfig 无此字段 ⇒ cfg.agentPreset＝undefined），
+  静态 diff 即构成「非恒真」证明。0.8.4 的变异反证轮对应的是 20+ 断言面的大改，本轮不适用。
+
 ## [0.8.4] - 2026-10-08
 
 **状态：已推送（`master` = `2a7f18e`、annotated tag `v0.8.4`）并已上线（2026-10-08 16:50，`step50-deploy-084.sh` 单次 `rc=0`，现存 9 份副本全落闸门 AC 字节）** —— CM 2026-10-08「三个都批准，不跑代码审查」。⚠️ **本批 6 条真机取证仍挂在 CM 手上**（#65 带文字发文件、#124 点卡默认值落地、A5/A6 审批入表→放行→到期、B5 三端卡片不回退、C7 跨 bot 员工名、C1 身份闸不误杀），机器侧只能佐证不能替代。本版把 CM 2026-10-06/07/08 点名的东西一次做完：两个模式开关、能力审批表与
