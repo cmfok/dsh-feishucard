@@ -27,18 +27,23 @@ ready；备份 `index.js.bak-20261009-pre-agentpreset`／`package.json.bak-20261
   要显式失败（回落＝把错误捂成正常，与本仓「拒得清楚」口径一致）；mounted 日志同样带后缀，
   真机取证时按 bot 名即可核对「谁挂了哪个预设」。旧日志前缀 `standard agent preset mounted`
   保持不变（DSH/G5 侧的 grep 不受影响）。
-- **部署配套（aiad 侧 feishu.config.json，非本仓代码）**：**未执行，两案待 CM 拍板**。
-  拍板前的新事实（2026-10-09 部署时核实）：宿主只有两个预设——`standard`（**含** bash/pwsh）
-  与 `employee`（＝standard 去 shell 的员工收权版，**同时**被 G5 插入了 hr-analyzer 等第三方
-  工具，且是全局 default）⇒ 0.8.2 当年设想的「非 HR bot 写 standard」是**反向陷阱**（会把
-  shell 发还给业务 bot）；而 4 bot 不写字段则全部留在 employee、继续互相可见第三方工具。
-  ⇒ **实际收口必须动 patch**（共享件，涉 G5/DSH 协作面）：
-  **案 A**（推荐）：patch 新增 `preset-hr`（复制 employee 声明、第三方工具只留在此预设），
-  `employee` 摘净第三方工具；HR bot（觅人小友）config 写 `agentPreset: hr`，其余 3 bot 不写
-  （＝employee，回归干净的员工预设）。与 #156 的工具下发口径**耦合**——建议 #156 口径定了一起动。
-  **案 B**：不动 patch，桥侧另做 per-bot 工具白名单（调用入口按 bot 拒）——机制快但模型仍见
-  工具名，且是第二个并行机制；除非 CM 要「今天就收口」，否则不推荐。
-  单 bot 实例（/home/agt*×7、/home/ubuntu 3099 桥）无暴露面问题，本版不动。
+- **部署配套（aiad 侧，非本仓代码）——2026-10-09 16:12 已按 CM 拍板「方案一」执行**：
+  ① `cordis.patch.yml`：`preset-employee` 摘除 HR 五件套（tool-hr-analyzer／tool-salary／
+  tool-salary-chat／tool-schedule-interview／tool-probation-chat，原位留指路注释）；同一
+  insert 列表新增 `preset-hr` 实体（config.id=`hr`，＝employee 基础组＋HR 五件套的完整复制体，
+  头部注明「改 employee 基础组必须同步本块」；G9 查库/feedback/日期/归档按跨域通用留在
+  employee）。备份 `cordis.patch.yml.bak-20261009-pre-presethr`，本地工作副本
+  `output/信息中台/cordis.patch.yml.new-20261009`（diff 审查：employee 与 preset-hr 剩余部分
+  逐字一致＝复制零漂移；YAML 解析过、employee 20 插件零 HR 件、hr 25 插件五件套全在）。
+  ② `feishu.config.json`：hr bot 写 `agentPreset: 'hr'`，其余 3 bot 不写（＝回落 employee）。
+  备份 `feishu.config.json.bak-20261009-pre-presethr`。
+  ③ 重启 `dsh-feishu-aiad`（16:12，apply #1 v0.8.5 md5=4181bfd4，4 helper 长连接 ready，
+  journal 无 preset/error 行——patch 非法则宿主起不来）。**工具面效果**：analyst/okr/knowledge
+  的会话预设里不再有 HR 五件套（摸不到 `analyze_resume` 等），hr bot 挂 `hr` 预设保持全量。
+  ④ 待自然流量回填：journal「standard agent preset mounted」行应出现 `employee (bot=…)`×3
+  与 `hr (bot=hr, agentPreset=hr)`×1——⚠️ hr bot 的 HR 工具能否被模型调用仍受 #156（preset
+  挂载的工具对模型不可见）制约，两案独立推进。
+  单 bot 实例（/home/agt*×7、/home/ubuntu 3099 桥）无暴露面问题，不动。
 
 ### 验证
 
