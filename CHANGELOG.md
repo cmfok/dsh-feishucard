@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.7] - 2026-10-09
+
+**状态：已上线 aiad 侧（2026-10-09 18:37，md5=00a49e07，5 helper 长连接 ready、journal 零错误；备份 `index.js.bak-20261009-pre-argfreeze`／`package.json.bak-20261009-pre-argfreeze`）。主题：D5 身份覆写落地修复——宿主 deepFreeze 契约适配（中台 #336 转交接手·open_id 报错排查）。**
+**根因（铁证）**：宿主 dsh-tools prepare 段把模型参数做无损 JSON 快照后 `deepFreeze` 再挂上
+`exec.arguments`——D5 覆写在 `tools/execute` 瀑布里对它原地赋值/删除必抛
+`Cannot assign to read only property 'open_id' of object '#<Object>'`（identityGuard 开启首日
+2026-10-09 13:02 起 journal 实录 19 次，覆写零成功，open_id 落池被挡＝G8 池 #271 验收的卡点）。
+本地最小复现脚本复现出与服务器日志逐字一致的错误消息。
+**修法（桥侧适配，内核 identity-inject.mjs 零改动）**：overwrite 支路改为
+浅克隆 `{...exec.arguments}` → 克隆上覆写 → `exec.arguments = 克隆` 整对象写回
+（瀑布期该属性可写：宿主 `Object.freeze(exec)` 在 notifyResult，即执行完成后才发生；
+工具执行读的就是写回后引用，官方变量名 mutableExec 同证）。
+**附带堵一个 fail-open 缺口**：写回若再抛（宿主未来收紧契约），就地返回
+`identity_writeback_failed` 拒绝（fail-closed，CM 2026-10-04 裁决口径）——旧代码外层 catch
+后 `next()` 等于把未覆写的原始参数放行，模型自填的冒充身份可带病过关。
+验证：`node --check` 绿；identity-inject --selftest 40/40；深冻结契约最小验证双绿
+（覆写生效+非身份字段不误伤+对照组复现 read-only）；全量冒烟 SMOKE PASS（用例数见部署行）。
+
+## [0.8.6] - 2026-10-09
+
+**状态：已上线 aiad 侧（2026-10-09 17:28，`plugin apply #1 v0.8.6 md5=01194ec8`，4 helper 长连接 ready；备份 `index.js.bak-20261009-pre-086`／`package.json.bak-20261009-pre-086`）。⚠️ ubuntu profile（3099 服务）仍在 0.8.4，跨 profile 版本漂移已投单。**
+**主题：插件边界与降级标准 §三 落地（CM 2026-10-09 拍板，中台 #311）——权限拒绝统一文案。**
+两处身份 deny 支路（`identity_unresolved`＝表不可达/人不在册；`identity_record_missing`＝无记录带身份键）
+的结果文本统一追加「请向用户原样转述：目前服务不可用，请联系管理员」——fail-closed 行为不变
+（CM 2026-10-04 裁决），只统一用户面文案；技术原因仍留在 error 码与 `[fs] identity ALERT[...]` 日志。
+smoke 用例 **114**：三条拔件演习（拔下层 deny+统一文案／拔平级身份件炸 catch 放行留痕／拔自己关闸
+直达）14 断言，全量 114 用例 SMOKE PASS（两跑）。「拒时告警管理员」由 G9 侧 `g9_alert_watch.py`
+落地（journal 捞 ALERT＋表巡检，cron 每 5 分钟，webhook 默认关），桥侧零改动。
+
 ## [0.8.5] - 2026-10-09
 
 **状态：已上线 aiad 侧（2026-10-09 15:38，`plugin apply #1 v0.8.5 md5=4181bfd4`，4 helper 长连接

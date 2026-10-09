@@ -10,7 +10,13 @@
     "  4. cwd 逐级向上 6 层；5. 已知工作区兜底",
     "每台机器可另放一份【本地增量】~/.dsh-feishucard/identity_map.local.json（放工作区之外 ⇒ 不参与同步 ⇒ 各机互不覆盖），",
     "只补本机 bot 的 open_ids，其余字段一律以主表为准。",
-    "⚠️ 功能【默认关闭】：配置里写 \"identityGuard\": true 才会启用（见 feishu.config.example.json）。"
+    "⚠️ 功能【默认关闭】：配置里写 \"identityGuard\": true 才会启用（见 feishu.config.example.json）。",
+    "🔑 schema 即契约（身份-授权契约-v1 §二/§四，V1.2 收口 2026-10-09）：",
+    "  · 人级【不许存 grants】—— grants/writable_scopes/item_grants 挂在岗位表 job_grants.json 的 jobs[].id 上，由 resolve_actor 按 job_id 现取；",
+    "  · 第 3 层限期字段名是 extra_grants_until（裸名 grants_until 已废）；",
+    "  · status 口径：可上岗只含「在职」；离职/终止办理/兼职终止 ⇒ not_active；兼职/待入职（V1.2 裁决不可上岗）与其余未知状态 ⇒ unknown_status；",
+    "  · is_cm 由 X3 主数据搬运（CM 本人一行 = true）—— L5 里 is_cm_subjective 的部分只有它为 true 才可见；",
+    "  · pending 条目【必须带 open_id 键】（值可为 null）—— 省略键会让 open_id_missing 判据永远不可达。"
   ],
   "v": 1,
   "updated": "1970-01-01T00:00:00+08:00",
@@ -28,16 +34,17 @@
       "status": "在职",
       "aliases": ["示例别名"],
       "scopes": [],
-      "grants": {},
       "extra_grants": {},
-      "grants_until": {},
+      "extra_grants_until": {},
+      "is_cm": false,
       "confirmed_at": "1970-01-01T00:00:00+08:00"
     }
   ],
   "pending": [
     {
       "name": "示例（资料未齐的人）",
-      "reason": "open_id 未取到（HRM 该行 Openid 为空）"
+      "reason": "open_id 未取到（HRM 该行 Openid 为空）",
+      "open_id": null
     }
   ]
 }

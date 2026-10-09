@@ -31,6 +31,12 @@
   ⑦ 新增 `--max-calls`（默认 3，日常 cron 用；**首次建表传 40**）：
      首版把 3 写死，导致一次性建表根本跑不完。日常靠「已有 union_id 就跳过」保持 0~3 次。
 ────────────────────────────────────────────────────────────────────────────
+2026-10-09 契约 V1.2 实施收口（中台 #158，验收＝身份-授权契约-v1 §七）：
+  ⑧ 人级 entry 去 `grants`（挂岗位 ⇒ grants 只从岗位表现取，§四 连带改动）；
+    限期键统一为 `extra_grants_until`（旧裸名全仓废弃，V2 机验零残留）；新增 `is_cm`（契约 §2.1，X3 主数据搬运）。
+  ⑨ 存量主表如带人级 grants / 旧裸名限期键 ⇒ 用 --migrate-contract-v12 一次性清洗
+    （只删键/搬键不改值；people 之外的字段不动）。
+────────────────────────────────────────────────────────────────────────────
 """
 import argparse
 import datetime
@@ -95,9 +101,46 @@ def contact_get_union_id(open_id):
     return None, "no_union_id_in_response"
 
 
+def migrate_contract_v12(m):
+    """契约 V1.2 收口迁移（中台 #158）：存量主表一次性清洗，只删键/搬键，不改任何判定数据。
+
+    ① 人级 `grants` 整键删除（契约 §四：挂岗位 ⇒ grants 只从岗位表现取；
+       残留人级 grants 不会被新版 resolve_actor 读到，留着只会误导排障）。
+    ② 旧裸名限期键整体改名 `extra_grants_until`（值原样搬运）——
+       🔴 不搬 ＝ 第 3 层限期数据【静默失效】（新版只读新键 ⇒ 永远空 dict），V2 点名的失效模式。
+    ③ 补 `is_cm` 默认 False（契约 §2.1；CM 本人一行由人工/主数据置 true）。
+    返回 (迁移人数, 限期搬运条数)。
+    """
+    n_people = 0
+    n_until = 0
+    for person in m.get("people", []):
+        if not isinstance(person, dict):
+            continue
+        changed = False
+        if "grants" in person:
+            person.pop("grants", None)
+            changed = True
+        if "grants_until" in person:
+            old = person.pop("grants_until") or {}
+            merged = dict(person.get("extra_grants_until") or {})
+            for k, v in old.items():
+                merged.setdefault(k, v)
+                n_until += 1
+            person["extra_grants_until"] = merged
+            changed = True
+        if "is_cm" not in person:
+            person["is_cm"] = False
+            changed = True
+        if changed:
+            n_people += 1
+    return n_people, n_until
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="不加= dry-run")
+    ap.add_argument("--migrate-contract-v12", action="store_true",
+                    help="契约 V1.2 收口迁移：人级去 grants、grants_until⇒extra_grants_until、补 is_cm")
     ap.add_argument("--seed", help="HRM 人员清单 JSON：[{name,job_id,channel,status,open_id}]")
     ap.add_argument("--via-contact", action="store_true",
                     help="用飞书通讯录（应用身份）把 open_id 换成 union_id")
@@ -108,6 +151,13 @@ def main():
     args = ap.parse_args()
 
     m = load_map()
+
+    # ⓪ 契约 V1.2 收口迁移（可选；--apply 才落盘）
+    if args.migrate_contract_v12:
+        n_people, n_until = migrate_contract_v12(m)
+        print("%s 契约V1.2迁移: 清洗 %d 人（限期键搬运 %d 条；grants 删键、is_cm 补默认）" % (
+            "[apply]" if args.apply else "[dry]  ", n_people, n_until))
+
     known = {p.get("name") for p in m.get("people", [])}
     pending_names = {p.get("name") for p in m.get("pending", [])}
     calls = 0
@@ -156,9 +206,13 @@ def main():
                 "status": person.get("status", ""),
                 "aliases": [nm],                      # 规格 §2.2；自助兜底靠它
                 "scopes": person.get("scopes", []),
-                "grants": person.get("grants", {}),
-                "extra_grants": {},
-                "grants_until": {},
+                # 🔴 契约 §四（2026-10-09 收口 #158）：挂岗位 ⇒ 人级【不许再存 grants】——
+                #    grants/writable_scopes/item_grants 一律由 resolve_actor 按 job_id
+                #    从 job_grants.json 现取；改一个岗位不用重刷全表，也不会出现
+                #    「表说批了 L1、这人还带着 L2」的人级漂移。人级只留第 3 层（个人叠加）。
+                "extra_grants": person.get("extra_grants", {}),
+                "extra_grants_until": person.get("extra_grants_until", {}),
+                "is_cm": bool(person.get("is_cm", False)),
                 "confirmed_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             }
             if args.apply:

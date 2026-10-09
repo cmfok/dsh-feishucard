@@ -36,6 +36,7 @@ export const IDENTITY_KEYS = Object.freeze([
 
 /** 默认表路径（服务器）；可用环境变量 MAILBOX_IDENTITY_MAP 覆盖 */
 export const DEFAULT_MAP_PATH = '/opt/scripts/G9/identity_map.json'
+export const DEFAULT_JOBGRANTS_PATH = '/opt/scripts/G9/job_grants.json'
 /** 默认 resolver 路径（服务器）；可用环境变量 MAILBOX_RESOLVER 覆盖 */
 export const DEFAULT_RESOLVER_PATH = '/opt/scripts/G9/resolve_actor.py'
 
@@ -81,12 +82,17 @@ export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
 
 const MAP_REL = path.join('output', 'g9-identity', 'identity_map.json')
 const RESOLVER_REL = path.join('output', 'g9-identity', 'resolve_actor.py')
+// 岗位授权表（契约 §四：grants/writable_scopes/item_grants 挂岗位，resolveActor 真查它）
+const JOBGRANTS_REL = path.join('AIAD', 'G9-Agent基座', 'agent', 'job_grants.json')
 
 export function mapCandidates (workspaceRoot) {
   return assetCandidates(workspaceRoot, 'MAILBOX_IDENTITY_MAP', DEFAULT_MAP_PATH, MAP_REL)
 }
 export function resolverCandidates (workspaceRoot) {
   return assetCandidates(workspaceRoot, 'MAILBOX_RESOLVER', DEFAULT_RESOLVER_PATH, RESOLVER_REL)
+}
+export function jobGrantsCandidates (workspaceRoot) {
+  return assetCandidates(workspaceRoot, 'MAILBOX_JOB_GRANTS', DEFAULT_JOBGRANTS_PATH, JOBGRANTS_REL)
 }
 
 export function pickFrom (candidates, fallback) {
@@ -101,6 +107,9 @@ export function pickMapPath (workspaceRoot) {
 }
 export function pickResolverPath (workspaceRoot) {
   return pickFrom(resolverCandidates(workspaceRoot), DEFAULT_RESOLVER_PATH)
+}
+export function pickJobGrantsPath (workspaceRoot) {
+  return pickFrom(jobGrantsCandidates(workspaceRoot), DEFAULT_JOBGRANTS_PATH)
 }
 
 // 🔑 **本地增量表路径**（第十三轮 MEDIUM#3：导出面，别再让"读不读增量"变成两处各自的私事）
@@ -231,9 +240,14 @@ const E_DUPLICATE = 'duplicate_open_id'
 const E_MISSING = 'open_id_missing'
 const E_NOT_GRANTED = 'job_not_granted'
 const E_NOT_ACTIVE = 'not_active'
-// 离职三态（与 resolve_actor.py `_INACTIVE_STATUS` 逐字一致；其余状态一律正常 ——
-// 「兼职」「待入职」是 HRM 在册正常人，正向枚举会把它们误拒，2026-10-04 裁决 0225 §四）
+const E_UNKNOWN_STATUS = 'unknown_status'
+// 在职口径（契约 §五 V1.2 定死，2026-10-09 收口 #158；与 resolve_actor.py 逐字一致）：
+//   离职三态 ⇒ not_active（正常拒绝，≠ 不认识）；
+//   「可上岗」只含 在职 —— 兼职/待入职（CM V1.2 裁决均不可上岗）与其余一切状态
+//   （未填 / 未来新状态）⇒ unknown_status 拒。旧版「其余一律正常」是 fail-open：
+//   HRM 冒出新状态 ⇒ 这人自动获得权限 —— 该断言已翻转，别再改回去。
 const INACTIVE_STATUS = new Set(['离职', '终止办理', '兼职终止'])
+const ACTIVE_STATUS = new Set(['在职'])
 
 /** 容错读映射表（镜像 py `_load`）：对象直接用；非空字符串按 JSON 解析；其余 = map_unavailable */
 function loadMapJs (raw) {
@@ -254,7 +268,7 @@ const objCopyJs = (x) => (x && typeof x === 'object' && !Array.isArray(x) ? { ..
  * `localMap` 对应 identity_map.local.json 的合并（按 name 匹配、只补 open_ids，
  * 镜像 makeResolver 内嵌 Python 的 lp 段）。返回 { actor, err }，绝不抛。
  */
-export function resolveActorJs (openId, identityMap, localMap) {
+export function resolveActorJs (openId, identityMap, localMap, jobGrants) {
   // ① open_id 本身缺失
   if (!openId || !String(openId).trim()) return { actor: null, err: E_NO_OPEN_ID }
   // ② 映射表可用性
@@ -289,21 +303,37 @@ export function resolveActorJs (openId, identityMap, localMap) {
     return { actor: null, err: E_UNKNOWN_PERSON }
   }
   const person = hits[0]
-  // ④ 在职校验（反向排除）⑤ 岗位授权
-  if (INACTIVE_STATUS.has(String((person.status || '')).trim())) return { actor: null, err: E_NOT_ACTIVE }
-  if (!person.job_id) return { actor: null, err: E_NOT_GRANTED }
-  // ⑥ 组装 actor（键序与 py 逐字一致，parity 断言直接 stringify 比对）
-  //    🔴 open_id 必须回带：它是内核 IDENTITY_KEYS 成员，不带会被【删除】而非覆写。
+  // ④ 在职校验（契约 §五 V1.2：离职三态 ⇒ not_active；其余必须是在职，否则 unknown_status）
+  const st = String(person.status || '').trim()
+  if (INACTIVE_STATUS.has(st)) return { actor: null, err: E_NOT_ACTIVE }
+  if (!ACTIVE_STATUS.has(st)) return { actor: null, err: E_UNKNOWN_STATUS }
+  // ⑤ 岗位授权：job_id 真查岗位表（契约 §三：非空即过 = 空判，作废；卡号 ≠ 岗位）。
+  //    岗位表缺失/坏表 ⇒ 集合为空 ⇒ 全拒（fail-closed，不许因缺表放行）。
+  const jid = String(person.job_id || '').trim()
+  let job = null
+  if (jid && jobGrants && typeof jobGrants === 'object' && Array.isArray(jobGrants.jobs)) {
+    for (const j of jobGrants.jobs) {
+      if (j && typeof j === 'object' && String(j.id || '').trim() === jid) { job = j; break }
+    }
+  }
+  if (!job) return { actor: null, err: E_NOT_GRANTED }
+  // ⑥ 组装 actor（键序与 py 逐字一致，parity 断言直接 stringify 比对）——契约 §二 13 字段：
+  //    判定 8（grants/writable_scopes/item_grants 从岗位表现取，人级不存 grants，§四）＋
+  //    标识/追溯 5。🔴 open_id 必须回带：不带会被内核【删除】而非覆写。
   return {
     actor: {
       name: (person.name === undefined || person.name === null) ? '' : person.name,
       scopes: arrCopyJs(person.scopes),
-      grants: objCopyJs(person.grants),
+      grants: objCopyJs(job.grants),
       extra_grants: objCopyJs(person.extra_grants),
-      grants_until: objCopyJs(person.grants_until),
-      channels: arrCopyJs(person.channels),
+      extra_grants_until: objCopyJs(person.extra_grants_until),
+      writable_scopes: arrCopyJs(job.writable_scopes),
+      is_cm: Boolean(person.is_cm),
+      item_grants: objCopyJs(job.item_grants),
       open_id: String(openId),
+      union_id: String(person.union_id || ''),
       person_id: String(person.person_id || ''),
+      job_id: jid,
       source: 'identity_map@v' + String(m.v === undefined || m.v === null ? '?' : m.v),
     },
     err: null,
@@ -316,6 +346,7 @@ function readTextNoBom (p) {
 
 export function makeResolver ({ mapPath = null,
                               resolverPath = null,
+                              jobGrantsPath = null,
                               workspaceRoot = null,
                               python = null, timeoutMs = 8000 } = {}) {
   const cache = new Map()
@@ -345,6 +376,11 @@ export function makeResolver ({ mapPath = null,
     if (process.env.MAILBOX_IDENTITY_MAP) return process.env.MAILBOX_IDENTITY_MAP
     return pickMapPath(workspaceRoot)
   }
+  function currentJobGrantsPath () {
+    if (jobGrantsPath) return jobGrantsPath
+    if (process.env.MAILBOX_JOB_GRANTS) return process.env.MAILBOX_JOB_GRANTS
+    return pickJobGrantsPath(workspaceRoot)
+  }
   function currentResolverPath () {
     if (resolverPath) return resolverPath
     if (process.env.MAILBOX_RESOLVER) return process.env.MAILBOX_RESOLVER
@@ -365,20 +401,31 @@ export function makeResolver ({ mapPath = null,
       const rp = currentResolverPath()
       if (forcePy && !fs.existsSync(rp)) return { actor: null, err: 'resolver_missing', tableOk: true }
       // 表换了（mtime 变）⇒ 清缓存，避免"旧身份"
-      // 输入换了 ⇒ 清缓存，避免"旧身份"。签名要覆盖**三样**：主表 mtime、本地增量 mtime、forcePy。
-      //   0.8.0 起 JS 分支也读本地增量（`localMapPath()`），只盯主表 mtime 会让
-      //   "改了增量表 / 切了 JS↔Python 通道"这两种变更在换表前一直吐旧结果。
+      // 输入换了 ⇒ 清缓存，避免"旧身份"。签名要覆盖**四样**：主表 mtime、本地增量 mtime、
+      // 岗位表 mtime、forcePy。（岗位表进签名：改岗位授权必须在换缓存前生效，#158 真查链路）
       try {
         let sig = String(fs.statSync(mp).mtimeMs)
         const lp0 = localMapPath()
         if (lp0) {
           try { if (fs.statSync(lp0).isFile()) sig += '|local=' + fs.statSync(lp0).mtimeMs } catch { /* 无增量表 */ }
         }
+        const jp0 = currentJobGrantsPath()
+        if (jp0) {
+          try { if (fs.statSync(jp0).isFile()) sig += '|jg=' + fs.statSync(jp0).mtimeMs } catch { /* 无岗位表 */ }
+        }
         sig += '|py=' + (forcePy ? '1' : '0')
         if (cachedTableSig !== null && sig !== cachedTableSig) cache.clear()
         cachedTableSig = sig
       } catch { /* 读不到 mtime 就用旧缓存 */ }
       if (cache.has(openId)) return { ...cache.get(openId), tableOk: true }
+      // 岗位授权表加载（契约 §三：job_id 真查；读不到 ⇒ {} ⇒ fail-closed 全拒 job_not_granted）
+      let jg = null
+      {
+        const jp = currentJobGrantsPath()
+        try {
+          if (jp && fs.statSync(jp).isFile()) jg = JSON.parse(readTextNoBom(jp))
+        } catch { jg = null }
+      }
       if (!forcePy) {
         // 0.8.0（P0-5）：默认纯 JS —— 主表 ＋ 本地增量（增量只补 open_ids）解析后直调镜像函数。
         let res
@@ -389,7 +436,7 @@ export function makeResolver ({ mapPath = null,
           if (lp) {
             try { if (fs.statSync(lp).isFile()) local = loadMapJs(readTextNoBom(lp)) } catch { local = null }
           }
-          const r = resolveActorJs(openId, mainMap, local)
+          const r = resolveActorJs(openId, mainMap, local, jg)
           res = { actor: r.actor || null, err: r.err || null, tableOk: true }
         } catch (e) {
           // 🔴 错误码归一（第十一轮门槛 LOW#2）：`loadMapJs` 抛的就是文档里的
@@ -408,7 +455,8 @@ export function makeResolver ({ mapPath = null,
         cache.set(openId, res)
         return res
       }
-      // 主表 ＋ **本地增量** 合并后再解析（增量只补 `open_ids`；其余字段以主表为准）
+      // 主表 ＋ **本地增量** 合并后再解析（增量只补 `open_ids`；其余字段以主表为准）；
+      // 岗位授权表路径一并传入（resolveActor 第三参，契约 §三 真查岗位）
       const code = [
         'import json,sys,os',
         'sys.path.insert(0, sys.argv[1])',
@@ -422,12 +470,17 @@ export function makeResolver ({ mapPath = null,
         '        tgt = byname.get(per.get("name"))',
         '        if tgt is not None:',
         '            tgt.setdefault("open_ids", {}).update(per.get("open_ids") or {})',
-        'a, e = resolveActor(sys.argv[3], m)',
+        'jg = {}',
+        'jp = sys.argv[5] if len(sys.argv) > 5 else ""',
+        'if jp and os.path.isfile(jp):',
+        '    try: jg = json.load(open(jp, encoding="utf-8-sig"))',
+        '    except Exception: jg = {}',
+        'a, e = resolveActor(sys.argv[3], m, jg)',
         'print(json.dumps({"actor": a, "err": e}, ensure_ascii=True))',
       ].join('\n')
       let out
       try {
-        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId, localMapPath()],
+        const r = spawnSync(currentPython(), ['-c', code, path.dirname(rp), mp, openId, localMapPath(), currentJobGrantsPath()],
           { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, PYTHONIOENCODING: 'utf-8' } })
         out = String(r.stdout || '').trim()
       } catch (e) {
@@ -501,42 +554,68 @@ export function selftest () {
 
   console.log('── 6) resolveActorJs：resolve_actor.py 的纯 JS 镜像（无 python3 也能认人）──')
   // 夹具与 resolve_actor.py __main__ 的 MAP **逐字段一致** —— 两边同一套题才算镜像。
+  // 岗位授权夹具 JOBG 同理镜像 py 的 JG（契约 §三：job_id 真查 jobs[].id，卡号≠岗位）。
+  const JOBG = {
+    v: 1, jobs: [
+      { id: '电商运营助理', card: 'CR-POST-20261003-01', grants: { 销售: 'L2', 财务: 'L1' },
+        item_grants: { '财务|净利': 'L2' }, writable_scopes: [] },
+      { id: '运营', card: 'CR-POST-20261003-02', grants: { 销售: 'L2', 财务: 'L1' },
+        item_grants: {}, writable_scopes: ['业务线:天猫'] },
+    ],
+  }
   const FIX6 = {
     v: 1, people: [
       { union_id: 'on_cm', open_ids: { cli_main: 'ou_cm_main', cli_hr: 'ou_cm_hr' },
-        name: '陈明', job_id: 'CR-POST-20261003-01', channels: ['main'],
-        status: '在职', scopes: ['公司'], grants: { 报表: 'L1' } },
+        person_id: 'P-001', name: '陈明', job_id: '电商运营助理',
+        channels: ['main'], is_cm: true,
+        status: '在职', scopes: ['公司'], extra_grants: {}, extra_grants_until: {} },
       { union_id: 'on_wgh', open_ids: { cli_main: 'ou_wgh_main' }, name: '伍国衡', job_id: '', status: '在职' },
       { union_id: 'on_gone', open_ids: { cli_main: 'ou_gone_main' }, name: '离职者', status: '离职' },
       { union_id: 'on_pt', open_ids: { cli_main: 'ou_pt_main' }, name: '兼职者', job_id: 'J-PT', status: '兼职' },
       { union_id: 'on_pre', open_ids: { cli_main: 'ou_pre_main' }, name: '待入职者', job_id: 'J-PRE', status: '待入职' },
+      { union_id: 'on_new', open_ids: { cli_main: 'ou_new_main' }, name: '新状态者', job_id: '电商运营助理', status: '停薪留职' },
     ],
     pending: [{ name: '李四', open_id: 'ou_lisi_unk', reason: 'union_id 未取到' }],
   }
   const CASES6 = [
     ['ou_cm_main', 'OK:陈明'], ['ou_cm_hr', 'OK:陈明'],
-    ['ou_pt_main', 'OK:兼职者'], ['ou_pre_main', 'OK:待入职者'],
+    ['ou_pt_main', 'unknown_status'], ['ou_pre_main', 'unknown_status'],
+    ['ou_new_main', 'unknown_status'],
     ['ou_unk', 'unknown_person'], ['ou_lisi_unk', 'open_id_missing'],
     ['', 'no_open_id'], ['ou_wgh_main', 'job_not_granted'],
     ['ou_gone_main', 'not_active'], ['ou_nobody_main', 'unknown_person'],
   ]
   const cloneFix = () => JSON.parse(JSON.stringify(FIX6))
   for (const [ou, want] of CASES6) {
-    const rr = resolveActorJs(ou, cloneFix(), null)
+    const rr = resolveActorJs(ou, cloneFix(), null, JOBG)
     const got = rr.err || ('OK:' + rr.actor.name)
     ok(got === want, 'JS 镜像：' + (ou || '(空)') + ' → ' + got + (got === want ? '' : '（期望 ' + want + '）'))
   }
   {
     const dup = cloneFix(); dup.people.push(JSON.parse(JSON.stringify(FIX6.people[0])))
-    ok(resolveActorJs('ou_cm_main', dup, null).err === 'duplicate_open_id', 'JS 镜像：两人共用 open_id ⇒ duplicate_open_id（判表损坏）')
-    const withOpenId = resolveActorJs('ou_cm_main', cloneFix(), null)
+    ok(resolveActorJs('ou_cm_main', dup, null, JOBG).err === 'duplicate_open_id', 'JS 镜像：两人共用 open_id ⇒ duplicate_open_id（判表损坏）')
+    const withOpenId = resolveActorJs('ou_cm_main', cloneFix(), null, JOBG)
     ok(withOpenId.actor.open_id === 'ou_cm_main', 'JS 镜像：🔴 actor 必须回带 open_id（不带会被内核【删除】而非覆写）')
-    ok(resolveActorJs('ou_cm_main', '\uFEFF' + JSON.stringify(FIX6), null).actor.name === '陈明',
+    // #158 收口：13 字段不多不少（契约 §二；channels 已移除）
+    ok(Object.keys(withOpenId.actor).length === 13 &&
+       withOpenId.actor.writable_scopes.length === 0 &&
+       withOpenId.actor.is_cm === true &&
+       withOpenId.actor.item_grants['财务|净利'] === 'L2' &&
+       withOpenId.actor.union_id === 'on_cm' && withOpenId.actor.job_id === '电商运营助理',
+      'JS 镜像：13 字段（挂岗位现取 grants/writable_scopes/item_grants ＋ is_cm/union_id/job_id）')
+    // V4：审批卡号冒充 job_id ⇒ 必须拒（卡号在 jobs[].card，不在 .id）
+    const cardFix = cloneFix(); cardFix.people[0].job_id = 'CR-POST-20261003-01'
+    ok(resolveActorJs('ou_cm_main', cardFix, null, JOBG).err === 'job_not_granted',
+      'V4：卡号冒充 job_id ⇒ job_not_granted（真查岗位表，不再非空即过）')
+    // fail-closed：岗位表缺失 ⇒ 即使在职＋真岗位也拒
+    ok(resolveActorJs('ou_cm_main', cloneFix(), null, null).err === 'job_not_granted',
+      '岗位表缺失 ⇒ fail-closed 全拒（不许因缺表放行）')
+    ok(resolveActorJs('ou_cm_main', '\uFEFF' + JSON.stringify(FIX6), null, JOBG).actor.name === '陈明',
       'JS 镜像：字符串表带 BOM（utf-8-sig 落盘）也能解析')
     const merged = resolveActorJs('ou_cm_local', cloneFix(),
-      { people: [{ name: '陈明', open_ids: { cli_local2: 'ou_cm_local' } }] })
+      { people: [{ name: '陈明', open_ids: { cli_local2: 'ou_cm_local' } }] }, JOBG)
     ok(merged.actor && merged.actor.name === '陈明', 'JS 镜像：本地增量按 name 合并 open_ids（本机 bot 的 ou 也能认）')
-    ok(resolveActorJs('ou_cm_local', cloneFix(), null).err === 'unknown_person',
+    ok(resolveActorJs('ou_cm_local', cloneFix(), null, JOBG).err === 'unknown_person',
       'JS 镜像：不合并本地增量时该 ou 仍是 unknown_person（合并没漏判成放行）')
   }
 
@@ -558,13 +637,15 @@ export function selftest () {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'identity-parity-'))
       const mapFile = path.join(tmp, 'identity_map.json')
       const localFile = path.join(tmp, 'identity_map.local.json')
+      const jgFile = path.join(tmp, 'job_grants.json')
       fs.writeFileSync(mapFile, JSON.stringify(FIX6), 'utf8')
       fs.writeFileSync(localFile, JSON.stringify({ people: [{ name: '陈明', open_ids: { cli_local2: 'ou_cm_local' } }] }), 'utf8')
+      fs.writeFileSync(jgFile, JSON.stringify(JOBG), 'utf8')
       const prevLocal = process.env.MAILBOX_IDENTITY_LOCAL
       process.env.MAILBOX_IDENTITY_LOCAL = localFile
       try {
-        const rJs = makeResolver({ mapPath: mapFile, resolverPath: pyScript, python: pyBin })
-        const rPy = makeResolver({ mapPath: mapFile, resolverPath: pyScript, python: pyBin })
+        const rJs = makeResolver({ mapPath: mapFile, resolverPath: pyScript, python: pyBin, jobGrantsPath: jgFile })
+        const rPy = makeResolver({ mapPath: mapFile, resolverPath: pyScript, python: pyBin, jobGrantsPath: jgFile })
         // ⚠️ FORCE_PY 是**每次 resolve() 调用时**读的 ⇒ 必须逐条切换，不能全程挂着
         //   （否则 JS 那半边也走了 Python 进程，比对的是「自己 vs 自己」= 假绿灯）。
         const prevForce = process.env.MAILBOX_RESOLVER_FORCE_PY
@@ -575,7 +656,7 @@ export function selftest () {
         const norm = (x) => JSON.stringify(x, (k, v) => (v && typeof v === 'object' && !Array.isArray(v))
           ? Object.fromEntries(Object.keys(v).sort().map((kk) => [kk, v[kk]])) : v)
         let drift = 0; let checked = 0
-        for (const ou of ['ou_cm_main', 'ou_cm_hr', 'ou_pt_main', 'ou_unk', 'ou_lisi_unk', 'ou_gone_main', 'ou_wgh_main', 'ou_cm_local']) {
+        for (const ou of ['ou_cm_main', 'ou_cm_hr', 'ou_pt_main', 'ou_new_main', 'ou_unk', 'ou_lisi_unk', 'ou_gone_main', 'ou_wgh_main', 'ou_cm_local']) {
           delete process.env.MAILBOX_RESOLVER_FORCE_PY
           const a = rJs.resolve(ou)
           process.env.MAILBOX_RESOLVER_FORCE_PY = '1'

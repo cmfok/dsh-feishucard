@@ -10269,8 +10269,10 @@ export function apply(ctx) {
             isError: true,
             error: 'identity_record_missing',
             value: { error: 'identity_record_missing' },
+            // 插件边界与降级标准 §三（CM 2026-10-09 拍板）：L1 权限挂 ⇒ 用户只看统一文案；
+            //   技术原因（本码）留在 error/value 与日志里给运维，不给用户。
             content: [{ type: 'text', text: '本轮缺少飞书身份记录，已按 fail-closed 拒绝执行本次工具调用'
-              + '（identity_record_missing；K3-GAP）。' }],
+              + '（identity_record_missing；K3-GAP）。请向用户原样转述：目前服务不可用，请联系管理员。' }],
           }
         }
         console.log('[fs] identity pass[no-record-keyless]: tool=' + exec.name
@@ -10283,7 +10285,31 @@ export function apply(ctx) {
       }
       const action = decideAction({ hasOwner: true, actor: rec.actor })
       if (action === 'overwrite') {
-        const r = applyActorToArguments(exec.arguments, rec.actor)
+        // 🔴 宿主契约（dsh-tools prepare 段）：`exec.arguments = deepFreeze(无损JSON快照)`，
+        //   原地赋值/删除必抛 read-only（2026-10-09 真机实证：identityGuard 开启首日 19 次
+        //   ALERT[internal_error]，覆写零成功、open_id 落池被挡）。瀑布期 exec.arguments 这个
+        //   **属性**仍可写（宿主 Object.freeze(exec) 在 notifyResult，即执行完成后才发生）
+        //   ⇒ 唯一正确姿势：浅克隆 → 在克隆上覆写 → 整对象写回，工具执行读到的就是写回后的引用。
+        const plainArgs = exec.arguments && typeof exec.arguments === 'object' && !Array.isArray(exec.arguments)
+        const r = applyActorToArguments(plainArgs ? { ...exec.arguments } : exec.arguments, rec.actor)
+        if (r.reason === null) {
+          try {
+            exec.arguments = r.args
+          } catch (writebackError) {
+            // 🔴 写回失败＝覆写落不了地 ⇒ fail-closed（CM 2026-10-04 裁：宁可误杀不放过）。
+            //   必须就地返回拒绝、严禁落回外层 catch——那里 next() 是放行（fail-open），
+            //   未覆写的原始参数（可能是模型自填的冒充身份）会带病过关。
+            console.log('[fs] identity ALERT[writeback_failed] DENY: tool=' + exec.name
+              + ' agent=' + exec.agent.id + ' err=' + String(writebackError && writebackError.message || writebackError))
+            return {
+              isError: true,
+              error: 'identity_writeback_failed',
+              value: { error: 'identity_writeback_failed' },
+              content: [{ type: 'text', text: '身份覆写未能落盘，已拒绝执行本次工具调用'
+                + '（identity_writeback_failed）。请向用户原样转述：目前服务不可用，请联系管理员。' }],
+            }
+          }
+        }
         if (r.overwritten.length || r.dropped.length) {
           console.log('[fs] identity overwrite: tool=' + exec.name + ' agent=' + exec.agent.id
             + ' set=[' + r.overwritten.join(',') + '] drop=[' + r.dropped.join(',') + ']')
@@ -10301,7 +10327,11 @@ export function apply(ctx) {
           isError: true,
           error: 'identity_unresolved',
           value: { error: 'identity_unresolved' },
-          content: [{ type: 'text', text: '身份未通过校验，已拒绝执行本次工具调用（identity_unresolved）。' }],
+          // 插件边界与降级标准 §三（CM 2026-10-09 拍板）：L1 权限挂（表不可达 table_unavailable /
+          //   人不在册 person_unknown）⇒ fail-closed 不变（CM 2026-10-04 裁决），但用户文案统一；
+          //   内部区分只留在 why 与日志留痕里。
+          content: [{ type: 'text', text: '身份未通过校验，已拒绝执行本次工具调用（identity_unresolved）。'
+            + '请向用户原样转述，不要展开技术细节：目前服务不可用，请联系管理员。' }],
         }
       }
     } catch (error) {

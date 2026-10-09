@@ -9363,6 +9363,100 @@ console.log('113) ★🔴 审批单只发已确认私聊；capabilityGuard 开�
   liveAgents.length = 0
 }
 
+// ---- 114：拔件演习（插件边界与降级标准 §五，CM 2026-10-09 拍板）----
+console.log('114) ★🔴 拔件演习：权限挂统一文案「目前服务不可用，请联系管理员」+ 桥内身份件炸不拖死回合 + 关闸直达')
+{
+  // 依据 AIAD/插件边界与降级标准.md（CM 2026-10-09 口述拍板）：
+  //   §三 L1 权限挂 ⇒ fail-closed 拒绝不变（CM 2026-10-04 裁决），但**用户文案统一**为
+  //   「目前服务不可用，请联系管理员」（技术原因只留 error 码与日志给运维，不外露）。
+  //   §五 三条演习：①拔下层（L1 身份解析不过 ⇒ deny+文案，进程不死）②拔平级（桥内身份件
+  //   自己炸 ⇒ catch 接住放行+留痕，回合不死）③拔自己（关闸=身份件不参与 ⇒ 工具调用直达）。
+  //   L3「卡片挂退纯文本」由既有降级用例族钉（建卡失败写回过程卡/relayCreateFallback/
+  //   托孤终态，见用例 76、中台#61/#62 收尾块），此处不重复造卡。
+  const UNIFIED = '目前服务不可用，请联系管理员'
+  const CFG_PATH114 = join(process.env.FS_CONFIG_DIR, 'feishu.config.json')
+  const cfgBefore114 = readFileSync(CFG_PATH114, 'utf8')
+  const patchCfg114 = (patch) => {
+    const cfg = JSON.parse(readFileSync(CFG_PATH114, 'utf8'))
+    Object.assign(cfg.bots[0], patch)
+    writeFileSync(CFG_PATH114, JSON.stringify(cfg, null, 2))
+  }
+  const nextSpy114 = () => Promise.resolve('next')
+  const capture114 = (runs) => runs.map((r) => Promise.resolve(r).then(
+    (value) => ({ value }), (error) => ({ error })))
+  const isDeny114 = (o) => Boolean(o && o.value && typeof o.value === 'object' && o.value.isError === true)
+  const brief114 = (os) => JSON.stringify(os.map((o) => (o.value === 'next'
+    ? 'next' : String(JSON.stringify(o.value)).slice(0, 80))))
+
+  // ── 演习① 拔下层：开闸 + 真实入站（open_id 不在册 ⇒ L1 解析不过）⇒ deny + 统一文案
+  const logFrom114 = consoleLines.length
+  patchCfg114({ identityGuard: true })
+  await settle(2)
+  agent.send = function (message) { this.sent.push(message) }
+  liveAgents.length = 0
+  feedInbound('om_drill114_a', '拔件演习①：这条走真实入站（在册校验不过）')
+  await settle(4)
+  const idLines114 = consoleLines.slice(logFrom114).filter((l) => l.includes('[fs] identity: agent='))
+  const recId114 = (idLines114.map((l) => (l.match(/\[fs\] identity: agent=(\S+)/) || [])[1]).find(Boolean)) || agent.id
+  const fsAgent114 = recId114 === agent.id ? agent : { id: recId114, ctx: agentCtx, session: agent.session }
+  const denyRun114 = await Promise.all(capture114(emitCtx('tools/execute',
+    { name: 'read', agent: fsAgent114, arguments: { file_path: 'a.md' }, signal: undefined }, nextSpy114)))
+  const denyHit114 = denyRun114.find(isDeny114)
+  ok(Boolean(denyHit114),
+    '★演习① L1 解析不过 ⇒ deny（isError:true，进程/回合不死）｜实得 ' + brief114(denyRun114))
+  ok(Boolean(denyHit114) && String(JSON.stringify(denyHit114.value)).includes('identity_unresolved'),
+    '★演习① 技术原因仍可追溯（identity_unresolved 码留在 error/value 给运维）')
+  ok(Boolean(denyHit114) && String(JSON.stringify(denyHit114.value)).includes(UNIFIED),
+    '★★演习① 统一文案随结果下发（用户面只见「' + UNIFIED + '」；只说技术话的旧字节 ⇒ 本条红）')
+
+  // ── 演习①·补：无记录 + 带身份键支路（identity_record_missing）也必须同一文案
+  // 来源用 createdSessionIds（本轮各用例真实建过的会话，113 刚建过 ⇒ 必非空）∪
+  //   persistedSessions；不要只依赖 persistedSessions —— 它是历史快照变量，会被中间用例改写。
+  const stale114 = [...new Set([
+    ...createdSessionIds.map((s) => String(s || '')),
+    ...persistedSessions.map((s) => String((s && s.id) || '')),
+  ])].filter(Boolean)
+  const probe114 = stale114.find((id) => id !== fsAgent114.id)
+  ok(Boolean(probe114),
+    '（前提）拿到一条本轮无入站记录的在册会话 id（拿不到＝本格如实红）｜候选 '
+      + JSON.stringify(stale114.slice(0, 3)))
+  if (probe114) {
+    const missRun114 = await Promise.all(capture114(emitCtx('tools/execute',
+      { name: 'read', agent: { id: probe114 }, arguments: { file_path: 'a.md', open_id: 'ou_drill114' },
+        signal: undefined }, nextSpy114)))
+    const missHit114 = missRun114.find(isDeny114)
+    ok(Boolean(missHit114) && String(JSON.stringify(missHit114.value)).includes('identity_record_missing')
+      && String(JSON.stringify(missHit114.value)).includes(UNIFIED),
+      '★★演习①·补 无记录+带身份键 ⇒ 拒且**同样**只给统一文案（两条 deny 支路一个口径）｜实得 '
+        + brief114(missRun114))
+  }
+
+  // ── 演习② 拔平级：身份件自己炸（agent.id 读即抛）⇒ catch 接住放行 + internal_error 留痕
+  const bomb114 = { get id() { throw new Error('drill114-bomb') } }
+  const logBomb114 = consoleLines.length
+  const bombRun114 = await Promise.all(capture114(emitCtx('tools/execute',
+    { name: 'read', agent: bomb114, arguments: { file_path: 'a.md' }, signal: undefined }, nextSpy114)))
+  ok(bombRun114.length >= 3 && bombRun114.every((o) => o.value === 'next'),
+    '★演习② 身份件内部炸 ⇒ 全监听器 next()（回合不死，不吞消息；实得 ' + brief114(bombRun114) + '）')
+  ok(consoleLines.slice(logBomb114).some((l) => l.includes('identity ALERT[internal_error]')),
+    '★演习② 炸点留痕 identity ALERT[internal_error]（不许静默；2026-10-04 静默失效事故的反向钉）')
+
+  // ── 演习③ 拔自己：关闸（=桥身份件不参与）⇒ 同一调用直达 next()（工具注册/执行不经桥）
+  patchCfg114({ identityGuard: false })
+  await settle(2)
+  const offRun114 = await Promise.all(capture114(emitCtx('tools/execute',
+    { name: 'read', agent: fsAgent114, arguments: { file_path: 'a.md' }, signal: undefined }, nextSpy114)))
+  ok(offRun114.length >= 3 && offRun114.every((o) => o.value === 'next'),
+    '★演习③ 关闸（拔掉桥身份件）⇒ 同一调用直达 next()（工具执行不依赖桥身份层；实得 '
+      + brief114(offRun114) + '）')
+
+  // 收尾还原（别给收尾块与以后加用例的人埋雷）
+  writeFileSync(CFG_PATH114, cfgBefore114)
+  await settle(2)
+  ok(JSON.parse(readFileSync(CFG_PATH114, 'utf8')).bots[0].identityGuard === undefined,
+    '（收尾）配置还原：identityGuard 键移除（回到默认关）')
+}
+
 // 🔴 中台 #61/#62（第三十五轮）：托孤双 60 秒对撞原来让「这张卡补送到不到」听天由命
 //   （sentCards 汇总因此 ±1 抖动，闸门 T/U 的 507/506 差的就是这张卡）。
 //   index.js 改成「退避结束后再给一个完整 TTL」后，这张卡**必然落终态**——
