@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [归属补记] f7b4f94 内含契约 V1.3 收口实现（中台 #158，2026-10-09）
+
+**f7b4f94（0.8.6/0.8.7 提交）因并行会话共享工作树，把 #158 身份-授权契约 V1.3 收口的实现一并提交了，
+commit message 未单独标注，特此补记归属。** 该提交中以下内容属 #158（HOME#Qoder 2026-10-09 18:07-18:31 实施，
+机验 V1-V10 25/25 全过，验收脚本 `work/output/g9-audit/契约V1-V10机验-20261009.py`）：
+
+- `scripts/resolve_actor.py`：13 字段 actor（契约 §二；`channels` 移除）、`grants_until`⇒`extra_grants_until`、
+  兼职/待入职/未填/新状态 ⇒ `unknown_status`（V1.2 裁决）、`job_id` 真查岗位表（缺表 fail-closed）、
+  补输出 `writable_scopes`/`item_grants`/`is_cm`/`union_id`
+- `scripts/build_identity_map.py`：人级去 `grants`（§四 挂岗位）、限期键改名、补 `is_cm`、
+  新增 `--migrate-contract-v12` 存量表迁移（旧键搬值，唯一合法持有旧键名处）
+- `identity_map.example.json`：schema 对齐契约（pending 补 `open_id` 键）
+- `identity-inject.mjs`：resolveActorJs 镜像同步（jobGrants 第 4 参、状态门、13 字段）＋
+  makeResolver 岗位表路径探测/缓存签名 ＋ 自测断言翻转（兼职/待入职放行⇒拒，40/40 绿、JS/Py parity 9 条一致）
+
+⚠️ 服务器侧（`/opt/scripts/G9/resolve_actor.py`、注入 JS、`job_grants.json`）**尚未部署本批改动**，
+随 G9 工具层全量切换批一起上（金丝雀＝中台待裁决 #11）；部署前服务器行为与 0.8.6 等价。
+契约文本（V1.3-26100901）见 `work/AIAD/0-必读文件/开发文件/身份-授权契约-v1.md`。
+
 ## [0.8.7] - 2026-10-09
 
 **状态：已上线 aiad 侧（2026-10-09 18:37，md5=00a49e07，5 helper 长连接 ready、journal 零错误；备份 `index.js.bak-20261009-pre-argfreeze`／`package.json.bak-20261009-pre-argfreeze`）。主题：D5 身份覆写落地修复——宿主 deepFreeze 契约适配（中台 #336 转交接手·open_id 报错排查）。**
