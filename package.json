@@ -1,6 +1,6 @@
 {
   "name": "dsh-feishucard",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "engines": {
     "node": ">=22.15.0"
   },

@@ -1824,6 +1824,12 @@ export function apply(ctx) {
         continue
       }
       if (block.type === 'tools') {
+        // 0.8.8（CM 2026-10-10）：stable 显示层连工具折叠面板也不再渲染 ——
+        // 旧实现渲染 expanded:false 的「🛠️ 工具调用 (N)」面板，面板头在群/员工卡上仍可见
+        //（CM 报「折叠没把工具调用做好，还是会显示」）。stable 下整块跳过，连面板头都不出。
+        // 数据层 blocks/tools 一字不动（与 note/message 同策略：过滤只发生在渲染层）；
+        // full 模式（CM 本人私聊）照旧显示。取代 10-03 旧拍板「stable 保留工具面板」。
+        if (card.mode === 'stable') continue
         const lines = []
         for (const id of block.toolIds) {
           const tool = card.tools.get(id)

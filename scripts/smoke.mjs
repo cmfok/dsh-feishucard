@@ -4736,10 +4736,11 @@ console.log('62) ★ 0.7.14 H3：热重载打断时旧实例不许封口推卡�
   await settle(2)
 }
 
-console.log('63) ★ 0.7.17 stable 显示层：员工只看 状态+工具面板+结论（过程叙述/指路不渲染）')
+console.log('63) ★ 0.8.8 stable 显示层：员工只看 状态+结论，工具调用面板不渲染（过程叙述/指路不渲染）')
 {
-  // CM 2026-10-03 拍板（10 问）：stable＝员工只看到「工作中」状态＋工具调用折叠面板（结果在内）＋结论卡；
-  // 过程叙述/🎯 行/指路行一律不渲染。cfg.mode 走白名单归一化（漏加就被丢——splitConclusionMinMs 同坑）。
+  // 0.8.8（CM 2026-10-10）：stable＝员工只看到「工作中」状态＋结论卡；**工具调用面板整个不渲染**
+  //（取代 10-03 旧拍板「工具折叠面板保留」——CM 报「折叠没把工具调用做好，还是显示」）。
+  // 过程叙述/🎯 行/指路行一律不渲染（0.7.17 原样保留）。cfg.mode 走白名单归一化（漏加就被丢——splitConclusionMinMs 同坑）。
   writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
     bots: [{
       name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
@@ -4773,7 +4774,7 @@ console.log('63) ★ 0.7.17 stable 显示层：员工只看 状态+工具面板+
   const last63 = ops63.length ? JSON.stringify(ops63[ops63.length - 1].payload) : ''
   ok(ops63.length >= 1, '（前提）建了卡（实际 ' + ops63.length + ' 张）')
   ok(last63.includes('最终答复-STABLE-乙'), '★ stable：结论照常显示（V2 结论卡一定出现）')
-  ok(last63.includes('工具调用'), '★ stable：工具调用折叠面板保留（结果在内）')
+  ok(!last63.includes('工具调用'), '★ stable：工具调用面板**不渲染**（0.8.8 CM 裁决隐藏工具调用；0.8.7 面板头可见 ⇒ 红）')
   ok(!last63.includes('过程叙述-STABLE-甲'), '★ stable：过程叙述**不渲染**（0.7.16 无过滤 ⇒ 红）')
   writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
     bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
