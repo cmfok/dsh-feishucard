@@ -24,6 +24,31 @@ commit message 未单独标注，特此补记归属。** 该提交中以下内�
 随 G9 工具层全量切换批一起上（CM 2026-10-09 裁决：不做金丝雀，验收后全量切）；部署前服务器行为与 0.8.6 等价。
 契约文本（V1.3-26100901）见 `work/AIAD/0-必读文件/开发文件/身份-授权契约-v1.md`。
 
+## [0.8.9] - 2026-10-12
+
+**主题：切换终态卡与状态栏显示「工作区 + 当前模型」（中台 #496/#497，WO-36；CM 2026-10-11 飞书两条需求）。**
+
+- **需求①（#496/B6）**：`✅ 已切换` 终态卡三个出口（新建／切回本聊天已有会话／接管）统一经 `applySwitch` 的
+  `ctxSuffix()` 拼两行 —— `🗂 工作区：<leaf>（<cwd>）` ＋ `🤖 下一条消息将用：<provider>/<model>`（#497 口径：
+  写具体模型名，禁止只写「默认」；来源小字「本会话已选/本会话上一条在用/全局默认」随行给出，给 #339 当探针）。
+  点卡路径（buildSwitchResultCard）与文字命令路径（sendPlainText）拿到**同一份文本**，不会各改各的。
+- **需求②（#496/B7，范围 A＝full 模式）**：`goalFooterElements` 的 metric 追加 `🤖 <模型名>`——只写模型名、
+  超 40 字符截断（防挤断 🧠/💾 两栏）；provider 全名＋取值来源放展开面板 detail 新增的「**模型**」行；
+  无目标分支（灰底 column_set）同享 metric；bare 过程卡一字未动（维持 CM 2026-10-01 A 方案）。
+- **取数**：`currentModelOf` 新增 `source` 字段（`pending`/`lastUsed`/`default`）＋ `modelSourceText()` 中文映射；
+  取值链一字未动（`pending → lastUsed → agentDefaultModel.currentSelection()`，与宿主 `selectionFor().current`
+  同源＝「下一条请求会用的那个」）；既有调用方（/model 卡、默认模型校验）只取 provider/model，零破坏。
+- **纪律**：读不到就不显示——工作区/模型任一取不到时对应整行不出现，取数失败不影响切换本身
+  （沿用 `goalFooterElements` 既有 :1619 纪律）。
+- **验证**：冒烟 +11 断言（终态卡两行 × 点卡/文字两路径、状态栏两分支、对照组＝模型取不到⇒模型行整行消失
+  且切换照常，防恒真），SMOKE PASS `sentCards=656 sessions=51` 0 红；真机验收在 **staging 桥 0.8.9**
+  （2026-10-12 01:07-01:08 CST，StagingBOT 单聊）：`/switch 1 new` 终态卡实拍「🗂 工作区：**supervisor**
+  （`/srv/aiad/agents/supervisor`）」「🤖 下一条消息将用：`zai-coding-cn/glm-5.3-flash` *（全局默认）*」；
+  回复卡状态栏实拍「… 💾 缓存命中 94.3% ｜ 🤖 glm-5.3-flash」。staging supervisor mode 临时 full 测完已还原
+  stable（OPS_CHANGELOG 2026-10-12 01:15 条）。
+- **已知范围外发现**（另行投中台，不在本版修）：`shortSessionId` 取 `id.slice(0,8)` ⇒ `fs-main-*` 会话在
+  终态卡句子里恒显示为 `fs-main-`（尾巴信息全截掉），0.8.7 前即如此。
+
 ## [0.8.8] - 2026-10-10
 
 **主题：stable 显示层隐藏工具调用面板（CM 2026-10-10 口头令：「折叠没有把工具调用做好，调用工具这里还是会显示……把调用工具隐藏起来」）。**
