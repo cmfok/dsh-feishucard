@@ -477,8 +477,14 @@ export function apply(ctx) {
   // message_id -> 摘要；入站命中 parent_id 时把摘要随正文一起注入会话。
   // 只用本地登记表：**不新增任何飞书权限**（GET /im/v1/messages 需要读消息 scope，
   // 当前应用没开；本地表覆盖"引用我们自己的卡片/消息"这一主场景）。
-  const recentMessages = new Map()      // messageId -> { label, at }
+  const recentMessages = new Map()      // messageId -> { label, at, full }
   const RECENT_MESSAGE_MAX = 300        // 只留最近若干条，避免长跑内存无界增长
+  // #515 存档反查 TTL：7 天。占位卡反查的价值窗口＝「刚发完被同群/同会话的另一个 bot 看到」；
+  // 过期条目在 loadMessageIndex 时就地淘汰，防 message-index.json 无限膨胀。
+  const CARD_ARCHIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+  // #515 存档正文上限：一张卡的全文（含工具面板/表格等所有文字）超过这个数就截断——
+  // 喂给 agent 的正文本身也不宜过长；300 条 × 8KB ≤ 2.4MB 落盘，体量可控。
+  const CARD_ARCHIVE_TEXT_MAX = 8000
   // ⚠️ 2026-10-01 真机实证（CM 引用一张卡片，卡面回「内容未登记，可能是更早的消息」）：
   //    登记表原本**只在内存**里，而 dsh 重启（改插件代码/框架升级）会把它清空
   //    ⇒ **重启前发出的卡片一律查不到**（实证：CM 引的卡 `om_x100b64d11132f0a0b0484fbba40a0ca`
@@ -514,14 +520,22 @@ export function apply(ctx) {
     let added = 0
     try {
       const obj = JSON.parse(readFileSync(messageIndexPath(), 'utf8') || '{}')
+      const now = Date.now()
       for (const [id, value] of Object.entries(obj || {})) {
         if (!id || !value || typeof value.label !== 'string') continue
+        // #515 存档 TTL：7 天前的条目不再加载（发卡存档的价值窗口就是「刚发完被同群 bot 看到」，
+        // 旧档只会让 message-index.json 无限膨胀）。at 缺失的旧格式条目按 0 ⇒ 视为过期，不加载。
+        if (!Number(value.at) || now - Number(value.at) > CARD_ARCHIVE_TTL_MS) continue
         // 2026-10-02 代码审查 low#10：**内存里已有的条目不许被盘上的旧值盖回去**。
         // quoteHintFor() 每次未命中都会再读一次盘（"每条引用都 readFileSync + JSON.parse"
         // 就是这么来的），而卡片每次成功同步都会重取标签、只等 300ms 去抖落盘
         // ⇒ 覆盖会把刚刷新的标签退回旧值。跳过快照里已有的 key，只补磁盘新增的。
         if (recentMessages.has(id)) continue
-        recentMessages.set(id, { label: value.label, at: Number(value.at) || 0 })
+        recentMessages.set(id, {
+          label: value.label,
+          at: Number(value.at) || 0,
+          full: (typeof value.full === 'string' && value.full) ? value.full : '',
+        })
         added += 1
       }
       while (recentMessages.size > RECENT_MESSAGE_MAX) {
@@ -532,11 +546,19 @@ export function apply(ctx) {
     return added
   }
 
-  function rememberMessage(messageId, label) {
+  function rememberMessage(messageId, label, full) {
     const id = String(messageId || '')
     if (!id) return
-    if (recentMessages.has(id)) recentMessages.delete(id)
-    recentMessages.set(id, { label: String(label || '').replace(/\s+/g, ' ').slice(0, 100), at: Date.now() })
+    // 中台 #515（CM 2026-10-12 拍板「做」）：存档反查 —— full＝卡片正文全文。
+    // **merge 语义**：同一 message_id 的后续登记（如入口 :6684 把收到的占位卡记成「CM 的消息」）
+    // 不带 full ⇒ 必须继承旧值，否则发卡时存的全文会被收件时的重登记抹掉，反查永远 miss。
+    const prev = recentMessages.get(id)
+    if (prev) recentMessages.delete(id)
+    recentMessages.set(id, {
+      label: String(label || '').replace(/\s+/g, ' ').slice(0, 100),
+      at: Date.now(),
+      full: (typeof full === 'string' && full.trim()) ? full : ((prev && prev.full) || ''),
+    })
     while (recentMessages.size > RECENT_MESSAGE_MAX) {
       const oldest = recentMessages.keys().next().value
       recentMessages.delete(oldest)
@@ -855,7 +877,17 @@ export function apply(ctx) {
     if (!(res.status >= 200 && res.status < 300) || !parsed || parsed.code !== 0) {
       throw new Error('create card failed: ' + (res.text || JSON.stringify(res)))
     }
-    return parsed.data && parsed.data.message_id
+    const createdId = parsed.data && parsed.data.message_id
+    // #515 存档反查：本桥发出的每一张卡都按 message_id 存全文 —— 另一个 bot 在群里/会话里
+    // 收到这张卡的**占位替身**（飞书对 2.0 卡只给「占位图＋请升级文案」）时，凭同一条 message_id
+    // 反查此处即可还原原文。登记失败绝不影响发卡本身（try 包住）。
+    try {
+      const archText = cardArchiveTextOf(payload)
+      if (createdId && archText) rememberMessage(createdId, archText.slice(0, 60), archText)
+    } catch (error) {
+      console.log('[fs] card archive remember failed: ' + String(error && error.message || error))
+    }
+    return createdId
   }
 
   async function updateInteractive(bot, messageId, payload, signal) {
@@ -870,6 +902,13 @@ export function apply(ctx) {
     const parsed = parseJson(res.text)
     if (!(res.status >= 200 && res.status < 300) || !parsed || parsed.code !== 0) {
       throw new Error('update card failed: ' + (res.text || JSON.stringify(res)))
+    }
+    // #515：PATCH 成功＝卡内容变了 ⇒ 存档同步刷新（流式卡随回合推进更新，反查要给到最新正文）。
+    try {
+      const archText = cardArchiveTextOf(payload)
+      if (archText) rememberMessage(messageId, archText.slice(0, 60), archText)
+    } catch (error) {
+      console.log('[fs] card archive refresh failed: ' + String(error && error.message || error))
     }
   }
 
@@ -2331,6 +2370,41 @@ export function apply(ctx) {
       }
       return parts.join('\n\n')
     } catch { return '' }
+  }
+
+  // #515 存档抽取器：**递归**抓卡片 JSON 里全部可读文字（header 标题、嵌套 column_set/
+  // collapsible_panel、表格单元格都算）——payloadPlainText 只看顶层两种 tag，存档要的是
+  // 「另一个 agent 反查时能还原卡上说了什么」，必须抓全。纯显示层，不影响发卡本身。
+  function cardArchiveTextOf(payload) {
+    const out = []
+    const push = (s) => {
+      const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+      if (t && !out.includes(t)) out.push(t)
+    }
+    const walk = (node, depth) => {
+      if (!node || depth > 8 || out.join('\n').length >= CARD_ARCHIVE_TEXT_MAX) return
+      if (typeof node === 'string') {
+        const s = node.trim()
+        if ((s.startsWith('{') || s.startsWith('[')) && s.length < 20000) {
+          try { walk(JSON.parse(s), depth + 1); return } catch { /* 不是 JSON ⇒ 当普通文字 */ }
+        }
+        push(s)
+        return
+      }
+      if (Array.isArray(node)) { for (const it of node) walk(it, depth + 1); return }
+      if (typeof node !== 'object') return
+      if (node.tag === 'img' || node.tag === 'media') return
+      if (node.tag === 'button' || node.tag === 'action') return
+      for (const k of ['content', 'text', 'title', 'name', 'user_name', 'label']) {
+        if (typeof node[k] === 'string') push(node[k])
+        else if (node[k] && typeof node[k] === 'object') walk(node[k], depth + 1)
+      }
+      for (const k of ['elements', 'fields', 'columns', 'items', 'children', 'body', 'header']) {
+        if (node[k] && typeof node[k] === 'object') walk(node[k], depth + 1)
+      }
+    }
+    walk(payload, 0)
+    return out.join('\n').slice(0, CARD_ARCHIVE_TEXT_MAX)
   }
   // 四类失败的文案**集中在这一张表**（审查 MED#1733/#1745：嵌套三元会随类别增多越写越乱，
   // 而且"给用户看的"与"给 Agent 看的"两处必须同步 ⇒ 一张表解决，两处都从这里取）。
@@ -5530,11 +5604,25 @@ export function apply(ctx) {
       //   agent ⇒ agent 复述「版本要升级」（错误归因）。识别到替身特征短语 ⇒ 改喂**诚实说明**，
       //   不再把占位当正文；正常卡（有真内容）照走 salvage，不受影响。
       if (salvaged && salvaged.indexOf('请升级至最新版本客户端') >= 0) {
-        text = '（收到一张飞书卡片消息，但它是飞书**服务端转译的占位卡**：飞书对 JSON 2.0 卡片在'
-          + '转发/跨会话场景只给「占位图＋请升级提示」，原卡片文字不在消息里，我读不到原内容'
-          + '——这不是客户端版本问题。要看内容请把要点**直接复制成文字**发我，或**截图**发我。）'
+        // #515 存档反查（CM 2026-10-12 拍板「做」）：占位替身与原卡**同一条 message_id**
+        //（只有「转发」会生成新 id）⇒ 同桥发出的卡在这里能按 id 查回全文，直接把原文喂给
+        // agent —— 群里/会话里 bot 互发卡片的场景由此完整可读。查不到（跨桥、外部卡、转发件）
+        // 才退回诚实说明。反查失败绝不影响后续流程（全程在既有 try 语义内）。
+        let archHit = null
+        try {
+          archHit = recentMessages.get(String(messageId || '')) || null
+          if (!archHit) { loadMessageIndex(); archHit = recentMessages.get(String(messageId || '')) || null }
+        } catch { }
+        const archOk = archHit && typeof archHit.full === 'string' && archHit.full.trim()
+          && (Date.now() - Number(archHit.at || 0) <= CARD_ARCHIVE_TTL_MS)
+        text = archOk
+          ? '（收到一张飞书卡片消息：它是**本桥此前发出的卡**——消息通道里只有飞书的占位替身，'
+            + '以下是从发卡存档还原的**原文**）\n\n' + archHit.full
+          : '（收到一张飞书卡片消息，但它是飞书**服务端转译的占位卡**：飞书对 JSON 2.0 卡片在'
+            + '转发/跨会话场景只给「占位图＋请升级提示」，原卡片文字不在消息里，我读不到原内容'
+            + '——这不是客户端版本问题。要看内容请把要点**直接复制成文字**发我，或**截图**发我。）'
         console.log('[fs] inbound snapshot-placeholder card: type=' + kind + ' chat=' + chatId
-          + ' message_id=' + String(messageId || ''))
+          + ' message_id=' + String(messageId || '') + ' archive=' + (archOk ? 'hit' : 'miss'))
       } else if (salvaged) {
         text = '（飞书**非文本**消息，类型 ' + kind + '；以下是从消息里抽出的正文）\n' + salvaged
         console.log('[fs] inbound rich message salvaged: type=' + kind + ' chat=' + chatId

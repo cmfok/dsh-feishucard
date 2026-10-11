@@ -4203,6 +4203,47 @@ console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢
     '★ 留痕 inbound snapshot-placeholder card 且带 chat/message_id')
   ok(fedRich.includes('卡片正文-GAMMA') || fedRich.includes('卡片标题-Z'),
     '★ 对照组：真内容卡片照走 salvage 抠正文（占位识别不误伤正常卡）')
+
+  // 中台 #515 存档反查（CM 2026-10-12 拍板「做」）：**同桥发出的卡**收到占位替身时，
+  // 凭同一条 message_id 反查发卡存档 ⇒ 喂还原后的原文（群内/会话内 bot 互发由此可读）。
+  // 对照＝上面 om_card_snapshot（陌生 id，无存档）仍走诚实说明。
+  const archCard = sentCards.filter((c) => c.op === 'create' && c.msgId).pop()
+  ok(Boolean(archCard && archCard.msgId), '★★ 前提：用例里存在桥发出的卡（' + ((archCard && archCard.msgId) || '无') + '）')
+  if (archCard && archCard.msgId) {
+    const archProbe = (() => {
+      try {
+        for (const el of (archCard.payload.body && archCard.payload.body.elements) || []) {
+          if (el && el.tag === 'markdown' && typeof el.content === 'string' && el.content.trim()) {
+            return el.content.replace(/\s+/g, ' ').trim().slice(0, 30)
+          }
+        }
+      } catch { }
+      return ''
+    })()
+    const markArch = sentCards.length
+    feedInboundRaw(archCard.msgId, 'interactive', {
+      title: null,
+      elements: [[
+        { tag: 'img', image_key: 'img_v3_snap_placeholder' },
+        { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+        { tag: 'text', text: '' },
+      ]],
+    })
+    await settle(3)
+    const fedArch = JSON.stringify(agent.sent.slice(-3))
+    ok(fedArch.includes('从发卡存档还原') && fedArch.includes('本桥此前发出的卡'),
+      '★★ 同 id 占位入站 ⇒ 反查命中，agent 收到「发卡存档还原」说明（#515）')
+    ok(!fedArch.includes('请升级至最新版本客户端'),
+      '★★ 反查命中时占位文案同样不进会话')
+    ok(!JSON.stringify(cardsSince(markArch)).includes('不是客户端版本问题'),
+      '★★ 对照组：陌生 id（om_card_snapshot）无存档 ⇒ 仍走诚实说明（反查不误命中）')
+    if (archProbe) {
+      ok(fedArch.includes(archProbe),
+        '★★ 反查还原的正文＝发卡时卡面文字（探针 ' + JSON.stringify(archProbe) + '）')
+    }
+    ok(consoleLines.some((l) => l.includes('archive=hit')),
+      '★ 留痕 archive=hit（miss 的那条已在上面占位格留痕）')
+  }
 }
 
 console.log('59) ★ 0.7.9 P5：11310（表格/元素超限）不再"通知+抢救+换卡"三连（CM：卡片乱发）')
