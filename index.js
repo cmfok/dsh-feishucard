@@ -1695,11 +1695,20 @@ export function apply(ctx) {
     }
     const snap = contextSnapshot(agent)
     const view = goalSnapshot(agent)
-    const metric = snap
+    // 中台 #496（CM 2026-10-11）：状态栏追加「🤖 现在在用的模型」。这一行容量有限
+    //（:1680 注释、header :1759 的 200 字符截断都是先例）⇒ 只写**模型名**、超长截断，
+    // provider 全名与取值来源放展开面板（#497：来源小字给 #339 当探针）。
+    // 读不到就不追加（:1619 既有纪律），绝不让状态栏因取数失败而炸。
+    let modelOfFooter = null
+    try { modelOfFooter = currentModelOf(agent) } catch { }
+    const modelShort = modelOfFooter && modelOfFooter.model
+      ? '🤖 ' + String(modelOfFooter.model).slice(0, 40) : ''
+    let metric = snap
       ? '🧠 ' + humanTokens(snap.ctx) + (snap.windowSize ? '/' + humanTokens(snap.windowSize) : '')
         + (snap.windowSize ? '（' + (100 * snap.ctx / snap.windowSize).toFixed(1) + '%）' : '')
         + '  ｜  💾 缓存命中 ' + snap.hit.toFixed(1) + '%'
       : ''
+    if (modelShort) metric = metric ? metric + '  ｜  ' + modelShort : modelShort
     // 2026-10-01 CM：「目标条上面加一条灰色分隔线，不然它跟正文会混到一起」。
     // 飞书 `hr` 组件就是那条灰色横线（JSON 2.0 结构组件；真机已发卡验证 schema 合法）。
     const rule = { tag: 'hr' }
@@ -1743,6 +1752,11 @@ export function apply(ctx) {
             ? String(view.blockedReason.message || view.blockedReason.reason || view.blockedReason.code || '（未给原因）')
             : String(view.blockedReason))
           : ''),
+      // 中台 #496/#497：状态栏那行只放得下模型名，provider 全名＋取值来源放这里。
+      modelOfFooter && modelOfFooter.provider
+        ? '**模型**：`' + modelOfFooter.provider + '/' + modelOfFooter.model + '`'
+          + (modelSourceText(modelOfFooter.source) ? '（' + modelSourceText(modelOfFooter.source) + '）' : '')
+        : '',
       created ? '**创建于**：' + new Date(created).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '',
       '',
       '**目标全文**',
@@ -8241,6 +8255,25 @@ export function apply(ctx) {
       if (typeof feedback === 'function') { await feedback(text, kind || 'ok'); return }
       await sendPlainText(bot, chatId, text)
     }
+    // 中台 #496/#497（CM 2026-10-11 飞书）：切换终态卡上要**直接看到**「这个会话在哪个工作区、
+    // 下一条消息用什么模型」——不能只藏在句子里，且必须写具体模型名（禁止只写「默认」）。
+    // 拼进 say 的文本 ⇒ 点卡路径（buildSwitchResultCard 的 markdown）与文字命令路径
+    // （sendPlainText）拿到的是同一份内容，不会各改各的。取数沿用 :1619 既有纪律：
+    // 读不到的行整行不出现，且取数失败绝不影响切换本身（try 包住）。
+    // 模型取 currentModelOf ⇒ pending→lastUsed→全局默认，正是「下一条消息实际会用的那个」；
+    // 来源小字（本会话已选/全局默认）给 #339 当探针：卡上写 X、实际用 Y 即复现证据。
+    const ctxSuffix = () => {
+      const lines = []
+      if (cwd) lines.push('🗂 工作区：**' + workspaceLeaf(cwd) + '**（`' + cwd + '`）')
+      let m = null
+      try { m = currentModelOf(liveAgentForChat(chat)) } catch { }
+      if (m && m.provider && m.model) {
+        const src = modelSourceText(m.source)
+        lines.push('🤖 下一条消息将用：`' + m.provider + '/' + m.model + '`'
+          + (src ? ' _（' + src + '）_' : ''))
+      }
+      return lines.length ? '\n' + lines.join('\n') : ''
+    }
     if (mode === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       const handle = await createDedicated(bot, sessionId, cwd)
@@ -8256,14 +8289,15 @@ export function apply(ctx) {
       await attachSessionToWorkspace(row, sessionId)
       console.log('[fs] /switch new session ' + sessionId + ' cwd=' + cwd)
       await say('✅ 已在工作区 `' + cwd + '` **新建会话并切过去**（旧会话一个都没动，会话 id `'
-        + shortSessionId(sessionId) + '`）。接着往下说就行。')
+        + shortSessionId(sessionId) + '`）。接着往下说就行。' + ctxSuffix())
       return
     }
     const idx = chat.sessions.findIndex((s) => String(s.id) === String(row && row.sessionId))
     if (idx >= 0) {
       chat.activeIndex = idx
       persistChats(bot, bot.chats)
-      await say('✅ 已切到本聊天已有的会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」。')
+      await say('✅ 已切到本聊天已有的会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」。'
+        + ctxSuffix())
       return
     }
     if (row.live) {
@@ -8284,7 +8318,7 @@ export function apply(ctx) {
     await attachSessionToWorkspace(row, row.sessionId)
     console.log('[fs] /switch takeover session ' + row.sessionId + ' cwd=' + cwd)
     await say('✅ 已接管会话 `' + shortSessionId(row.sessionId) + '`'
-      + (cwd ? '（工作目录 `' + cwd + '`）' : '') + '，接着往下说就行。')
+      + (cwd ? '（工作目录 `' + cwd + '`）' : '') + '，接着往下说就行。' + ctxSuffix())
   }
 
   async function handleSwitchAction(bot, chatId, value) {
@@ -8407,14 +8441,27 @@ export function apply(ctx) {
       const st = sp && session && typeof sp.stateOf === 'function'
         ? sp.stateOf(session, 'modelSelection') : undefined
       const sel = st && (st.pending || st.lastUsed)
-      if (sel && sel.provider) return { provider: sel.provider, model: sel.model }
+      if (sel && sel.provider) {
+        // source（中台 #497）：这个值从哪层来的 —— pending＝本会话已选还没用上、
+        // lastUsed＝本会话上一条真用的、default＝全局默认。终态卡拿它当小字，
+        // 给 #339（新会话模型注入不稳）当探针：卡上写 X 实际用 Y 即复现证据。
+        return { provider: sel.provider, model: sel.model, source: st.pending ? 'pending' : 'lastUsed' }
+      }
     } catch { }
     try {
       const dm = ctx.get('agentDefaultModel')
       const sel = dm && typeof dm.currentSelection === 'function' ? dm.currentSelection() : undefined
-      if (sel && sel.provider) return { provider: sel.provider, model: sel.model }
+      if (sel && sel.provider) return { provider: sel.provider, model: sel.model, source: 'default' }
     } catch { }
     return null
+  }
+
+  // source 的中文小字（终态卡卡面 + 状态栏展开面板共用一个口径）。
+  function modelSourceText(source) {
+    if (source === 'pending') return '本会话已选'
+    if (source === 'lastUsed') return '本会话上一条在用'
+    if (source === 'default') return '全局默认'
+    return ''
   }
 
   // 🔴 CM 2026-10-05：「自动视图（卡上写作 `X + 自动识图`）先把它删掉」。

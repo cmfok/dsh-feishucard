@@ -1533,6 +1533,12 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
     '结果卡是终态卡：一个按钮都没有（实际 ' + (resultCard ? allButtons(resultCard).length : '?') + ' 个）')
   ok(!JSON.stringify(cardsSince(takeoverMark)).includes('回到工作区列表'),
     '结果卡/提示文案里不再出现「回到工作区列表」（那个按钮已经删了，留着就是让人去点空气）')
+  // 中台 #496/#497（WO-36 需求①，CM 2026-10-11）：终态卡上必须**直接看到**工作区与
+  // 「下一条消息实际会用的模型」——写具体名（provider/model），禁止只写「默认」。
+  ok(JSON.stringify(resultCard && resultCard.payload).includes('🗂 工作区：'),
+    '★★ 终态卡卡面直接给出工作区行（#496：不藏在句子里）')
+  ok(JSON.stringify(resultCard && resultCard.payload).includes('🤖 下一条消息将用：`test/test-model`'),
+    '★★ 终态卡写具体模型名 `test/test-model`（#497：写具体名，禁「默认」二字）')
   ok(registryAttached.some((a) => a.id === 'gui-session-aaaa1111'),
     '接管时把会话**挂进了工作区注册表**（与 GUI 同源：侧边栏也看得到）')
 
@@ -1556,6 +1562,45 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   const otherEntity = fakeWorkspaceRegistry._entities.find((e) => e.path === OTHER_WORKSPACE)
   ok(Boolean(otherEntity) && registryAttached.some((a) => a.ws === otherEntity.id),
     '新建的会话也挂进了那个工作区（GUI 侧边栏能看到）')
+  // 中台 #496/#497（WO-36）：**文字命令路径**（sendPlainText）与点卡路径同源——
+  // 同样给出工作区行与具体模型名（ctxSuffix 拼进同一份文本，两条出口不会各改各的）。
+  const newReplyText = () => {
+    const creates = sentCards.slice(beforeNew)
+      .filter((c) => c.op === 'create' && c.payload && !c.payload.schema && Array.isArray(c.payload.elements))
+    const last = creates[creates.length - 1]
+    return last ? String(last.payload.elements[0].content || '') : ''
+  }
+  const otherLeaf = OTHER_WORKSPACE.split(/[\\/]/).filter(Boolean).pop()
+  ok(newReplyText().includes('🗂 工作区：**' + otherLeaf + '**'),
+    '★★ 文字 /switch new 的回复同样带工作区行（两条路径同一份内容，#496）')
+  ok(newReplyText().includes('🤖 下一条消息将用：`test/test-model`'),
+    '★★ 文字路径也写具体模型名（#497）')
+
+  // ④B 对照组（#497 防恒真）：模型取不到（dm 桩回空、投影为 undefined）⇒ 模型行**整行不出现**、
+  //    工作区行照常、切换功能本身不受影响（index.js :1619 既有纪律：读不到就不显示，绝不炸卡）。
+  {
+    const dmBackup = dmSelection
+    const msBackup = modelSelectionState
+    dmSelection = null
+    modelSelectionState = undefined
+    try {
+      const guardSessMark = createdSessions
+      const guardCardsMark = sentCards.length
+      feedInbound('om_switch_new_nomodel', '/switch ' + (wsIndexOther + 1) + ' new')
+      await drain()
+      const guardCreates = sentCards.slice(guardCardsMark)
+        .filter((c) => c.op === 'create' && c.payload && !c.payload.schema && Array.isArray(c.payload.elements))
+      const guardLast = guardCreates[guardCreates.length - 1]
+      const guardBody = guardLast ? String(guardLast.payload.elements[0].content || '') : ''
+      ok(createdSessions === guardSessMark + 1, '对照组：模型取不到时切换照常新建成功（取数失败不炸切换）')
+      ok(guardBody.includes('新建会话并切过去'), '对照组：成功文案照常（' + JSON.stringify(guardBody.slice(0, 60)) + '…）')
+      ok(!guardBody.includes('下一条消息将用'), '★★ 对照组：模型取不到 ⇒ 模型行整行不出现（防恒真，#497）')
+      ok(guardBody.includes('🗂 工作区：'), '对照组：工作区行不受模型取数影响，照常显示')
+    } finally {
+      dmSelection = dmBackup
+      modelSelectionState = msBackup
+    }
+  }
 
   // ⑤ 运行中的会话（🟡）只给「新建」；文字接管也必须被挡住
   liveAgents.push({ id: 'fu-session-bbbb2222', session: agent.session })
@@ -2138,6 +2183,11 @@ console.log('25) 卡片底部「目标条」：目标全文 + 状态 + 上下文
   ok(body.includes('第 3/20 轮'), '轮数 N/M 正确')
   ok(body.includes('缓存命中'), '带缓存命中率')
   ok(/（\d+\.\d%）/.test(body), '上下文带占比')
+  // 中台 #496（WO-36 需求②）：full 模式状态栏 metric 追加「🤖 模型名」——只写模型名防挤断，
+  // provider 全名＋取值来源放展开面板（#497：来源是给 #339 当探针的小字）。
+  ok(/🤖 [A-Za-z0-9._\-\/]+/.test(body), '★★ 状态栏带「🤖 模型名」（#496 需求②）｜实得 ' + (body.match(/🤖 [^"｜_]{2,40}/) || ['（无）'])[0])
+  ok(body.includes('**模型**：`test/test-model`（全局默认）'),
+    '★★ 展开面板带模型全名＋取值来源（#497 探针口径）')
   ok(body.includes('collapsible_panel'), '目标条是可折叠面板')
   ok(body.includes('"tag":"hr"'), '目标条上面有灰色分隔线 hr（CM 2026-10-01：不然跟正文混到一起）')
 
@@ -2170,6 +2220,7 @@ console.log('25) 卡片底部「目标条」：目标全文 + 状态 + 上下文
   ok(!body3.includes('未启用'), '★ 无目标时目标条**不再**写「未启用」（一行只有一个模式位）')
   ok(body3.includes('grey-50'), '未启用形态也有灰色底（grey-50）')
   ok(body3.includes('"tag":"hr"'), '未启用形态同样带灰色分隔线')
+  ok(/🤖 [A-Za-z0-9._\-\/]+/.test(body3), '★★ 无目标分支的灰底行同样带「🤖 模型名」（#496 需求②）')
   fakeGoalEnabled = true
 }
 
