@@ -1525,7 +1525,7 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   ok(resumedSessions === tookBefore + 1, '点「接管」真的 resume 了那个会话（接管生效）')
   ok(cardsSince(takeoverMark).filter((c) => c.op === 'create').length === 0,
     '接管后**没有新发卡片**（结果写回同一张）')
-  ok(JSON.stringify(cardsSince(takeoverMark)).includes('已接管'), '结果直接显示在原来那张卡上')
+  ok(JSON.stringify(cardsSince(takeoverMark)).includes('会话接管成功'), '结果直接显示在原来那张卡上（CM 2026-10-12 定稿标题）')
   // 2026-10-02 CM：「切换了…那个卡片就是已切换就行了，就不要有一个返回按钮啊」
   // ⇒ 结果卡＝**终态卡**：一个按钮都不留（旧写法挂了个「← 回到工作区列表」）。
   const resultCard = sentCards.slice(takeoverMark).filter((c) => c.op === 'update').pop()
@@ -1537,8 +1537,8 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   // 「下一条消息实际会用的模型」——写具体名（provider/model），禁止只写「默认」。
   ok(JSON.stringify(resultCard && resultCard.payload).includes('🗂 工作区：'),
     '★★ 终态卡卡面直接给出工作区行（#496：不藏在句子里）')
-  ok(JSON.stringify(resultCard && resultCard.payload).includes('🤖 下一条消息将用：`test/test-model`'),
-    '★★ 终态卡写具体模型名 `test/test-model`（#497：写具体名，禁「默认」二字）')
+  ok(JSON.stringify(resultCard && resultCard.payload).includes('🤖 模型：test/**test-model**'),
+    '★★ 终态卡写具体模型名 test/test-model（CM 2026-10-12 定稿格式「🤖 模型：provider/**model**」；#497：禁「默认」二字）')
   ok(registryAttached.some((a) => a.id === 'gui-session-aaaa1111'),
     '接管时把会话**挂进了工作区注册表**（与 GUI 同源：侧边栏也看得到）')
 
@@ -1573,8 +1573,8 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
   const otherLeaf = OTHER_WORKSPACE.split(/[\\/]/).filter(Boolean).pop()
   ok(newReplyText().includes('🗂 工作区：**' + otherLeaf + '**'),
     '★★ 文字 /switch new 的回复同样带工作区行（两条路径同一份内容，#496）')
-  ok(newReplyText().includes('🤖 下一条消息将用：`test/test-model`'),
-    '★★ 文字路径也写具体模型名（#497）')
+  ok(newReplyText().includes('🤖 模型：test/**test-model**'),
+    '★★ 文字路径也写具体模型名（CM 2026-10-12 定稿格式，#497）')
 
   // ④B 对照组（#497 防恒真）：模型取不到（dm 桩回空、投影为 undefined）⇒ 模型行**整行不出现**、
   //    工作区行照常、切换功能本身不受影响（index.js :1619 既有纪律：读不到就不显示，绝不炸卡）。
@@ -1593,8 +1593,8 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
       const guardLast = guardCreates[guardCreates.length - 1]
       const guardBody = guardLast ? String(guardLast.payload.elements[0].content || '') : ''
       ok(createdSessions === guardSessMark + 1, '对照组：模型取不到时切换照常新建成功（取数失败不炸切换）')
-      ok(guardBody.includes('新建会话并切过去'), '对照组：成功文案照常（' + JSON.stringify(guardBody.slice(0, 60)) + '…）')
-      ok(!guardBody.includes('下一条消息将用'), '★★ 对照组：模型取不到 ⇒ 模型行整行不出现（防恒真，#497）')
+      ok(guardBody.includes('新建会话并切换成功'), '对照组：成功文案照常（' + JSON.stringify(guardBody.slice(0, 60)) + '…）')
+      ok(!guardBody.includes('🤖 模型：'), '★★ 对照组：模型取不到 ⇒ 模型行整行不出现（防恒真，#497）')
       ok(guardBody.includes('🗂 工作区：'), '对照组：工作区行不受模型取数影响，照常显示')
     } finally {
       dmSelection = dmBackup

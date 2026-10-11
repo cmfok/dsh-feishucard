@@ -7458,6 +7458,21 @@ export function apply(ctx) {
     return parts.length ? parts[parts.length - 1] : '（无工作区）'
   }
 
+  // CM 2026-10-12 定稿卡面格式：工作区行括号里给「短路径」——能相对 HOME 缩短就相对
+  // （staging：/srv/aiad/agents/supervisor ⇒ agents/supervisor），相对不了（跨盘等）原样；
+  // 反斜杠统一成正斜杠，与 CM 给的示例同形。纯显示层，比较用大小写不敏感（Windows 盘符）。
+  function shortWorkspacePath(cwd) {
+    let p = String(cwd || '').replace(/\\/g, '/')
+    const home = String(process.env.HOME || process.env.USERPROFILE || '')
+      .replace(/\\/g, '/').replace(/\/+$/, '')
+    if (home) {
+      const low = p.toLowerCase()
+      const homeLow = home.toLowerCase() + '/'
+      if (low.indexOf(homeLow) === 0) p = p.slice(home.length + 1)
+    }
+    return p
+  }
+
   function sameWorkspace(a, b) {
     const norm = (v) => String(v || '').replace(/[\\/]+$/, '').toLowerCase()
     return norm(a) === norm(b) && norm(a) !== ''
@@ -8260,19 +8275,22 @@ export function apply(ctx) {
     // 拼进 say 的文本 ⇒ 点卡路径（buildSwitchResultCard 的 markdown）与文字命令路径
     // （sendPlainText）拿到的是同一份内容，不会各改各的。取数沿用 :1619 既有纪律：
     // 读不到的行整行不出现，且取数失败绝不影响切换本身（try 包住）。
-    // 模型取 currentModelOf ⇒ pending→lastUsed→全局默认，正是「下一条消息实际会用的那个」；
-    // 来源小字（本会话已选/全局默认）给 #339 当探针：卡上写 X、实际用 Y 即复现证据。
-    const ctxSuffix = () => {
-      const lines = []
-      if (cwd) lines.push('🗂 工作区：**' + workspaceLeaf(cwd) + '**（`' + cwd + '`）')
+    // 模型取 currentModelOf ⇒ pending→lastUsed→全局默认，正是「下一条消息实际会用的那个」。
+    // 🔴 卡面格式 CM 2026-10-12 定稿（三行，覆盖 0.8.9 初版的长句+来源小字写法）：
+    //   **新建会话并切换成功**
+    //   🗂 工作区：**supervisor**（路径:agents/supervisor）
+    //   🤖 模型：zai-coding-cn/**glm-5.3-flash**
+    // 具体模型名（provider/model）照旧必写（#497 口径不变）；来源小字按 CM 定稿从卡面移除
+    //（展开面板 detail 里的来源行保留，#339 探针口径不丢）。
+    const switchBody = (title) => {
+      const lines = ['**' + title + '**']
+      if (cwd) lines.push('🗂 工作区：**' + workspaceLeaf(cwd) + '**（路径:' + shortWorkspacePath(cwd) + '）')
       let m = null
       try { m = currentModelOf(liveAgentForChat(chat)) } catch { }
       if (m && m.provider && m.model) {
-        const src = modelSourceText(m.source)
-        lines.push('🤖 下一条消息将用：`' + m.provider + '/' + m.model + '`'
-          + (src ? ' _（' + src + '）_' : ''))
+        lines.push('🤖 模型：' + m.provider + '/**' + m.model + '**')
       }
-      return lines.length ? '\n' + lines.join('\n') : ''
+      return lines.join('\n')
     }
     if (mode === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
@@ -8288,16 +8306,14 @@ export function apply(ctx) {
       persistChats(bot, bot.chats)
       await attachSessionToWorkspace(row, sessionId)
       console.log('[fs] /switch new session ' + sessionId + ' cwd=' + cwd)
-      await say('✅ 已在工作区 `' + cwd + '` **新建会话并切过去**（旧会话一个都没动，会话 id `'
-        + shortSessionId(sessionId) + '`）。接着往下说就行。' + ctxSuffix())
+      await say(switchBody('新建会话并切换成功'))
       return
     }
     const idx = chat.sessions.findIndex((s) => String(s.id) === String(row && row.sessionId))
     if (idx >= 0) {
       chat.activeIndex = idx
       persistChats(bot, bot.chats)
-      await say('✅ 已切到本聊天已有的会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」。'
-        + ctxSuffix())
+      await say(switchBody('已切换到会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」'))
       return
     }
     if (row.live) {
@@ -8317,8 +8333,7 @@ export function apply(ctx) {
     persistChats(bot, bot.chats)
     await attachSessionToWorkspace(row, row.sessionId)
     console.log('[fs] /switch takeover session ' + row.sessionId + ' cwd=' + cwd)
-    await say('✅ 已接管会话 `' + shortSessionId(row.sessionId) + '`'
-      + (cwd ? '（工作目录 `' + cwd + '`）' : '') + '，接着往下说就行。' + ctxSuffix())
+    await say(switchBody('会话接管成功'))
   }
 
   async function handleSwitchAction(bot, chatId, value) {
