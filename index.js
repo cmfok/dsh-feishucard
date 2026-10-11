@@ -5522,7 +5522,20 @@ export function apply(ctx) {
       //   旧实现**静默丢弃** ⇒ CM「转发卡片到 dsh，没反应」。
       const kind = String((evt && (evt.msg_type || evt.message_type)) || 'unknown')
       const salvaged = salvageTextFromRich(evt)
-      if (salvaged) {
+      // 中台 #510（CM 2026-10-12 报障「转发卡片 agent 读不出，说版本要升级」）：
+      //   飞书对 **JSON 2.0 卡片**在转发/跨会话场景做**服务端转译**——消息通道里落的不是原卡，
+      //   而是一张「通用火箭占位图 +『请升级至最新版本客户端，以查看内容』」的替身卡
+      //   （机器实证 2026-10-12：转发卡与 bot 直发 2.0 卡在 IM 历史/单条 API 里都是同一替身形状，
+      //   占位图下载实拍＝通用火箭图，原卡文字不存在）。旧实现把这句占位文案抠出来当正文喂给
+      //   agent ⇒ agent 复述「版本要升级」（错误归因）。识别到替身特征短语 ⇒ 改喂**诚实说明**，
+      //   不再把占位当正文；正常卡（有真内容）照走 salvage，不受影响。
+      if (salvaged && salvaged.indexOf('请升级至最新版本客户端') >= 0) {
+        text = '（收到一张飞书卡片消息，但它是飞书**服务端转译的占位卡**：飞书对 JSON 2.0 卡片在'
+          + '转发/跨会话场景只给「占位图＋请升级提示」，原卡片文字不在消息里，我读不到原内容'
+          + '——这不是客户端版本问题。要看内容请把要点**直接复制成文字**发我，或**截图**发我。）'
+        console.log('[fs] inbound snapshot-placeholder card: type=' + kind + ' chat=' + chatId
+          + ' message_id=' + String(messageId || ''))
+      } else if (salvaged) {
         text = '（飞书**非文本**消息，类型 ' + kind + '；以下是从消息里抽出的正文）\n' + salvaged
         console.log('[fs] inbound rich message salvaged: type=' + kind + ' chat=' + chatId
           + ' message_id=' + String(messageId || '') + ' chars=' + salvaged.length)

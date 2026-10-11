@@ -4180,6 +4180,29 @@ console.log('58) ★ 0.7.9 P6：非文本入站（转发卡片）不许静默丢
     '★ 抠不到文字时**回一条可见提示**（绝不静默）')
   ok(consoleLines.some((l) => l.includes('inbound dropped visible') && l.includes('message_id=')),
     '★ 留痕 inbound dropped visible 且带 chat/message_id（可事后对上是谁发的）')
+
+  // 中台 #510（CM 2026-10-12）：飞书对 JSON 2.0 卡转发/跨会话做服务端转译，消息通道里只有
+  // 「占位图＋请升级提示」替身。旧实现把占位文案当正文喂给 agent ⇒ agent 复述「版本要升级」。
+  // 正例：替身卡 ⇒ agent 收到**诚实说明**（不含占位原文）；对照组＝上面 GAMMA 真内容卡照走 salvage。
+  const markSnap = sentCards.length
+  feedInboundRaw('om_card_snapshot', 'interactive', {
+    title: 'finance',
+    elements: [[
+      { tag: 'img', image_key: 'img_v3_snap_placeholder' },
+      { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+      { tag: 'text', text: '' },
+    ]],
+  })
+  await settle(3)
+  const fedSnap = JSON.stringify(agent.sent.slice(-3))
+  ok(!fedSnap.includes('请升级至最新版本客户端'),
+    '★★ 占位文案**不再当正文喂给模型**（旧字节把「请升级…」原样送进会话＝agent 复述"版本要升级"）')
+  ok(fedSnap.includes('占位卡') && fedSnap.includes('不是客户端版本问题'),
+    '★★ 占位卡 ⇒ agent 收到诚实说明（服务端转译、读不到原内容、非版本问题，#510）')
+  ok(consoleLines.some((l) => l.includes('inbound snapshot-placeholder card') && l.includes('message_id=')),
+    '★ 留痕 inbound snapshot-placeholder card 且带 chat/message_id')
+  ok(fedRich.includes('卡片正文-GAMMA') || fedRich.includes('卡片标题-Z'),
+    '★ 对照组：真内容卡片照走 salvage 抠正文（占位识别不误伤正常卡）')
 }
 
 console.log('59) ★ 0.7.9 P5：11310（表格/元素超限）不再"通知+抢救+换卡"三连（CM：卡片乱发）')
