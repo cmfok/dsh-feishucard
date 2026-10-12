@@ -865,6 +865,14 @@ await new Promise((r) => setTimeout(r, 600))
 for (const fn of intervals) fn()
 await new Promise((r) => setTimeout(r, 600))
 ok(createdSessions === 2, '/new created a second session (' + createdSessions + ')')
+// 中台 #496/#497 补口（CM 2026-10-12 指出 /new 入口漏改）：/new 回复同样按定稿三行格式。
+{
+  const newReply = sentCards.filter((c) => c.op === 'create' && c.payload && !c.payload.schema && Array.isArray(c.payload.elements)).pop()
+  const newText = newReply ? String(newReply.payload.elements[0].content || '') : ''
+  ok(newText.includes('新建会话「调研」并切换成功') && newText.includes('🗂 工作区：')
+    && /🤖 模型：.+\*\*/.test(newText),
+    '★★ /new 回复按 CM 定稿三行格式（标题＋工作区＋模型；实际 ' + JSON.stringify(newText.slice(0, 80)) + '…）')
+}
 
 console.log('5) fallback path (circuit open => plain text)')
 const before = sentCards.length

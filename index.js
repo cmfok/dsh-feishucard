@@ -4200,8 +4200,19 @@ export function apply(ctx) {
       // cmd.arg 是整段压平文本（splitCommand 连换行一起压成空格）。
       // 只改 label 不改这里，就会出现「状态表里名字是对的、回复里还是一整段」的割裂
       //（CM 实测：label=「[名称] 新建会话」，回复却回了全部 10 行）。
-      await sendPlainText(bot, chatId, '已新建会话' + (nameArg ? '「' + nameArg + '」' : '') + '并切换过去。'
-        + (stoppedPrev ? '（旧会话 ' + stoppedPrev + ' 已停 —— 避免两个会话同时往这个群发卡）' : ''))
+      // 🔴 中台 #496/#497（CM 2026-10-12 指出本入口漏改）：/new 是「创建新会话」的
+      // 最常用入口，卡面/回复**同样**按 CM 定稿三行格式给工作区与模型（0.8.10 只改了
+      // /switch 三个出口，漏了这里）。/new 不传 cwd ⇒ 用 bot 默认工作区；新会话还没跑过
+      // 请求 ⇒ currentModelOf 走全局默认，正是「下一条消息会用的模型」（#497 口径）。
+      const newCwd = String((bot.cfg && bot.cfg.workspace) || '')
+      let newModel = null
+      try { newModel = currentModelOf(liveAgentForChat(chat)) } catch { }
+      if (!newModel) { try { newModel = currentModelOf(null) } catch { } }
+      await sendPlainText(bot, chatId, '**新建会话' + (nameArg ? '「' + nameArg + '」' : '') + '并切换成功**'
+        + (newCwd ? '\n🗂 工作区：**' + workspaceLeaf(newCwd) + '**（路径:' + shortWorkspacePath(newCwd) + '）' : '')
+        + (newModel && newModel.provider && newModel.model
+          ? '\n🤖 模型：' + newModel.provider + '/**' + newModel.model + '**' : '')
+        + (stoppedPrev ? '\n（旧会话 ' + stoppedPrev + ' 已停 —— 避免两个会话同时往这个群发卡）' : ''))
       return true
     }
     if (resolved === 'list') {
