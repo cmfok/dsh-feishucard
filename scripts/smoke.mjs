@@ -496,6 +496,7 @@ let dmSilentDrop = false
 let dmSaveFails = false
 let dmSaveHangs = false
 let dmNoSaveApi = false
+let dmServiceAbsent = false               // #350：true ⇒ ctx.get('agentDefaultModel') 返回 undefined（服务整个不在）
 // 🔴 第四十四轮 MEDIUM#5（核对为真）：#124 各格全在**第一拍**回读就命中（健康桩当场写、
 //   静默桩永远不写）⇒ 轮询循环的后续拍与「宿主半拍后落地（第 N 拍读到）」支是死代码。
 //   dmDelayedLand=N ⇒ 健康 selectModel 不即时写默认值，前 N 次 currentSelection() 仍读旧值、
@@ -520,6 +521,7 @@ function resetDmFixtures() {
   dmSaveFails = false
   dmSaveHangs = false
   dmNoSaveApi = false
+  dmServiceAbsent = false
   dmDelayedLand = 0
   dmPendingLand = null
   dmSelection = { provider: 'test', model: 'test-model' }
@@ -600,6 +602,8 @@ const ctx = {
     }
     if (key === 'sandboxPolicy') return { workspaceRoot: WORKSPACE }
     if (key === 'agentDefaultModel') {
+      // #350 fail-loud 面：服务整个不在（宿主头几拍未注册/热重载风暴期）⇒ 返回 undefined。
+      if (dmServiceAbsent) return undefined
       // #124 有状态桩：见文件头 dm* 系列开关的注释。
       const dmSvc = {
         currentSelection: () => {
@@ -1607,6 +1611,62 @@ console.log('15) /switch：两级（① 工作区 → ② 该工作区的会话�
     } finally {
       dmSelection = dmBackup
       modelSelectionState = msBackup
+    }
+  }
+
+  // ④C 中台 #529（修复后回归钉子）：fs-main- 前缀的会话 id，短 id 取**尾 8 位**——
+  //    旧实现 slice(0,8) 恰好只剩前缀「fs-main-」，列表/终态卡里所有新建会话显示
+  //    同一串无信息量前缀（staging 0.8.9 真机实拍）。无 title/summary 时 label 回落
+  //    shortSessionId ⇒ /list 卡面即回归面。
+  {
+    const s529Backup = persistedSessions
+    const t529Had = Object.prototype.hasOwnProperty.call(persistedFirstText, 'fs-main-abc12345')
+    const t529Backup = persistedFirstText['fs-main-abc12345']
+    persistedSessions = [
+      { version: 0, id: 'fs-main-abc12345', createdAt: Date.now() - 300e3, cwd: OTHER_WORKSPACE },
+    ]
+    try {
+      const m529 = sentCards.length
+      feedInbound('om_list_529', '/list')
+      await drain()
+      const body529 = JSON.stringify(cardsSince(m529))
+      ok(body529.includes('abc12345'),
+        '★★ #529: fs-main- 前缀会话的短 id 显示尾 8 位（卡面含「abc12345」）')
+      ok(!body529.includes('fs-main-'),
+        '★★ #529: 裸前缀「fs-main-」不再出现在短 id 位置（旧实现必然显示它）')
+    } finally {
+      persistedSessions = s529Backup
+      if (t529Had) persistedFirstText['fs-main-abc12345'] = t529Backup
+      else delete persistedFirstText['fs-main-abc12345']
+    }
+  }
+
+  // ④D 中台 #350（fail-loud 面）：agentDefaultModel **服务整个不在**（宿主头几拍未注册/
+  //     热重载风暴期，CM 报障「/new 后首条消息没绑定模型」的病灶环境）⇒ createDedicated
+  //     退避重试 3×500ms 后必须抛错、且 /new 出口把失败**回执给用户**（不许静默建无模型
+  //     会话）。对照组语义见 ④B（服务在、选择空 ⇒ 照常回落创建，两条面不混淆）。
+  {
+    resetDmFixtures()
+    dmServiceAbsent = true
+    const beforeD = createdSessions
+    const markD = sentCards.length
+    try {
+      feedInbound('om_new_nomodel_svc', '/new')
+      await drain()
+      // 🔴 #350 重试窗是**真实 setTimeout**（3×500ms），drain() 的 mock 拍等不到它
+      //     ⇒ 回执迟到：既让本块抓空、又会漏进后续用例的窗口污染断言。等满重试窗。
+      await new Promise((resolve) => setTimeout(resolve, 1800))
+      await drain()
+      const repliesD = sentCards.slice(markD)
+        .filter((c) => c.op === 'create' && c.payload && !c.payload.schema && Array.isArray(c.payload.elements))
+      const lastD = repliesD[repliesD.length - 1]
+      const bodyD = lastD ? String(lastD.payload.elements[0].content || '') : ''
+      ok(createdSessions === beforeD, '★★ #350: 默认模型服务不在 ⇒ 不许建出无模型会话（创建数不变）')
+      ok(bodyD.includes('新会话创建失败') && bodyD.includes('agentDefaultModel'),
+        '★★ #350: /new 出口把失败原因回执给用户（fail-loud 不静默，实际：'
+        + JSON.stringify(bodyD.slice(0, 70)) + '…）')
+    } finally {
+      resetDmFixtures()
     }
   }
 
@@ -3229,6 +3289,27 @@ console.log('45) exit_plan_mode 经【工具层】接管（2026-10-02 换的通�
   const emptyPlan = await Promise.all(capture(emitCtx('tools/execute',
     { name: 'exit_plan_mode', agent, arguments: { plan: '   ' }, signal: undefined }, nextSpy)))
   ok(emptyPlan.every((o) => o.value === 'next'), '计划正文为空 ⇒ 交回下一个（不吞）')
+
+  // (a2) 中台 #330②（插件边界与降级标准 §三 L2「工具挂」，CM 2026-10-09 拍板）：
+  //      工具失败（isError:true）⇒ 给模型的返回文字追加「如实告知暂时不可用＋未经核实」
+  //      引导语；成功结果一字不动；瀑布不吞不抛（next 链原样透传）。
+  {
+    const bad = await Promise.all(capture(emitCtx('tools/execute',
+      { name: 'fake_broken_tool', agent, arguments: {}, signal: undefined },
+      async () => ({ isError: true, value: null, content: [{ type: 'text', text: '工具内部报错：连接超时' }] }))))
+    const badText = bad.map((o) => o.value && Array.isArray(o.value.content)
+      ? o.value.content.map((p) => p && p.text || '').join('') : '').join('')
+    ok(badText.includes('工具内部报错：连接超时') && badText.includes('暂时不可用')
+      && badText.includes('未经工具/数据核实'),
+      '★★ #330② L2: 工具失败结果被追加「如实告知＋未经核实」引导语（原错误文本保留）')
+    const good = await Promise.all(capture(emitCtx('tools/execute',
+      { name: 'fake_ok_tool', agent, arguments: {}, signal: undefined },
+      async () => ({ isError: false, value: 1, content: [{ type: 'text', text: 'fine' }] }))))
+    const goodText = good.map((o) => o.value && Array.isArray(o.value.content)
+      ? o.value.content.map((p) => p && p.text || '').join('') : '').join('')
+    ok(goodText.includes('fine') && !goodText.includes('未经工具/数据核实'),
+      '★★ #330② L2 对照组: 成功结果一字不动（不加引导语，防恒真）')
+  }
 
   // (b) 飞书会话 ⇒ 接管 + 出计划审查卡（计划正文必须完整在卡上）
   const mark = sentCards.length

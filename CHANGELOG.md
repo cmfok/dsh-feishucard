@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-15 · 契约 V1.1（minor）：identity_map 自助称呼列 display_name（CM 台账 H 系列裁决）
+
+- `scripts/resolve_actor.py`：ACTOR_KEYS 13→14，输出加 display_name（兜底 name）；判权路径零改动；自测 23→25 用例全过
+- `identity-inject.mjs`：组装 actor 加 display_name 键（与 py 同形，parity 9/9）；applyActorToArguments 注入 name 处 display_name 优先（兜底 name）；selftest 40/40
+- `identity-inject.mjs`：selftest 入口与 parity 路径判定改 fileURLToPath（修非 ASCII 工作区路径下入口判定失效的既有局限）
+- `scripts/build_identity_map.py`：新增 --migrate-display-name（存量补 display_name，is_cm 行=「CM」，v→1.1；幂等）；seed 生成带 display_name
+- 配套（G9 侧）：update_display_name.py 自助写通道（门禁+校验+落 spool，不改表）、dsh-update-display-name.js 桥薄壳、g9_alert_watch V3.1 心跳应用器（查 4）
+- 真名单点纪律：工资/法定链从 HRM 直取真名；display_name 新链路禁真名进显示层（工具侧连自己真名都禁取）
+
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -23,6 +32,34 @@ commit message 未单独标注，特此补记归属。** 该提交中以下内�
 ⚠️ 服务器侧（`/opt/scripts/G9/resolve_actor.py`、注入 JS、`job_grants.json`）**尚未部署本批改动**，
 随 G9 工具层全量切换批一起上（CM 2026-10-09 裁决：不做金丝雀，验收后全量切）；部署前服务器行为与 0.8.6 等价。
 契约文本（V1.3-26100901）见 `work/AIAD/0-必读文件/开发文件/身份-授权契约-v1.md`。
+
+## [0.8.14] - 2026-10-14
+
+**主题：#529 短 id 截断修复 ＋ #350 新会话模型注入退避重试/fail-loud ＋ #330② L2 工具失败引导语（三单一批，HOME#ZCode-sess_ac1913c9 施工）。本版未上生产、未发 npm；生产仍在 0.8.8（0.8.9-0.8.14 批次上生产走 G11 审批，G9 观察期至 10-15 避开重启）。**
+
+- **#529（low）**：`shortSessionId` 对 `fs-main-` 前缀会话改取**尾 8 位**——旧实现 `slice(0,8)`
+  恰好只剩前缀「fs-main-」，终态卡/列表里所有新建会话显示同一串无信息量前缀（staging 0.8.9
+  真机实拍）。纯显示层：/switch 序号解析（列表索引）与 persistedSessions id 全等比较不经此函数。
+  smoke 新增 2 断言（/list 卡面含尾 8 位「abc12345」＋裸前缀「fs-main-」不再出现）。
+- **#350（high，CM 报障「/new 后首条消息没绑定模型，第二次才正常」）**：`createDedicated` 三步——
+  ①`defaultAgentOptions()` 拿不到时**退避重试 3×500ms**（病灶＝agentDefaultModel 服务宿主头几拍
+  未就绪，与 C6 校验 MEDIUM#7 同源）；②重试后仍拿不到 ⇒ **区分两情形**：服务整个不在＝fail-loud
+  抛错（`/new` 与 `/switch N new` 出口补 catch，把失败原因**回执给用户**，不许静默建无模型会话）；
+  服务在但无默认选择＝宿主回落语义，按旧行为继续＋醒目留痕；③创建后**读回校验落库**打日志
+  （`#350 session model binding check: <id> → provider/model（来源）`；saveSelection 无门补写不了
+  ——见 verifyDefaultModelLanded 既有记录；留痕即 #339 探针：卡上写 X 实际用 Y 即复现证据）。
+  resumeDedicated 不动（旧会话已有落库选择，resume 的 agentOptions 本就可选）。
+  smoke 新增 2 断言（服务不在 ⇒ 创建数不变＋/new 出口回执失败原因）＋④D 等待修正
+  （重试窗是真实 setTimeout，drain 的 mock 拍等不到 ⇒ 回执迟到会污染后续用例窗口）。
+- **#330②（high，插件边界与降级标准 §三 L2「工具挂」，CM 2026-10-09 拍板）**：新增通用
+  `tools/execute` 瀑布——工具结果 `isError === true` 时给**模型**看到的 content 文本追加引导语
+  「该工具本次调用失败（暂时不可用）…凭自身知识回答必须声明未经工具/数据核实…不要假装工具成功了」。
+  只认结构化失败（g9-tools 形态：失败返回错误文本不抛），成功结果一字不动；包装失败 catch 后
+  原样返回（绝不吞结果）。至此 #330 四项整改全部落地（①权限拒绝统一文案＝0.8.6；
+  ②本条；③纯文本降级用例＝既有 fallback 用例＋0.8.6 拔件演习；④三条拔件演习＝0.8.6 用例 114）。
+  smoke 新增 2 断言（失败追加引导语＋成功对照不加）。
+- **验证**：`node --check` 绿；全量冒烟见当日执行记录（#529/#350 断言＋L2 断言全绿后随 G11 报批）。
+- 生产部署注意：G9 观察期至 2026-10-15，重启窗口避开观察期审计；0.8.9-0.8.14 合批走 G11。
 
 ## [0.8.13] - 2026-10-12
 

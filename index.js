@@ -28,6 +28,9 @@ import {
   TurnIdentityStore, applyActorToArguments, decideAction, makeResolver, pickMapPath, localMapPath,
   IDENTITY_KEYS,
 } from './identity-inject.mjs'
+// G3 员工会话「工具调用失败」旁路上报（#514 / D38=H-D95 路径A）。默认零触发：
+// 白名单（AIAD_G3_REPORT_CWD_ALLOW）与写入根（AIAD_INBOX_ROOT）不注入 ⇒ 不写任何东西。
+import { isG3OkrWorkspace, reportG3Failure } from './g3-inbox-report.mjs'
 
 // D5：进程内单例 —— 「本轮上下文」按 agent.id 存，所以多 bot 实例共享一个 store 也不会串号。
 // 表/resolver 路径默认取 /opt/scripts/G9/（服务器），可用 MAILBOX_IDENTITY_MAP 覆盖。
@@ -460,6 +463,14 @@ export function apply(ctx) {
     return h.toString(16).padStart(8, '0')
   }
 
+  // #1532（2026-10-16）：回调动作令牌（审批卡 fs_approval / 审批单 fs_form / 问题卡 fs_question /
+  //   能力申请 fs_cap_grant / 计划卡 fs_plan_goal 的 randomUUID）**不整串进日志**——日志只留
+  //   sha256 前 10 位短摘要：排障要的是「两行日志能不能对上同一张卡」，摘要可关联、不可逆推原文。
+  //   与 shortHash（djb2 载荷指纹）分工：令牌摘要必须走密码学散列，不能用可碰撞的指纹凑数。
+  function tokenDigest(token) {
+    return createHash('sha256').update(String(token == null ? '' : token)).digest('hex').slice(0, 10)
+  }
+
   // 找出某个会话当前正在跑的、还没封口的卡片（用于让 feishu_send 知道"这个对话正在被回复"）。
   // 2026-09-15：agent 在活跃对话里调 feishu_send 会另发一条消息，与卡片里的回复重复
   //（CM 反馈"同一段东西分两个卡片发"）——有活跃卡时应当跳过。
@@ -822,18 +833,46 @@ export function apply(ctx) {
   }
 
   // ---- outbound HTTP -------------------------------------------------------
-  async function httpJson(url, method, headers, body, signal) {
+  // #1533（2026-10-16）：**所有外呼带有限时限**。旧实现只有调用方传 signal 才有中止
+  //   （全文件只有卡片同步链传），其余调用一旦对端不响应就无限挂起（undici 默认要等
+  //   好几分钟），且 httpJson 把异常吞成 `{status:0}` 后表面看只是「慢」。现在统一套
+  //   AbortSignal.timeout 兜底：不传 signal ⇒ 默认 15s；已传 signal（卡片同步自带
+  //   CARD_TIMEOUT=15s）⇒ AbortSignal.any 并联，谁先触发谁生效，行为不收窄。
+  //   超时的失败必须**可识别**：错误信息里带「超时」与 timeout 字样，不许静默挂起。
+  const HTTP_JSON_TIMEOUT_MS = 15000      // 常规 API（token/消息/卡片/表情）默认时限
+  const HTTP_UPLOAD_TIMEOUT_MS = 60000    // 图片/文件上传与入站资源下载放宽到 60s
+  async function fetchWithDeadline(url, options, timeoutMs) {
+    const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : HTTP_JSON_TIMEOUT_MS
+    const deadline = AbortSignal.timeout(ms)
+    const signal = options && options.signal ? AbortSignal.any([options.signal, deadline]) : deadline
     try {
-      const response = await fetch(url, {
+      return await fetch(url, { ...options, signal })
+    } catch (error) {
+      if (deadline.aborted) {
+        throw new Error('HTTP 请求超时（timeout）' + ms + 'ms: '
+          + String((options && options.method) || 'GET') + ' ' + String(url).slice(0, 200))
+      }
+      throw error
+    }
+  }
+  async function httpJson(url, method, headers, body, signal, timeoutMs) {
+    try {
+      const response = await fetchWithDeadline(url, {
         method,
         headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         ...(signal ? { signal } : {}),
-      })
+      }, timeoutMs)
       const text = await response.text()
       return { status: response.status, text }
     } catch (error) {
-      return { status: 0, text: String(error && error.message || error) }
+      // 读 body 阶段被 deadline 掐断时 undici 抛 TimeoutError（英文报文）——统一补上
+      // 「超时」字样；fetchWithDeadline 已改写的超时报文不再重复加前缀。
+      let msg = String(error && error.message || error)
+      if (error && error.name === 'TimeoutError' && !/超时/.test(msg)) {
+        msg = 'HTTP 请求超时（timeout）: ' + msg
+      }
+      return { status: 0, text: msg }
     }
   }
 
@@ -2123,11 +2162,12 @@ export function apply(ctx) {
     const form = new FormData()
     form.append('image_type', 'message')
     form.append('image', new Blob([buf]), baseNameOf(filePath) || 'image.png')
-    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
+    // #1533：上传类走 60s 宽限（大图/大文件在慢链路上合法地慢），超时抛带「超时」字样的错。
+    const res = await fetchWithDeadline('https://open.feishu.cn/open-apis/im/v1/images', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
       body: form,
-    })
+    }, HTTP_UPLOAD_TIMEOUT_MS)
     const parsed = parseJson(await res.text())
     const key = parsed && parsed.data && parsed.data.image_key
     if (!(res.status >= 200 && res.status < 300) || !key) {
@@ -2160,11 +2200,12 @@ export function apply(ctx) {
     form.append('file_type', FILE_TYPES[ext] || 'stream')
     form.append('file_name', name)
     form.append('file', new Blob([buf]), name)
-    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/files', {
+    // #1533：上传类走 60s 宽限（与 uploadImage 同口径）。
+    const res = await fetchWithDeadline('https://open.feishu.cn/open-apis/im/v1/files', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
       body: form,
-    })
+    }, HTTP_UPLOAD_TIMEOUT_MS)
     const parsed = parseJson(await res.text())
     const key = parsed && parsed.data && parsed.data.file_key
     if (!(res.status >= 200 && res.status < 300) || !key) {
@@ -2770,10 +2811,19 @@ export function apply(ctx) {
           if (tool) {
             if (tool.status === 'running') card.pendingTools = Math.max(0, Number(card.pendingTools || 0) - 1)
             const block = event.data.message.content && event.data.message.content[0]
-            tool.status = block && block.isError ? 'failed' : 'completed'
+            // 🔴 #1277 实流取证（2026-10-16 staging 真实事件钉死）：harness 把失败标记写在**消息层**
+            //    event.data.message.isError，content[0] 块里没有 isError 字段——旧判据只看 block.isError
+            //    ⇒ 真实工具失败全被记成 completed，G3 旁路一个字节都不投（静默漏报，正是本单要治的病）。
+            //    两处任一为 true 即判失败，兼容未来标记下放回块形态。
+            const failed = event.data.message.isError === true || (block && block.isError === true)
+            tool.status = failed ? 'failed' : 'completed'
             if (tool.status === 'failed') {
               tool.error = toolResultText(event.data.message)
                 || (event.data.error && event.data.error.code ? 'code ' + event.data.error.code : '失败')
+              // G3 员工会话失败旁路上报（#514）：先在扫描处做精确 workspace 门禁；
+              // reportG3Failure() 仍会重复门禁，防止未来出现绕过扫描器的直接调用。
+              const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
+              if (isG3OkrWorkspace({ env: process.env, cwd })) reportG3Failure(agent, tool)
             }
             changed = true
           }
@@ -3560,13 +3610,41 @@ export function apply(ctx) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
     const cfg = bot.cfg
-    return agents.create({
+    // 中台 #350（CM 报障：/new 后首条消息没绑定模型，第二条才正常）：agentDefaultModel
+    // 在宿主头几拍可能还没就绪（与下方 C6 校验 MEDIUM#7 注释同证），defaultAgentOptions()
+    // 偶发拿不到 ⇒ agents.create 不带 agentOptions ⇒ 会话无模型选择落库，首条请求落
+    // fallback。按工单建议三步：①短暂退避重试（3×500ms）；②重试后仍拿不到 ⇒ 区分两种
+    // 情形——服务整个不在＝异常环境 fail-loud 抛错（调用方给用户回执，不许静默建无模型
+    // 会话）；服务在但无默认选择＝宿主语义允许回落，按旧行为继续＋醒目留痕；
+    // ③创建后读回校验落库并打日志（saveSelection 无门、补写做不到——见
+    // verifyDefaultModelLanded 的记录；留痕即 #339 探针：卡上写 X 实际用 Y 即复现证据）。
+    let agentOptions = defaultAgentOptions()
+    for (let i = 0; !agentOptions && i < 3; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      agentOptions = defaultAgentOptions()
+    }
+    if (!agentOptions) {
+      const dm = ctx.get('agentDefaultModel')
+      if (!dm) {
+        throw new Error('agentDefaultModel 服务不可用（重试 3×500ms 仍拿不到）——拒绝创建无模型会话（中台 #350 fail-loud）')
+      }
+      console.log('[fs] ⚠️ #350: 默认模型选择为空（服务在、无默认配置或未就绪）——按宿主回落继续创建，落库校验见下一行')
+    }
+    const handle = await agents.create({
       sessionId,
       meta: { cwd: (cwdOverride && String(cwdOverride).trim())
         || (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined },
-      ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
+      ...(agentOptions ? { agentOptions } : {}),
       setup: (agentCtx) => mountStandardPreset(bot, agentCtx),
     })
+    try {
+      const landed = currentModelOf(handle && handle.agent)
+      console.log('[fs] #350 session model binding check: ' + sessionId + ' → '
+        + (landed && landed.provider
+          ? landed.provider + '/' + landed.model + '（' + modelSourceText(landed.source) + '）'
+          : 'NONE（宿主未落库 ⚠️ 桥只留痕，saveSelection 无门补写不了）'))
+    } catch { }
+    return handle
   }
 
   async function resumeDedicated(bot, sessionId) {
@@ -3654,12 +3732,59 @@ export function apply(ctx) {
     writeState(bot.cfg.appId, state)
   }
 
+  // ---- #771 根治 B：resume/revive 腿挂载检测（2026-10-14，staging 落码待审批上产）----
+  // 生产实证（中台 #771）：hr bot 接管旧会话后 journal 照打「preset mounted」，但被接管
+  // 会话的模型目录缺 preset 工具（jlog 7/7 reason=resume；#557 修正诊断进一步实证新会话
+  // 同样可能缺）。检测手段：宿主 tools 服务按 agent 视角查 'read'（tool-fs 的招牌工具，
+  // 三张 preset 都声明）——不可见即挂载丢失。
+  // 保守边界：探测自身异常（服务不在/接口变化）⇒ 不判缺失不重建，只留日志——误杀好会话
+  // = 丢历史，比带病放行更贵；只有 'read' 明确缺席才触发重建。
+  function presetToolsMissing(agent) {
+    try {
+      const tools = ctx.get('tools')
+      if (!tools || typeof tools.get !== 'function') return false   // 旧宿主无此接口：不判
+      return tools.get('read', agent) === undefined
+    } catch (error) {
+      console.log('[fs] #771 preset tools probe failed (no rebuild): ' + String(error && error.message || error))
+      return false
+    }
+  }
+
+  // 探测失败（缺工具）⇒ 自动重建一个全新 dedicated 会话替换当前条目（chat 指针/落盘同步
+  // 更新）。重建失败 ⇒ 带病放行原 agent 并留日志（收发至少还通）。只挂 resolveAgent 统一
+  // 出口（入站消息主路径）；/switch 的手工 resume 腿本轮不动（影响面收窄，见单 #771）。
+  async function ensurePresetTools(bot, chat, agent) {
+    if (!agent || !presetToolsMissing(agent)) return agent
+    const entry = chat.sessions[chat.activeIndex]
+    const oldId = entry && entry.id
+    console.log('[fs] #771 preset tools missing on ' + oldId + ' (mount lost) — rebuilding session')
+    try {
+      const sessionId = 'fs-main-' + Date.now().toString(36)
+      const handle = await createDedicated(bot, sessionId)
+      if (entry) {
+        entry.id = sessionId
+        entry.label = String(entry.label || '会话') + '（挂载丢失已自动重建）'
+        entry.title = undefined
+        entry.type = 'dedicated'
+        entry.gen = SESSION_GEN
+        entry.handle = handle
+      }
+      persistChats(bot, bot.chats)
+      console.log('[fs] #771 rebuilt session ' + sessionId + ' replacing ' + oldId)
+      return handle.agent
+    } catch (error) {
+      console.log('[fs] #771 rebuild failed, falling back to original agent ' + oldId + ': '
+        + String(error && error.message || error))
+      return agent
+    }
+  }
+
   // Resolve the live agent handle for a chat's active session.
   async function resolveAgent(bot, chat, mainAgent) {
     const entry = chat.sessions[chat.activeIndex]
     if (!entry) return undefined
     if (entry.type === 'main') return undefined          // legacy marker -> recreate
-    if (entry.handle) return entry.handle.agent
+    if (entry.handle) return ensurePresetTools(bot, chat, entry.handle.agent)
     // (1) The session may already be LIVE in this process: DSH restores
     //     sessions on boot (and the GUI may hold them). resume would be
     //     rejected with "cannot prepare session while it is live", but the
@@ -3672,7 +3797,7 @@ export function apply(ctx) {
       if (live) {
         entry.handle = { agent: live }
         console.log('[fs] reused live session ' + entry.id + ' (context preserved)')
-        return live
+        return ensurePresetTools(bot, chat, live)
       }
     } catch (error) {
       console.log('[fs] live lookup failed: ' + String(error && error.message || error))
@@ -3681,7 +3806,7 @@ export function apply(ctx) {
     try {
       const handle = await resumeDedicated(bot, entry.id, mainAgent)
       entry.handle = handle
-      return handle.agent
+      return ensurePresetTools(bot, chat, handle.agent)
     } catch (error) {
       console.log('[fs] resume failed for ' + entry.id + ': ' + String(error && error.message || error))
       return undefined
@@ -4192,7 +4317,17 @@ export function apply(ctx) {
         }
       }
       const sessionId = 'fs-main-' + Date.now().toString(36)
-      const handle = await createDedicated(bot, sessionId)
+      // 中台 #350 fail-loud 回执：createDedicated 对「默认模型服务不可用」会抛错，
+      // 这里不能让命令无响应——捕住并原样告诉用户（回执文案带根因，CM 可直接照着处置）。
+      let handle
+      try {
+        handle = await createDedicated(bot, sessionId)
+      } catch (error) {
+        console.log('[fs] /new create failed: ' + String(error && error.message || error))
+        await sendPlainText(bot, chatId, '❌ 新会话创建失败：' + String(error && error.message || error)
+          + '。稍后重发 /new；仍失败请查看桥日志。')
+        return true
+      }
       chat.sessions.push({ id: sessionId, label: nameArg || ('会话 ' + (chat.sessions.length + 1)), type: 'dedicated', gen: SESSION_GEN, handle })
       chat.activeIndex = chat.sessions.length - 1
       persistChats(bot, bot.chats)
@@ -5281,7 +5416,11 @@ export function apply(ctx) {
       const token = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
       const url = 'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(messageId)
         + '/resources/' + encodeURIComponent(key) + '?type=' + type
-      const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+      // #1533：资源下载也带有限时限（60s 宽限，与上传同口径）。排队路径另有
+      // withDownloadBail 的可见失败兜底（默认 15s 先到先报）；这里的 deadline 保证
+      // 挂死的连接本身最终会被掐断，不再无限占用。超时被外层 catch 转成⚠️回执。
+      const res = await fetchWithDeadline(url,
+        { headers: { Authorization: 'Bearer ' + token } }, HTTP_UPLOAD_TIMEOUT_MS)
       if (!res.ok) {
         console.log('[fs] inbound file download failed: HTTP ' + res.status + ' (' + fileName + ')')
         // 失败必须**可见**（否则又回到"我不知道你发了文件"）：回一条文本，让插件照常起轮告诉 CM。
@@ -5494,7 +5633,7 @@ export function apply(ctx) {
         const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
         const r = idc.resolver.resolve(openId)
         identityActor = r.actor
-        idc.store.set(entry.agent.id, { actor: r.actor, chatId, messageId: evt.message_id, tableOk: r.tableOk })
+        idc.store.set(entry.agent.id, { actor: r.actor, chatId, messageId: evt.message_id, tableOk: r.tableOk, err: r.err })
         console.log('[fs] identity(steer): agent=' + entry.agent.id
           + ' open_id=' + String(openId).slice(0, 12) + '…'
           + ' -> ' + (r.actor ? ('OK ' + r.actor.name) : String(r.err || 'no_actor'))
@@ -5778,7 +5917,7 @@ export function apply(ctx) {
         const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
         const r = idc.resolver.resolve(openId)
         identityActor = r.actor
-        idc.store.set(agent.id, { actor: r.actor, chatId, messageId, tableOk: r.tableOk })
+        idc.store.set(agent.id, { actor: r.actor, chatId, messageId, tableOk: r.tableOk, err: r.err })
         console.log('[fs] identity: agent=' + agent.id
           + ' open_id=' + String(openId).slice(0, 12) + '…'
           + ' -> ' + (r.actor ? ('OK ' + r.actor.name + ' source=' + r.actor.source) : String(r.err || 'no_actor'))
@@ -7116,7 +7255,7 @@ export function apply(ctx) {
       sendInteractive(bot, chatId, cardPayload)
         .then((msgId) => {
           record.cardId = msgId
-          console.log('[fs] approval card sent: ' + request.toolName + ' token=' + token)
+          console.log('[fs] approval card sent: ' + request.toolName + ' token=' + tokenDigest(token))
         })
         .catch((error) => {
           console.log('[fs] approval card send failed: ' + String(error && error.message || error))
@@ -7362,7 +7501,7 @@ export function apply(ctx) {
       .then((msgId) => {
         record.cardId = msgId
         console.log('[fs] capability request card sent: cap=' + capability
-          + ' to_approver_chat=' + String(approverChat).slice(-8) + ' token=' + token)
+          + ' to_approver_chat=' + String(approverChat).slice(-8) + ' token=' + tokenDigest(token))
       })
       .catch((error) => {
         if (record.timer) clearTimeout(record.timer)
@@ -7438,7 +7577,7 @@ export function apply(ctx) {
     const token = value.fs_cap_grant
     const record = pendingCapRequests.get(token)
     if (!record) {
-      console.log('[fs] capability click ignored (no pending request for token): ' + String(token).slice(0, 8))
+      console.log('[fs] capability click ignored (no pending request for token): ' + tokenDigest(token))
       // 🔴 第二十六轮门槛 LOW#8（核对为真）：失效卡的点击不许**只留日志**——30 分钟超时清理
       //   只在 PATCH 成功时才把卡改灰，PATCH 失败 ⇒ 卡还在、记录已没，审批人点「批准」
       //   毫无反应。与 fs_question/fs_plan_goal 同一口径：给点击者可见回执（不作答≠不吭声）。
@@ -7556,7 +7695,15 @@ export function apply(ctx) {
   const SWITCH_SESS_MAX = 50          // 翻页也只翻最近 50 个（避免为一个工作区读上百条会话）
   const pendingSwitchCards = new Map()   // token -> { bot, chatId, wsRows, ws, sessRows, timer }
 
-  function shortSessionId(id) { return String(id || '').slice(0, 8) }
+  // 中台 #529：本桥自建会话 id 形如 `fs-main-mv42umv4`，slice(0,8) 恰好只剩前缀
+  // 「fs-main-」——终态卡句子里所有新建会话显示同一串无信息量前缀（真机实拍
+  // staging 0.8.9 /switch 1 new）。区分度在尾巴 ⇒ 对该前缀改取尾 8 位；其余 id
+  // 维持 slice(0,8) 原样。纯显示层函数：/switch 文字命令序号解析走列表索引、
+  // persistedSessions 的 id 全等比较用完整 id，都不经过这里，不受影响。
+  function shortSessionId(id) {
+    const s = String(id || '')
+    return s.startsWith('fs-main-') && s.length > 8 ? s.slice(-8) : s.slice(0, 8)
+  }
 
   function fmtClock(ms) {
     if (!Number.isFinite(ms) || ms <= 0) return ''
@@ -8406,7 +8553,16 @@ export function apply(ctx) {
     }
     if (mode === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
-      const handle = await createDedicated(bot, sessionId, cwd)
+      // 中台 #350 fail-loud 回执：创建失败（如默认模型服务不可用）必须让点卡的人看到原因，
+      // 不能静默吞掉只留日志。
+      let handle
+      try {
+        handle = await createDedicated(bot, sessionId, cwd)
+      } catch (error) {
+        console.log('[fs] /switch new create failed: ' + String(error && error.message || error))
+        await say('❌ 新会话创建失败：' + String(error && error.message || error), 'warn')
+        return
+      }
       chat.sessions.push({
         id: sessionId,
         label: workspaceLeaf(cwd) + '（新建）',
@@ -9218,7 +9374,7 @@ export function apply(ctx) {
       const record = pendingForms.get(value.fs_form)
       if (!record) {
         // stale 点击**绝不静默**（照抄 fs_question 那条的做法）。
-        console.log('[fs] form button: record not found for chat ' + chatId + ' token=' + value.fs_form)
+        console.log('[fs] form button: record not found for chat ' + chatId + ' token=' + tokenDigest(value.fs_form))
         const hint = recentForms.get(value.fs_form)
           ? '这张审批单已经处理过了（点过即生效，重复点击不会再变）。'
           : '这张审批单已过期或已作废。请看我最新一条卡片，或让 AI 重新发一张。'
@@ -9265,7 +9421,7 @@ export function apply(ctx) {
       const record = questionByToken.get(value.fs_plan_goal)
       if (!record) {
         console.log('[fs] plan goal button: record not found for chat ' + chatId
-          + ' token=' + value.fs_plan_goal)
+          + ' token=' + tokenDigest(value.fs_plan_goal))
         if (chatId) {
           const ownerBot = evtBot   // 🔴 收到事件的连接 bot（同 `fs_switch` 那条判据），不按会话猜
           if (ownerBot) {
@@ -9376,7 +9532,7 @@ export function apply(ctx) {
         // Stale-card click (already answered / superseded) must never be a
         // silent no-op: tell the user visibly instead of dropping the tap.
         // (2026-09-08 CM: clicked a stale card button -> nothing happened.)
-        console.log('[fs] question button: record not found for chat ' + chatId + ' token=' + value.fs_question)
+        console.log('[fs] question button: record not found for chat ' + chatId + ' token=' + tokenDigest(value.fs_question))
         const stale = recentQuestions.get(value.fs_question)
         const hint = stale
           ? '该选项已经处理过了（点过即生效）。请看我最新一条消息，或直接回复文字。'
@@ -9446,7 +9602,7 @@ export function apply(ctx) {
     }
     const record = pendingApprovals.get(token)
     if (!record) {
-      console.log('[fs] card action: token not found (already settled?) ' + token)
+      console.log('[fs] card action: token not found (already settled?) ' + tokenDigest(token))
       return
     }
     // 与上面三处同一口径：这张卡给的是**工具权限**（allow-once），被转发到别的会话后
@@ -10264,7 +10420,7 @@ export function apply(ctx) {
           record.cardId = msgId
           try { rememberMessage(msgId, 'bot 的审批单：' + String((form && form.title) || '')) } catch { }
           console.log('[fs] approval form sent: ' + String((form && form.title) || '')
-            + ' token=' + record.token + ' msg=' + String(msgId || ''))
+            + ' token=' + tokenDigest(record.token) + ' msg=' + String(msgId || ''))
         })
         .catch((error) => {
           console.log('[fs] approval form send failed: ' + String(error && error.message || error))
@@ -10357,7 +10513,7 @@ export function apply(ctx) {
             // 2026-10-01 真机抓出：问题卡**没进消息索引** ⇒ CM 引用它时只能看到「内容未登记」。
             // 这里补登记（与纯文本/流式卡同一套 rememberMessage）。
             try { rememberMessage(msgId, 'bot 的问题卡：' + String(q.question || '').replace(/\s+/g, ' ').slice(0, 60)) } catch {}
-            console.log('[fs] question card sent: ' + q.id + ' token=' + record.token)
+            console.log('[fs] question card sent: ' + q.id + ' token=' + tokenDigest(record.token))
           })
           .catch((error) => {
             console.log('[fs] question card send failed: ' + String(error && error.message || error))
@@ -10499,8 +10655,13 @@ export function apply(ctx) {
         //    table_unavailable ＝ 表丢了/读不到（**运维事件** ⇒ 去修表，不许静默降级）
         //    person_unknown    ＝ 表在、但这个人不在册（**业务事件** ⇒ 去补人）
         const why = rec.tableOk === false ? 'table_unavailable' : 'person_unknown'
+        // 工单1364（案1，2026-10-15）：DENY 行附 resolver 错误码原文 —— tableOk=true 只说明
+        //   stat 到文件，表 EACCES/EPERM 读不了时 why 仍是 person_unknown（语义未改），
+        //   err 原文里的 `map_unreadable:表存在但不可读…` 是排查者区分「补人 vs 修权限」的依据
+        //   （#1130 实证：只有 person_unknown 会把方向带偏）。
         console.log('[fs] identity ALERT[' + why + '] DENY: tool=' + exec.name
-          + ' agent=' + exec.agent.id + ' tableOk=' + rec.tableOk)
+          + ' agent=' + exec.agent.id + ' tableOk=' + rec.tableOk
+          + (rec.err ? ' resolver_err=' + rec.err : ''))
         // ⚠️ 必须带 `error`：isError===true 时 harness 会**无条件**读 result.error，
         //    不给就是 undefined ⇒ 抛 "tool result must be losslessly JSON-serializable"。
         return {
@@ -10624,6 +10785,26 @@ export function apply(ctx) {
       value: answer,
       content: [{ type: 'text', text: JSON.stringify(answer) }],
     }
+  })
+
+  // 中台 #330②（插件边界与降级标准 §三 L2「工具挂」，CM 2026-10-09 拍板）：工具失败时
+  // 给**模型**看到的返回文字追加引导语——如实告知「该工具暂时不可用」、凭自身知识回答
+  // 必须声明未经工具/数据核实、禁止假装成功。只认 `isError === true` 的结构化失败
+  // （g9-tools 形态：失败返回错误文本不抛异常），成功结果一字不动；包装失败绝不吞结果
+  // （catch 后原样返回）。standard §三：L2 同插件其他工具照常，本瀑布只加字不改判。
+  ctx.on('tools/execute', async (exec, next) => {
+    const result = await next()
+    try {
+      if (result && result.isError === true && Array.isArray(result.content)) {
+        const GUIDE = '\n\n[降级引导·标准§三L2] 该工具本次调用失败（暂时不可用）。请向用户如实说明'
+          + '该工具暂时不可用；如你凭自身知识继续回答，必须声明结论未经工具/数据核实。不要假装工具成功了。'
+        result.content = result.content.map((part) => (part && part.type === 'text' && typeof part.text === 'string'
+          ? { ...part, text: part.text + GUIDE }
+          : part))
+        console.log('[fs] L2 tool-failure guide appended: tool=' + String(exec && exec.name || '?'))
+      }
+    } catch { /* 引导语是加字，绝不让包装本身影响工具结果 */ }
+    return result
   })
 
   // ---- 计划审查 / 其它 UI 提问：接管 `user-questions/request` 水位线 ----------------
