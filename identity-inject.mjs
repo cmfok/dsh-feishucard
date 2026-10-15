@@ -569,6 +569,51 @@ export function selftest () {
   ok(r.resolve('ou_x').err === 'map_unavailable', '表不存在 ⇒ map_unavailable（tableOk=false **仅供告警文案**；上层按 fail-closed 拒，不再据此放行）')
   ok(r.resolve('').err === 'no_open_id', '空 open_id ⇒ no_open_id')
 
+  console.log('── 5b) 工单1364 案1 变异自测：EACCES ⇒ 显式「表存在但不可读」──')
+  const eAcc = Object.assign(new Error('permission denied, open x'), { code: 'EACCES' })
+  ok(mapMainReadError(eAcc).includes('map_unreadable') &&
+     mapMainReadError(eAcc).includes('表存在但不可读') &&
+     mapMainReadError(eAcc).includes('非未登记'),
+    'EACCES ⇒ map_unreadable 显式标注（表在但读不了 ≠ 未登记，#1130 误判根因封堵）')
+  ok(mapMainReadError(eAcc).includes('EACCES'), '标注附错误码原文（排查者直接读码）')
+  ok(mapMainReadError(Object.assign(new Error('x'), { code: 'EPERM' })).includes('map_unreadable'), 'EPERM 同判')
+  ok(mapMainReadError(new Error('map_unavailable')) === 'map_unavailable', '坏 JSON 仍原样吐 map_unavailable（JS/Py 两通道口径等价不回归）')
+  ok(mapMainReadError(new Error('boom')).startsWith('resolver_js_failed:'), '其余异常仍走 resolver_js_failed 前缀')
+  // 端到端变异：真实表文件（stat 过 ⇒ tableOk=true 的前提）+ 注入 readFileSync EACCES。
+  // Windows 无 chmod 语义，标准变异法＝patch 读函数；statSync 不 patch，走真实路径。
+  // 夹具人带 job_id＋岗位表（岗位链路 fail-closed：无岗位 ⇒ job_not_granted，与本自测无关）。
+  {
+    const td = fs.mkdtempSync(path.join(os.tmpdir(), 'tbl1364-'))
+    try {
+      const mapF = path.join(td, 'identity_map.json')
+      fs.writeFileSync(mapF, JSON.stringify({ v: 1, people: [
+        { union_id: 'on_1364', open_ids: { c: 'ou_1364_ok' }, name: 'T1364',
+          job_id: 'J1364', status: '在职' },
+      ] }))
+      const jgF = path.join(td, 'job_grants.json')
+      fs.writeFileSync(jgF, JSON.stringify({ v: 1, jobs: [
+        { id: 'J1364', grants: {}, writable_scopes: [], item_grants: {} },
+      ] }))
+      const realRead = fs.readFileSync
+      try {
+        fs.readFileSync = (p, enc) => {
+          if (String(p) === mapF) throw Object.assign(new Error('permission denied, open ' + p), { code: 'EACCES' })
+          return realRead(p, enc)
+        }
+        const bad = makeResolver({ mapPath: mapF, jobGrantsPath: jgF }).resolve('ou_1364_ok')
+        ok(bad.err && bad.err.includes('map_unreadable') && bad.err.includes('表存在但不可读'),
+          '端到端 EACCES ⇒ DENY err 显式标注「表存在但不可读」')
+        ok(bad.tableOk === true, 'tableOk 语义不变（案1 只改失败文案，案2 改语义弃用待另批）')
+      } finally {
+        fs.readFileSync = realRead
+      }
+      const good = makeResolver({ mapPath: mapF, jobGrantsPath: jgF }).resolve('ou_1364_ok')
+      ok(good.actor && good.actor.name === 'T1364', '正常场景行为不变（读得到表照常认人）')
+    } finally {
+      fs.rmSync(td, { recursive: true, force: true })
+    }
+  }
+
   console.log('── 6) resolveActorJs：resolve_actor.py 的纯 JS 镜像（无 python3 也能认人）──')
   // 夹具与 resolve_actor.py __main__ 的 MAP **逐字段一致** —— 两边同一套题才算镜像。
   // 岗位授权夹具 JOBG 同理镜像 py 的 JG（契约 §三：job_id 真查 jobs[].id，卡号≠岗位）。
