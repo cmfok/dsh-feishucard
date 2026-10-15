@@ -133,12 +133,15 @@ export class TurnIdentityStore {
     this.byAgent = new Map()
   }
 
-  set (agentId, { actor, chatId, messageId, tableOk }) {
+  set (agentId, { actor, chatId, messageId, tableOk, err }) {
     this.byAgent.set(String(agentId), {
       actor: actor || null,
       chatId: chatId || '',
       messageId: messageId || '',
       tableOk: tableOk !== false,
+      // 工单1364（案1，2026-10-15）：resolver 错误码原文随 rec 透传，供调用侧 DENY
+      // 告警行附带打印 —— tableOk 只说「stat 到文件」，读不了（EACCES/EPERM）全靠这里可见。
+      err: err || null,
       at: Date.now(),
     })
   }
@@ -256,6 +259,25 @@ function loadMapJs (raw) {
     try { return JSON.parse(raw.replace(/^\uFEFF/, '')) } catch { throw new Error(E_MAP_UNAVAILABLE) }
   }
   throw new Error(E_MAP_UNAVAILABLE)
+}
+
+/**
+ * 工单1364（案1 最小修，2026-10-15）：主表读文件异常 → resolver err 文案（导出＝供变异自测直测）。
+ *
+ * EACCES/EPERM ＝ 表文件**在**但读不了（属组/权限位问题）——此前只会吐
+ * `resolver_js_failed:EACCES: permission…`，而 tableOk 仍是 true ⇒ DENY 告警打
+ * person_unknown，排查者误判「表在、人不在册」去走「补人」方向（中台 #1130 实证中招）。
+ * 此处显式标注「表存在但不可读…非未登记」并附错误码原文（DENY 行由调用侧附带打印）。
+ *
+ * 🔴 只改失败文案，**不改 tableOk 返回语义**（案2 会改语义影响下游告警文案，弃用待另批）。
+ */
+export function mapMainReadError (e) {
+  const msg = String(e && e.message || e)
+  const ec = e && e.code
+  if (ec === 'EACCES' || ec === 'EPERM') {
+    return 'map_unreadable:表存在但不可读（属组/权限位问题），非未登记｜' + ec + ': ' + msg.slice(0, 80)
+  }
+  return msg === E_MAP_UNAVAILABLE ? E_MAP_UNAVAILABLE : 'resolver_js_failed:' + msg.slice(0, 60)
 }
 const arrCopyJs = (x) => (Array.isArray(x) ? x.slice() : [])
 const objCopyJs = (x) => (x && typeof x === 'object' && !Array.isArray(x) ? { ...x } : {})
@@ -444,13 +466,8 @@ export function makeResolver ({ mapPath = null,
           //   同一份坏主表，JS 通道吐 `resolver_js_failed:map_unavailable`、
           //   Python 通道吐 `map_unavailable`，两条通道的口径**不等价**。
           //   现在：文档内的码原样透出，其它异常才带 `resolver_js_failed:` 前缀（那是"意外"，本来就该可见）。
-          const msg = String(e && e.message || e)
-          res = {
-            actor: null,
-            err: msg === E_MAP_UNAVAILABLE ? E_MAP_UNAVAILABLE
-              : 'resolver_js_failed:' + msg.slice(0, 60),
-            tableOk: true,
-          }
+          //   EACCES/EPERM 分支见 mapMainReadError（工单1364 案1）。
+          res = { actor: null, err: mapMainReadError(e), tableOk: true }
         }
         cache.set(openId, res)
         return res

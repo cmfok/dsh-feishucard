@@ -64,6 +64,40 @@ def save(m):
         json.dump(m, f, ensure_ascii=False, indent=1)
     os.chmod(tmp, 0o640)
     os.replace(tmp, MAP_PATH)
+    _ensure_consumable_group()
+
+
+def _ensure_consumable_group():
+    """落盘后属组校正（#928②，2026-10-14 HR bot EACCES 事故防复发）。
+
+    表的消费方＝生产桥 dsh-feishu-aiad（aiad 用户，属组 agtagents）。规格要求
+    root:agtagents 0640（P1.5-D1 施工记录:98）；任何以 ubuntu/root 身份重写本表的
+    部署批或 cron 都会把属组打回写入者主组 ⇒ aiad EACCES ⇒ 全员 person_unknown。
+    写完立即校正属组并断言；非 Linux / 无该组（本机开发环境）降级告警不抛。
+    """
+    try:
+        import grp
+        import stat as _stat
+        st = os.stat(MAP_PATH)
+        try:
+            gid = grp.getgrnam("agtagents").gr_gid
+        except KeyError:
+            sys.stderr.write("[identity_map] 无 agtagents 组（非生产环境），跳过属组校正\n")
+            return
+        if st.st_gid != gid:
+            os.chown(MAP_PATH, -1, gid)
+        else:
+            os.chmod(MAP_PATH, 0o640)
+        st2 = os.stat(MAP_PATH)
+        if st2.st_gid != gid or (st2.st_mode & _stat.S_IRWXO):
+            sys.stderr.write(
+                "[identity_map] 🔴 属组/other 位校正失败：gid=%s mode=%o —— 桥(aiad)将读不到表，"
+                "需手工 chgrp agtagents 且 chmod o-rwx\n" % (st2.st_gid, st2.st_mode & 0o777))
+    except AttributeError:
+        # Windows（本机开发）无 os.chown
+        pass
+    except Exception as e:
+        sys.stderr.write("[identity_map] 属组校正异常（不阻断主流程）: %s\n" % e)
 
 
 def _lark_prefix():
