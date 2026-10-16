@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.8.15] - 2026-10-17：#771 挂载重建腿补单次熔断（止血）＋ 冒烟夹具假绿灯二次修复
+
+- **补登记（文档漂移根因）**：中台 #771 的根治方案 B（`presetToolsMissing` / `ensurePresetTools`，
+  `index.js` 约 :3795-3855）由提交 `1d5702a`（0.8.14）带进仓库，并已随 0.8.9–0.8.14 合批上生产，
+  但 CHANGELOG 从未登记它（全文 grep `771` 零命中）——在此补记。
+- **止血（fix，本会话二次修正落点）**：**同一条聊天**最多自动重建一次，计数挂在 **chat 记录**
+  （`chat.remounts`，随 `persistChats` 落盘到 state 的 `chats.<chatId>.remounts`）⇒ 跨进程重启仍生效。
+  🔴 **为什么不挂会话条目（第一版就是这么写的，是错的）**：heal（空回复自愈，`index.js:6525-6543`）
+  会 `chat.sessions.splice(activeIndex, 1)` 再 push 新条目，挂在条目上的计数随条目一起被抹掉
+  ⇒ 熔断形同虚设。这条不是推测：2026-10-17 全量冒烟 N3 跑出「第二次仍重建、重建日志 2 条」
+  （`output/smoke-771-fuse-retry.log:5687`）才暴露出来。
+  第二次仍判定缺失时不再重建，只打 `[fs] #771 preset tools still missing ... skipping (fail-open)`
+  日志并让原 agent 带病放行（保持既有 fail-open 语义，不新增拒答）；`entry.label` 的
+  「（挂载丢失已自动重建）」改为幂等追加。
+  修复前的失控：真病灶没治好时**每一条入站消息重建一次**——每次换 id ⇒ 旧会话被隔离、员工历史对其
+  永久丢失；label 无限累加；每轮一次 `persistChats` 写盘放大。
+  ⚠️ **熔断口径（如实）**：一次额度用完后该聊天不再自动重建（`/new` 也不重置）——理由是 `/new`
+  本身就产出全挂载新会话，自动重建的全部目的已由它达成；此后该聊天若再遇挂载丢失，只留日志、
+  由员工 `/new` 或运维处理，不再自动换会话。
+- **测试接线（test，本批硬指标）**：`scripts/smoke.mjs` 的 ctx mock `tools` 原只有 `register`、
+  没有 `get` ⇒ 重建分支自 10-14 落码到上生产在全量冒烟里**零执行**（绿灯是假的）。
+  🔴 **补正（2026-10-17 本会话实测，纠正前一会话的错误登记）**：前一版只把 `get` 加在
+  **属性** `ctx.tools` 上，而桥的探测走**服务定位器** `ctx.get('tools')`（`index.js:3792`）——
+  夹具 `ctx.get(key)` 链里没有 `tools` 分支、链末尾一律 `return undefined`（现文 `smoke.mjs:679`），
+  于是 `presetToolsMissing` 仍第一道就 return false，N3 用例①②**当场报红 8 条**
+  （`output/smoke-20261017-044407.log:5639-5679`，SMOKE FAIL: 8 assertion(s) failed）。
+  同一条「假绿灯」被踩了第二次，而上一条还写着「变异反证：断言②确实报红」——那条反证
+  不可能为真（分支根本没跑），属不实登记，已随本次一并更正。
+  现行修法：夹具把 tools 服务对象抽成 `fakeTools`（`smoke.mjs:369`），**属性形态**（`ctx.tools`，
+  桥 `ctx.tools.register` 注册工具用，`index.js:11198/11390`）与**服务定位器形态**
+  （`ctx.get('tools')`，探测用）共用同一对象，与宿主真形一致。用例 N3 三条断言：①`read` 不可见
+  ⇒ 恰好重建一次（换 id ＋ label 标注 ＋ 落盘 remounts=1）；②同一条目再次判定缺失 ⇒ 熔断生效
+  不再重建（id 不再变、remounts 停在 1、label 不叠加）；③`read` 可见 ⇒ 零重建零 #771 日志
+  （阴性对照，防把熔断写成「永远不重建」仍报绿）。
+- **仓库完整性（fix，本批第二处硬伤）**：`index.js:33` 相对 import `./g3-inbox-report.mjs`，但该件
+  **从未进过 Git**（`git log --all -- g3-inbox-report.mjs` 零提交）且**不在 package.json 的 `files` 清单**
+  ⇒ `npm run check-packaging` 报红「npm publish 出来的包装上就 failed to import」。生产未炸是因为
+  10-13 那次部署把它单独铺了过去（`OPS_CHANGELOG` 回滚条目点名该件）——属「靠运气在跑」，不是靠机制。
+  现已纳入 Git 跟踪并补进 `files`。字节复核：本地与生产在位件 sha256 逐字节一致
+  （`c91cf3420c87b14f6e920d6153c3ac6af5b9b8b1e04e35a9470c479043116fea`，2026-10-17 生产只读实测），
+  本次收口**不改变生产行为**，只是把它纳入版本管理与打包清单。
+- **审查追加两条修复（2026-10-17 独立只读审查，缺陷优先，全部当场修）**：
+  ① **日期锚被命令轮「消耗但不注入」**（中台 #1105 的实打实缺陷）：`/plan <正文>`／`/goal <正文>`
+     这类「命令把正文投进会话、由命令腿起回合」的形态会置位 `commandHold`，runTurn 走
+     `skipSend` ⇒ 带锚的那条 message 从不 send，而原实现**先记当天再判 skipSend**
+     （现文 `index.js:5960`）⇒ 该 chat 当天余下所有消息都没有锚，验收整天落空。
+     现改为 `commandHold ? '' : dateAnchorFor(...)`；冒烟 N1 加一条断言（命令轮之后第一条普通消息仍带锚，
+     `scripts/smoke.mjs:9736-9741`）。⚠️ 该断言的判别力来自代码路径推演（原形态必然记档后 skipSend），
+     **未做「摘掉修复跑红」的变异实测**，如实标注。
+  ② **熔断额度会随 chat 对象重建而归零**：入站路径在 `chat.sessions.length === 0` 时整个重建
+     chat 对象（`index.js:5907-5914`），而 heal 失败支路（`createDedicated` 抛错，条目已被 splice）
+     恰好会留下空数组 ⇒ 下一条入站把 `remounts` 一起丢掉＝熔断形同虚设。现重建时透传旧计数。
+- **审查认定但本批不改的三件（如实挂账，不装已完成）**：
+  ① **heal 腿不受熔断约束**：空回复自愈（`index.js:6525-6543`）不看 `chat.remounts`，
+     真病灶未治且该轮空回复时，**换会话 id 仍逐条发生**。⇒ 上面「历史不再被反复隔离」这句
+     只对 #771 的重建腿成立，对 heal 腿不成立；本文件的表述已按此收窄，heal 额度归并与
+     烟雾用例（N3 特意喂回复绕开 heal，见 `scripts/smoke.mjs:9832-9838`）一起挂 #771 待办。
+  ② **告警兜底把表类异常混进 person_unknown**：`not_active`（离职）、`duplicate_open_id`、
+     `map_unreadable`（EACCES）、`resolver_missing` 现在都落 `person_unknown`（`index.js:10749`），
+     运维事件会被带去「补人」方向（与 #1130 教训同族；journal 行带 err 原文可缓解）。
+     改判据属 #1447 的口径扩展，另批走，本批不动（避免与已审定的三分判据混在一起）。
+  ③ **「跨重启仍拦住」无用例**：现在只断言写盘（chat 级 remounts=1），没断言重载读回仍拦；
+     夹具已有 `mod.apply(ctx)` 重载先例（`scripts/smoke.mjs:4416/4444`），补一条即可，挂 #771。
+- **本条未解决（如实）**：真病灶「宿主按 agent 视角的行级可见性分叉」仍未取证证实，熔断只是止血；
+  重建走 `createDedicated` 不带 cwd ⇒ 用 `/switch` 切过工作区的会话重建后被拉回 bot 默认 workspace，
+  待另立单。
+- **另一处口径更正（生产操作面，2026-10-17 实测代码）**：G9 #342 报告称「state 文件热读、
+  清指针桥无需重启」——与代码不符：`loadChats()` 只在 bot 首次创建时调用一次（`index.js:6674`），
+  运行中改文件会被下一次 `persistChats` 用内存旧态整体覆盖。⇒ 清会话指针**必须配合重启**才生效。
+
 ## 2026-10-15 · 契约 V1.1（minor）：identity_map 自助称呼列 display_name（CM 台账 H 系列裁决）
 
 - `scripts/resolve_actor.py`：ACTOR_KEYS 13→14，输出加 display_name（兜底 name）；判权路径零改动；自测 23→25 用例全过

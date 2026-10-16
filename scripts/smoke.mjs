@@ -354,6 +354,20 @@ const registeredTools = []
 let createdSessions = 0
 let resumedSessions = 0
 
+// 🔴 #771 挂载检测夹具接线（2026-10-16 止血）：index.js 的 presetToolsMissing 走
+//   `ctx.get('tools').get('read', agent)`，而本 mock 的 tools 原来**只有 register、没有 get**
+//   ⇒ 第一道 `typeof tools.get !== 'function'` 直接 return false，整条重建分支在全量冒烟里
+//   **零执行**（10-14 落码到上生产，从来没有任何一次测试真正跑过它——假绿灯）。
+//   默认返回「可见」＝不重建，保证既有几十个用例行为逐字不变；用例按需把 read 收成不可见，
+//   驱动重建/熔断分支（务必在 finally 里还原，否则后面的用例被无声波及）。
+let toolVisibility = () => ({ name: 'read' })
+
+// 🔴 同一个服务对象必须**两种访问形态都给**（宿主真形）：桥注册工具走属性 `ctx.tools.register`
+//   （index.js:11198/11390），#771 探测走服务定位器 `ctx.get('tools')`（index.js:3792）。
+//   夹具原来只给了属性那份 ⇒ `ctx.get('tools')` 落到 get 链末尾 return undefined ⇒
+//   presetToolsMissing 第一道就 return false，重建/熔断分支照样零执行（同族假绿灯，第二次踩）。
+const fakeTools = { register: (t) => registeredTools.push(t), get: (name, ag) => toolVisibility(name, ag) }
+
 // 🔴 取「当前这一代」注册的工具（第十三轮门槛 MEDIUM#4 附带收口）：`registeredTools` 跨热重载
 //   **累积**，`.find()` 拿到的是**最老**一代的闭包 ⇒ 断言可能在验旧代码（只因身份/@ 解析在调用
 //   时才重读配置文件，才碰巧仍然测出新行为——这叫假绿灯，不叫通过）。
@@ -656,6 +670,8 @@ const ctx = {
     if (key === 'goals') return fakeGoals
     if (key === 'commands') return fakeCommands
     if (key === 'sessionPersistence') return fakePersistence
+    // #771：服务定位器形态（index.js:3792 `ctx.get('tools')`）与属性形态共用同一对象。
+    if (key === 'tools') return fakeTools
     // 门槛第三轮 low：允许把注册表**只**以客户端服务名 workspaces 暴露（且可以没有 get()），
     // 用来锁住"服务名两种都认 + 逐个方法判可用"这两条兜底（否则它们永远没被跑过）。
     if (key === 'workspaceRegistry') return registryOverride ? undefined : fakeWorkspaceRegistry
@@ -683,7 +699,7 @@ const ctx = {
     return cleanup
   },
   webServer: { register: (route) => registeredRoutes.push(route) },
-  tools: { register: (t) => registeredTools.push(t) },
+  tools: fakeTools,
   inject(keys, callback) {
     // cordis service injection: only invoke when a known service is present.
     // 2026-10-02：planMode 现在也提供（见 fakePlanMode）—— exit_plan_mode 工具层接管要断言
@@ -9707,6 +9723,21 @@ console.log('N1) #1105 date anchor: first turn of a chat carries it, same-day se
   const secondText = (agent.sent[sentBefore + 1] && agent.sent[sentBefore + 1].content && agent.sent[sentBefore + 1].content[0].text) || ''
   ok(secondText.indexOf('【日期锚】') !== 0, '#1105 同日第二条不带锚（≤1次/天/会话去重）')
   ok(secondText.length > 0, '#1105 同日第二条消息本体正常送达（锚去重不吞消息）')
+
+  // 🔴 补（2026-10-17 代码审查第 1 条，缺陷当场修）：命令起回合的形态（`/plan <正文>`／
+  //   `/goal <正文>` ⇒ commandHold 置位、runTurn 走 skipSend，带锚的那条 message 从不 send）
+  //   **不许消耗当天的锚额度**。原实现先记当天再判 skipSend ⇒ 命令轮之后该 chat 当天
+  //   余下所有消息都没有锚，#1105 的验收整天落空。判据：命令轮后的第一条普通消息仍带锚。
+  feedInbound('om_anchor_cmd', '/plan 命令轮正文（不该吃掉今天的锚）', { chatId: 'oc_anchor_cmd1' })
+  await drain()
+  const sentBeforeAfterCmd = agent.sent.length
+  feedInbound('om_anchor_after_cmd', '命令轮之后的普通消息', { chatId: 'oc_anchor_cmd1' })
+  await drain()
+  const afterCmdText = (agent.sent[sentBeforeAfterCmd] && agent.sent[sentBeforeAfterCmd].content
+    && agent.sent[sentBeforeAfterCmd].content[0].text) || ''
+  ok(afterCmdText.indexOf('【日期锚】') === 0,
+    '#1105 命令轮（commandHold）不消耗锚额度：之后第一条普通消息仍带锚（实得前 24 字：'
+    + JSON.stringify(afterCmdText.slice(0, 24)) + '）')
 }
 
 console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver err 码分流（三场景标签各自正确）')
@@ -9776,6 +9807,119 @@ console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver
     else delete process.env.MAILBOX_IDENTITY_LOCAL
     if (prevJobs1447) process.env.MAILBOX_JOB_GRANTS = prevJobs1447
     else delete process.env.MAILBOX_JOB_GRANTS
+  }
+}
+
+console.log('N3) #771 preset 工具挂载重建：单次熔断（同一条聊天最多自动重建一次）＋ 计数挂 chat 级不被 heal 抹掉')
+{
+  // 本用例钉的是**假绿灯本身**：#771 的重建腿自 2026-10-14 落码（0.8.14）到上生产，
+  // 因 ctx.tools 缺 get 而在全量冒烟里一次都没执行过。三条断言：
+  //   ① read 不可见 ⇒ 重建恰好一次（日志 + entry.id 换掉 + label 标注 + 落盘 remounts=1）；
+  //   ② 同一条目再次判定缺失 ⇒ 熔断生效，不再重建（id 不再变、remounts 仍 1、label 不叠加）；
+  //   ③ read 可见 ⇒ 不重建（阴性对照——防把熔断写成「永远不重建」仍报绿）。
+  const CHAT771 = 'oc_771_remount'
+  const STATE771 = join(process.env.FS_CONFIG_DIR,
+    'state-' + String(APP_ID).replace(/[^a-zA-Z0-9]/g, '') + '.json')
+  const active771 = () => {
+    let st = null
+    try { st = JSON.parse(readFileSync(STATE771, 'utf8')) } catch { st = null }
+    const rec = st && st.chats && st.chats[CHAT771]
+    if (!rec || !Array.isArray(rec.sessions) || !rec.sessions.length) return null
+    return rec.sessions.find((s) => s && s.id === rec.active) || rec.sessions[rec.sessions.length - 1]
+  }
+  const linesFrom771 = (from) => consoleLines.slice(from).map(String)
+  const count771 = (lines, needle) => lines.filter((l) => l.includes(needle)).length
+  // 🔴 每条入站都要「本轮有回复」，而且**必须在 send 里喂**（不是喂在 feedInbound 之前）——
+  //   夹具的正规形态是用例自己覆写 `agent.send`，在桥把消息交给 agent 的那一刻才 push 事件
+  //   （见用例 7/8 的 `agent.send = function …`），再用递增 seq 避开游标。不喂 ⇒ 本轮空回复
+  //   ⇒ 触发**另一条重建腿** heal（`chat.sessions.splice(activeIndex)`＋push「主会话（自愈）」，
+  //   index.js:6525-6543），那时测的就不是 #771 熔断，而是 heal 换条目——本用例第一版就栽在
+  //   这里（label/entry.id 断言全红而熔断断言全绿，因为计数已经改挂 chat 级、扛得住换条目）。
+  let seq771 = 97000
+  const realSend771 = agent.send
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({
+      type: 'assistant/message', seq: (seq771 += 10),
+      data: { message: { content: [{ type: 'text', text: 'N3 本轮回复' }] } },
+    })
+  }
+  const chatRec771 = () => {
+    let st = null
+    try { st = JSON.parse(readFileSync(STATE771, 'utf8')) } catch { st = null }
+    return (st && st.chats && st.chats[CHAT771]) || null
+  }
+  try {
+    // ③ 前置（阴性对照基线）：read 可见时先建会话，重建分支一次都不许进。
+    toolVisibility = () => ({ name: 'read' })
+    let mark771 = consoleLines.length
+    feedInbound('om_771_a', '#771 挂载检测基线（工具可见）', { chatId: CHAT771 })
+    await settle(2)
+    const baseEntry = active771()
+    ok(Boolean(baseEntry && baseEntry.id), '（前提）#771 独立 chat 的会话已建立并落盘')
+    ok(count771(linesFrom771(mark771), '#771 preset tools missing') === 0
+      && count771(linesFrom771(mark771), '#771 rebuilt session') === 0,
+      '★③ 阴性对照：tools.get 返回可见 ⇒ 不判缺失、不重建（实得 #771 行数='
+      + count771(linesFrom771(mark771), '#771 ') + '）')
+    const beforeId771 = baseEntry && baseEntry.id
+
+    // ① read 不可见 ⇒ 恰好重建一次
+    toolVisibility = (name) => (name === 'read' ? undefined : { name })
+    mark771 = consoleLines.length
+    feedInbound('om_771_b', '#771 挂载丢失首条（应重建一次）', { chatId: CHAT771 })
+    await settle(2)
+    const w1 = linesFrom771(mark771)
+    const rebuiltLine771 = w1.find((l) => l.includes('#771 rebuilt session'))
+    const newId771 = rebuiltLine771
+      ? String((rebuiltLine771.match(/rebuilt session (\S+) replacing/) || [])[1] || '') : ''
+    ok(count771(w1, '#771 preset tools missing on ' + beforeId771) === 1,
+      '★① 前提：判定到挂载丢失并打出重建日志（会话 ' + beforeId771 + '）')
+    ok(newId771 !== '' && newId771 !== beforeId771 && newId771.startsWith('fs-main-'),
+      '★① 挂载丢失 ⇒ 重建一个新 dedicated 会话并换掉 entry.id（实得 ' + newId771 + '）')
+    const e1 = active771()
+    ok(Boolean(e1) && String(e1.label || '').includes('（挂载丢失已自动重建）'),
+      '★① 重建痕对用户可见：label 带「挂载丢失已自动重建」（实得 ' + JSON.stringify(e1 && e1.label) + '）')
+    ok(Number(chatRec771() && chatRec771().remounts) === 1,
+      '★① 熔断计数已随 persistChats 落盘在 **chat 记录**上（remounts=1，实得 '
+      + JSON.stringify(chatRec771() && chatRec771().remounts) + '）')
+
+    // ② 同一条目第二次仍判定缺失 ⇒ 熔断生效，不再重建
+    mark771 = consoleLines.length
+    feedInbound('om_771_c', '#771 挂载仍丢失第二条（应被熔断）', { chatId: CHAT771 })
+    await settle(2)
+    feedInbound('om_771_d', '#771 挂载仍丢失第三条（应仍被熔断）', { chatId: CHAT771 })
+    await settle(2)
+    const w2 = linesFrom771(mark771)
+    ok(count771(w2, '#771 rebuilt session') === 0,
+      '★★② 熔断：第二次/第三次判定缺失都不再重建（实得重建日志 '
+      + count771(w2, '#771 rebuilt session') + ' 条，应为 0）')
+    ok(count771(w2, '#771 preset tools still missing on ' + newId771) >= 1,
+      '★② 熔断只留日志：带病放行仍打 still missing（不静默）')
+    const e2 = active771()
+    ok(Boolean(e2) && e2.id === newId771,
+      '★② entry.id 不再变化 ⇒ 历史不再被反复隔离（实得 ' + (e2 && e2.id) + '）')
+    ok(Number(chatRec771() && chatRec771().remounts) === 1,
+      '★② chat 级计数停在 1（未累加，实得 ' + JSON.stringify(chatRec771() && chatRec771().remounts) + '）')
+    // 🔴 本条钉的是**修复本体**：计数若还挂在会话条目上，heal（空回复自愈）或 /new 换条目后
+    //   就会被抹平 ⇒ 熔断失效（2026-10-17 第一次跑就是这样，第二次仍重建、日志两条）。
+    //   条目里不应再出现 remounts 字段 ⇒ 唯一真相源＝chat 记录。
+    ok((chatRec771()?.sessions || []).every((s) => s && s.remounts === undefined),
+      '★② 计数不再挂在会话条目上（防被换条目抹平；实得条目 '
+      + JSON.stringify((chatRec771()?.sessions || []).map((s) => s && s.remounts)) + '）')
+    ok(String((e2 && e2.label) || '').split('（挂载丢失已自动重建）').length === 2,
+      '★② label 幂等：标注只出现一次不叠加（实得 ' + JSON.stringify(e2 && e2.label) + '）')
+
+    // ③ 还原可见 ⇒ 既不重建也不打熔断日志（证明拦住它的是可见性、不是熔断）
+    toolVisibility = () => ({ name: 'read' })
+    mark771 = consoleLines.length
+    feedInbound('om_771_e', '#771 工具恢复可见（不该有任何 #771 日志）', { chatId: CHAT771 })
+    await settle(2)
+    ok(count771(linesFrom771(mark771), '#771 ') === 0,
+      '★★③ 阴性对照（收口）：tools.get 正常返回 ⇒ 零 #771 日志（实得 '
+      + count771(linesFrom771(mark771), '#771 ') + ' 条）')
+  } finally {
+    toolVisibility = () => ({ name: 'read' })
+    agent.send = realSend771
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-feishucard",
-  "version": "0.8.14",
+  "version": "0.8.15",
   "engines": {
     "node": ">=22.15.0"
   },
@@ -23,6 +23,7 @@
   "files": [
     "index.js",
     "identity-inject.mjs",
+    "g3-inbox-report.mjs",
     "helper.cjs",
     "cordis.patch.yml",
     "feishu.config.example.json",

@@ -3722,7 +3722,14 @@ export function apply(ctx) {
         const idx = sessions.findIndex((s) => s && s.id === activeId)
         if (idx >= 0) activeIndex = idx
       }
-      chats.set(chatId, { sessions, activeIndex })
+      chats.set(chatId, {
+        sessions, activeIndex,
+        // #771 熔断计数挂在 **chat 记录**上，不挂在会话条目上：heal（空回复自愈）会
+        // `chat.sessions.splice(chat.activeIndex, 1)` 再 push 新条目（:6537-6543），per-entry
+        // 计数必然被抹平＝熔断形同虚设（2026-10-17 全量冒烟 N3 实测：第二次仍重建，日志两条）。
+        // 旧 state 没这个字段 ⇒ 0。
+        remounts: Number(record && record.remounts) || 0,
+      })
       // 0.7.19（审查 MED#1-B）：把落盘的 chat 类型恢复回内存 —— 热重载/重启后 chatKinds 是
       // 空的，没有这步「群 ⇒ 恒 stable」只能靠下一条真消息自愈；无入站的主动推卡（goal/自动轮卡、
       // 换卡）在恢复前会按 cfg（缺省 full）渲染，把过程叙述泄露给群（用例 69 实测红）。
@@ -3758,6 +3765,9 @@ export function apply(ctx) {
         sessions: chat.sessions.map((s) => ({
           id: s.id, label: s.label, title: s.title, type: s.type, gen: s.gen,
         })),
+        // #771 熔断计数（挂 chat 级，见 loadChats :3725-3731 的说明）：0 次不写字段，
+        // 与 kind/peer 同规则（undefined 被 JSON 丢弃）；跨进程重启靠它继续拦住第二次重建。
+        remounts: Number(chat.remounts) > 0 ? Number(chat.remounts) : undefined,
         active: active ? active.id : (chat.sessions[0] ? chat.sessions[0].id : 'main'),
         // 0.7.19（审查 MED#1-B）：chat 类型随 chats 一起落盘（undefined 会被 JSON 丢弃 ⇒
         // 没记过的 chat 不写字段）。kind 只在 bot.chatKinds 里，persistChats 的 9 个调用点
@@ -3796,22 +3806,41 @@ export function apply(ctx) {
   // 探测失败（缺工具）⇒ 自动重建一个全新 dedicated 会话替换当前条目（chat 指针/落盘同步
   // 更新）。重建失败 ⇒ 带病放行原 agent 并留日志（收发至少还通）。只挂 resolveAgent 统一
   // 出口（入站消息主路径）；/switch 的手工 resume 腿本轮不动（影响面收窄，见单 #771）。
+  //
+  // 🔴 单次熔断（2026-10-16 止血，本函数原缺）：真病灶（宿主按 agent 视角的行级可见性分叉，
+  //   或该 bot 用的是不含 tool-fs 的 preset）并没有被本函数治好——重建出来的新会话照样探不到
+  //   'read'。没有熔断时**每一条入站消息都重建一次**：每次换 id ⇒ 旧会话被隔离、员工历史对其
+  //   永久丢失；label 无限累加；每轮一次 persistChats 写盘。故**同一条聊天**最多自动重建一次，
+  //   第二次仍判定缺失只留日志、原 agent 带病放行（保持既有 fail-open 语义，不新增拒答）。
+  //   计数落在 chat 记录（chat.remounts）并经 persistChats 落盘 ⇒ 跨进程重启同样生效，
+  //   且不会被 heal 的「splice 旧条目＋push 新条目」抹掉（挂 entry 上必失效，见 :3725 说明）。
+  const REMOUNT_LABEL = '（挂载丢失已自动重建）'
+
   async function ensurePresetTools(bot, chat, agent) {
     if (!agent || !presetToolsMissing(agent)) return agent
     const entry = chat.sessions[chat.activeIndex]
-    const oldId = entry && entry.id
+    if (!entry) return agent                       // 无从落标记：不重建，带病放行
+    // 🔴 计数读 chat 级（不是 entry 级）：heal 会 splice 掉当前条目，per-entry 计数活不过
+    //   下一条消息 ⇒ 熔断失效（2026-10-17 冒烟 N3 实测「第二次仍重建、日志两条」即此）。
+    if (Number(chat.remounts) >= 1) {
+      console.log('[fs] #771 preset tools still missing on ' + entry.id
+        + ' — auto-rebuild already attempted ' + Number(chat.remounts) + ' time(s), skipping (fail-open)')
+      return agent
+    }
+    const oldId = entry.id
     console.log('[fs] #771 preset tools missing on ' + oldId + ' (mount lost) — rebuilding session')
     try {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       const handle = await createDedicated(bot, sessionId)
-      if (entry) {
-        entry.id = sessionId
-        entry.label = String(entry.label || '会话') + '（挂载丢失已自动重建）'
-        entry.title = undefined
-        entry.type = 'dedicated'
-        entry.gen = SESSION_GEN
-        entry.handle = handle
-      }
+      chat.remounts = Number(chat.remounts || 0) + 1
+      entry.id = sessionId
+      // label 幂等：已带该标注不再叠加（防多次重建把字符串无限增长糊掉 /list 单行渲染宽度）。
+      const baseLabel = String(entry.label || '会话')
+      entry.label = baseLabel.includes(REMOUNT_LABEL) ? baseLabel : baseLabel + REMOUNT_LABEL
+      entry.title = undefined
+      entry.type = 'dedicated'
+      entry.gen = SESSION_GEN
+      entry.handle = handle
       persistChats(bot, bot.chats)
       console.log('[fs] #771 rebuilt session ' + sessionId + ' replacing ' + oldId)
       return handle.agent
@@ -5879,7 +5908,10 @@ export function apply(ctx) {
     let agent
     let sessionReused = false
     if (!chat || chat.sessions.length === 0) {
-      chat = { sessions: [], activeIndex: 0 }
+      // #771 熔断额度必须**跨「chat 对象重建」保留**：heal 失败支路（:6531 已 splice 掉条目、
+      // createDedicated 又抛错）会把 sessions 留成空数组 ⇒ 下一条入站整个 chat 对象被重建，
+      // 额度若跟着归零＝每条入站又能各重建一次（审查 2026-10-17 第 3 条）。
+      chat = { sessions: [], activeIndex: 0, remounts: Number(chat && chat.remounts) || 0 }
       bot.chats.set(chatId, chat)
       const sessionId = 'fs-main-' + Date.now().toString(36)
       try {
@@ -5922,7 +5954,10 @@ export function apply(ctx) {
 
     // #1105 日期锚：本轮消息是否带锚在此一次性判定（同日去重由状态保证）；
     // runTurn 内 heal 重试复用同一 text ⇒ 不会二次计数。
-    const dateAnchor = dateAnchorFor(bot, chatId)
+    // 🔴 commandHold（/plan <正文>／/goal <正文> 这类「命令把正文投进会话、由命令腿起回合」的形态）
+    //   ⇒ 本轮走 skipSend，带锚的那条 message 从不 send：此时**不许消耗当天的锚额度**，
+    //   否则命令轮之后该 chat 当天余下所有消息都无锚（#1105 的验收整天落空）。
+    const dateAnchor = commandHold ? '' : dateAnchorFor(bot, chatId)
     // 2026-10-01：拿到飞书 agent 的第一时间就把提问水位线挂到它自己的 scope 上。
     bindFeishuAgentQuestions(agent)
     // 2026-10-02：审批水位线同样下沉到 agent scope（否则 GUI 连着时飞书收不到审批卡）。
