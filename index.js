@@ -665,6 +665,49 @@ export function apply(ctx) {
   }
   migrateLegacyConfig()
 
+  // ---- #1105 日期锚注入器（CM 2026-10-14 定稿，双条件 ≤1次/天/会话，追加式）--------
+  // 背景：长会话跨天续跑、内核与桥都不注入日期、get_now 授权断裂（G9 #1089）⇒ 模型只能
+  // 从历史旧日期「猜今天」（实锤：10-14 当天日报被记成 10-10）。判据一行话：state.last
+  // 不等于今天 ⇒ 注（首次出现＝无记录；跨天＝日期变了）；同日 ⇒ 不注（天然去重）。
+  // 锚是纯数据一行、拼在当轮消息最前（**追加式不回写历史**——改历史=缓存失效，CM 明确关注点）；
+  // 状态按 "<appId>|<chatId>" 记最近注入日期，落盘 date-anchor.json（同 message-index 目录）。
+  // 状态丢失（删档/换机）＝所有 chat 按新会话多注一次锚，幂等无害，无需复杂重建。
+  const dateAnchorState = new Map()     // "<appId>|<chatId>" -> 'YYYY-MM-DD'
+  const WEEKDAYS_CN = ['日', '一', '二', '三', '四', '五', '六']
+  function dateAnchorPath() {
+    return join(configDir(), 'date-anchor.json')
+  }
+  function localDateStr(d = new Date()) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
+  }
+  function loadDateAnchorState() {
+    try {
+      const obj = JSON.parse(readFileSync(dateAnchorPath(), 'utf8') || '{}')
+      for (const [k, v] of Object.entries(obj || {})) {
+        if (k && typeof v === 'string') dateAnchorState.set(k, v)
+      }
+      if (dateAnchorState.size > 0) console.log('[fs] date-anchor state loaded: ' + dateAnchorState.size + ' chats')
+    } catch { /* 无文件＝全新状态：各 chat 按新会话注一次锚 */ }
+  }
+  // 返回今天的锚行（含尾换行）或 ''（同日已注/判据异常——锚失败绝不挡消息）。
+  // 用服务器本地时区（生产 CST）；内部合成事件（_internal：卡片失败回执/热重载续跑/归档
+  // 调度等主动轮）同走本判断 ⇒ 任务书「bot 主动发起的轮次走同一判断」由统一入口天然满足。
+  function dateAnchorFor(bot, chatId) {
+    try {
+      const now = new Date()
+      const today = localDateStr(now)
+      const key = String((bot.cfg && bot.cfg.appId) || '') + '|' + String(chatId || '')
+      if (dateAnchorState.get(key) === today) return ''
+      dateAnchorState.set(key, today)
+      try { writeFileSync(dateAnchorPath(), JSON.stringify(Object.fromEntries(dateAnchorState))) } catch { }
+      return '【日期锚】' + today + ' 星期' + WEEKDAYS_CN[now.getDay()] + '\n'
+    } catch (error) {
+      console.log('[fs] date-anchor judge failed (skip): ' + String(error && error.message || error))
+      return ''
+    }
+  }
+  loadDateAnchorState()
+
   // 引用透传（改造⑤）：消息索引落盘 → **重启后仍能查出"CM 引的是哪一条/哪张卡"**
   // （2026-10-01 真机实证：不落盘时，重启前发出的卡片一律回「内容未登记」）。
   try {
@@ -5877,6 +5920,9 @@ export function apply(ctx) {
       }
     }
 
+    // #1105 日期锚：本轮消息是否带锚在此一次性判定（同日去重由状态保证）；
+    // runTurn 内 heal 重试复用同一 text ⇒ 不会二次计数。
+    const dateAnchor = dateAnchorFor(bot, chatId)
     // 2026-10-01：拿到飞书 agent 的第一时间就把提问水位线挂到它自己的 scope 上。
     bindFeishuAgentQuestions(agent)
     // 2026-10-02：审批水位线同样下沉到 agent scope（否则 GUI 连着时飞书收不到审批卡）。
@@ -5968,7 +6014,8 @@ export function apply(ctx) {
       const message = {
         id: 'fs-' + messageId,
         role: 'user',
-        content: [{ type: 'text', text: label + text + senderMark.footer + (evt.mentionFooter || '') + quote }],
+        // #1105：日期锚拼在当轮消息最前（同日已注时为空串，追加式不回写历史）。
+        content: [{ type: 'text', text: dateAnchor + label + text + senderMark.footer + (evt.mentionFooter || '') + quote }],
         source: { kind: 'user' },
       }
       let card = makeCardState(turnAgent)
@@ -10654,7 +10701,17 @@ export function apply(ctx) {
         // 🔴 告警要【显眼】且区分原因（CM 2026-10-04 关心"留痕"）：
         //    table_unavailable ＝ 表丢了/读不到（**运维事件** ⇒ 去修表，不许静默降级）
         //    person_unknown    ＝ 表在、但这个人不在册（**业务事件** ⇒ 去补人）
-        const why = rec.tableOk === false ? 'table_unavailable' : 'person_unknown'
+        // #1447（2026-10-16）：tableOk 但无 actor 时按 resolver err 码三分标注——
+        //   job_not_granted（岗位缺册 ⇒ 去补岗册）/ unknown_status（状态门 ⇒ 查状态）/
+        //   person_unknown（真表外人 ⇒ 去补人）。原「tableOk 但无 actor 一律 person_unknown」
+        //   使身份表缺人与岗位缺册不可分辨（修表后 person_unknown 告警 8 条实为两人岗位缺册，
+        //   G9 #1361 甄别因此假立项）。err 带前缀形态（如 map_unreadable:…）用 includes 归类；
+        //   前缀异常形态落 person_unknown 与原语义一致。
+        const errStr = String(rec.err || '')
+        const why = rec.tableOk === false ? 'table_unavailable'
+          : errStr.includes('job_not_granted') ? 'job_not_granted'
+          : errStr.includes('unknown_status') ? 'unknown_status'
+          : 'person_unknown'
         // 工单1364（案1，2026-10-15）：DENY 行附 resolver 错误码原文 —— tableOk=true 只说明
         //   stat 到文件，表 EACCES/EPERM 读不了时 why 仍是 person_unknown（语义未改），
         //   err 原文里的 `map_unreadable:表存在但不可读…` 是排查者区分「补人 vs 修权限」的依据

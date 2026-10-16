@@ -6,6 +6,7 @@
 //
 // Run: node scripts/smoke.mjs   (from the package root)
 import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { EventEmitter } from 'node:events'
@@ -4531,8 +4532,9 @@ console.log('52) 审批单卡通道（feishu_approval_form）：工具 / 版式 
   ok(actionBtns.every((b) => b && b.behaviors && b.behaviors[0].value.fs_form !== undefined
     && b.behaviors[0].value.fs_choice !== undefined), '两个按钮都带 { fs_form, fs_choice }')
   const formToken = actionBtns[0].behaviors[0].value.fs_form
-  ok(consoleLines.some((l) => l.includes('approval form sent:') && l.includes('token=' + formToken)),
-    '留痕 `approval form sent`（可日志复验）')
+  const formTokenDigest = createHash('sha256').update(String(formToken == null ? '' : formToken)).digest('hex').slice(0, 10)
+  ok(consoleLines.some((l) => l.includes('approval form sent:') && l.includes('token=' + formTokenDigest)),
+    '留痕 `approval form sent` 短摘要（可日志复验）')
 
   // 点击「采纳」⇒ 工具拿到选择 + 卡就地变回执卡
   const decideMark = sentCards.length
@@ -9685,6 +9687,96 @@ console.log('114) ★🔴 拔件演习：权限挂统一文案「目前服务不
   ok(relayTok84 === '' || dl84 + dr84 <= 1,
     '★★ 中台#62：这张卡的补送痕/丢弃痕至多一条（互斥，实得 delivered=' + dl84 + ' dropped=' + dr84 + '）'
     + (relayTok84 === '' ? '｜84 前提已红（没拿到 token），本条不级联误伤' : ''))
+}
+
+console.log('N1) #1105 date anchor: first turn of a chat carries it, same-day second does not')
+{
+  // 用例①（#1105 验证清单 3-a）：新 chat 首条带【日期锚】前缀，同日第二条不带（状态去重）。
+  // 跨天分支说明（如实，不装过）：锚状态是模块内存 Map（loadDateAnchorState 启动加载一次，
+  // dateAnchorFor 只读写内存）⇒ 改状态文件造不了跨天；跨天与新会话走同一 `get(key) !== today`
+  // 判真路径，由本用例「首条（无记录）注锚」覆盖。真跨天验证归 HOME 试点 48h 观察。
+  const sentBefore = agent.sent.length
+  // 用独立 chatId：默认 CHAT_ID 在前面几十个用例里已注过锚（同日去重），造「新 chat」必须换 id。
+  feedInbound('om_anchor_1', '日期锚首条测试', { chatId: 'oc_anchor_new1' })
+  await drain()
+  const firstText = (agent.sent[sentBefore] && agent.sent[sentBefore].content && agent.sent[sentBefore].content[0].text) || ''
+  ok(firstText.indexOf('【日期锚】') === 0, '#1105 新 chat 首条带【日期锚】前缀（实得前 24 字：' + JSON.stringify(firstText.slice(0, 24)) + '）')
+  ok(/^【日期锚】\d{4}-\d{2}-\d{2} 星期[日一二三四五六]\n/.test(firstText), '#1105 锚格式＝纯数据一行（日期＋星期＋换行），追加式不碰正文')
+  feedInbound('om_anchor_2', '日期锚同日第二条测试', { chatId: 'oc_anchor_new1' })
+  await drain()
+  const secondText = (agent.sent[sentBefore + 1] && agent.sent[sentBefore + 1].content && agent.sent[sentBefore + 1].content[0].text) || ''
+  ok(secondText.indexOf('【日期锚】') !== 0, '#1105 同日第二条不带锚（≤1次/天/会话去重）')
+  ok(secondText.length > 0, '#1105 同日第二条消息本体正常送达（锚去重不吞消息）')
+}
+
+console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver err 码分流（三场景标签各自正确）')
+{
+  // 任务书 output/dsh-feishucard-工单-告警标签修正-20261015.md 验收三条：
+  //   岗位缺册 ⇒ job_not_granted / 状态门 ⇒ unknown_status / 表外真未知 ⇒ person_unknown。
+  //   标签出口＝index.js identityGuard deny 支路的 journal 行「[fs] identity ALERT[why] DENY」
+  //   （resolver 只吐 err 码，打标在桥侧——分流代码所在处即标签本体出口，非死代码）。
+  //   路径与用例 70 同款：开闸 → 真实入站 resolve 失败入 store → emit tools/execute 触发 deny。
+  const CFG_PATH1447 = join(process.env.FS_CONFIG_DIR, 'feishu.config.json')
+  const cfgText1447 = readFileSync(CFG_PATH1447, 'utf8')
+  const prevMap1447 = process.env.MAILBOX_IDENTITY_MAP
+  const prevLocal1447 = process.env.MAILBOX_IDENTITY_LOCAL
+  const prevJobs1447 = process.env.MAILBOX_JOB_GRANTS
+  const MAP1447 = join(tmpdir(), 'fs-smoke-identity_map_1447.json')
+  const JOBS1447 = join(tmpdir(), 'fs-smoke-job_grants_1447.json')
+  const nextSpy1447 = () => Promise.resolve('next')
+  const capture1447 = (runs) => runs.map((r) => Promise.resolve(r).then(
+    (value) => ({ value }), (error) => ({ error })))
+  const isDeny1447 = (o) => Boolean(o && o.value && typeof o.value === 'object' && o.value.isError === true)
+  try {
+    // 夹具三场景：J_MISSING 不在岗位表 ⇒ job_not_granted；「待入职」不在在职口径 ⇒ unknown_status；
+    // ou_outsider_1447 根本没进表 ⇒ unknown_person（err）⇒ 标签落 person_unknown（原语义不变）。
+    writeFileSync(MAP1447, JSON.stringify({ v: 1, people: [
+      { name: '缺岗在册人', status: '在职', job_id: 'J_MISSING', open_ids: { app_a: 'ou_jng_1447' } },
+      { name: '待入职人', status: '待入职', job_id: 'J_OK', open_ids: { app_a: 'ou_ust_1447' } },
+    ] }))
+    writeFileSync(JOBS1447, JSON.stringify({ jobs: [
+      { id: 'J_OK', grants: {}, writable_scopes: [], item_grants: {} },
+    ] }))
+    process.env.MAILBOX_IDENTITY_MAP = MAP1447
+    process.env.MAILBOX_JOB_GRANTS = JOBS1447
+    delete process.env.MAILBOX_IDENTITY_LOCAL
+    const cfg1447 = JSON.parse(readFileSync(CFG_PATH1447, 'utf8'))
+    cfg1447.bots[0].identityGuard = true
+    writeFileSync(CFG_PATH1447, JSON.stringify(cfg1447, null, 2))
+    await settle(2)
+    agent.send = function (message) { this.sent.push(message) }
+    const cases1447 = [
+      ['ou_jng_1447', 'job_not_granted', '岗位缺册（在册＋在职，job_id 不在岗位表）'],
+      ['ou_ust_1447', 'unknown_status', '状态门（非在职口径的状态）'],
+      ['ou_outsider_1447', 'person_unknown', '表外真未知 id（原语义不变）'],
+    ]
+    for (const [openId1447, label1447, desc1447] of cases1447) {
+      liveAgents.length = 0   // 与用例 70 同款：让入站复用 mock agent ⇒ 身份记录写进它的 store 格
+      const logFrom1447 = consoleLines.length
+      feedInbound('om_1447_' + openId1447, '告警标签三分用例：' + openId1447, { openId: openId1447 })
+      await settle(4)
+      const idLines1447 = consoleLines.slice(logFrom1447).filter((l) => l.includes('[fs] identity:'))
+      ok(idLines1447.length >= 1 && !idLines1447.some((l) => l.includes('-> OK ')),
+        '（前提）' + openId1447 + ' 走真实入站解析且未解析出 actor（' + desc1447 + '）')
+      const recId1447 = (idLines1447.map((l) => (l.match(/\[fs\] identity: agent=(\S+)/) || [])[1]).find(Boolean)) || agent.id
+      const fsAgent1447 = recId1447 === agent.id ? agent : { id: recId1447, ctx: agentCtx, session: agent.session }
+      const run1447 = await Promise.all(capture1447(emitCtx('tools/execute',
+        { name: 'read', agent: fsAgent1447, arguments: { file_path: 'a.md' }, signal: undefined }, nextSpy1447)))
+      const alertLines1447 = consoleLines.slice(logFrom1447).filter((l) => String(l).includes('identity ALERT['))
+      ok(run1447.some(isDeny1447)
+          && alertLines1447.some((l) => String(l).includes('identity ALERT[' + label1447 + '] DENY')),
+        '★ ' + desc1447 + ' ⇒ journal 标签 ' + label1447 + '｜ALERT 行实得 '
+          + JSON.stringify(alertLines1447.map(String)))
+    }
+  } finally {
+    writeFileSync(CFG_PATH1447, cfgText1447)
+    if (prevMap1447) process.env.MAILBOX_IDENTITY_MAP = prevMap1447
+    else delete process.env.MAILBOX_IDENTITY_MAP
+    if (prevLocal1447) process.env.MAILBOX_IDENTITY_LOCAL = prevLocal1447
+    else delete process.env.MAILBOX_IDENTITY_LOCAL
+    if (prevJobs1447) process.env.MAILBOX_JOB_GRANTS = prevJobs1447
+    else delete process.env.MAILBOX_JOB_GRANTS
+  }
 }
 
 if (failures === 0) {
