@@ -16,6 +16,12 @@ duplicate_open_id / open_id_missing / job_not_granted / not_active /
 unknown_status / (自助兜底另记 identity.unverified)
 
 ────────────────────────────────────────────────────────────────────
+2026-10-15 契约 V1.1（minor）实施（CM 台账 H 系列裁决 · identity_map 自助称呼列）：
+  ① identity_map 人级新增 display_name（纯显示字段：全员默认=name，CM 行=「CM」）
+  ② ACTOR_KEYS 13→14 字段：输出加 display_name（表缺该键/为空时兜底 = name），
+    判权路径（open_id/job_id/status）零改动 —— display_name 不参与任何判定
+  ③ 判权逻辑、错误码、在职口径与 V1.2 完全一致；旧表（v1 无 display_name）照常可读
+────────────────────────────────────────────────────────────────────
 2026-10-09 契约 V1.2 实施收口（中台 #158 · 验收＝身份-授权契约-v1 §七 V1-V10）：
   ① 裸名 grants_until ⇒ extra_grants_until（契约 §2.1 键名以 policy_axis.py 为准）
   ② 人级不再存/输出 grants —— 挂岗位后 grants 只从 job_grants.json 按 job_id 现取（契约 §四）
@@ -48,7 +54,7 @@ _INACTIVE_STATUS = ("离职", "终止办理", "兼职终止")
 
 # 契约 §二：actor 的 13 字段（判定 8 ＋ 标识/追溯 5），多一个少一个都算不合规（V1 机验用）
 ACTOR_KEYS = (
-    "name", "scopes", "grants", "extra_grants", "extra_grants_until",
+    "name", "display_name", "scopes", "grants", "extra_grants", "extra_grants_until",
     "writable_scopes", "is_cm", "item_grants",
     "open_id", "union_id", "person_id", "job_id", "source",
 )
@@ -146,8 +152,9 @@ def resolveActor(open_id, identity_map, job_grants=None):
     #    ⚠️ `open_id` 必须回带：它是内核 `IDENTITY_KEYS` 的成员，
     #       不带就会被【删除】而非覆写（2026-10-04 实测过的坑）。
     return ({
-        # 判定 8（policy_axis.User）
+        # 判定 8（policy_axis.User）＋ 显示字段 display_name（V1.1：纯显示，不参与判权）
         "name": person.get("name", ""),
+        "display_name": str(person.get("display_name") or person.get("name") or ""),
         "scopes": list(person.get("scopes", [])),
         "grants": dict(job.get("grants", {})),
         "extra_grants": dict(person.get("extra_grants", {})),
@@ -254,12 +261,18 @@ if __name__ == "__main__":
     # 反面断言：**完全不认识**的人仍然是 unknown_person —— 两者不可混
     _, err = resolveActor("ou_nobody_main", MAP, JG)
     print(("✅" if err == E_UNKNOWN_PERSON else "❌") + " 陌生人 → " + str(err))
-    # 画像层：`open_id` 必须**回带**；13 字段不多不少（契约 §二）
+    # V1.1：display_name 优先（有 display_name 的行取之）＋ 无该键的行兜底 name
+    m_dn = dict(MAP); m_dn["people"] = [dict(MAP["people"][0], display_name="CM")] + MAP["people"][1:]
+    a_dn, _e2 = resolveActor("ou_cm_main", m_dn, JG)
+    print(("✅" if (a_dn or {}).get("display_name") == "CM" else "❌") + " V1.1 display_name 优先 → " + str((a_dn or {}).get("display_name")))
+    a_fb, _e3 = resolveActor("ou_cm_main", MAP, JG)
+    print(("✅" if (a_fb or {}).get("display_name") == "陈明" else "❌") + " V1.1 display_name 兜底 name → " + str((a_fb or {}).get("display_name")))
+    # 画像层：`open_id` 必须**回带**；14 字段不多不少（契约 §二，V1.1 起）
     a, _e = resolveActor("ou_cm_main", MAP, JG)
     _got = (a or {}).get("open_id")
     print(("✅" if _got == "ou_cm_main" else "❌") + " 画像层 open_id → " + str(_got))
     _keys_ok = set((a or {}).keys()) == set(ACTOR_KEYS)
-    print(("✅" if _keys_ok else "❌") + " 13 字段不多不少 → " + str(sorted((a or {}).keys())))
+    print(("✅" if _keys_ok else "❌") + " 14 字段不多不少 → " + str(sorted((a or {}).keys())))
     # ⑥ 挂岗位现取：grants/writable_scopes/item_grants 来自岗位表，is_cm 来自人册
     _g_ok = (a or {}).get("grants") == {"销售": "L2", "财务": "L1"} and \
             (a or {}).get("item_grants") == {"财务|净利": "L2"} and \

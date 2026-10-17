@@ -27,6 +27,7 @@ import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 /** actor 里允许/必须被覆写的身份字段（白名单，规格 §2.5 定死） */
 export const IDENTITY_KEYS = Object.freeze([
@@ -177,6 +178,14 @@ export function applyActorToArguments (args, actor, keys = IDENTITY_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(args, k)) continue
     const has = Object.prototype.hasOwnProperty.call(actor, k) && actor[k] !== undefined && actor[k] !== null
     if (has) {
+      if (k === 'name') {
+        // V1.1（CM 台账 H 系列）：注入 name 处 display_name 优先（自助称呼列，纯显示），兜底真名 name
+        const shown = (actor.display_name !== undefined && actor.display_name !== null && actor.display_name !== '')
+          ? actor.display_name : actor.name
+        if (args[k] !== shown) overwritten.push(k)
+        args[k] = shown
+        continue
+      }
       if (args[k] !== actor[k]) overwritten.push(k)
       args[k] = actor[k]
     } else {
@@ -344,7 +353,13 @@ export function resolveActorJs (openId, identityMap, localMap, jobGrants) {
   //    标识/追溯 5。🔴 open_id 必须回带：不带会被内核【删除】而非覆写。
   return {
     actor: {
+      // V1.1（2026-10-15，CM 台账 H 系列）：新增 display_name（纯显示，兜底 name）；
+      // name 保持真名（契约原语义）；「注入 name 处 display_name 优先」在
+      // applyActorToArguments 的 name 键覆写处生效 —— 判权路径零改动。
       name: (person.name === undefined || person.name === null) ? '' : person.name,
+      display_name: (person.display_name === undefined || person.display_name === null || person.display_name === '')
+        ? ((person.name === undefined || person.name === null) ? '' : person.name)
+        : person.display_name,
       scopes: arrCopyJs(person.scopes),
       grants: objCopyJs(job.grants),
       extra_grants: objCopyJs(person.extra_grants),
@@ -536,10 +551,10 @@ export function selftest () {
     '🔴 表可达但认不出这个人 ⇒ 同样拒（两者本质一样：拿不到身份）')
 
   console.log('── 2) applyActorToArguments：核心自证「塞别人身份必被覆写」──')
-  const actor = { name: '陈明', open_id: 'ou_cm', union_id: 'on_cm', scopes: ['公司'] }
+  const actor = { name: '陈明', display_name: 'CM', open_id: 'ou_cm', union_id: 'on_cm', scopes: ['公司'] }
   const evil = { name: '老板', open_id: 'ou_boss', scopes: ['全部'], query: 'SELECT 1' }
   const r1 = applyActorToArguments(evil, actor)
-  ok(evil.name === '陈明', '① 伪造的 name 被覆写')
+  ok(evil.name === 'CM', '① 伪造的 name 被覆写，且取 display_name 优先（V1.1）——注入 name=称呼')
   ok(evil.open_id === 'ou_cm', '① 伪造的 open_id 被覆写')
   ok(JSON.stringify(evil.scopes) === JSON.stringify(['公司']), '① 伪造的 scopes 被覆写')
   ok(evil.query === 'SELECT 1', '① 非身份字段（query）原样保留 —— 不误伤工具入参')
@@ -658,13 +673,14 @@ export function selftest () {
     ok(resolveActorJs('ou_cm_main', dup, null, JOBG).err === 'duplicate_open_id', 'JS 镜像：两人共用 open_id ⇒ duplicate_open_id（判表损坏）')
     const withOpenId = resolveActorJs('ou_cm_main', cloneFix(), null, JOBG)
     ok(withOpenId.actor.open_id === 'ou_cm_main', 'JS 镜像：🔴 actor 必须回带 open_id（不带会被内核【删除】而非覆写）')
-    // #158 收口：13 字段不多不少（契约 §二；channels 已移除）
-    ok(Object.keys(withOpenId.actor).length === 13 &&
+    // #158 收口 13 字段 ＋ V1.1 display_name ⇒ 14 字段不多不少（契约 §二；channels 已移除）
+    ok(Object.keys(withOpenId.actor).length === 14 &&
        withOpenId.actor.writable_scopes.length === 0 &&
        withOpenId.actor.is_cm === true &&
        withOpenId.actor.item_grants['财务|净利'] === 'L2' &&
-       withOpenId.actor.union_id === 'on_cm' && withOpenId.actor.job_id === '电商运营助理',
-      'JS 镜像：13 字段（挂岗位现取 grants/writable_scopes/item_grants ＋ is_cm/union_id/job_id）')
+       withOpenId.actor.union_id === 'on_cm' && withOpenId.actor.job_id === '电商运营助理' &&
+       withOpenId.actor.display_name === '陈明' && withOpenId.actor.name === '陈明',
+      'JS 镜像：14 字段（display_name 兜底 name ＋ 挂岗位现取 grants/writable_scopes/item_grants ＋ is_cm/union_id/job_id）')
     // V4：审批卡号冒充 job_id ⇒ 必须拒（卡号在 jobs[].card，不在 .id）
     const cardFix = cloneFix(); cardFix.people[0].job_id = 'CR-POST-20261003-01'
     ok(resolveActorJs('ou_cm_main', cardFix, null, JOBG).err === 'job_not_granted',
@@ -683,7 +699,7 @@ export function selftest () {
 
   console.log('── 7) parity：JS 与 Python 同夹具逐字段一致（漂移当场暴露）──')
   {
-    const pyScript = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    const pyScript = path.join(path.dirname(fileURLToPath(import.meta.url)),
       'scripts', 'resolve_actor.py')
     let pyBin = ''
     for (const c of ['python3', 'python', 'py']) {
@@ -745,7 +761,7 @@ export function selftest () {
 }
 
 // 直接 `node identity-inject.mjs --selftest` 时跑自测（被 import 时不跑）
-const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 if (invokedDirectly) {
   if (process.argv.includes('--selftest')) process.exit(selftest())
   console.log('用法：node identity-inject.mjs --selftest')
