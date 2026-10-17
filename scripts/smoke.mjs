@@ -1270,6 +1270,68 @@ console.log('12e) 字节额度换卡的**块数下限＝2**（中台 #1672 案 1
   ok(allB.includes('字节换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
 }
 
+console.log('12f) 字节护栏的**量尺对象＝将发出的完整载荷**（中台 #1685，CM 2026-10-18 在 AC-0088 拍方案 1）：正文块小、工具文本把真实载荷顶过线 ⇒ 也必须换卡')
+{
+  // 判别力设计（为什么这一条「不修就红」）：
+  //   旧尺子量的是 `card.blocks`，而工具块只存 toolIds、**不含文本**（`index.js` 块结构注释 :1221），
+  //   工具行要到 `buildCardPayload` 渲染时才由 `formatToolLine` 生成 ⇒
+  //   「blocks 很小／渲染载荷很大」这一支在旧口径下**根本不参与判定**，护栏放行、飞书整卡拒收。
+  //   靶子构成（两把尺各自只有一把够得着，否则失去判别力）：
+  //   · 3 段短叙述 ＋ 1 个工具块 ⇒ blocks 里只有 toolIds（500 个 id × 约 20 字节 ≈ 10 KB 级），
+  //     够不着粗筛线 CARD_ROTATE_BYTES=120000，块数也只有 4、够不着 170 ⇒ **粗筛不参与判定**；
+  //   · 500 条**失败**工具调用（渲染成 `- ❌ · 名 \`参数摘要\` · 错误≤100 字`，中文错误 90 字＝270 字节 ⇒ 单行约 330 字节）
+  //     ⇒ 真实请求体 ≈ 170 KB，越过发送闸 CARD_SEND_MAX_BYTES=160000，但**不超过**实测硬线 198.5 KB。
+  //   ⇒ 只有「量将发出的完整载荷」这一条路能触发换卡；把新增的字节闸整段删掉，本条 ★ 断言必红。
+  //   另钉一条 P1 判据：换卡那一刻旧卡是 force 推送（闸放行），所以**每一帧**请求体都必须 ≤ 198.5 KB，
+  //   否则指路语送不出去、旧卡停在半截——这条只能在载荷字节上判，不能靠存根（存根不按字节拒收）。
+  const markF = sentCards.length
+  let releaseF
+  const gateF = new Promise((r) => { releaseF = r })
+  const prevIdleF = agent.whenIdle.bind(agent)
+  agent.whenIdle = () => gateF
+  agent.send = function (message) {
+    this.sent.push(message)
+    for (let i = 0; i < 3; i++) {
+      agentEvents.push({ type: 'assistant/message', seq: 12001 + i, data: { message: { content: [{ type: 'text', text: '工具爆多的一轮叙述 ' + i }] } } })
+    }
+    for (let i = 0; i < 500; i++) {
+      agentEvents.push({ type: 'tool/call', seq: 12100 + i, data: { callId: 'call_1685_' + i, name: 'probe_tool_' + i, arguments: '{"path":"/srv/aiad/x' + i + '.md"}' } })
+      agentEvents.push({ type: 'tool/result', seq: 12600 + i, data: { message: {
+        source: { callId: 'call_1685_' + i }, isError: true,
+        content: [{ type: 'tool-result', content: [{ type: 'text', text: '工具失败原因：' + '障'.repeat(90) }] }],
+      } } })
+    }
+  }
+  feedInbound('om_rotate_payload', '载荷量尺换卡')
+  await drain()
+  agentEvents.push({ type: 'assistant/message', seq: 13200, data: { message: { content: [{ type: 'text', text: '载荷量尺换卡后的续写段' }] } } })
+  await drain()
+  releaseF()
+  agent.whenIdle = prevIdleF
+  await drain()
+
+  const createsF = cardsSince(markF).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  const framesF = cardsSince(markF).filter((c) => c.payload && c.payload.schema === '2.0')
+  const allF = JSON.stringify(cardsSince(markF))
+  // 前提钉：靶子必须真的长成「blocks 小、载荷大」——用每帧自带的标记与真实请求体字节反查
+  //   （不读被测对象自报的护栏日志，那属于「用被测代码的输出证明被测代码没错」）
+  const toolLinesF = (allF.match(/- ❌ · probe_tool_/g) || []).length
+  const noteMarksF = Array.from({ length: 3 }, (_, i) => '工具爆多的一轮叙述 ' + i).filter((m) => allF.includes(m)).length
+  const bodyBytesF = framesF.map((c) => Buffer.byteLength(JSON.stringify(JSON.stringify(c.payload)), 'utf8'))
+  const maxBodyF = Math.max.apply(null, bodyBytesF.concat([0]))
+  ok(createsF.length >= 1, '（前提）载荷量尺例确实建出了回合卡')
+  ok(toolLinesF >= 400, '（前提·判别形态）卡上真实渲染出 ' + toolLinesF + ' 行工具文本（＝载荷侧字节主体，blocks 里没有这些文本）')
+  ok(noteMarksF === 3 && maxBodyF > 160000 && maxBodyF <= 198500,
+    '（前提·判别窗口）叙述段数=' + noteMarksF + '（⇒ blocks 只有个位数块、toolIds 撑不起 120000 粗筛线）；'
+    + '最大帧请求体=' + maxBodyF + ' 必须落在 160000–198500：既越过发送闸、又不越飞书实测硬线')
+  ok(allF.includes('本卡内容已达飞书单卡上限'),
+    '★ 主断言：blocks 不越线而**将发出的载荷**越线 ⇒ 按完整载荷判、换卡并留下指路语（旧尺子量 blocks 时这一支不判定，本断言必红）')
+  ok(createsF.length >= 2, '★ 主断言：载荷超限后新建了第二张卡（create 次数 ' + createsF.length + '）')
+  ok(bodyBytesF.every((b) => b <= 198500),
+    '★ 审查 P1 判据：本例发出的每一帧请求体（含换卡那一刻被放行的 force 旧卡帧）都 ≤ 实测通过线 198.5 KB，共 ' + bodyBytesF.length + ' 帧')
+  ok(allF.includes('载荷量尺换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
+}
+
 console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
 {
   // 背景（CM 反馈）：目标模式续轮由 @deepseek-ai/dsh-goal-round-driver 以**同会话**注入

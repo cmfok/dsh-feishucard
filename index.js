@@ -1225,6 +1225,10 @@ export function apply(ctx) {
       failCount: 0,
       circuitOpen: false,
       retryUntil: 0,
+      // #1685（AC-0088 方案 1）发送前字节闸用的两个字段：换卡处置回调（由 startCardWatcher 挂上、
+      //   stop 时撤）与喊话去抖时刻。登记在这里，是为了「卡上有哪些可变状态」仍有一份完整清单可读。
+      onSizeBudget: null,
+      sizeGuardAt: 0,
       queue: Promise.resolve(),
       // 2026-09-15 修复：一卡一游标 + 已消费事件去重。
       // 旧实现的 seal 前补扫用 `{from: seqBefore}`（本轮起点）重放整轮，而 appendNote 无去重
@@ -1547,10 +1551,16 @@ export function apply(ctx) {
   // 0.7.9（CM 2026-10-03 ③ 拍板）：**指路语写在旧卡**（读者正看着旧卡）⇒ 必须说"下面那条"。
   const SIDE_NOTICE_OLD = '⬇️ 下面那条是**另发的**提示；后续内容见下方新卡，**本卡正文原样保留**。'
   function rotateNoticeSize() {
-    return '📄 本卡内容已达飞书单卡上限（约 ' + CARD_ROTATE_BLOCKS + ' 块 / '
-      + Math.round(CARD_ROTATE_BYTES / 1000) + ' KB），后续内容见下方新卡；**本卡正文原样保留**。'
+    // #1685：触发换卡现在有两把尺（粗筛＝blocks 120 KB；发送闸＝将发出载荷 160 KB），
+    //   文案只报**贴近飞书真实上限**的那个口径，免得读者以为 120 KB 就是飞书的线。
+    return '📄 本卡内容已达飞书单卡上限（约 ' + CARD_ROTATE_BLOCKS + ' 块 / 载荷 '
+      + Math.round(CARD_SEND_MAX_BYTES / 1000) + ' KB），后续内容见下方新卡；**本卡正文原样保留**。'
   }
   const CARD_ROTATE_BYTES = 120000        // 120 KB，低于实测通过线 198.5 KB
+  // #1685（CM 2026-10-18 在 AC-0088 拍方案 1）：**发送前这把尺**量的是真实请求体里的载荷（与飞书
+  //   拒卡同尺寸），所以可以比 blocks 粗筛贴近实测通过线——取 160 KB，给转义与封口文案增量留约 20%
+  //   余量。粗筛（CARD_ROTATE_BYTES）照旧提前换卡，两把尺各司其职：粗筛省渲染、发送尺兜住真实上限。
+  const CARD_SEND_MAX_BYTES = 160000
   // ⚠️ 体积必须按**真字节**量（审查 MED#958）：中文 1 字 ≈ 3 UTF-8 字节，用 String.length
   // 会低估到 ~1/3 —— 150000 "字符" 对 CJK 其实是 ~450 KB，早已越过实测 198.5 KB 的通过线。
   function blocksBytes(blocks) {
@@ -2712,6 +2722,50 @@ export function apply(ctx) {
       } catch (error) {
         console.log('[fs] inline images failed: ' + String(error && error.message || error))
       }
+      // #1685（CM 2026-10-18 在 AC-0088 拍方案 1）：字节护栏改量**将要发出的完整载荷**，判定挪到发送前一刻。
+      //   旧尺子量的是 card.blocks —— 工具块只存 toolIds、不含文本，工具行要到渲染才生成，
+      //   实测插桩 490 帧里 489 帧真实载荷比护栏值大（最大差 21 KB；生产形态工具面板可达 223 KB，
+      //   见本文件 CARD_ROTATE_BYTES 上方那条实测记录）⇒ 护栏放行、飞书却整卡拒收。
+      //   这里按「发出即所量」判：超限就不发，改走换卡（旧卡留指路语、新卡从游标接续）。
+      let payloadBytes = 0
+      try {
+        // 量的是**真实请求体里那段**：send/update 传的是 `content: JSON.stringify(payload)`
+        //   （见 :959 / :985），转义后比 payload 自身还大——#1685 的病根就是低估，这里不留口径差。
+        //   （多算的 2 个引号字节按保守方向处理，不修。）
+        payloadBytes = Buffer.byteLength(JSON.stringify(JSON.stringify(payload)), 'utf8')
+      } catch (error) {
+        console.log('[fs] payload size guard skipped this push (measure failed): ' + String(error && error.message || error))
+      }
+      if (payloadBytes > CARD_SEND_MAX_BYTES) {
+        const tail = String(card.token || '-').slice(-8)
+        if (force) {
+          // 封口／换卡／托孤补发这类"最后一次机会"的推送不许被这条闸挡死，否则旧卡永远停在
+          //   超限前那一拍（换卡自己也要 force 推旧卡）。真被飞书拒时走既有 rescue 纯文本兜底。
+          console.log('[fs] payload size guard: forced push sent anyway bytes=' + payloadBytes
+            + ' limit=' + CARD_SEND_MAX_BYTES + ' card=' + tail + ' (拒收时由 sendPlainText 兜底)')
+        } else if (card.status === 'sealed' || card.status === 'error') {
+          // 换卡处置 stop() 时会撤掉回调，此时旧卡队列里还排着更早入队的非 force 任务：
+          //   把超限帧推给一张**不再更新**的封口卡，只会换来拒收＋失败计数噪声，内容也早已由新卡接续。
+          console.log('[fs] payload size guard: stale oversized push dropped (card ' + card.status
+            + ') bytes=' + payloadBytes + ' card=' + tail)
+          return
+        } else if (typeof card.onSizeBudget === 'function') {
+          // 5 秒去抖：换卡处置若一时没接上（熔断/额度已满会静默 return），别让每 300ms 的推送各喊一次
+          const lastFire = Number(card.sizeGuardAt || 0)
+          card.sizeGuardAt = Date.now()
+          console.log('[fs] payload size guard: rotate instead of send bytes=' + payloadBytes
+            + ' limit=' + CARD_SEND_MAX_BYTES + ' blocks=' + card.blocks.length + ' card=' + tail)
+          if (Date.now() - lastFire > 5000) {
+            try { card.onSizeBudget('size') } catch (error) {
+              console.log('[fs] payload size guard rotate failed: ' + String(error && error.message || error))
+            }
+          }
+          return
+        } else {
+          console.log('[fs] payload size guard: no rotation handler on this card, sending anyway bytes='
+            + payloadBytes + ' card=' + tail)
+        }
+      }
       // F：留一份"纯文本版"，卡片被拒时用它抢救正文（sendPlainText 内部还会再剥一次非法片段）
       const rescueText = payloadPlainText(payload)
       const controller = new AbortController()
@@ -3048,6 +3102,10 @@ export function apply(ctx) {
 
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
     const entry = { agent, card, bot, chatId, stop: null }
+    // #1685（CM 2026-10-18 在 AC-0088 拍方案 1）：把「超限就换卡」的处置挂到**卡对象**上，
+    //   供 syncCard 在真正发送的前一刻调用。这些调用点本来就已经把同一个回调传进 watcher，
+    //   挂在卡上比给每个 syncCard 调用点（全文件 37 处）再加一个参数改动面小得多。
+    card.onSizeBudget = onTableBudget
     const sealAsFinished = (why) => {
       // 0.7.21（MEDIUM）：接管来的**自动轮**卡（目标轮／回执轮）收口要走自动轮那套
       //   （补扫→提升正文→失败归因→✅/❌），旧实现一律用普通回合的补封口文案 ⇒
@@ -3078,9 +3136,17 @@ export function apply(ctx) {
             // ② 元素/体积额度（实测：200 元素、载荷 ~198.5 KB 通过）⇒ **换卡续写**：
             //    旧卡正文原样保留＋一行说明，新卡从旧卡游标接续（不重放、不丢、不重）。
             //    这样"过程文字默认可见"与"绝不撞上限"同时成立（CM 2026-10-03 口径）。
-            if (card.blocks.length > CARD_ROTATE_BLOCKS
-              || (card.blocks.length > CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK
-                && blocksBytes(card.blocks) > CARD_ROTATE_BYTES)) {
+            //    ⚠ #1685（AC-0088 方案 1）：这把尺量的是 blocks（工具块只存 toolIds、不含文本），
+            //      只能当**省渲染的粗筛**；权威判定在发送前一刻按将发出载荷判（syncCard 内，同一 'size' 处置）。
+            //      留一条日志是**判据需要**：夹具 12e 靠它钉「换卡走的是 blocks 粗筛这一支」，
+            //      否则块数下限改回 60 也会被发送尺兜住，用例失去判别力。
+            const overBlocks = card.blocks.length > CARD_ROTATE_BLOCKS
+            const blocksB = !overBlocks && card.blocks.length > CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK
+              ? blocksBytes(card.blocks) : 0
+            if (overBlocks || blocksB > CARD_ROTATE_BYTES) {
+              console.log('[fs] coarse size ruler rotate: blocks=' + card.blocks.length
+                + ' blocksBytes=' + blocksB + ' limit=' + CARD_ROTATE_BYTES
+                + ' card=' + String(card.token || '-').slice(-8))
               onTableBudget('size'); return
             }
           }
@@ -3212,6 +3278,8 @@ export function apply(ctx) {
       clearInterval(timer)
       liveCardWatchers.delete(entry)
       if (liveCardRegistry.get(String(agent.id)) === entry) liveCardRegistry.delete(String(agent.id))
+      // #1685：watcher 停了，这张卡就没有换卡处置可调了 ⇒ 撤挂，别让 syncCard 调到已失效的闭包
+      if (card.onSizeBudget === onTableBudget) card.onSizeBudget = null
     }
     // 0.7.8 不变式（CM 2026-10-03 报障「换了新卡，旧卡也一直在更新」）：
     //   同一个 agent（＝同一条会话）同一时刻**只允许一个 watcher**。旧实现只做
