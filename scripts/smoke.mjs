@@ -10011,10 +10011,12 @@ console.log('N1b) #1105 E4b：卡片失败回注的合成轮（`_internal`）**�
   }
 }
 
-console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver err 码分流（三场景标签各自正确）')
+console.log('N2) #1447 告警标签分流：按 resolver err 码逐码给独立标签（七场景各自正确；0.8.18 起含表损坏/主表非文件/离职三态/共用号）')
 {
   // 任务书 output/dsh-feishucard-工单-告警标签修正-20261015.md 验收三条：
-  //   岗位缺册 ⇒ job_not_granted / 状态门 ⇒ unknown_status / 表外真未知 ⇒ person_unknown。
+  //   岗位缺册 ⇒ job_not_granted / 状态门 ⇒ unknown_status / 离职三态 ⇒ person_not_active /
+  //   共用号 ⇒ identity_map_duplicate / 表内容坏 ⇒ identity_map_unavailable / 读表抛非权限错 ⇒ resolver_failed /
+  //   表外真未知 ⇒ person_unknown。
   //   标签出口＝index.js identityGuard deny 支路的 journal 行「[fs] identity ALERT[why] DENY」
   //   （resolver 只吐 err 码，打标在桥侧——分流代码所在处即标签本体出口，非死代码）。
   //   路径与用例 70 同款：开闸 → 真实入站 resolve 失败入 store → emit tools/execute 触发 deny。
@@ -10030,11 +10032,16 @@ console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver
     (value) => ({ value }), (error) => ({ error })))
   const isDeny1447 = (o) => Boolean(o && o.value && typeof o.value === 'object' && o.value.isError === true)
   try {
-    // 夹具三场景：J_MISSING 不在岗位表 ⇒ job_not_granted；「待入职」不在在职口径 ⇒ unknown_status；
+    // 夹具场景：J_MISSING 不在岗位表 ⇒ job_not_granted；「待入职」不在在职口径 ⇒ unknown_status；
+    // 「离职」＝离职三态 ⇒ not_active（0.8.18 起独立标签 person_not_active，不再是 person_unknown）；
+    // 两人共用同一 open_id ⇒ duplicate_open_id（判表损坏）；
     // ou_outsider_1447 根本没进表 ⇒ unknown_person（err）⇒ 标签落 person_unknown（原语义不变）。
     writeFileSync(MAP1447, JSON.stringify({ v: 1, people: [
       { name: '缺岗在册人', status: '在职', job_id: 'J_MISSING', open_ids: { app_a: 'ou_jng_1447' } },
       { name: '待入职人', status: '待入职', job_id: 'J_OK', open_ids: { app_a: 'ou_ust_1447' } },
+      { name: '离职人', status: '离职', job_id: 'J_OK', open_ids: { app_a: 'ou_na_1447' } },
+      { name: '共用号甲', status: '在职', job_id: 'J_OK', open_ids: { app_a: 'ou_dup_1447' } },
+      { name: '共用号乙', status: '在职', job_id: 'J_OK', open_ids: { app_a: 'ou_dup_1447' } },
     ] }))
     writeFileSync(JOBS1447, JSON.stringify({ jobs: [
       { id: 'J_OK', grants: {}, writable_scopes: [], item_grants: {} },
@@ -10047,15 +10054,11 @@ console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver
     writeFileSync(CFG_PATH1447, JSON.stringify(cfg1447, null, 2))
     await settle(2)
     agent.send = function (message) { this.sent.push(message) }
-    const cases1447 = [
-      ['ou_jng_1447', 'job_not_granted', '岗位缺册（在册＋在职，job_id 不在岗位表）'],
-      ['ou_ust_1447', 'unknown_status', '状态门（非在职口径的状态）'],
-      ['ou_outsider_1447', 'person_unknown', '表外真未知 id（原语义不变）'],
-    ]
-    for (const [openId1447, label1447, desc1447] of cases1447) {
+    // 一条场景的完整跑法：真实入站解析失败 → emit tools/execute 触发 deny → 读 journal 标签
+    const runLabelCase1447 = async (openId1447, label1447, desc1447) => {
       liveAgents.length = 0   // 与用例 70 同款：让入站复用 mock agent ⇒ 身份记录写进它的 store 格
       const logFrom1447 = consoleLines.length
-      feedInbound('om_1447_' + openId1447, '告警标签三分用例：' + openId1447, { openId: openId1447 })
+      feedInbound('om_1447_' + openId1447 + '_' + label1447, '告警标签用例：' + openId1447, { openId: openId1447 })
       await settle(4)
       const idLines1447 = consoleLines.slice(logFrom1447).filter((l) => l.includes('[fs] identity:'))
       ok(idLines1447.length >= 1 && !idLines1447.some((l) => l.includes('-> OK ')),
@@ -10070,6 +10073,28 @@ console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver
         '★ ' + desc1447 + ' ⇒ journal 标签 ' + label1447 + '｜ALERT 行实得 '
           + JSON.stringify(alertLines1447.map(String)))
     }
+    for (const [openId1447, label1447, desc1447] of [
+      ['ou_jng_1447', 'job_not_granted', '岗位缺册（在册＋在职，job_id 不在岗位表）'],
+      ['ou_ust_1447', 'unknown_status', '状态门（非在职口径的状态）'],
+      ['ou_na_1447', 'person_not_active', '离职三态（not_active ⇒ 独立标签，落回 person_unknown 即误导向「补人」）'],
+      ['ou_dup_1447', 'identity_map_duplicate', '两人共用同一 open_id（duplicate_open_id ⇒ 判表损坏）'],
+      ['ou_outsider_1447', 'person_unknown', '表外真未知 id（原语义不变）'],
+    ]) await runLabelCase1447(openId1447, label1447, desc1447)
+    // 表本身坏掉的两支（0.8.18 #1447 口径扩展）：内容不可解析 ⇒ map_unavailable（表在、判得出文件）；
+    //   路径不是常规文件 ⇒ statSync().isFile() 判假 ⇒ tableOk=false 抢先落 table_unavailable。
+    //   这两支从前一律落 person_unknown，排查者会被带去「补人」而不是「修表」（#1130 同族）。
+    //   ⚠️ 第二条同时是**顺序对照**：它的 err 串也含 map_unavailable，若把 tableOk 判据挪到
+    //      err 码链之后，本条即变红（identity_map_unavailable）——新链不许遮蔽运维事件。
+    //   `resolver_failed`/`resolver_missing` 两支要解析器**意外抛**才到，夹具无法从文件内容造出来
+    //      （resolveActorJs 对任意 JSON 形态一律不抛，identity-inject.mjs:302 起逐段有护栏）；
+    //      其错误码前缀口径由 identity-inject --selftest 的 mapMainReadError 断言钉（:596）。
+    writeFileSync(MAP1447, '{这不是合法 JSON')
+    await settle(2)
+    await runLabelCase1447('ou_jng_1447', 'identity_map_unavailable', '身份表内容不可解析（map_unavailable ⇒ 表损坏，不是人不在册）')
+    process.env.MAILBOX_IDENTITY_MAP = tmpdir()   // 指向目录 ⇒ 不是常规文件 ⇒ tableOk=false
+    await settle(2)
+    await runLabelCase1447('ou_jng_1447', 'table_unavailable',
+      '主表路径不是常规文件（tableOk=false ⇒ 运维事件优先，新 err 码链不得遮蔽）')
   } finally {
     writeFileSync(CFG_PATH1447, cfgText1447)
     if (prevMap1447) process.env.MAILBOX_IDENTITY_MAP = prevMap1447

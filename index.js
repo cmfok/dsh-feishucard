@@ -10952,16 +10952,27 @@ export function apply(ctx) {
         // 🔴 告警要【显眼】且区分原因（CM 2026-10-04 关心"留痕"）：
         //    table_unavailable ＝ 表丢了/读不到（**运维事件** ⇒ 去修表，不许静默降级）
         //    person_unknown    ＝ 表在、但这个人不在册（**业务事件** ⇒ 去补人）
-        // #1447（2026-10-16）：tableOk 但无 actor 时按 resolver err 码三分标注——
+        // #1447（2026-10-16 起，0.8.18 逐码扩展）：tableOk 但无 actor 时按 resolver err 码分流标注——
         //   job_not_granted（岗位缺册 ⇒ 去补岗册）/ unknown_status（状态门 ⇒ 查状态）/
         //   person_unknown（真表外人 ⇒ 去补人）。原「tableOk 但无 actor 一律 person_unknown」
         //   使身份表缺人与岗位缺册不可分辨（修表后 person_unknown 告警 8 条实为两人岗位缺册，
         //   G9 #1361 甄别因此假立项）。err 带前缀形态（如 map_unreadable:…）用 includes 归类；
         //   前缀异常形态落 person_unknown 与原语义一致。
+        // #1447 口径扩展（0.8.18，CHANGELOG 0.8.17 条②挂账件）：resolver 的表类/状态类错误码
+        //   从前全落 person_unknown ⇒ 运维事件被带去「补人」方向（#1130 同族）。逐码给独立标签，
+        //   person_unknown 仍作兜底（unknown_person 与未登记形态语义不变），fail-closed 与用户文案一字不改。
         const errStr = String(rec.err || '')
         const why = rec.tableOk === false ? 'table_unavailable'
           : errStr.includes('job_not_granted') ? 'job_not_granted'
           : errStr.includes('unknown_status') ? 'unknown_status'
+          : errStr.includes('not_active') ? 'person_not_active'
+          : errStr.includes('duplicate_open_id') ? 'identity_map_duplicate'
+          : errStr.includes('map_unreadable') ? 'identity_map_unreadable'
+          : errStr.includes('map_unavailable') ? 'identity_map_unavailable'
+          : errStr.includes('resolver_js_failed') ? 'resolver_failed'
+          : errStr.includes('resolver_missing') ? 'resolver_missing'
+          : errStr.includes('no_open_id') ? 'no_open_id'
+          : errStr.includes('open_id_missing') ? 'open_id_missing'
           : 'person_unknown'
         // 工单1364（案1，2026-10-15）：DENY 行附 resolver 错误码原文 —— tableOk=true 只说明
         //   stat 到文件，表 EACCES/EPERM 读不了时 why 仍是 person_unknown（语义未改），

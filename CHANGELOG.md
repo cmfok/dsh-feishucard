@@ -1,5 +1,44 @@
 # Changelog
 
+# Changelog
+
+## [0.8.18] - 2026-10-18：#1447 身份告警标签逐码扩展（表类/状态类异常不再混进 person_unknown）
+
+**本批范围**：只有 #1447 一件——它是 0.8.17 条②挂账的那件（CHANGELOG 0.8.17 段里记着「前缀异常形态落 person_unknown 与原语义一致」，本次就是把这半截补齐）。
+顺带在本文件对 0.8.17 段两处被 staging 真链**证伪的数字**加更正标注（只加标注、不改写当时的记录原文）。
+不含文案面改动，不含 `CARD_SEND_MAX_BYTES` 阈值调整（那件挂在裁决卡 AC-0096，等 CM 拍）。
+
+- **为什么必须拆（不是锦上添花）**：0.8.15 起的三分只到 `job_not_granted / unknown_status / person_unknown`，
+  而 resolver 的 err 码有八个（`map_unavailable / no_open_id / unknown_person / duplicate_open_id / open_id_missing
+  / job_not_granted / not_active / unknown_status`）＋ `map_unreadable:` 与 `resolver_js_failed:` 两种前缀形态。
+  落在 `person_unknown` 的那些**语义是反的**：修表后 8 条 `person_unknown` 告警实测是两人的岗位缺册
+  （G9 #1361 因此假立项），#1130 则是表文件在但 EACCES 读不了、告警仍写 `person_unknown`，排查者被带去
+  「补人」而不是「修权限」。告警标签把方向带偏＝这条链路的实害。
+- **修法（`index.js:10965-10975`，标签链扩到 11 支）**：按 resolver err 码逐码给独立标签——
+  `person_not_active`（离职三态：正常拒绝，不是「不认识」）/ `identity_map_duplicate`（两人共用一个
+  open_id ⇒ 表损坏）/ `identity_map_unreadable`（表在但读不了）/ `identity_map_unavailable`（内容不可解析）/
+  `resolver_failed`、`resolver_missing`、`no_open_id`、`open_id_missing` 各自成支；
+  `tableOk === false` 仍**优先**落 `table_unavailable`（运维事件不被 err 码链遮蔽）；
+  `person_unknown` 保留为兜底（`unknown_person` 与未登记形态语义不变）。
+  🔴 fail-closed 判定、拒绝返回结构、给用户看的那句文案**一字未改**——本批只动日志标签。
+- **检查点（N2 七场景，全绿）**：岗位缺册／状态门／离职三态／共用号／表外真未知／表内容不可解析／
+  主表路径不是常规文件。最后一条同时是**顺序对照**——它的 err 串也含 `map_unavailable`，
+  若有人把 `tableOk` 判据挪到 err 码链之后就变红。
+  全量冒烟：`SMOKE PASS (sentCards=768, sessions=76)`，✅1072／❌0（`output/smoke-1447-v2-20261018.log`）。
+- **三条单变量变异反证（各跑一遍全量冒烟）**：摘掉 `not_active` 支 ⇒ 红 1 条且恰是离职三态场景；
+  摘掉 `duplicate_open_id` 支 ⇒ 红 1 条且恰是共用号场景（实得标签回落到 `person_unknown`）；
+  把 `rec.tableOk === false` 改成永不等 ⇒ 红 1 条且恰是「主表路径不是常规文件」场景。
+  三次 `smoke rc` 均为 1，复原后 `index.js` 逐字节一致（sha256 前缀 `a29fff33212d580c`），
+  驱动器与日志见 `output/mut-1447-result*.log`。
+- **未覆盖面（如实）**：`resolver_failed`／`resolver_missing`／`no_open_id`／`open_id_missing` 四支
+  夹具到不了——`resolveActorJs` 对任意 JSON 形态一律不抛（逐段有护栏），要触发得靠解析器意外异常或
+  Python 通道；其**错误码前缀口径**由 `identity-inject.mjs --selftest` 钉住（48 断言／0 失败）。
+  生产侧正向样本仍缺：现役版本没有这些新串，取不到样本属**没机会发生**而不是不发生，
+  闭环要等本批上生产后用同一条只读命令取 `ALERT[` 逐码分布（见中台 #1447 史段 27）。
+- **版本一致性**：`package.json` 与 `package-lock.json`（顶层＋`packages[""]`）同步到 0.8.18，按 #1771 口径。
+- ⚠️ **载荷事实**：0.8.17 定版件的导出 MANIFEST 钉的是 commit `4945ac4` 的 `index.js`
+  （`4ef822af…`，762150 字节），本批改码后该件已失效——重导要与 AC-0096 的阈值修法合进同一次发版，少一次重启。
+
 ## [0.8.17] - 2026-10-18：#1685 字节护栏改量「将发出的完整载荷」（CM 在 AC-0088 拍方案 1）＋ #1771 依赖版本字段同步
 
 **本批范围**：只有 #1685（量尺对象）一件，外加顺手补掉 #1771（package-lock 的 version 字段落后一个版本）。
@@ -10,6 +49,14 @@
   插桩 490 帧实测 **489 帧真实载荷 > 护栏值**（最大差 21498 字节；生产形态工具面板可达 223763 字节，
   而飞书实测通过线只有 198.5 KB）⇒ 护栏放行、飞书整卡拒收。量化全文见
   `output/工单正文/G1685-案1射程实测补充-20261017.md` §四。
+- ⚠️ **数字更正（0.8.18 批，2026-10-18 staging 真 bot 实测）**：上面与下面第 2 条里的「实测通过线 198.5 KB」
+  是**本地夹具的世界线**，真链路不支持——卡片更新（PATCH）的拒收线经两轮独立压测夹在
+  `(128340, ≈131075]` 字节，精确吻合 **131072＝128 KiB**；`CARD_SEND_MAX_BYTES=160000` 落在这道线**之上**
+  ⇒ 量尺对象虽然改对了，阈值仍然**永不触发**（正向轮 journal 全文 `payload size guard` 0 次，
+  `tools=675` 那一帧照旧 `230099 / ext=ErrCode 200800`，与 0.8.15 对照组同位置同行为）。
+  证据指纹 `e2e-20261018-1c7fc6007fe3e629`——此串证明「已验证**且未达标**」，不得当 E2E-VERIFIED 写进任何审批单；
+  阈值重定＋换卡时旧卡那一推（force 分支只留痕不拦）的兜底，挂在裁决卡 **AC-0096**（工单 #1787）等 CM 拍。
+  详见 `output/dsh1685-e2e-staging/结论.md`。
 - **修法（按 CM 拍的方案 1＝判定挪到真正发送的前一刻）**：
   1. `syncCard` 队列体内、`buildCardPayload`＋`inlinePayloadImages` 之后，量 **真实请求体**那段：
      `Buffer.byteLength(JSON.stringify(JSON.stringify(payload)))` —— 与 `send`/`update` 送出的
@@ -33,6 +80,9 @@
   160000–198500 判别窗内 ⇒ 只有「量将发出载荷」这一条路能触发换卡。断言四条：指路语在旧卡、create≥2、
   续写落新卡，外加一条 P1 判据——**本例每一帧请求体 ≤ 198.5 KB**（换卡那一刻旧卡是 force 推送、闸放行，
   这条只能按字节判，冒烟存根不按字节拒收）。
+  ⚠️ 更正（0.8.18 批，见上面「数字更正」条）：判别窗右端 198500 不成立，真实拒收线是 128 KiB——
+  夹具里那 171493 字节的帧**本身就在线上**，所以 12f 能红能绿只证明「量尺对象换对了」，
+  完全不证明阈值可用（教训：本地夹具的世界线不能当生产事实）。
 - **验证（全部当场跑出，末行原文照抄）**：
   · 正身两轮全量：`SMOKE PASS (sentCards=752, sessions=72)`，零失败项，发送闸与粗筛各触发 2 次；
   · 变异 m1（整段删除发送闸 44 行，删前先 diff 证明单变量）：`SMOKE FAIL: 2 assertion(s) failed`，
