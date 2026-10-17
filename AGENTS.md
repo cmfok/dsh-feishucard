@@ -17,8 +17,12 @@
 
 ## 决策台账（A34 项目自管）
 
-- 位置：`decisions/` 目录，一篇一裁决（CM 拍板实录＋落地指针，首行 `[已落地→<路径>]`）。
-- 流转纪律：本项目 **ledger 脚本待建**；建脚本之前新条目随裁决轮手工创建（文件头标注日期与 actor），建脚本后追加只走脚本。
+- 位置：`decisions/` 目录，一篇一裁决（CM 拍板实录＋落地指针，首行 `[已落地→<路径>]`），长文叙述留这里。
+- 机器台账（2026-10-17 建成，取代原「ledger 脚本待建」口径）：追加只走
+  `powershell -File AIAD/scripts/ledger.ps1 -Action append -Machine HOME -Root <工作区根> -Project dsh-feishucard -Title … -BodyFile …`
+  → 落 `0-必读文件/CM决策台账-HOME.md`，台账号 `H-D<N>` 自动取号（该目录已进本仓 `.gitignore`，属内部台账不入库）。
+  🔴 信息中台关单（`mt.py close`）对「已有 CM 裁决」的单强制要求 `--landed <文件路径>#<台账号>`，
+  所以每条裁决**必须**有台账本里的台账号，否则关不掉（固化回写闸 B9）。
 
 ## 工程速查
 
