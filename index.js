@@ -3873,11 +3873,14 @@ export function apply(ctx) {
   //   主判据＝「这条会话实际挂载的预设所声明的工具集合」（挂载腿从 registry 返回值里带出来，
   //   见 mountStandardPreset 的 rememberPresetMount）——逐键按 agent 视角问宿主 tools 服务，
   //   **一个都看不见**才判挂载丢失（看见任意一个即放行，避免把「预设本来就没有某个键」误杀）。
-  //   拿不到集合时（宿主 registry 不声明工具名／旧夹具只提供 get）走保守兜底：仅对**走默认预设**
-  //   的 bot 使用默认预设的招牌工具常量 DEFAULT_PRESET_SIGNATURE_TOOLS（tool-fs 的读文件工具，
-  //   标准预设必然声明——原注释口径）；专用预设（agentPreset 指过名）拿不到集合就**不判定**，
-  //   因为此时无法区分「该预设没有这个工具」与「挂载真丢了」，误判的代价是把员工历史隔离一次。
-  //   两条路都留可判定日志（修法 5），把「假阴性（探测不可用）」与「真没丢」区分开。
+  //   拿不到集合时（宿主 registry 不声明工具名／旧夹具只提供 get）走保守兜底：**对所有 bot**——
+  //   默认预设与专用预设一视同仁——退回 0.8.15 的招牌键探针 DEFAULT_PRESET_SIGNATURE_TOOLS
+  //   （tool-fs 的读文件工具，标准预设必然声明）。#1689 裁决（CM 2026-10-17 选 1）：实测生产与
+  //   staging 宿主 AgentPreset 均无工具集合字段 ⇒ 主判据 declared 恒空必落兜底，若专用预设在此
+  //   不判定就等于把 0.8.15 已有的自动重建保护从 hr bot 身上撤掉（保护面倒退）；退回探针后误杀
+  //   代价＝「预设本来没招牌键」的 bot 被判缺失一次，由重建腿的 chat 级熔断限「每聊天最多一次」。
+  //   CRIT「退回兜底」在判出缺失时每次留痕（异常路径，频率＝故障频率），把「退回兜底
+  //   （宿主不提供声明集合）」与「探测不可用」「真没丢」三种可观测态区分开。
   const DEFAULT_PRESET_SIGNATURE_TOOLS = ['read']
   let probeShapeWarned = false
 
@@ -3915,15 +3918,18 @@ export function apply(ctx) {
         + ' 个工具按 agent 视角**全部不可见** ⇒ 判挂载丢失 session=' + String(sessionId || '-'))
       return true
     }
-    // 兜底判据：拿不到声明集合。
-    const isDefaultPreset = !bot || !bot.cfg || !bot.cfg.agentPreset
-    if (!isDefaultPreset) {
-      console.log('[fs] 专用预设 ' + String((info && info.id) || bot.cfg.agentPreset)
-        + ' 未暴露工具集合 ⇒ 无法区分「预设本来没这工具」与「挂载丢失」，不判定、不重建'
-        + ' session=' + String(sessionId || '-'))
-      return false
+    // 兜底判据（#1689 选 1 收口）：拿不到声明集合 ⇒ 不分默认/专用预设，一律退回 0.8.15
+    //   招牌键探针——保护面不倒退（专用预设 bot 也保住自动重建）。误杀代价＝「预设本来没有
+    //   招牌键」的 bot 被判缺失一次，由重建腿 chat 级熔断限「每聊天最多一次」。
+    //   CRIT 在**判出缺失**时每次留痕：这是异常路径（正常 bot 探针可见），频率＝故障频率，
+    //   不与修法 5 的常态探测路径共用每进程一次的节流——生产诊断时每条消息都能看到
+    //   「这个 bot 仍在兜底判定且仍缺失」，与重建（首条）/熔断（后续）日志互相印证。
+    const missing = DEFAULT_PRESET_SIGNATURE_TOOLS.every((name) => tools.get(name, agent) === undefined)
+    if (missing) {
+      console.log('[fs] CRIT 预设声明集合不可得（宿主不提供）⇒ 退回 0.8.15 招牌键探针判定挂载丢失'
+        + '（这是退回兜底，不是宿主没坏；误杀由重建熔断限每聊天一次）session=' + String(sessionId || '-'))
     }
-    return DEFAULT_PRESET_SIGNATURE_TOOLS.every((name) => tools.get(name, agent) === undefined)
+    return missing
   }
 
   // 探测失败（缺工具）⇒ 自动重建一个全新 dedicated 会话替换当前条目（chat 指针/落盘同步

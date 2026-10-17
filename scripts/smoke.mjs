@@ -10144,7 +10144,7 @@ console.log('N4) 0.8.16 修法 1/2/3/4/5 检查点：挂载丢失判定三条新
   const CHATC = 'oc_n4_notfound'      // 修法2：预设不在册 ⇒ 跳过自动重建
   const CHATS = 'oc_n4_noservice'     // 修法5：agentPresets 服务不在
   const CHATP = 'oc_n4_noget'         // 修法5：tools 服务没有 get ⇒ 探测不可用留痕
-  const CHATD = 'oc_n4_dedicated'     // 修法1 兜底：专用预设未暴露集合 ⇒ 不判定
+  const CHATD = 'oc_n4_dedicated'     // 修法1 兜底（#1689 选1）：专用预设无集合 ⇒ 退回招牌键探针仍重建
   const STATEN4 = join(process.env.FS_CONFIG_DIR,
     'state-' + String(APP_ID).replace(/[^a-zA-Z0-9]/g, '') + '.json')
   const recN4 = (chatKey) => {
@@ -10270,11 +10270,9 @@ console.log('N4) 0.8.16 修法 1/2/3/4/5 检查点：挂载丢失判定三条新
       + '（实得 探测不可用=' + cntN4(wP, '挂载丢失探测不可用') + '／重建='
       + cntN4(wP, '#771 rebuilt session') + '）')
 
-    // ⑤ 修法1 兜底：专用预设拿不到声明集合 ⇒ 不判定、不重建。
-    //   🔴 这条同时钉住**保护面收窄**：0.8.15 只要 read 不可见就重建，0.8.16 对配了 agentPreset 的
-    //   bot（生产形态，#171）在该宿主不声明工具名时**不再重建**。取舍写在 index.js:3915 注释里
-    //   （误判代价＝把员工历史隔离一次），但「宿主到底声明不声明」本地无从证实 ⇒ 须生产日志读回，
-    //   读回之前不得宣称 #771 已根治。
+    // ⑤ 修法1 兜底（#1689 选 1 收口）：专用预设拿不到声明集合 ⇒ 退回 0.8.15 招牌键探针，
+    //   仍判定、仍重建——保护面不倒退。🔴 判别力：0.8.16 原字节（「不判定、不重建」）此格
+    //   重建=0 且无 CRIT ⇒ 两条断言必红；0.8.15 字节无「退回兜底」CRIT ⇒ 第一条也红。
     writeCfgN4({ agentPreset: 'preset-n4' })
     await new Promise((r) => { setTimeout(r, 11000) })   // 等过热读节拍（bot.cfg 每 10 秒重读）
     toolVisibility = () => undefined
@@ -10284,9 +10282,12 @@ console.log('N4) 0.8.16 修法 1/2/3/4/5 检查点：挂载丢失判定三条新
     feedN4(CHATD)
     await settle(3)
     const wD = linesN4(markN4)
-    ok(cntN4(wD, '未暴露工具集合') >= 1 && cntN4(wD, '#771 rebuilt session') === 0,
-      '★★ 修法1 兜底：专用预设未暴露工具集合 ⇒ 不判定、不重建（保护面收窄的可判定记录；实得 '
-      + cntN4(wD, '未暴露工具集合') + '／重建=' + cntN4(wD, '#771 rebuilt session') + '）')
+    ok(cntN4(wD, '退回 0.8.15 招牌键探针') >= 1,
+      '★★ 修法1 兜底（选1）：专用预设未暴露集合 ⇒ 打「退回兜底」CRIT 留痕（实得 '
+      + cntN4(wD, '退回 0.8.15 招牌键探针') + ' 条）')
+    ok(cntN4(wD, '#771 rebuilt session') === 1,
+      '★★ 修法1 兜底（选1）：仍判定、仍重建＝保护面不倒退（实得 重建='
+      + cntN4(wD, '#771 rebuilt session') + '；原「不判定」字节此格=0＝必红）')
     writeCfgN4(undefined)
   } finally {
     presetDeclaredTools = null

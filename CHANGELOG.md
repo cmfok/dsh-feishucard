@@ -9,15 +9,18 @@
 - **修法 1｜挂载丢失的判定键不再硬编码招牌工具**（`index.js` `presetToolsMissing` 重写）：
   主判据＝「这条会话实际挂载的预设所声明的工具集合」，逐键按 agent 视角问宿主 tools 服务，
   **一个都看不见**才判挂载丢失（部分可见＝预设那份挂上了，只是个别键不在，不重建）；
-  拿不到集合时，走默认预设的 bot 仍用招牌键常量 `DEFAULT_PRESET_SIGNATURE_TOOLS` 兜底，
-  专用预设（bot 配了 `agentPreset`）的 bot 按「不判定、不重建」处理。
-  🔴 **如实登记（不得据此宣称 #771 已根治）**：本次定版读宿主源实测——生产与 staging 的
-  `@deepseek-ai/dsh-agent-preset-registry/lib/types/preset.d.ts` 里 `interface AgentPreset`
-  只有 `id / name? / description? / order? / broken?`，而服务方法 `mount(ctx, id?)` 的返回类型就是它
-  ⇒ **现装宿主不返回工具集合**，主判据在真机上恒不触发、一律走兜底；而生产日志 13:07 窗实回
-  `standard agent preset mounted: hr (bot=hr, agentPreset=hr)` ⇒ 线上的 hr bot 正是"专用预设"那一类。
-  变异件 z1（0.8.15 判定腿）用同套夹具跑出的红条把这条能力差写实了：同一场景 0.8.15 **重建 1 次**、
-  0.8.16 **不判定不重建**。兜底口径要不要改回保留保护面，已投裁决卡 **#1689**（推荐选项 1）。
+  拿不到集合时，**对所有 bot（默认与专用预设一视同仁）退回 0.8.15 的招牌键探针**
+  `DEFAULT_PRESET_SIGNATURE_TOOLS`，并打一条每进程一次的 CRIT「退回兜底」留痕（说清这是
+  宿主不提供声明集合，不是宿主没坏）。
+  🔴 **兜底口径已按 CM 裁决收口（中台 #1689／卡 AC-0080，2026-10-17 22:2x 选 1）**：本次定版读宿主源
+  实测——生产与 staging 的 `@deepseek-ai/dsh-agent-preset-registry/lib/types/preset.d.ts` 里
+  `interface AgentPreset` 只有 `id / name? / description? / order? / broken?`，而服务方法 `mount(ctx, id?)`
+  的返回类型就是它 ⇒ **现装宿主不返回工具集合**，主判据在真机上恒不触发、一律走兜底；而生产日志
+  13:07 窗实回 `standard agent preset mounted: hr (bot=hr, agentPreset=hr)` ⇒ 线上的 hr bot 正是
+  "专用预设"那一类。首版兜底对专用预设「不判定、不重建」，变异件 z1（0.8.15 判定腿）用同套夹具
+  证实那等于撤掉 0.8.15 已有的自动重建保护（同一场景 0.8.15 重建 1 次、首版 0.8.16 不重建）；
+  CM 据此拍选项 1：兜底退回探针（保护面不倒退，误杀由重建熔断限每聊天一次），N4⑤ 断言反转为
+  「仍判定、仍重建」。台账 H-D6。
 - **修法 2｜配置无效 ≠ 挂载丢失，不走自动重建**：挂载腿报 `agent-preset/not-found`
   （或报文含 `unknown agent preset`）时打 CRIT 说明并登记该会话，`ensurePresetTools` 见到这条登记
   就**只喊话不重建**、也**不计熔断额度**——重建既救不回配置错误（预设名没改就还是查无），
