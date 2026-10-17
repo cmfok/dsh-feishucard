@@ -552,17 +552,28 @@ let modelSelectionState                   // sessionProjections.stateOf(session,
 let presetMountCalls = []
 let presetMountImpl = null
 let presetMountSkipResumeOn = false
-const mountPresetAgentCtx = () => ({ get: () => ({
+// 🔴 N4（0.8.16 修法 1／5 检查点）两处夹具开关，默认全关＝既有几十个用例逐字不变：
+//   · presetDeclaredTools 非空 ⇒ mount 返回值带上「该预设声明的工具集合」（宿主真形之一）。
+//     没有这个开关，index.js:3901 的主判据分支（全不可见⇒重建／部分可见⇒不重建）在整套
+//     冒烟里**一次都不会执行**——正是 #771 假绿灯的同族形态（审查 P1）。
+//   · presetServiceAbsent ＝ true ⇒ agentCtx.get('agentPresets') 返回 undefined，演修法 5
+//     的「服务不在」出口（旧字节在这里静默 return，日志上「没走挂载」与「挂载成功」长得一样）。
+let presetDeclaredTools = null
+let presetServiceAbsent = false
+const mountPresetAgentCtx = () => ({ get: () => (presetServiceAbsent ? undefined : {
   mount: async (_agentCtx, id) => {
     presetMountCalls.push(id)
     if (presetMountImpl) return presetMountImpl(_agentCtx, id)
-    return { id: id || 'default' }
+    return Object.assign({ id: id || 'default' },
+      presetDeclaredTools ? { tools: presetDeclaredTools } : {})
   },
 }) })
 function resetPresetMountFixtures() {
   presetMountCalls = []
   presetMountImpl = null
   presetMountSkipResumeOn = false
+  presetDeclaredTools = null
+  presetServiceAbsent = false
 }
 function makeRegistryEntity(path, title, id) {
   const entityId = id || ('ws-' + (++registryIdSeq))
@@ -1211,6 +1222,52 @@ console.log('12b) 元素/体积超限 ⇒ **换卡续写**（旧卡正文原样�
   // ⚠️ 这作废了 0.7.8 按审查 MED#967/MED#2272 改成"新卡视角"的方向 —— 以 CM 最新口径为准。
   ok(oldCardBody.includes('本卡内容已达飞书单卡上限') && !newCardBody.includes('本卡内容已达飞书单卡上限'),
     '★ 12d 换卡指路语写在**旧卡**上、新卡干净起步（CM 2026-10-03 ③）')
+}
+
+console.log('12e) 字节额度换卡的**块数下限＝2**（中台 #1672 案 1，CM 2026-10-17 11:28 拍「只做案 1」）：块数在 2–60 之间、字节越线也必须换卡')
+{
+  // 判别力设计（为什么不能用"一条超长过程话语"造靶子——第一版就是这么写的，红了，是夹具错不是代码错）：
+  //   过程话语建块时走 `appendNote → clipNoteText(…, MAX_NOTE_CHARS=500)`，单块被截到 ≤500 字，
+  //   「5 块 ×30000 字」的假设**根本不成立**（实测一块只有 KB 级，够不着 120 KB 线）。
+  //   但同一个函数里有一条真实保护：目的行（`🎯 …`）被截掉会**整批补回**（`purposeLinesOf`／
+  //   `MAX_PURPOSE_CHARS`，每行 ≤200 字）⇒ 一条含几十行**互不相同**目的行的过程话语能合法留成
+  //   ~18 KB 的块（算式级预演见 `output/dsh1672-bytecase/clipcalc.mjs`：单块 6158 字／18255 字节）。
+  //   用 8 块 ⇒ 块数 8（**在 2–60 增量窗口内**）而字节约 146 KB > 120 KB 线，且远不到 170。
+  //   ⇒ 只有 `blocks.length > 2 && bytes > 线` 这一支能触发；下限退回 60 的变异件必须红。
+  const markB = sentCards.length
+  let releaseB
+  const gateB = new Promise((r) => { releaseB = r })
+  const prevIdleB = agent.whenIdle.bind(agent)
+  agent.whenIdle = () => gateB
+  // 30 行互不相同的 `🎯 …`（每行约 197 字）——目的行保护会把被截掉的行整批补回块内
+  const noteB = Array.from({ length: 30 }, (_, i) => '🎯 目的' + i + '：' + '补'.repeat(190)).join('\n')
+  agent.send = function (message) {
+    this.sent.push(message)
+    for (let i = 0; i < 8; i++) {
+      agentEvents.push({ type: 'assistant/message', seq: 11001 + i, data: { message: { content: [{ type: 'text', text: noteB }] } } })
+    }
+  }
+  feedInbound('om_rotate_bytes', '字节换卡')
+  await drain()
+  agentEvents.push({ type: 'assistant/message', seq: 11010, data: { message: { content: [{ type: 'text', text: '字节换卡后的续写段' }] } } })
+  await drain()
+  releaseB()
+  agent.whenIdle = prevIdleB
+  await drain()
+
+  const createsB = cardsSince(markB).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
+  const allB = JSON.stringify(cardsSince(markB))
+  // 判别窗口的证据来源（2026-10-17 二次纠正）：**不能**用 `[fs] buildCardPayload … blocks=N` 那条日志——
+  // 它打的是**渲染后**的元素计数（换卡那一拍就没再打），实测取到 max=1 是读数口径错，不是代码错。
+  // 改用每段自带的唯一目的行标记 `🎯 目的k：` 反查卡上真实承载了几段（一段＝一个 note 块）。
+  const marksB = Array.from({ length: 8 }, (_, i) => '🎯 目的' + i + '：').filter((m) => allB.includes(m))
+  ok(createsB.length >= 1, '（前提）字节换卡例确实建出了回合卡')
+  ok(marksB.length >= 3 && marksB.length <= 60,
+    '（前提·判别窗口）卡上真实承载 ' + marksB.length + ' 段过程正文（＝块数级），必须落在 2–60 之间：够不着 170，也够不着旧下限 60')
+  ok(allB.includes('本卡内容已达飞书单卡上限'),
+    '★ 主断言：8 块／字节越 120000 线 ⇒ 换卡并留下指路语（下限 2 生效；旧下限 60 时这一支根本不参与判定）')
+  ok(createsB.length >= 2, '★ 主断言：字节超限后新建了第二张卡（create 次数 ' + createsB.length + '）')
+  ok(allB.includes('字节换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
 }
 
 console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
@@ -9707,6 +9764,23 @@ console.log('114) ★🔴 拔件演习：权限挂统一文案「目前服务不
 
 console.log('N1) #1105 date anchor: first turn of a chat carries it, same-day second does not')
 {
+  // 🔴 2026-10-17 定版复跑查出的夹具缺陷（由 N1b 的前提条报红牵出，属实修不是掩盖）：
+  //   本用例群原本**继承用例 113 那一代**的配置（capabilityGuard 开、planEnabled 缺省）⇒
+  //   `/plan` 在 N1③/N1b 里被 `capability DENY(no_grant): cap=plan` 挡在 agent 回合之前：
+  //   N1③「命令轮不消耗锚额度」是**开关拒发的形状**（假绿，commandHold 根本没跑），
+  //   N1b 要的「卡片被拒→回注合成轮」更是压根没产生。⇒ 本用例群自带一代配置：
+  //   planEnabled/goalEnabled 开、capabilityGuard 关（锚判据与能力闸无关，别拿闸门当配置）。
+  writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
+    bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+             reactionEmoji: 'GLANCE', approvalForm: true, planEnabled: true, goalEnabled: true }],
+  }, null, 2))
+  for (const cleanup of effectCleanups) { try { cleanup() } catch { /* 夹具清理尽力而为 */ } }
+  effectCleanups.length = 0
+  globalThis.__fsReloadHint = null
+  const modN1 = await import('../index.js')
+  modN1.apply(ctx)
+  await settle(2)
+  liveAgents.push(agent)
   // 用例①（#1105 验证清单 3-a）：新 chat 首条带【日期锚】前缀，同日第二条不带（状态去重）。
   // 跨天分支说明（如实，不装过）：锚状态是模块内存 Map（loadDateAnchorState 启动加载一次，
   // dateAnchorFor 只读写内存）⇒ 改状态文件造不了跨天；跨天与新会话走同一 `get(key) !== today`
@@ -9728,8 +9802,38 @@ console.log('N1) #1105 date anchor: first turn of a chat carries it, same-day se
   //   `/goal <正文>` ⇒ commandHold 置位、runTurn 走 skipSend，带锚的那条 message 从不 send）
   //   **不许消耗当天的锚额度**。原实现先记当天再判 skipSend ⇒ 命令轮之后该 chat 当天
   //   余下所有消息都没有锚，#1105 的验收整天落空。判据：命令轮后的第一条普通消息仍带锚。
-  feedInbound('om_anchor_cmd', '/plan 命令轮正文（不该吃掉今天的锚）', { chatId: 'oc_anchor_cmd1' })
+  // 🔴 L1 复验（2026-10-17 定版，查出本格此前是**假绿**）：默认桩 `fakeCommands.execute` 返回
+  //   undefined（smoke.mjs:458）⇒ `/plan <正文>` 在 handleCommand 里落到 plan-mode 兜底的 `return true`
+  //   ⇒ handleInbound 在锚判断**之前**就 return（index.js:6027）⇒ commandHold／skipSend 那条支路
+  //   一行没执行，绿的是「命令提前返回、压根没碰锚」这个形状。正解＝本格临时让注册表真接管
+  //   （返回非 undefined 且带正文 ⇒ index.js:4381 `return {turnStarted}`），用完还原、不外泄给别的用例。
+  const prevExecN1 = fakeCommands.execute
+  const lineBeforeCmd1 = consoleLines.length
+  // 🔴 先建会话再演命令腿：`/plan` 在**没有会话的 chat** 上走的是「当前没有可用会话」提前 return
+  //   （index.js:4349-4352）⇒ commands.execute 根本没被调用、commandHold 支路零执行（本单 10:3x 史段
+  //   记过同族坑）。`/new` 是命令腿、不起 agent 回合 ⇒ 不碰锚额度，正好当"造会话"的前置。
+  fakeCommands.execute = async () => ({ result: { text: 'ok' } })
+  feedInbound('om_anchor_new_cmd1', '/new', { chatId: 'oc_anchor_cmd1' })
   await drain()
+  const sentBeforeCmd1 = agent.sent.length
+  try {
+    feedInbound('om_anchor_cmd', '/plan 命令轮正文（不该吃掉今天的锚）', { chatId: 'oc_anchor_cmd1' })
+    await drain()
+    const segCmd1 = consoleLines.slice(lineBeforeCmd1).filter((l) => l.indexOf('oc_anchor_cmd1') >= 0)
+    ok(segCmd1.some((l) => l.indexOf('card created chat=oc_anchor_cmd1') >= 0),
+      '（前提·归属）命令腿真起了一个带卡的回合（没这条＝`/plan` 提前 return，commandHold 支路零执行，下面那条恒真）'
+      + '｜本 chat 日志前 3 条 ' + JSON.stringify(segCmd1.slice(0, 3).map((l) => l.slice(0, 52))))
+    ok(agent.sent.slice(sentBeforeCmd1).some((m) => {
+      const t = String((m && m.content && m.content[0] && m.content[0].text) || '')
+      return t.indexOf('命令轮正文') >= 0 && t.indexOf('【日期锚】') !== 0
+    }),
+      '（前提·归属）命令腿那一拍真进了 agent 且**不带锚**（commandHold 生效的形状；没这条＝支路没跑，下面那条恒真）'
+      + '｜本段条数=' + agent.sent.slice(sentBeforeCmd1).length
+      + '，各条前 12 字 ' + JSON.stringify(agent.sent.slice(sentBeforeCmd1)
+        .map((m) => String((m && m.content && m.content[0] && m.content[0].text) || '').slice(0, 12))))
+  } finally {
+    fakeCommands.execute = prevExecN1
+  }
   const sentBeforeAfterCmd = agent.sent.length
   feedInbound('om_anchor_after_cmd', '命令轮之后的普通消息', { chatId: 'oc_anchor_cmd1' })
   await drain()
@@ -9738,6 +9842,111 @@ console.log('N1) #1105 date anchor: first turn of a chat carries it, same-day se
   ok(afterCmdText.indexOf('【日期锚】') === 0,
     '#1105 命令轮（commandHold）不消耗锚额度：之后第一条普通消息仍带锚（实得前 24 字：'
     + JSON.stringify(afterCmdText.slice(0, 24)) + '）')
+}
+
+console.log('N1b) #1105 E4b：卡片失败回注的合成轮（`_internal`）**照样走锚判断**——配对对照证它把当天状态写掉了（A 组无锚／B 组有锚）')
+{
+  // 为什么这一格值得单独钉（中台 #1105 验收清单里的 E4b）：锚的覆盖面口径是「凡进 handleInbound 的轮次」，
+  //   而全仓**只有一个** `_internal: true` 的注入点（卡片被拒后回注系统提示那条，index.js 的 notifyCardFailure）
+  //   ⇒ 它必须走同一套锚判断，否则"合成轮既不占额度也不留状态"这种半吊子行为会悄悄留在生产里。
+  // 构造（真实支路，不补桩）：命令腿 `/plan <正文>` 起回合——commandHold 那一拍 `dateAnchor=''`、**不写状态**
+  //   （N1③ 已钉），于是该 chat 当天额度仍未用；这一拍的卡被拒 ⇒ 回注系统提示 ⇒
+  //   合成轮进来时额度还没用 ⇒ 它必须照样带锚并把状态写掉。
+  // 🔴 实测更正一处旧说法（本轮跑出来的形状，别再当"skipSend＝正文永不 send"）：命令腿那一拍在夹具里
+  //   先无产出（`turn sealed status=error silent=true`），heal 随即**重建会话并把正文补发**给 agent
+  //   （补发的是同一条不带锚的消息，且不会重算锚 ⇒ 当天额度仍未被用）。所以判据写成
+  //   「命令腿那条进了 agent 但不带锚」＋「它之后的合成轮带锚」，两条合起来才排除恒真。
+  // 🔴 L1 复验（2026-10-17 定版）两处必改，都是本格的假绿来源：
+  //   ①默认桩 `fakeCommands.execute` 返回 undefined ⇒ `/plan` 落到 plan-mode 兜底 `return true`
+  //     ⇒ handleInbound 在锚判断**之前**就 return（index.js:6027），commandHold 支路零执行
+  //     ⇒ 本格临时让注册表真接管（与 N1③ 同款，用完还原）；
+  //   ②判据原先在**整片 slice** 上 some/findIndex、不绑本 chat ⇒ 会被别家用例迟到的「系统提示」喂绿
+  //     ⇒ 现在先按日志钉「本 chat 的卡真被拒过、失败出口真走到 notifyCardFailure」，
+  //       前提红时判别条用占位文本**必红**，不级联假绿。
+  const CHATE = 'oc_anchor_internal'
+  let sentBeforeE = agent.sent.length
+  let lineBeforeE = consoleLines.length
+  let seqE = 97500
+  const realSendE = agent.send
+  const prevExecE = fakeCommands.execute
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({
+      type: 'assistant/message', seq: (seqE += 10),
+      data: { message: { content: [{ type: 'text', text: 'E4b 本轮回复' }] } },
+    })
+  }
+  const textsE = () => agent.sent.slice(sentBeforeE)
+    .map((m) => String((m && m.content && m.content[0] && m.content[0].text) || ''))
+  try {
+    fakeCommands.execute = async () => ({ result: { text: 'ok' } })
+    // 先建会话再演命令腿（与 N1③ 同因：无会话的 `/plan` 走「当前没有可用会话」提前 return）；
+    // `/new` 是命令腿、不起 agent 回合 ⇒ 不碰当天锚额度，合成轮仍是"当天首进"。
+    feedInbound('om_e4b_new', '/new', { chatId: CHATE })
+    await drain()
+    sentBeforeE = agent.sent.length
+    lineBeforeE = consoleLines.length
+    // 注册表接管后，`/plan` 这一拍会先回一句纯文本回执，实测那条腿要吃掉**两次** create 配额
+    //   （`plain text send failed` ＋ `plain text degraded retry`），第三次才轮到这一拍的卡 ⇒ 注 3 次。
+    //   本格随后立即归零；后续若再被拒也无害（notifyCardFailure 有 chat|类判重窗口）。
+    rejectPatches = 3
+    rejectPatchesBody = {
+      code: 230099,
+      msg: 'Failed to create card content, ext=ErrCode: 200570; ErrMsg: card contains invalid image keys',
+    }
+    feedInbound('om_e4b_cmd', '/plan E4b 正文（命令腿起回合，卡要被拒一次）', { chatId: CHATE })
+    await drain()
+    rejectPatches = 0
+    rejectPatchesBody = null
+    await settle(3)
+    const segE = consoleLines.slice(lineBeforeE).filter((l) => l.indexOf('chat=' + CHATE) >= 0)
+    ok(segE.some((l) => l.indexOf('card sync failed') >= 0),
+      '（前提·归属）本 chat 的卡确实被拒过（`card sync failed chat=' + CHATE + '`）'
+      + '｜本 chat 日志前 2 条 ' + JSON.stringify(segE.slice(0, 2).map((l) => l.slice(0, 58))))
+    ok(segE.some((l) => l.indexOf('card failure notice sent') >= 0 || l.indexOf('card failure notice skipped') >= 0),
+      '（前提·归属）失败出口真走到 notifyCardFailure（notice sent／skipped 至少一条；没有＝合成轮不会存在）')
+    const texts = textsE()
+    const humanIdx = texts.findIndex((t) => t.indexOf('E4b 正文') >= 0)
+    ok(humanIdx >= 0 && texts[humanIdx].indexOf('【日期锚】') !== 0,
+      '（前提·归属）命令腿那一拍真进了 agent 且**不带锚**（＝commandHold 生效、当天额度还没被用；没这条＝支路没跑，判别条①恒真）'
+      + '｜本段条数=' + texts.length + '，各条前 12 字 ' + JSON.stringify(texts.map((t) => t.slice(0, 12))))
+    // 🔴 合成轮那条「系统提示」在本夹具里**取不到正文**（2026-10-17 定版实测：`card failure notice sent`
+    //   之后那一回合确实跑了并产出回复，但它落在 heal 新建的会话上，`agent.sent` 里看不到注入文本）。
+    //   ⇒ 判据不硬凑"取到正文"，改用**配对对照**钉同一个事实（合成轮走了锚判断并把当天状态写掉）：
+    //     A 组（本 chat）：命令腿（不吃锚）→ 卡被拒 → 有合成轮 → 紧随的真人轮**不带锚**；
+    //     B 组（对照 chat）：同样的命令腿，但卡**不被拒**（没有合成轮）→ 紧随的真人轮**必须带锚**。
+    //   两组唯一差别＝有没有合成轮 ⇒ A 组的"不带锚"只能归因于合成轮写了状态；
+    //   `_internal` 若整段跳过锚判断（既不读也不写）A 组必红；命令腿若自己吃了额度 B 组必红。
+    feedInbound('om_e4b_real', 'E4b 之后的真人消息', { chatId: CHATE })
+    await drain()
+    const texts2 = textsE()
+    const realText = texts2[texts2.length - 1] || '（前提已红：没有新入站）'
+    ok(realText.indexOf('E4b 之后的真人消息') >= 0,
+      '（前提）A 组紧随的真人轮确实进了 agent（拿到的是这一条的正文）')
+    ok(realText.indexOf('【日期锚】') !== 0,
+      '★★ E4b 判别条 A：合成轮把当天状态写了 ⇒ 紧随的真人轮不再带锚（`_internal` 若跳过锚判断＝本条红；实得前 24 字：'
+      + JSON.stringify(realText.slice(0, 24)) + '）')
+    const CHATE2 = 'oc_anchor_internal_ctl'
+    const sentBeforeCtl = agent.sent.length
+    feedInbound('om_e4b_ctl_cmd', '/plan E4b 对照正文（卡不被拒）', { chatId: CHATE2 })
+    await drain()
+    await settle(2)
+    feedInbound('om_e4b_ctl_real', 'E4b 对照之后的真人消息', { chatId: CHATE2 })
+    await drain()
+    const ctlTexts = agent.sent.slice(sentBeforeCtl)
+      .map((m) => String((m && m.content && m.content[0] && m.content[0].text) || ''))
+    const ctlReal = ctlTexts[ctlTexts.length - 1] || '（对照腿没跑到）'
+    ok(ctlReal.indexOf('E4b 对照之后的真人消息') >= 0,
+      '（前提）B 组对照的真人轮进了 agent（拿不到＝对照组没跑，判据不成立）')
+    ok(ctlReal.indexOf('【日期锚】') === 0,
+      '★★ E4b 判别条 B（对照）：没有合成轮时命令腿不吃额度 ⇒ 紧随真人轮带锚（本条红＝额度是被命令腿吃掉的，A 组结论作废；实得前 24 字：'
+      + JSON.stringify(ctlReal.slice(0, 24)) + '）')
+  } finally {
+    agent.send = realSendE
+    fakeCommands.execute = prevExecE
+    rejectPatches = 0
+    rejectPatchesBody = null
+  }
 }
 
 console.log('N2) #1447 告警标签三分：tableOk 但无 actor 时按 resolver err 码分流（三场景标签各自正确）')
@@ -9921,6 +10130,225 @@ console.log('N3) #771 preset 工具挂载重建：单次熔断（同一条聊天
     toolVisibility = () => ({ name: 'read' })
     agent.send = realSend771
   }
+}
+
+console.log('N4) 0.8.16 修法 1/2/3/4/5 检查点：挂载丢失判定三条新分支＋配置无效不重建＋重建沿用原工作区＋两处探测留痕')
+{
+  // 背景（L1 审查 P1/P2，2026-10-17）：0.8.16 主补丁把 #771 的判定腿整体重写（index.js:3881 起），
+  //   但夹具的 registry mount 只回 `{ id }` ⇒ 新写的「声明集合全部不可见／部分可见／专用预设无集合」
+  //   三条分支在全量冒烟里**一次都没执行**；修法 2/4/5 的新分支同样零断言。这正是 N3 注释里自述过的
+  //   那类假绿灯（落码→上生产→分支从未跑过），所以本用例把每条分支各钉一个可判别断言，
+  //   并给阴性对照（可见⇒不重建、部分可见⇒不重建、无集合⇒不判定）。
+  const CHATA = 'oc_n4_declared'      // 声明集合全不可见 ⇒ 重建（＋修法4 cwd）
+  const CHATB = 'oc_n4_partial'       // 部分可见 ⇒ 不重建
+  const CHATC = 'oc_n4_notfound'      // 修法2：预设不在册 ⇒ 跳过自动重建
+  const CHATS = 'oc_n4_noservice'     // 修法5：agentPresets 服务不在
+  const CHATP = 'oc_n4_noget'         // 修法5：tools 服务没有 get ⇒ 探测不可用留痕
+  const CHATD = 'oc_n4_dedicated'     // 修法1 兜底：专用预设未暴露集合 ⇒ 不判定
+  const STATEN4 = join(process.env.FS_CONFIG_DIR,
+    'state-' + String(APP_ID).replace(/[^a-zA-Z0-9]/g, '') + '.json')
+  const recN4 = (chatKey) => {
+    let st = null
+    try { st = JSON.parse(readFileSync(STATEN4, 'utf8')) } catch { st = null }
+    return (st && st.chats && st.chats[chatKey]) || null
+  }
+  const activeN4 = (chatKey) => {
+    const rec = recN4(chatKey)
+    if (!rec || !Array.isArray(rec.sessions) || !rec.sessions.length) return null
+    return rec.sessions.find((s) => s && s.id === rec.active) || rec.sessions[rec.sessions.length - 1]
+  }
+  const linesN4 = (from) => consoleLines.slice(from).map(String)
+  const cntN4 = (lines, needle) => lines.filter((l) => l.includes(needle)).length
+  const writeCfgN4 = (extra) => writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'),
+    JSON.stringify({ bots: [Object.assign({
+      name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET,
+      reactionEmoji: 'GLANCE', approvalForm: true, planEnabled: true, goalEnabled: true,
+    }, extra)] }, null, 2))
+  let seqN4 = 98000
+  let msgN4 = 0
+  const realSendN4 = agent.send
+  const realToolsGet = fakeTools.get
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({
+      type: 'assistant/message', seq: (seqN4 += 10),
+      data: { message: { content: [{ type: 'text', text: 'N4 本轮回复' }] } },
+    })
+  }
+  const feedN4 = (chatKey) => feedInbound('om_n4_' + (++msgN4), 'N4 轮次消息', { chatId: chatKey })
+  try {
+    // ① 主判据：预设声明 read＋grep，两条都不可见 ⇒ 判挂载丢失并重建；重建必须沿用原工作区
+    presetServiceAbsent = false
+    presetDeclaredTools = ['read', 'grep']
+    toolVisibility = () => ({ name: 'read' })
+    let markN4 = consoleLines.length
+    feedN4(CHATA)
+    await settle(3)
+    const entryA = activeN4(CHATA)
+    ok(Boolean(entryA && entryA.id), '（前提）① 独立 chat 的会话已建并落盘')
+    ok(linesN4(markN4).some((l) => l.includes('preset mounted') && /session=[^-\s]/.test(l)
+      && !l.includes('session=-')),
+      '★ 修法3：挂载**成功**日志带上具体 sessionId（失败侧与成功侧将来能对上；实得 '
+      + JSON.stringify(String(linesN4(markN4).find((l) => l.includes('preset mounted')) || '').slice(-70)) + '）')
+    ok(cntN4(linesN4(markN4), '#771 ') === 0,
+      '★ ①阴性对照：声明的工具都可见 ⇒ 零 #771 日志（实得 ' + cntN4(linesN4(markN4), '#771 ') + ' 条）')
+    // 修法4 靶子：先把这条会话挪到「其它工作区」，重建后必须还在那个目录
+    agent.session.header.cwd = OTHER_WORKSPACE
+    markN4 = consoleLines.length
+    toolVisibility = () => undefined
+    feedN4(CHATA)
+    await settle(3)
+    const wA = linesN4(markN4)
+    ok(cntN4(wA, '全部不可见') === 1,
+      '★★ 修法1 主判据：声明的 2 个工具按 agent 视角全不可见 ⇒ 走主判据分支并留痕（实得 '
+      + cntN4(wA, '全部不可见') + ' 条，旧字节这段代码不存在＝必红）')
+    ok(cntN4(wA, '#771 rebuilt session') === 1,
+      '★ ①主判据确实触发重建恰好一次（实得 ' + cntN4(wA, '#771 rebuilt session') + ' 条）')
+    const rebuiltA = String(wA.find((l) => l.includes('#771 rebuilt session')) || '')
+    ok(rebuiltA.includes('cwd=' + OTHER_WORKSPACE),
+      '★★ 修法4：重建沿用原会话工作区——日志带 cwd=' + OTHER_WORKSPACE + '（不传则红）｜实得行尾 '
+      + JSON.stringify(rebuiltA.slice(-90)))
+    ok(agent.session.header.cwd === OTHER_WORKSPACE,
+      '★ 修法4 结果侧：新会话建在原工作区（实得 ' + String(agent.session.header.cwd) + '）')
+
+    // ② 部分可见 ⇒ 预设那一份挂上了，不判挂载丢失（防把「预设本来没某个键」误杀成丢历史）
+    toolVisibility = (name) => (name === 'read' ? { name } : undefined)
+    markN4 = consoleLines.length
+    feedN4(CHATB)
+    await settle(3)
+    feedN4(CHATB)
+    await settle(3)
+    const wB = linesN4(markN4)
+    ok(cntN4(wB, '部分可见') >= 1 && cntN4(wB, '#771 rebuilt session') === 0,
+      '★★ 修法1：声明集合部分可见（1/2）⇒ 留痕「部分可见」且不重建（实得 部分可见='
+      + cntN4(wB, '部分可见') + '／重建=' + cntN4(wB, '#771 rebuilt session') + '）')
+
+    // ③ 修法2：预设不在册＝配置无效 ⇒ 只喊话，不烧重建额度、不隔离历史
+    presetDeclaredTools = null
+    toolVisibility = () => ({ name: 'read' })
+    presetMountImpl = () => {
+      const e = new Error('Unknown agent preset: preset-n4')
+      e.code = 'agent-preset/not-found'
+      throw e
+    }
+    feedN4(CHATC)
+    await settle(3)
+    markN4 = consoleLines.length
+    toolVisibility = () => undefined
+    feedN4(CHATC)
+    await settle(3)
+    const wC = linesN4(markN4)
+    ok(cntN4(wC, 'CRIT 跳过自动重建') >= 1,
+      '★★ 修法2：登记过「预设不在册」的会话即便工具不可见也只喊话（实得跳过日志 '
+      + cntN4(wC, 'CRIT 跳过自动重建') + ' 条；旧字节没有这道闸＝本条红）')
+    ok(cntN4(wC, '#771 rebuilt session') === 0,
+      '★ 修法2 后果面：配置无效不触发重建（不白烧额度、不把员工历史隔离一次）')
+    presetMountImpl = null
+
+    // ④ 修法5：两条「探测面缺失」的出口必须留痕，不许与「一切正常」长得一样
+    presetServiceAbsent = true
+    markN4 = consoleLines.length
+    const markCardsS = sentCards.length
+    toolVisibility = () => ({ name: 'read' })
+    feedN4(CHATS)
+    await settle(3)
+    presetServiceAbsent = false
+    ok(cntN4(linesN4(markN4), 'agentPresets 服务不在') === 1,
+      '★★ 修法5：agentPresets 服务不在 ⇒ 打「服务不在」留痕（旧字节静默 return＝假阴性）')
+    ok(cardsSince(markCardsS).length > 0,
+      '★ 修法5 不拒服务：挂载整体跳过时卡片链路照常走（fail-soft 不在消息层）')
+    fakeTools.get = undefined
+    markN4 = consoleLines.length
+    feedN4(CHATP)
+    await settle(3)
+    feedN4(CHATP)
+    await settle(3)
+    fakeTools.get = realToolsGet
+    const wP = linesN4(markN4)
+    ok(cntN4(wP, '挂载丢失探测不可用') >= 1 && cntN4(wP, '#771 rebuilt session') === 0,
+      '★★ 修法5：宿主 tools 服务没有 get ⇒ 留痕「探测不可用」（不等于「工具确实在」）且不重建'
+      + '（实得 探测不可用=' + cntN4(wP, '挂载丢失探测不可用') + '／重建='
+      + cntN4(wP, '#771 rebuilt session') + '）')
+
+    // ⑤ 修法1 兜底：专用预设拿不到声明集合 ⇒ 不判定、不重建。
+    //   🔴 这条同时钉住**保护面收窄**：0.8.15 只要 read 不可见就重建，0.8.16 对配了 agentPreset 的
+    //   bot（生产形态，#171）在该宿主不声明工具名时**不再重建**。取舍写在 index.js:3915 注释里
+    //   （误判代价＝把员工历史隔离一次），但「宿主到底声明不声明」本地无从证实 ⇒ 须生产日志读回，
+    //   读回之前不得宣称 #771 已根治。
+    writeCfgN4({ agentPreset: 'preset-n4' })
+    await new Promise((r) => { setTimeout(r, 11000) })   // 等过热读节拍（bot.cfg 每 10 秒重读）
+    toolVisibility = () => undefined
+    markN4 = consoleLines.length
+    feedN4(CHATD)
+    await settle(3)
+    feedN4(CHATD)
+    await settle(3)
+    const wD = linesN4(markN4)
+    ok(cntN4(wD, '未暴露工具集合') >= 1 && cntN4(wD, '#771 rebuilt session') === 0,
+      '★★ 修法1 兜底：专用预设未暴露工具集合 ⇒ 不判定、不重建（保护面收窄的可判定记录；实得 '
+      + cntN4(wD, '未暴露工具集合') + '／重建=' + cntN4(wD, '#771 rebuilt session') + '）')
+    writeCfgN4(undefined)
+  } finally {
+    presetDeclaredTools = null
+    presetServiceAbsent = false
+    presetMountImpl = null
+    toolVisibility = () => ({ name: 'read' })
+    fakeTools.get = realToolsGet
+    agent.send = realSendN4
+    writeCfgN4(undefined)
+  }
+}
+
+console.log('N5) 0.8.16 修法 6：真机字节超限报文 code=200860 card over max size 必须归体积类（走抢救腿），裸数字不得误纳')
+{
+  // 判别力（A3 缺陷本体）：旧正则几道字面都不命中 200860 ⇒ 落到末尾默认 transport ⇒
+  //   「抢救纯文本」与「用户可见失败说明」两条腿都不触发。归成 toolarge 的可观测指纹＝
+  //   留痕 `card failure notice skipped`（用例 59 同款口径，不是凭日志猜）。
+  let seqN5 = 99000
+  const linesN5slice = (from) => consoleLines.slice(from).map(String)
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: (seqN5 += 10),
+      data: { message: { content: [{ type: 'text', text: '修法6 超限回合的答复' }] } } })
+  }
+  rejectPatches = 1
+  rejectPatchesBody = { code: 200860, msg: 'card over max size' }
+  const markN5 = consoleLines.length
+  const markCardsN5 = sentCards.length
+  feedInbound('om_200860', '修法6 字节超限')
+  await settle(4)
+  rejectPatches = 0
+  rejectPatchesBody = null
+  const wN5 = linesN5slice(markN5)
+  ok(wN5.some((l) => l.includes('card failure notice skipped')),
+    '★★ 修法6：200860 报文归成 toolarge（留痕 notice skipped；旧字节归 transport＝本条必红）')
+  ok(!JSON.stringify(cardsSince(markCardsN5)).includes('卡片发送失败'),
+    '★ 修法6 用户侧：正文走抢救，不再多发一条「卡片发送失败」')
+  // 阴性对照（审查 P3 收紧）：报文里只是**恰好出现**这串业务数字、没有 code 前缀 ⇒ 不许按体积处理。
+  // 🔴 判据口径（2026-10-17 两次踩坑后定稿）：
+  //   第一版写「不含 notice skipped 且 含 notice sent」，实跑 `skipped=0 sent=0` —— 两个计数都 0 说明
+  //   **失败说明这条路压根没走到**（transport 类首拍失败后先重试，重试成功就不抱怨），断言恒真；
+  //   第二版给 `rejectPatches=3` 让重试也失败，结果连纯文本救援也被拒、走 `fallback text reply` 收场，
+  //   仍然到不了 notice 出口（夹具注释：rejectPatches 只对 create 生效，而纯文本发送也走 create）。
+  //   ⇒ 正确形态：用**同一条腿的正/负配对**做判别——正格（200860）已经证明这两个体积类指纹在完全相同的
+  //   夹具形态下会出现（`notice skipped (toolarge` ＋ `card body rescued`），本格就在同一 chat 上复现
+  //   "失败确实发生"（`card sync failed … retry=`）但**两个体积类指纹都不许出现**。
+  //   若正则写成裸数字（变异件 z2），本格会跑出那两个指纹 ⇒ 本条必红。
+  rejectPatches = 1
+  rejectPatchesBody = { code: 999999, msg: 'request failed，正文里带着一串业务数字 200860' }
+  const markN5b = consoleLines.length
+  feedInbound('om_200860_neg', '修法6 阴性对照：裸数字')
+  await settle(5)
+  rejectPatches = 0
+  rejectPatchesBody = null
+  const wN5b = linesN5slice(markN5b)
+  ok(wN5b.some((l) => l.includes('card sync failed'))
+    && !wN5b.some((l) => l.includes('card failure notice skipped'))
+    && !wN5b.some((l) => l.includes('card body rescued')),
+    '★★ 阴性对照：不含 code 前缀的裸「200860」没被按体积类处理（失败腿确实跑了、但两个体积类指纹都不在；'
+    + '正则写裸数字则本条红）｜实得 '
+    + JSON.stringify(wN5b.filter((l) => l.includes('card sync failed') || l.includes('notice skipped')
+      || l.includes('body rescued')).map((l) => String(l).slice(0, 40))))
 }
 
 if (failures === 0) {

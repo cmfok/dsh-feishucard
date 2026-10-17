@@ -690,8 +690,12 @@ export function apply(ctx) {
     } catch { /* 无文件＝全新状态：各 chat 按新会话注一次锚 */ }
   }
   // 返回今天的锚行（含尾换行）或 ''（同日已注/判据异常——锚失败绝不挡消息）。
-  // 用服务器本地时区（生产 CST）；内部合成事件（_internal：卡片失败回执/热重载续跑/归档
-  // 调度等主动轮）同走本判断 ⇒ 任务书「bot 主动发起的轮次走同一判断」由统一入口天然满足。
+  // 用服务器本地时区（生产 CST）。
+  // 0.8.16 更正（修法 7）：旧注释举的三个例子里**只有一个仍成立**——「卡片失败回执」那条
+  //   `handleInbound(bot, {…, _internal: true, …})`（卡片被拒后回注的系统提示）至今在跑，且与本判断
+  //   同径：#1105 端到端 E4b ★判别条实测过「某 chat 当天首进 agent 的是这条合成轮 ⇒ 它照样带锚并写状态」。
+  //   「热重载续跑」的注入腿 2026-10-04 已整段删除（见本文件 hot reload notice 处说明），「归档调度」代码里从来没有。
+  //   另记一条边界：命令失败回注那条走 `agent.send`、不经 `handleInbound` ⇒ **天然不带锚**，别把它算进"合成轮"。
   function dateAnchorFor(bot, chatId) {
     try {
       const now = new Date()
@@ -1528,7 +1532,12 @@ export function apply(ctx) {
   const CARD_ROTATE_BLOCKS = 170
   // 体积护栏的**块数粗筛下限**（审查 LOW#2128）：块数不到这里就**不做** JSON.stringify 体积检查（性能）。
   // 必须 <= CARD_ROTATE_BLOCKS —— 否则体积检查会在"真超限"的卡上被跳过、护栏静默失效。
-  const CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK = 60
+  // 🔴 0.8.16（中台 #1672 选项 1，CM 2026-10-17 11:28 拍板）：60 → 2。
+  // 为什么：这道粗筛把「工具多、正文短」的回合整体放过了——工具文本只在渲染时从 card.tools 取，
+  // blocksBytes(blocks) 量不到它（实测一次整卡 223763 B 里面板占 223524 B），块数够不着 60 就连查都不查。
+  // 付价：块数 ≥2 的卡每次更新都会多做一次 JSON.stringify(blocks)（原本是为省这笔而设的下限），
+  // 换来的是字节线在低块数也能参与判定。量尺本身的修正另挂第 ⑧ 项（改按渲染后载荷计量）。
+  const CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK = 2
   // 换卡/侧消息的**共享文案**（审查 MED#2246：三处近乎逐字重复、且硬编码 "约 200 元素 / 200 KB"
   // 与真实阈值 170 块 / 120 KB 矛盾 ⇒ 抽常量并把数字**从阈值派生**）。
   // 0.7.9（CM 2026-10-03 ③ 拍板）：**指路语写在旧卡**（读者就在这张卡上）⇒ 文案用旧卡视角。
@@ -2438,7 +2447,15 @@ export function apply(ctx) {
     // 11310 = card table number over limit（见本文件 ~934 行的真机记录）⇒ 属**数量/体积**类，不是写法错。
     // ⚠️ 不能只写 `exceed`：`timeout exceeded` / `retries exceeded` 都会被误判成体积类
     // 并触发"正文抢救"（审查 LOW#1711）⇒ 必须紧跟 limit 才算体积。
-    if (/too large|exceed\w*.{0,20}limit|element.*limit|content.*limit|11310/i.test(s)) return 'toolarge'
+    // 0.8.16（修法 6，A3 缺陷）：真机字节超限那次的原文是 `code=200860 card over max size`
+    //   （见本文件 CARD_FOLD_THRESHOLD 上方那条实测记录「198.5 KB 通过；983 KB → 200860」），
+    //   上面几道**字面都不命中** ⇒ 旧字节落到末尾默认 `transport` ⇒ 救援纯文本与用户可见说明
+    //   两条腿都不触发。这里只补**体积专属**的字面量（错误码 200860 / "over max size"），
+    //   `exceed…limit` 那条「必须紧跟 limit」的约束一字不动 ⇒ timeout 类报文仍不会被误纳。
+    //   （审查 P3 收紧）错误码不写裸数字：报文若回显卡面正文，用户文本里恰好出现这 6 位
+    //   数字就会被误判成体积类、白跑一次摘片段抢救 ⇒ 要求前面带 `code` 字样（`code=200860`／
+    //   `"code":200860` 两种真形都命中）。`over max size` 本身无歧义，保持字面直判。
+    if (/too large|exceed\w*.{0,20}limit|element.*limit|content.*limit|11310|over max size|code[^0-9]{0,3}200860/i.test(s)) return 'toolarge'
     // ③ **限流类**：重发也会被限 ⇒ 走退避/熔断，别谎报"摘掉片段就好了"（审查 MED#1513）
     if (/frequency|rate limit|rate_limit|99991400/i.test(s)) return 'limited'
     return 'transport'
@@ -3629,9 +3646,38 @@ export function apply(ctx) {
   // context — sessions created/resumed without it only expose plugin-owned
   // tools (feishu_send): the "飞书新会话没有工具" failure (2026-09-08, dsh
   // 0.1.2-rc.1). Mirrors the GUI session factory (presets.mount from setup).
-  async function mountStandardPreset(bot, agentCtx) {
+  // 0.8.16（修法 2/3/5）：挂载腿的三件事——
+  //   ① 成功日志带上 sessionId，「挂载成功」这句话将来能对上具体会话（修法 3）；
+  //   ② **配置无效 ≠ 挂载丢失**：registry 报「预设不在册」(agent-preset/not-found) 时打一条
+  //      CRIT 说明并登记该会话，让 ensurePresetTools **拒绝**为它自动重建（修法 2）——重建既
+  //      救不回预设（配置没改就还是查无此名），又要烧掉一次自动重建额度、还把员工历史隔离一次；
+  //   ③ 挂载结果里能拿到的**预设 id / 预设声明的工具名**登记到 bot，供 #771 判定按「该 bot
+  //      实际挂载的预设」来问，不再凭硬编码的单个招牌键（修法 1 的主判据）。
+  const PRESET_MOUNT_INFO_MAX = 200   // 每个会话一条，超上限从头清（防长跑进程无界增长）
+  let presetServiceMissingWarned = false   // 修法 5：服务不在的日志每进程只报一次（防每条消息刷一行）
+
+  function rememberPresetMount(bot, sessionId, info) {
+    if (!bot || !sessionId) return
+    const map = bot.presetMountInfo || (bot.presetMountInfo = new Map())
+    if (map.size >= PRESET_MOUNT_INFO_MAX) {
+      const oldest = map.keys().next().value
+      if (oldest !== undefined) map.delete(oldest)
+    }
+    map.set(String(sessionId), info)
+  }
+
+  async function mountStandardPreset(bot, agentCtx, sessionId) {
     const presets = agentCtx.get('agentPresets')
-    if (!presets) return
+    if (!presets) {
+      // 修法 5（FN1 出口）：旧字节在这里**静默 return**，于是「这个会话压根没走挂载」和
+      // 「挂载成功」在日志里长得一模一样（假阴性）。现在留一条可判定的日志。
+      if (!presetServiceMissingWarned) {
+        presetServiceMissingWarned = true
+        console.log('[fs] ⚠️ agentPresets 服务不在（宿主未暴露）⇒ 预设挂载整体跳过；'
+          + '此后「挂载丢失」判定不具备依据（本日志每进程只报一次）session=' + String(sessionId || '-'))
+      }
+      return
+    }
     // 0.8.5（中台 #171 per-bot 预设）：bot 配置 `agentPreset` ⇒ 按 id 挂载；
     // 不写 ⇒ undefined ⇒ registry 回落全局默认（registry `mount(ctx, id?)` 官方通道，
     // `id ?? defaultId`——行为与旧版一字不动）。id 不存在 ⇒ registry 抛
@@ -3643,9 +3689,40 @@ export function apply(ctx) {
       : ''
     try {
       const preset = await presets.mount(agentCtx, wanted)
-      console.log('[fs] standard agent preset mounted: ' + String(preset && preset.id || 'default') + tag)
+      const presetId = String((preset && preset.id) || wanted || 'default')
+      console.log('[fs] standard agent preset mounted: ' + presetId + tag
+        + ' session=' + String(sessionId || '-'))
+      // 宿主若把预设声明的工具名带出来（数组，元素可为字符串或 {name}），登记下来供判定用。
+      const declared = []
+      try {
+        const raw = (preset && (preset.tools || preset.toolNames)) || []
+        if (Array.isArray(raw)) {
+          for (const item of raw) {
+            const n = typeof item === 'string' ? item : String((item && item.name) || '')
+            if (n) declared.push(n)
+          }
+        }
+      } catch { /* 形态不符：按「拿不到集合」处理，走下面的保守判据 */ }
+      // 挂载成功 ⇒ 撤销这条会话的「配置无效」登记（配置被修好后重建腿重新可用）。
+      rememberPresetMount(bot, sessionId, { id: presetId, names: declared, failed: false })
     } catch (error) {
-      console.log('[fs] preset mount failed: ' + String(error && error.message || error) + tag)
+      const message = String(error && error.message || error)
+      console.log('[fs] preset mount failed: ' + message + tag
+        + ' session=' + String(sessionId || '-'))
+      // 修法 2：区分「预设不在册（配置无效）」与「挂载过程本身出错（挂载丢失）」。
+      const notFound = String((error && error.code) || '') === 'agent-preset/not-found'
+        || /unknown agent preset|agent[- ]preset[/ ]not[- ]found/i.test(message)
+      if (notFound) {
+        console.log('[fs] CRIT 预设不在册＝**配置无效**（不是挂载丢失）：'
+          + String(bot.cfg.name || bot.cfg.appId) + ' 要求 agentPreset='
+          + String(wanted || '（未配置，默认预设查无）') + ' session=' + String(sessionId || '-')
+          + ' ⇒ 拒绝触发自动重建（重建救不回配置错误，还要烧重建额度并把员工历史隔离一次），请改 bot 配置')
+        rememberPresetMount(bot, sessionId, {
+          id: String(wanted || 'default'), names: [], failed: true, reason: 'not-found',
+        })
+      } else {
+        rememberPresetMount(bot, sessionId, { id: String(wanted || 'default'), names: [], failed: true })
+      }
     }
   }
 
@@ -3678,7 +3755,7 @@ export function apply(ctx) {
       meta: { cwd: (cwdOverride && String(cwdOverride).trim())
         || (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined },
       ...(agentOptions ? { agentOptions } : {}),
-      setup: (agentCtx) => mountStandardPreset(bot, agentCtx),
+      setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
     try {
       const landed = currentModelOf(handle && handle.agent)
@@ -3696,7 +3773,7 @@ export function apply(ctx) {
     return agents.resume({
       resumeSessionId: sessionId,
       ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
-      setup: (agentCtx) => mountStandardPreset(bot, agentCtx),
+      setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
   }
 
@@ -3792,15 +3869,61 @@ export function apply(ctx) {
   // 三张 preset 都声明）——不可见即挂载丢失。
   // 保守边界：探测自身异常（服务不在/接口变化）⇒ 不判缺失不重建，只留日志——误杀好会话
   // = 丢历史，比带病放行更贵；只有 'read' 明确缺席才触发重建。
-  function presetToolsMissing(agent) {
+  // 0.8.16（修法 1）判据重构：**判定键不再硬编码在判据分支里**。
+  //   主判据＝「这条会话实际挂载的预设所声明的工具集合」（挂载腿从 registry 返回值里带出来，
+  //   见 mountStandardPreset 的 rememberPresetMount）——逐键按 agent 视角问宿主 tools 服务，
+  //   **一个都看不见**才判挂载丢失（看见任意一个即放行，避免把「预设本来就没有某个键」误杀）。
+  //   拿不到集合时（宿主 registry 不声明工具名／旧夹具只提供 get）走保守兜底：仅对**走默认预设**
+  //   的 bot 使用默认预设的招牌工具常量 DEFAULT_PRESET_SIGNATURE_TOOLS（tool-fs 的读文件工具，
+  //   标准预设必然声明——原注释口径）；专用预设（agentPreset 指过名）拿不到集合就**不判定**，
+  //   因为此时无法区分「该预设没有这个工具」与「挂载真丢了」，误判的代价是把员工历史隔离一次。
+  //   两条路都留可判定日志（修法 5），把「假阴性（探测不可用）」与「真没丢」区分开。
+  const DEFAULT_PRESET_SIGNATURE_TOOLS = ['read']
+  let probeShapeWarned = false
+
+  function presetToolsMissing(bot, sessionId, agent) {
+    let tools = null
     try {
-      const tools = ctx.get('tools')
-      if (!tools || typeof tools.get !== 'function') return false   // 旧宿主无此接口：不判
-      return tools.get('read', agent) === undefined
+      tools = ctx.get('tools')
     } catch (error) {
       console.log('[fs] #771 preset tools probe failed (no rebuild): ' + String(error && error.message || error))
       return false
     }
+    if (!tools || typeof tools.get !== 'function') {
+      // 修法 5（FN1 出口，原 :3798 的静默 return false）：宿主接口形态不符 ⇒ 探测**根本不可用**，
+      //   不等于「工具都在」。每进程留一次痕（防每条消息刷一行），日志不含重建关键字。
+      if (!probeShapeWarned) {
+        probeShapeWarned = true
+        console.log('[fs] ⚠️ 挂载丢失探测不可用：宿主 tools 服务没有 get 接口 ⇒ 本轮起不判定、不重建'
+          + '（这是探测面缺失，不是「工具确实在」）session=' + String(sessionId || '-'))
+      }
+      return false
+    }
+    const info = bot && bot.presetMountInfo ? bot.presetMountInfo.get(String(sessionId || '')) : null
+    const declared = info && Array.isArray(info.names) ? info.names : []
+    if (declared.length > 0) {
+      // 主判据：按该 bot 实际挂载预设声明的工具集合逐键探测。
+      const visible = declared.filter((name) => tools.get(name, agent) !== undefined)
+      if (visible.length === declared.length) return false
+      if (visible.length > 0) {
+        // 部分可见 ⇒ 预设那一份确实挂上了（只是个别键不在），不按挂载丢失重建。
+        console.log('[fs] 预设 ' + String((info && info.id) || 'default') + ' 声明的工具部分可见（'
+          + visible.length + '/' + declared.length + '）⇒ 不判挂载丢失 session=' + String(sessionId || '-'))
+        return false
+      }
+      console.log('[fs] 预设 ' + String((info && info.id) || 'default') + ' 声明的 ' + declared.length
+        + ' 个工具按 agent 视角**全部不可见** ⇒ 判挂载丢失 session=' + String(sessionId || '-'))
+      return true
+    }
+    // 兜底判据：拿不到声明集合。
+    const isDefaultPreset = !bot || !bot.cfg || !bot.cfg.agentPreset
+    if (!isDefaultPreset) {
+      console.log('[fs] 专用预设 ' + String((info && info.id) || bot.cfg.agentPreset)
+        + ' 未暴露工具集合 ⇒ 无法区分「预设本来没这工具」与「挂载丢失」，不判定、不重建'
+        + ' session=' + String(sessionId || '-'))
+      return false
+    }
+    return DEFAULT_PRESET_SIGNATURE_TOOLS.every((name) => tools.get(name, agent) === undefined)
   }
 
   // 探测失败（缺工具）⇒ 自动重建一个全新 dedicated 会话替换当前条目（chat 指针/落盘同步
@@ -3817,9 +3940,21 @@ export function apply(ctx) {
   const REMOUNT_LABEL = '（挂载丢失已自动重建）'
 
   async function ensurePresetTools(bot, chat, agent) {
-    if (!agent || !presetToolsMissing(agent)) return agent
-    const entry = chat.sessions[chat.activeIndex]
+    const activeEntry = chat.sessions[chat.activeIndex]
+    const currentSessionId = activeEntry ? String(activeEntry.id || '') : ''
+    if (!agent || !presetToolsMissing(bot, currentSessionId, agent)) return agent
+    const entry = activeEntry
     if (!entry) return agent                       // 无从落标记：不重建，带病放行
+    // 🔴 0.8.16（修法 2）：**配置无效不走重建腿**。挂载那一步如果报的是「预设不在册」
+    //   （agent-preset/not-found），病根是 bot 配置写错，不是这条会话的挂载掉了——重建一条
+    //   新会话既救不回预设（配置没改还是查无此名），又要白烧一次自动重建额度、还把员工历史
+    //   隔离一次（真实代价）。这里只喊话，不重建、也不计熔断。
+    const mountInfo = bot.presetMountInfo ? bot.presetMountInfo.get(currentSessionId) : null
+    if (mountInfo && mountInfo.failed && mountInfo.reason === 'not-found') {
+      console.log('[fs] CRIT 跳过自动重建：会话 ' + entry.id
+        + ' 的预设不在册（配置无效，不是挂载丢失），请先改 bot 的 agentPreset 配置')
+      return agent
+    }
     // 🔴 计数读 chat 级（不是 entry 级）：heal 会 splice 掉当前条目，per-entry 计数活不过
     //   下一条消息 ⇒ 熔断失效（2026-10-17 冒烟 N3 实测「第二次仍重建、日志两条」即此）。
     if (Number(chat.remounts) >= 1) {
@@ -3831,7 +3966,13 @@ export function apply(ctx) {
     console.log('[fs] #771 preset tools missing on ' + oldId + ' (mount lost) — rebuilding session')
     try {
       const sessionId = 'fs-main-' + Date.now().toString(36)
-      const handle = await createDedicated(bot, sessionId)
+      // 0.8.16（修法 4）：重建必须**沿用原会话的 cwd**，不能用默认工作目录。
+      //   会话的工作区就是它的 cwd（本文件口径「当前工作区＝活跃会话的 cwd」），换目录重建
+      //   等于把这条会话挪到别的工作区：/list 的分组、工作区相对路径、已读文件的位置全变，
+      //   员工看到的还是「同一条会话」。取不到 cwd 时才按原有回落链（bot.workspace → 根）。
+      const originalCwd = String((agent.session && agent.session.header && agent.session.header.cwd)
+        || entry.cwd || '')
+      const handle = await createDedicated(bot, sessionId, originalCwd || undefined)
       chat.remounts = Number(chat.remounts || 0) + 1
       entry.id = sessionId
       // label 幂等：已带该标注不再叠加（防多次重建把字符串无限增长糊掉 /list 单行渲染宽度）。
@@ -3842,7 +3983,8 @@ export function apply(ctx) {
       entry.gen = SESSION_GEN
       entry.handle = handle
       persistChats(bot, bot.chats)
-      console.log('[fs] #771 rebuilt session ' + sessionId + ' replacing ' + oldId)
+      console.log('[fs] #771 rebuilt session ' + sessionId + ' replacing ' + oldId
+        + ' cwd=' + (originalCwd || '（未取到，按默认工作区）'))
       return handle.agent
     } catch (error) {
       console.log('[fs] #771 rebuild failed, falling back to original agent ' + oldId + ': '
