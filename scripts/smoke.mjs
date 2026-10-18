@@ -1195,6 +1195,18 @@ console.log('12b) 元素/体积超限 ⇒ **换卡续写**（旧卡正文原样�
   const allR = JSON.stringify(cardsSince(markR))
   ok(allR.includes('已达飞书单卡上限'), '★ 旧卡带"换卡续写"说明（用户知道内容接在哪张卡）')
   ok(allR.includes('本卡') || allR.includes('上一张'), '说明里点明"正文原样保留"')
+  // 缺陷 C（#1685 第九节，0.8.19 施工段①；L1 审查后加强）：换卡说明不许把**内部常量**当飞书上限印给读者。
+  //   三条断言按「文案里不出现任何数字」这条**可迁移**的口径写，不按某个具体数字写：
+  //   ① noticeR 非空——上一行那句 `allR.includes(...)` 用的是整串检索，正则抓空时会让后两条**空真**，这里显式钉住"抓到过"；
+  //   ② 文案内不得出现任何阿拉伯数字（旧写法插值 CARD_ROTATE_BLOCKS / CARD_SEND_MAX_BYTES 必带数字 ⇒ 摘掉修复即红）；
+  //   ③ 保留具体黑名单形态，防未来有人把数字改写成「约 200 元素」这类同样错轴的表述之外的新常量。
+  //   为什么不用「必须出现 128 KB」当判据（L1 审查 MED）：换卡有**两把尺**触发（块数/元素数线、载荷墙），
+  //   夹具 12b 喂的是 175 段短句、载荷远不到墙也会换卡 ⇒ 任何写死数字的文案都会在某条触发轴上说的是错话。
+  const noticeR = (allR.match(/本卡内容已达飞书单卡上限[^"]*/) || [''])[0]
+  ok(noticeR.length > 0, '★ 换卡说明本体抓得到（防空真：抓不到时后两条会集体假绿）')
+  ok(!/[0-9]/.test(noticeR),
+    '★ 换卡说明不含任何数字——阈值与文案彻底脱钩（实得：' + noticeR.slice(0, 46) + '）')
+  ok(!/170 块|160 KB|123 KB|200 元素|200 KB/.test(noticeR), '换卡说明不点名任何阈值/元素数常量（旧写法与派生数字都被否掉）')
   // 零丢失：换卡前旧卡的载荷里必须还能看到第 0 段叙述（不被折叠隐藏）
   const firstCreateIdx = cardsSince(markR).findIndex((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0')
   const beforeRotate = firstCreateIdx >= 0 ? JSON.stringify(cardsSince(markR).slice(0, firstCreateIdx + 1)) : ''
