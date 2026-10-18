@@ -134,6 +134,12 @@ const imageUploads = []
 const fileUploads = []
 let rejectPatches = 0
 let rejectPatchesBody = null   // 0.7.9：可注入具体错误体（P5 用 11310）
+// 0.8.19 缺陷 E 夹具（施工段③）：**按会话**锁定「这个会话的卡片 create 被拒一次」。
+//   为什么不复用 rejectPatches：它是**全局计数**，而纯文本提示也走 create（N5 块里那句
+//   「rejectPatches 只对 create 生效，而纯文本发送也走 create」记过这个坑），
+//   两个会话同时造失败时，额度会被第一个会话的「建卡＋提示」吃光 ⇒ 第二个会话根本不失败 ⇒ 夹具空转。
+//   本杠杆只拒 `schema === '2.0'` 的建卡请求（sendPlainText 的卡片没有 schema 键 ⇒ 提示照发）。
+let rejectCreateCardFor = null
 // 0.7.22（第五轮门槛 HIGH 用例）：让**载荷里含指定片段的那一次 PATCH** 抛错（只用一次）。
 //   按内容锁定而不是按次数：封口/看门狗/降级都可能是 PATCH，按次数会打错目标（用例 82 的靶心
 //   是"结论写回过程卡那一次"，不是封口那一次）。
@@ -237,6 +243,17 @@ globalThis.fetch = async (url, init) => {
       const shouldThrow = createThrowAfterHang
       await createHangGate.promise
       if (shouldThrow) throw new Error('smoke: transient create failure (mid-flight dispose)')
+    }
+    if (rejectCreateCardFor && raw.receive_id && payload && payload.schema === '2.0'
+        && rejectCreateCardFor.has(raw.receive_id)) {
+      // 缺陷 E 夹具：这个会话的建卡**只拒一次**（拒完即摘，避免它后续每一拍都被拒）。
+      rejectCreateCardFor.delete(raw.receive_id)
+      return {
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify(rejectPatchesBody || {
+          code: 230099, msg: 'Failed to create card content (injected: chat-scoped card create reject)',
+        })),
+      }
     }
     if (rejectPatches > 0) {
       // F 用例：模拟"内容被拒"（真机原话 code 230099 / ErrCode 200570 / invalid image keys）
@@ -5266,12 +5283,69 @@ console.log('66) ★ 0.7.19 RED-A 群判定不许被内部合成事件覆盖（c
     '（前提）注入轮渲染出了答复（证明卡是活的，不是死卡假绿）')
   ok(!last66b.includes('过程叙述-INJECT-丙'),
     '★ 注入轮仍按 stable 渲染：内部事件不许把群改写成 p2p（旧实现 || \'p2p\' 覆盖 ⇒ full ⇒ 红）')
-  // 缺陷 D（0.8.19 施工段②）：内部合成轮的 message_id 是假的（`cardfail-<ts>`），飞书侧不存在 ⇒
+  // 缺陷 D（0.8.19 施工段②）：内部合成轮的 message_id 是合成的（`cardfail-<ms36>-<seq36>`），飞书侧不存在 ⇒
   //   给它加打字提示＝每次卡片失败必吃一发 99992354（staging 真链日志 02-positive-0817-journal.log:750 原样），
   //   白烧 API 额度＋日志里多一条与真实故障混在一起的 ERR 噪声。判据＝**任何** reactions 调用都不许带合成 id。
   //   变异靶：把 `&& !(evt && evt._internal)` 摘掉 ⇒ 这条必红（前提条已确认注入真的发生了）。
   ok(!reactionCalls.some((c) => String(c.url).includes('cardfail-')),
     '★ 内部合成轮不给假 message_id 加打字提示（合成 id 出现在任何 reactions 请求里都算红）')
+
+  // 缺陷 E（0.8.19 施工段③，L1 复核 b563544 时点出的存量）：**同一毫秒、两个不同会话**各失败一次时，
+  //   两条回注给 Agent 的合成 message_id 必须互不相同。旧写法只拼 Date.now() 的 36 进制，
+  //   而入站去重键＝appId|message_id（index.js 的 inboundKey；命中后 isDuplicateInbound 让 handleInbound
+  //   打一行 `duplicate inbound skipped: <id>` 并 return）⇒ 撞号的那条被当重投**静默丢弃**，
+  //   那个会话的 Agent 从此不知道"上一步输出没送达"。体积风暴下正是"多会话同毫秒被拒"的形态，不是假想。
+  //   夹具把 Date.now **按偏移式钉住**（取当下再冻结，理由见下面 try 里那段）来造出同毫秒，并按会话各拒一次建卡；
+  //   变异靶＝摘掉自增序号 ⇒ 两条 id 相同 ⇒ 第二条被 `duplicate inbound skipped` 吞掉：
+  //   两条 ★（去重吞没／号互不相同）变红，而「接线闸」仍绿（注入日志打在 handleInbound **之前**，
+  //   所以它只证"两个会话真的各失败并各排队了一条注入"，不证注入被接收——被接收由 ★ 那条 duplicate 判据兜）。
+  //   注意用两个**全新会话**：失败提示按 chatId|klass 去抖（notifyCardFailure 开头的 FAILURE_NOTICE_WINDOW_MS），
+  //   复用 M2 那个群会被去抖挡掉，红得没道理。
+  const GROUP66C = 'oc_group66_multi_c'
+  const GROUP66D = 'oc_group66_multi_d'
+  const feedMulti = (msgId, chatId) => {
+    fakeProc.output += JSON.stringify({
+      type: 'event', eventType: 'im.message.receive_v1',
+      data: {
+        message: { message_id: msgId, message_type: 'text', chat_type: 'group',
+                    chat_id: chatId, content: JSON.stringify({ text: '同毫秒失败-' + msgId }), mentions: GROUP_MENTION },
+        sender: { sender_id: { open_id: 'ou_test' } },
+      },
+    }) + '\n'
+  }
+  const realNow66 = Date.now
+  const frozen66 = realNow66()
+  const mark66e = consoleLines.length
+  let logE = []
+  try {
+    // 时钟按**偏移式**钉住：取当下当基准、偏移恒零（等价于把时间停在当下），与本文件假时钟口径一致
+    //   （useFakeClock 的 `realNow() + off`）。L1 复核点名：写成几个月前的绝对常量＝时钟倒退八个半月，窗口内所有 `now - 早先戳` 变负，
+    //   退避入口闸（card.retryUntil 那条 `now < card.retryUntil`）、失败提示去抖（FAILURE_NOTICE_WINDOW_MS）、
+    //   托孤 TTL 会演成与生产相反的行为；且窗口内盖下的戳在复原后立刻变成"陈旧"，
+    //   会被既有的补封口逻辑（idleSince 与 CARD_ORPHAN_SEAL_MS 那一对判据）扫到，串味到用例 66 之后。
+    Date.now = () => frozen66
+    rejectCreateCardFor = new Set([GROUP66C, GROUP66D])
+    rejectPatchesBody = { code: 230099, msg: 'Failed to create card content (injected: cardfail id collision E)' }
+    feedMulti('om_group66c_m1', GROUP66C)
+    feedMulti('om_group66d_m1', GROUP66D)
+    await settle(8)
+  } finally {
+    Date.now = realNow66
+    rejectCreateCardFor = null
+    rejectPatchesBody = null
+    logE = consoleLines.slice(mark66e)
+  }
+  const idsE = logE
+    .filter((l) => l.includes('cardfail note inject queued'))
+    .map((l) => ((l.match(/id=(\S+)/) || [])[1] || ''))
+    .filter((s) => s.startsWith('cardfail-'))
+  ok(logE.some((l) => l.includes('card failure notice sent')),
+    '（前提 E）两个新会话里至少一个真的走了失败注入（没触发则下面三条恒真＝假保险丝）')
+  ok(idsE.length === 2,
+    '（接线闸 E）两个会话各注入一条、双双落日志（实得 ' + idsE.length + ' 条：' + idsE.join(' / ') + '）')
+  ok(!logE.some((l) => l.includes('duplicate inbound skipped') && l.includes('cardfail-')),
+    '★ 同毫秒两条注入没有一条被入站去重吞掉（日志出现 duplicate inbound skipped: cardfail-… 即红）')
+  ok(new Set(idsE).size === 2, '★ 合成号互不相同（appId|message_id 去重键不撞）：' + idsE.join(' / '))
   await settle(2)
 }
 
