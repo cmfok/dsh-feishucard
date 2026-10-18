@@ -2600,11 +2600,21 @@ export function apply(ctx) {
           + (code ? ' code=' + code : ''))
       }
       // ② 让 **Agent 也收到**（复用入站通道注入系统提示；下一次推理必然看到）
+      // 🔴 缺陷 E（0.8.19 施工段③，L1 复核 b563544 时点出的存量）：合成号必须**每轮唯一**。
+      //   入站去重键＝`appId|message_id`（inboundKey／isDuplicateInbound 两个函数），而旧写法只拼
+      //   `Date.now()` 的 36 进制 ⇒ **同一毫秒内两个不同 chat 各自失败**时两条注入拿到同一个 id，第二条被
+      //   当重投静默丢弃——那个 chat 的 Agent 就此不知道「自己上一步的输出没送达」。这恰好是体积风暴下的
+      //   形态（多会话同时被拒），不是假想。加**按 bot 计数**的自增序号（与去重键同维度：键含 appId ⇒ 一个
+      //   appId 一个 bot 对象，跨 bot 同毫秒也不算撞），id 形如 `cardfail-<ms36>-<seq36>`；另打一行 `cardfail
+      //   note inject queued` 当可观测锚——写 queued 不写 injected，因为 handleInbound 首行缺 chat_id 会 return。
+      const cardfailSeq = ((bot._cardfailSeq = (bot._cardfailSeq || 0) + 1)).toString(36)
+      const injectId = 'cardfail-' + nowMs.toString(36) + '-' + cardfailSeq
       const note = '（系统提示：你上一步的**输出没有送达用户** —— 卡片被飞书拒了（' + klass
         + (code ? '，code ' + code : '') + '）。'
         + words.note + '）'
+      console.log('[fs] cardfail note inject queued chat=' + chatId + ' id=' + injectId)
       void handleInbound(bot, {
-        message_id: 'cardfail-' + Date.now().toString(36),
+        message_id: injectId,
         message_type: 'text',
         chat_id: chatId,
         _internal: true,   // 审查 LOW#1555：内部系统提示**不是**用户在回答提问卡
@@ -6251,8 +6261,8 @@ export function apply(ctx) {
 
     // Typing reaction: added on arrival, removed after the reply is delivered.
     // 🔴 缺陷 D（0.8.19 施工段②，2026-10-18 staging 真链日志抓到）：**内部合成轮不许打字提示**。
-    //   卡片被拒后回注的系统提示走 `handleInbound(bot, {message_id: 'cardfail-<ts>', _internal: true})`
-    //   （:2606-2612），那个 id 是合成的、飞书侧不存在 ⇒ 旧实现在这里照旧 POST reactions，
+    //   卡片被拒后回注的系统提示走 `handleInbound(bot, {message_id: 'cardfail-<ms36>-<seq36>', _internal: true})`
+    //   （注入点在 notifyCardFailure 末尾的 handleInbound 调用），那个 id 是合成的、飞书侧不存在 ⇒ 旧实现这里照旧 POST reactions，
     //   每次卡片失败都**必然**吃一发 `99992354 … Invalid ids: [cardfail-…]`（实测原样见
     //   staging `e2e-20261018-1685/02-positive-0817-journal.log:750`）。代价两条：白烧一次 API 额度
     //   （07-飞书API额度与最小调用口径）、日志里多一条与真实故障混在一起的 ERR 噪声（按 ERR 计数的巡检会虚报）。

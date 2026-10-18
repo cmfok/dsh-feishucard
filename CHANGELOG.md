@@ -2,16 +2,52 @@
 
 # Changelog
 
+## [0.8.19] - 2026-10-18：施工段③＝卡片失败回注的合成号每轮唯一（缺陷 E，L1 复核点出的存量）
+
+- **症状**：同一毫秒内**两个不同会话**各自卡片被拒时，回注给 Agent 的"你上一步输出没送达"系统提示只生效一条，
+  另一条**静默消失**——那个会话的 Agent 全程不知道自己那轮没送达，用户那边就是"干着干着突然停了"（A21 同源事故形态）。
+- **根因**：旧写法把合成 `message_id` 拼成 `'cardfail-' + Date.now().toString(36)`，而入站去重键是 `appId|message_id`
+  （`inboundKey`／`isDuplicateInbound`；命中后 `handleInbound` 打一行 `duplicate inbound skipped: <id>` 并 return）
+  ⇒ 同毫秒两条注入同号，第二条被当飞书重投丢弃。**这不是假想场景**：体积风暴正是"多会话同毫秒被拒"。
+- **改法**：加**按 bot 计数**的进程内自增序号，id 形如 `cardfail-<ms36>-<seq36>`；序号挂在 `bot._cardfailSeq`
+  而不是全局——**与去重键同维度**（键含 appId，一个 appId 一个 bot 对象），所以跨 bot 同毫秒也不可能互撞；
+  热重载时 `seenInboundIds` 与 `bots` 同为 `apply()` 闭包局部、一起归零，不存在"序号重置后撞旧 id"。
+  另打一行 `[fs] cardfail note inject queued chat=… id=…` 当可观测锚（**写 queued 不写 injected**：
+  `handleInbound` 首行 `if (!chatId) return`，此刻还不能声称已送达）。
+- **夹具（用例 66 内）**：造两个**全新群会话**各喂一条入站、各拒一次建卡，把 `Date.now` 钉在当下以造出真同毫秒，
+  四条判据＝前提（注入真的发生）／接线闸（两条 queued 都落日志）／★ 窗口内不得出现含 `cardfail-` 的
+  `duplicate inbound skipped`／★ 两个 id 互不相同。
+  为此新增 mock 杠杆 `rejectCreateCardFor`（**按会话**锁定"该会话的卡片 create 只拒一次"，且只拒 `schema==='2.0'` 的建卡）：
+  原因是 `rejectPatches` 是全局计数而纯文本提示也走 create，两个会话的额度会被第一个会话的"建卡＋重试"吃光——
+  上一版夹具就是这么空转的（日志实证：multi_c 有 `card sync failed … retry=1000ms` 两次拒、multi_d 直接 `card created`）。
+- **L1 独立审查（general-purpose 复核本次未提交改动）四修**：① P2＝`Date.now` 被冻成绝对常量 `1770000000000`
+  ＝时钟倒退八个半月，窗口内所有 `now - 早先戳` 变负，退避入口闸（`card.retryUntil`）、失败去抖（`FAILURE_NOTICE_WINDOW_MS`）、
+  托孤 TTL 会演成与生产相反的行为，且复原后窗口内盖的戳立刻变"陈旧"会被补封口判据扫到 ⇒ 改为取当下钉住（偏移式），
+  并把 `Date.now` 与两个 mock 杠杆的复原收进 `try/finally`；② P3＝注释行号指针漂移 ⇒ 新文字一律改符号锚，本批起不写行号；
+  ③ P3＝`injected` 措辞与事实不符 ⇒ 改 `queued`；④ 覆盖缺口如实记录不硬补：窗口内 `turn sealed` 3 条而
+  `card reply delivered` 仅 2 条，"每条注入都送达一次"的语义还没读懂，写成硬判据要么假绿要么 flaky，转 AC-0096 同批处理。
+- **验证（变异反证）**：唯一变量＝摘掉合成号里的 `+ '-' + cardfailSeq`（驱动器 `mut-e-driver.py`，
+  按 CRLF 字节读写，跑完 `finally` 复原）。回 `SMOKE FAIL: 2 assertion(s) failed`、锚定红条 2、
+  目标夹具命中 **2/2**、**非靶红条 0**；`（前提 E）`与`（接线闸 E）`保持绿——接线闸实得
+  「2 条：cardfail-mvdh506g / cardfail-mvdh506g」并打出 `duplicate inbound skipped: cardfail-mvdh506g`
+  ⇒ 红的是判据本身而不是夹具接线。用时 859 秒，正身复原字节一致（sha 前缀 `04c1e7de13`）。
+- **验证（基线）**：全量冒烟 `SMOKE PASS (sentCards=780, sessions=78)`，1080 条 ✅、锚定红条 0；
+  四条 E 判据全绿，实测同毫秒号 `cardfail-mvdgiq77-2`／`cardfail-mvdgiq77-3`（前缀相同、序号不同）。
+  顺带 `node scripts/check-packaging.mjs --repo .` ⇒ 打包完整性 ✅（本段零新文件零新依赖）。
+
 ## [0.8.19] - 2026-10-18：施工段②＝内部合成轮不再打「打字提示」（缺陷 D，staging 真链日志抓到）
 
 - **症状（真链证据，不是猜）**：staging 那轮 E2E 的正向日志里，每次卡片失败都伴随一条
   `[fs] reaction add failed: reaction create failed: {"code":99992354, … "Invalid ids": [cardfail-mvcvm1ue] …}`
   （`/opt/scripts/logs/e2e-20261018-1685/02-positive-0817-journal.log:750`，04:55:53）。
-- **根因**：卡片被拒后回注给 Agent 的系统提示走 `handleInbound(bot, {message_id: 'cardfail-' + …, _internal: true})`（index.js:2606-2612），
-  那个 id 是**合成的**、飞书侧不存在；而入站开头的「打字提示」段（:6252-6262）不区分内外，照旧 POST `/reactions` ⇒ 每次注入必吃一发必然失败的调用。
+- **根因**：卡片被拒后回注给 Agent 的系统提示走 `handleInbound(bot, {message_id: 'cardfail-' + …, _internal: true})`
+  （注入点在 `notifyCardFailure` 末尾），那个 id 是**合成的**、飞书侧不存在；而入站开头那段「打字提示」
+  （`let reactionId` 之后那道 `if (emoji && emoji !== 'none' …)` 守卫，守卫内调 `addReaction`）不区分内外，照旧 POST `/reactions` ⇒ 每次注入必吃一发必然失败的调用。
+  ⚠️ **本条 06:42 订正**：原文用行号指针（`:2606-2612`／`:6252-6262`）——写下的那一刻就已漂 7 行（对账 `git show HEAD:index.js` 实测守卫在 6262），
+  施工段③再动同文件后又漂 10 行（现 6272）。评审本轮点名了同样的行号漂移（P3），故本批起**改用符号锚**（函数名＋条件原文），不再写行号。
 - **为什么要治**：①白烧飞书 API 额度（07-飞书API额度与最小调用口径，一次事故一轮就是一次）；②日志里多一条 ERR 形态噪声，
   与真实故障混在一起——按 ERR 计数的巡检（#1362 那条链）会因此虚报。
-- **改法**：打字提示条件加 `&& !(evt && evt._internal)`（:6255）。**只**跳过表情，不动注入本身——
+- **改法**：打字提示条件加 `&& !(evt && evt._internal)`（`if (emoji && emoji !== 'none' && …)` 那一行）。**只**跳过表情，不动注入本身——
   #1105 的 E4b ★ 判据要求「合成轮照样带日期锚并写状态」，那条路径在这段之后，不受影响（用例 40 的正常入站打字提示仍绿）。
 - **夹具**：用例 66（cardfail 注入那条，本来就有「前提：注入真的发生了」的防空保险丝条）后加 1 条 ★：
   任何 `/reactions` 请求里都不许出现合成 id `cardfail-`。变异靶＝摘掉这个守卫条件，摘掉即红。
@@ -23,8 +59,8 @@
 ## [0.8.19] - 2026-10-18：施工段①＝换卡文案与内部常量脱钩（缺陷 C，承 #1685 第九节）
 
 **本批范围（施工中，未定版）**：本段只是 0.8.19 的第一件，`package.json` 仍是 **0.8.18**，不构成定版。
-（其后又追加了**施工段②＝缺陷 D**，见本文件上方同名 0.8.19 段；那段不依赖任何裁决卡，已独立验证完毕。）
-批次里剩下三件都挂在裁决卡 AC-0096 与 #1685 史段：① 阈值调整＋force 支硬顶与显式 rescue（等 CM 回 1／2／3；
+（其后又追加了**施工段②＝缺陷 D**与**施工段③＝缺陷 E**，见本文件上方同名 0.8.19 两段；那两段都不依赖任何裁决卡，各自独立验证完毕。）
+批次里剩下两件都挂在裁决卡 AC-0096 与 #1685 史段：① 阈值调整＋force 支硬顶与显式 rescue（等 CM 回 1／2／3；
 硬顶取值按实测墙贴近 130000、**不等于**软闸值，否则每次换卡的指路语都会被自己拦掉）；
 ② 缺陷 A＝stable 形态下换卡粗筛把**根本不渲染**的 note 文本计入 `blocksBytes`，群聊会在载荷远未到墙时就提前换卡；
 ③ 缺陷 B＝`sendPlainText` 无按字节分段、其失败被 `.catch(() => {})` 静默吞，极端突发下该帧内容无声丢失（要先实测再定改法）。
