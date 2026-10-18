@@ -3852,6 +3852,53 @@ export function apply(ctx) {
     }
   }
 
+  // #560 同族修法（0.8.20 段①）：默认模型退避与绑定读回原先**只长在 create 腿**，
+  // resume/switch 腿既不读回也不留痕 ⇒ 生产绝大多数轮次（走 resume）根本没有 binding 行，
+  // 「首条到底绑没绑上模型」平时物理不可观测。抽成共用件，两腿同口径。
+  // retry 只给 create 腿开：#350 的退避是给「宿主头几拍服务还没注册」这个启动竞态用的；
+  //   resume 腿的触发条件是「本进程还没这个会话的句柄」＝重启后每条会话的首个入站，
+  //   而入站回合按 bot 串行（bot.chain），在这里空等 1.5 秒会把同 bot 的其它会话一起顶住，
+  //   而它换不来任何信息——本单的牙齿是读回留痕，不是重试。
+  // strictThrow 同理只给 create 腿：resume 腿抛错会掉进「恢复失败→自动新建」，
+  //   等于把一次恢复变成杀会话重建，爆炸半径远大于收益，所以 resume 腿只响亮留痕、不抛。
+  async function agentOptionsWithRetry(label, strictThrow, retry) {
+    let agentOptions = defaultAgentOptions()
+    for (let i = 0; !agentOptions && retry && i < 3; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      agentOptions = defaultAgentOptions()
+    }
+    if (!agentOptions) {
+      const dm = ctx.get('agentDefaultModel')
+      if (!dm && strictThrow) {
+        throw new Error('agentDefaultModel 服务不可用（重试 3×500ms 仍拿不到）——拒绝创建无模型会话（中台 #350 fail-loud）')
+      }
+      if (!dm) {
+        console.log('[fs] ⚠️ #350: 默认模型拿不到（agentDefaultModel 服务不在）——不带 agentOptions 继续'
+          + label + '（此处不抛：抛会被判成恢复失败并自动新建会话），落库校验见下一行')
+        return agentOptions
+      }
+      console.log('[fs] ⚠️ #350: 默认模型选择为空（服务在、无默认配置或未就绪）——按宿主回落继续'
+        + label + '，落库校验见下一行')
+    }
+    return agentOptions
+  }
+
+  // 原先这里是个空 catch：探针自身出问题时**整行消失**，读的人以为是"没建会话"。
+  // 改成把吞掉的原因打出来——宁可多一行噪音，也不要再造一次假零条。
+  function logModelBinding(legTag, sessionId, agent) {
+    const head = '[fs] #350 session model binding check' + (legTag ? ' (' + legTag + ')' : '') + ': ' + sessionId
+    try {
+      const landed = currentModelOf(agent)
+      console.log(head + ' → '
+        + (landed && landed.provider
+          ? landed.provider + '/' + landed.model + '（' + modelSourceText(landed.source) + '）'
+          : 'NONE（宿主未落库 ⚠️ 桥只留痕，saveSelection 无门补写不了）'))
+    } catch (e) {
+      console.log(head + ' → 读回失败（探针自身异常：'
+        + String((e && e.message) || e).slice(0, 80) + '）')
+    }
+  }
+
   async function createDedicated(bot, sessionId, cwdOverride) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
@@ -3864,18 +3911,7 @@ export function apply(ctx) {
     // 会话）；服务在但无默认选择＝宿主语义允许回落，按旧行为继续＋醒目留痕；
     // ③创建后读回校验落库并打日志（saveSelection 无门、补写做不到——见
     // verifyDefaultModelLanded 的记录；留痕即 #339 探针：卡上写 X 实际用 Y 即复现证据）。
-    let agentOptions = defaultAgentOptions()
-    for (let i = 0; !agentOptions && i < 3; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 500))
-      agentOptions = defaultAgentOptions()
-    }
-    if (!agentOptions) {
-      const dm = ctx.get('agentDefaultModel')
-      if (!dm) {
-        throw new Error('agentDefaultModel 服务不可用（重试 3×500ms 仍拿不到）——拒绝创建无模型会话（中台 #350 fail-loud）')
-      }
-      console.log('[fs] ⚠️ #350: 默认模型选择为空（服务在、无默认配置或未就绪）——按宿主回落继续创建，落库校验见下一行')
-    }
+    const agentOptions = await agentOptionsWithRetry('创建', true, true)
     const handle = await agents.create({
       sessionId,
       meta: { cwd: (cwdOverride && String(cwdOverride).trim())
@@ -3883,24 +3919,23 @@ export function apply(ctx) {
       ...(agentOptions ? { agentOptions } : {}),
       setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
-    try {
-      const landed = currentModelOf(handle && handle.agent)
-      console.log('[fs] #350 session model binding check: ' + sessionId + ' → '
-        + (landed && landed.provider
-          ? landed.provider + '/' + landed.model + '（' + modelSourceText(landed.source) + '）'
-          : 'NONE（宿主未落库 ⚠️ 桥只留痕，saveSelection 无门补写不了）'))
-    } catch { }
+    logModelBinding('', sessionId, handle && handle.agent)
     return handle
   }
 
   async function resumeDedicated(bot, sessionId) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
-    return agents.resume({
+    const agentOptions = await agentOptionsWithRetry('恢复', false, false)
+    const handle = await agents.resume({
       resumeSessionId: sessionId,
-      ...(defaultAgentOptions() ? { agentOptions: defaultAgentOptions() } : {}),
+      ...(agentOptions ? { agentOptions } : {}),
       setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
+    // 与 create 腿对称的读回（#560 判据可达性）：这一行以前不存在，
+    // 所以"resume 后首条没模型"只能靠新建会话的偶然样本去抓。
+    logModelBinding('resume', sessionId, handle && handle.agent)
+    return handle
   }
 
   // ---- chat/session bookkeeping ---------------------------------------------
@@ -4629,6 +4664,10 @@ export function apply(ctx) {
       const nameArg = String((cmd.rawArg !== undefined && cmd.rawArg !== null) ? cmd.rawArg : (cmd.arg || ''))
         .split('\n')[0].replace(/\s+/g, ' ').trim()
       if (nameArg.length > NEW_NAME_MAX) {
+        // 补一行留痕（0.8.20 段①）：这条拒绝原先只发飞书回执、零 console.log，
+        // 事后查 journal 会误判成"/new 没进命令支"——本次 #560 取证就绕了这段弯路。
+        console.log('[fs] /new rejected: session name too long (' + nameArg.length
+          + ' chars, limit ' + NEW_NAME_MAX + '), previous session untouched')
         await sendPlainText(bot, chatId,
           '会话名太长（' + nameArg.length + ' 字，上限 ' + NEW_NAME_MAX + '）—— **没有新建**，你的当前会话未受影响。\n'
           + '请用简短名称重发：「/new 足球复盘」\n'

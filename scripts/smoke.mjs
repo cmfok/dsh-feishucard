@@ -10701,6 +10701,49 @@ console.log('N5) 0.8.16 修法 6：真机字节超限报文 code=200860 card ove
       || l.includes('body rescued')).map((l) => String(l).slice(0, 40))))
 }
 
+console.log('N6) #560 判据可达性：模型绑定行必须 create 与 resume **两腿都打**（0.8.20 段①）')
+{
+  // 判别力（缺陷本体）：旧码 `#350 session model binding check` 只长在 createDedicated 尾部，
+  //   resumeDedicated 一条都不打 ⇒ 生产绝大多数轮次走 resume，"首条到底绑没绑上模型"平时
+  //   物理不可观测（#1600 的验收因此只能等偶然新建会话，取证两度走偏——见 dsh 台账 H-D13/H-D14）。
+  // 🔴 夹具姿势的来路（L1 复核实测证伪了第一版，别照抄第一版）：清 `liveAgents` **进不了 resume 腿**——
+  //   index.js 里 `if (entry.handle) return …` 句柄已缓存就直接返回，resume 分支永不执行
+  //   （第一版就是这么红的：实得 0，且红得"像"夹具没修好而不是代码没修好）。正解沿用 #171
+  //   用例的真重启姿势：重新 apply ⇒ chats 从落盘 state 重灌、句柄天然为空 ⇒ 第二条才真走 resume。
+  const linesN6 = (from) => consoleLines.slice(from).map(String)
+  const markN6 = consoleLines.length
+  feedInbound('om_legs_n6a', '两腿绑定第一条', { chatId: 'oc_legs_bind_n6' })
+  await settle(4)
+  const createHit = linesN6(markN6).filter((l) => l.includes('#350 session model binding check: '))
+  const modN6 = await import('../index.js')
+  modN6.apply(ctx)
+  await settle(2)
+  liveAgents.length = 0
+  const markN6b = consoleLines.length
+  const sessBefore = createdSessions
+  const resumedBefore = resumedSessions
+  feedInbound('om_legs_n6b', '两腿绑定第二条', { chatId: 'oc_legs_bind_n6' })
+  await settle(4)
+  const wN6 = linesN6(markN6b).filter((l) => l.includes('#350 session model binding check (resume):'))
+  ok(createHit.length >= 1,
+    '（前提 N6）create 腿确实建了会话并打印绑定行——本条不绿说明夹具没走到腿，后面三条会恒真｜实得 '
+    + createHit.length)
+  ok(resumedBefore + 1 === resumedSessions,
+    '（接线闸 N6）第二条真的走了恢复腿（mock resume 计数必须 +1，否则 ★★★ 那条的绿是白捡的）｜实得 '
+    + resumedSessions + '（前 ' + resumedBefore + '）')
+  ok(wN6.length === 1,
+    '★★★ #560：resume 腿也必须打印绑定行，且只打一行（0 条＝旧码静默形态⇒本条必红；'
+    + '>1 条＝多实例重复计数，会把本条抬成假绿）｜实得 ' + wN6.length)
+  ok(createdSessions === sessBefore,
+    '★ N6 配对钉：第二条是恢复不是新建（createdSessions 不许涨；涨了说明走的还是 create 腿）｜'
+    + '前 ' + sessBefore + ' 后 ' + createdSessions)
+  // 探针自身异常时改打「读回失败」，不再静默——但读回失败**不算达标**，单独钉住，
+  // 防止下一任拿一行噪音当"两腿都有样本"。
+  ok(!linesN6(markN6).some((l) => l.includes('读回失败')),
+    '★ N6：两腿的绑定行都不许是探针自身异常兜出来的（异常要可见，但不能当达标证据）｜实得 '
+    + JSON.stringify(linesN6(markN6).filter((l) => l.includes('读回失败')).map((l) => l.slice(0, 56))))
+}
+
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
   process.exit(0)

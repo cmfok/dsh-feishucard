@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.8.20] - 2026-10-18：施工段①＝模型绑定探针补到 resume 腿（缺陷 G，承 #560／台账 H-D14）
+
+- **症状**：桥日志里 `#350 session model binding check: <id> → provider/model（来源）` 这一行，
+  生产只在**新建会话**那一次出现；日常轮次一条都没有。于是「新会话首条到底绑没绑上模型」
+  这条判据平时**物理不可观测**——#1600 的发布后验收因此只能等偶然新建会话，本会话两度把
+  "窗口内零条" 误读成结论（一次误判"未命中"，一次误判"/new 链路坏了"，更正记录在 dsh 台账 H-D13→H-D14）。
+- **根因**：①探针只写在 `createDedicated()` 尾部，`resumeDedicated()` 与 `/switch` 接管腿一条都不打，
+  而生产绝大多数轮次走 resume；②默认模型取值也不对称——create 腿有 3×500ms 退避＋服务不在即抛
+  （#350 的 fail-loud），resume 腿是单次 `defaultAgentOptions()`（且在同一表达式里调两次）、拿到空也不留痕；
+  ③`catch { }` 空吞：探针自身出问题时**整行消失**，读日志的人以为是"没建会话"，属假零条的直接制造者。
+- **改法**：抽出两腿共用 `agentOptionsWithRetry(label, strictThrow, retry)` 与 `logModelBinding(legTag, sessionId, agent)`。
+  create 腿调用 `('创建', true, true)`——退避、抛错、留痕三段语义与旧码**逐字一致**（抛错文案与回落文案
+  拼接后与旧串同字节，既有 ④D 断言不受影响），读回行前缀 `check: <id>` 在 `legTag=''` 时也与旧码同字节。
+  resume 腿调用 `('恢复', false, false)`：**不退避、不抛**，理由写进代码注释——入站回合按 bot 串行
+  （`bot.chain`），在这里空等 1.5 秒会把同 bot 其它会话一起顶住，而它换不来任何信息；
+  抛错则会掉进"恢复失败→自动新建"，等于把一次恢复变成杀会话重建，爆炸半径远大于收益。
+  resume 腿结束后打 `#350 session model binding check (resume): <id> → …`。
+  `catch` 改为打印「读回失败（探针自身异常：…）」。另把 `/new` 会话名超长的拒绝分支补一行 console.log
+  （原先只发飞书回执、journal 无痕，本次取证正是被这个盲区带偏过一次）。
+- **夹具（新增 N6，五条）**：create 腿第一条 → 真重启（重新 `apply(ctx)`，chats 从落盘 state 重灌、句柄为空）
+  → 第二条走 resume 腿。断言＝前提（create 腿确有绑定行）／接线闸（mock `resumedSessions` 必须 +1）／
+  ★★★（resume 腿**恰 1 行**，0 条＝旧码静默必红，>1 条＝多实例重复计数会造假绿）／
+  配对钉（`createdSessions` 不涨，涨了说明走的还是 create 腿）／禁把「读回失败」当达标证据。
+  🔴 姿势来路如实记：第一版按"清 `liveAgents`"逼 resume 腿，实测**走不到**（`if (entry.handle)` 命中缓存直接返回），
+  基线跑批时唯一红条就是 ★★★ 那条（实得 0）——L1 复核指出后改成真重启姿势。这条写进来是为了下一任别再照抄。
+- **验证**：基线全量冒烟 `SMOKE PASS (sentCards=802, sessions=81)`，锚定红条 **0**，872 秒；
+  单变量变异（删掉 resume 腿那一行 `logModelBinding('resume', …)`，共 66 字节，其余逐字未动；
+  驱动器 `output/dsh1685-c-fix/mut-i-driver.py` 按 CRLF 字节精确匹配，靶标命中数≠1 即中止，防多变量）
+  回 `SMOKE FAIL: 1 assertion(s) failed`，锚定红条恰 1 条且就是 N6 的 ★★★ 主断言（实得 0），
+  非靶红条 **0**，873 秒；跑完正身字节复原一致，定版 `index.js` sha 前缀 `ec533a43cd`、纯 CRLF（bare_lf=0）、
+  `node --check` 过。两轮严格串行，无并发跑批。
+- **未修面（不当已修）**：`currentModelOf()` 内部两支各自 `catch {}`，探针自身异常会被它吞成"读到空"，
+  于是 `logModelBinding` 的「读回失败」支在生产近乎不可达，真读不到时输出的是 `NONE（宿主未落库…）`
+  这句对宿主的定性结论——**这是 L1 复核点出的 P2，本次没修**（修法要改 `currentModelOf` 的返回契约，
+  牵动终卡小字与 #339 探针口径，另案）。同批未动：`mountStandardPreset` 的服务缺失告警每进程只打一次。
+- **未验证面**：staging／生产真机复验待本段定版后随发布批次取（0.8.19 那条指纹不覆盖本段）。
+
 ## [0.8.19] - 2026-10-18：定版＝L1 P2 修正（字节尺门槛回原始块数）＋串行复验链三段全对靶
 
 - **L1 复核抓出的一处 P2（段④的越界）**：粗筛有两把尺——元素/块数线、字节线。首版把字节线的数据源换成了
