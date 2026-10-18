@@ -10106,6 +10106,30 @@ console.log('N2) #1447 告警标签分流：按 resolver err 码逐码给独立�
   }
 }
 
+console.log('N4) #1685 发送闸量尺的 fail-closed：量不出来的帧不许当成「没超限」放行（入站打不到的支路，直测导出口＋接线钉）')
+{
+  // 审查（护栏触发次序报告）实锤的假绿形态：旧写法 `let payloadBytes = 0` ＋ try 里赋值 ＋ catch 只打日志，
+  // stringify 一抛就保持 0 ⇒ `0 > 160000` 恒假 ⇒ 这一帧**完全没过硬顶**照发。
+  // 该支路从真实入站打不到（卡片载荷里的内容全部来自模型文本，构造不出 BigInt/循环引用），
+  // 所以这里做两层：①导出口 `measurePayloadBytes` 的行为级直测；②调用点接线（摘掉 fail-closed 即红）。
+  const { measurePayloadBytes } = await import('../index.js')
+  const goodN4 = { elements: [{ tag: 'div', text: { content: { tag: 'plain_text', content: 'x'.repeat(500) } } }] }
+  const rGood = measurePayloadBytes(goodN4)
+  ok(rGood.ok === true && rGood.bytes === Buffer.byteLength(JSON.stringify(JSON.stringify(goodN4)), 'utf8'),
+    '★ 正常载荷：量得出，且与 double-stringify 字节逐字相等（口径差正是 #1685 的病根）')
+  const rBig = measurePayloadBytes({ elements: [{ n: 1n }] })
+  ok(rBig.ok === false && rBig.bytes === 0 && typeof rBig.error === 'string' && rBig.error.length > 0,
+    '★ BigInt 载荷：stringify 抛 ⇒ ok=false（bytes=0 只作占位，判据一律看 ok，不许拿它当「没超限」）')
+  const circN4 = { elements: [] }
+  circN4.self = circN4
+  ok(measurePayloadBytes(circN4).ok === false, '★ 循环引用载荷：同判 ok=false')
+  const srcN4 = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  ok(srcN4.includes('const guard = measurePayloadBytes(payload)')
+      && srcN4.includes('if (!guard.ok) {')
+      && srcN4.includes('本帧不推送（fail-closed）'),
+    '★ 接线钉：syncCard 走的是导入口量尺，且 !ok 即 return 不发（把 fail-closed 那段摘掉＝本条必红）')
+}
+
 console.log('N3) #771 preset 工具挂载重建：单次熔断（同一条聊天最多自动重建一次）＋ 计数挂 chat 级不被 heal 抹掉')
 {
   // 本用例钉的是**假绿灯本身**：#771 的重建腿自 2026-10-14 落码（0.8.14）到上生产，
