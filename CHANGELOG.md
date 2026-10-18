@@ -1,6 +1,73 @@
 # Changelog
 
-# Changelog
+## [0.8.19] - 2026-10-18：定版＝L1 P2 修正（字节尺门槛回原始块数）＋串行复验链三段全对靶
+
+- **L1 复核抓出的一处 P2（段④的越界）**：粗筛有两把尺——元素/块数线、字节线。首版把字节线的数据源换成了
+  `rulerBlocks(card)` 之后，顺带把**门槛**（`> CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK`）也量到了尺后的集合上。
+  后果：stable 下一条长 note 让原始块数=3、尺后只剩 1 时，字节线被门槛静默关掉——判据少了一路，而这条越界
+  不在 AC-0088 裁决的范围内（裁决只说"量将发出的载荷"，没说改门槛口径）。
+- **改法**：门槛保持 `card.blocks.length`（原始块数），只有字节量取 `ruler`：
+  `const blocksB = !overBlocks && card.blocks.length > CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK ? blocksBytes(ruler) : 0`。
+  符号锚不变，不新增常量。
+- **串行复验链（严格串行，无并发跑批；脚本 `output/dsh1685-c-fix/chain-0819-final.py`，汇总 `chain-0819-final-170912.out`）**：
+  1. 基线全量冒烟 → `SMOKE PASS (sentCards=798, sessions=80)`，锚定红条 **0**，rc=0，866 秒；
+  2. 段④单变量变异（`rulerBlocks(card)` → `card.blocks`）→ `SMOKE FAIL: 1 assertion(s) failed`，
+     锚定红条恰 1 条且就是 12g 的 ★ 主断言（群卡 create 2 张），目标夹具命中 1/1、非靶红条 0，872 秒；
+  3. 段⑤单变量变异（表格计数 `rulerBlocks(card)` → `card.blocks`）→ `SMOKE FAIL: 1 assertion(s) failed`，
+     锚定红条恰 1 条且就是 12h 的 ★ 主断言（群卡 create 2 张），目标夹具命中 1/1、非靶红条 0，868 秒；
+  4. 两次变异跑完正身字节复原一致，定版 `index.js` sha 前缀 `f7fd849440`、纯 CRLF（LF-raw=0）、`node --check` 通过。
+  总判定：基线绿＝是 段④反证＝成立 段⑤反证＝成立。
+- **未验证面**：本批全部结论为夹具级；staging／生产真机复验仍无记录，发布前置（H-D24 真 bot「通过」指纹）未做，
+  挂下一动作。缺陷 B（rescue 纯文本兜底不分段）等 AC-0100 裁决，不在本批。
+
+## [0.8.19] - 2026-10-18：施工段⑤＝表格额度也只数会渲染的块（缺陷 F，段④的同类兄弟）
+
+- **症状**：群聊里 Agent 的过程话语一含 markdown 表格，卡片就在**屏幕上一张表都没显示**的情况下换成第二张，
+  还留一句「本卡表格已满（飞书单卡最多 5 张）」。那句话对群卡是事实错误——那些表格根本没进过这张卡。
+- **根因**：`cardTableCount`（表格额度判据）遍历 `card.blocks`，而注释里写明它**必须**同时数 message 与 note
+  （2026-09-16 实测：只数 message 时判定永不触发）——那条经验属于 full（私聊）形态；
+  stable 渲染层整块跳过 note，于是过程话语里的表格被数进额度却一个字节都不发。与段④同一缺陷形态，另一把尺。
+- **改法**：`cardTableCount` 的循环改为遍历 `rulerBlocks(card)`（与段④同一把尺），注释把「必须数 note」限定为
+  full 模式下的理由；stable 下 note 已被尺子滤掉，`note` 分支只在 full 生效。
+  表格类没有独立的块类型（表格是 message/note 文本里的 markdown），所以 `card.blocks` 的四种类型
+  message/note/tools/notice 已被 `rulerBlocks` 全覆盖，notice 在 stable 照旧渲染、照旧计入——这点按渲染层逐条核过。
+- **夹具（新增用例 12h，成对）**：6 个独立过程话语、每段各带一张 3 行 markdown 表（每张都在 500 字截断线内）；
+  ★ 群卡（stable）必须**不换卡**（create 1 张、无「表格已满」语），★ 对照组私聊（full）必须**换卡**（create ≥2 且留指路语）；
+  前提两条：夹具自己按 markdown 口径数出 6 张表（够到 5 张额度）、群卡帧里确实没有那些表格行。
+- **验证**：基线全量 `SMOKE PASS (sentCards=798, sessions=80)`、锚定红条 0、12h 五条全绿；
+  单变量变异（`for (const block of rulerBlocks(card))` → `for (const block of (card && card.blocks) || [])`）
+  回 `SMOKE FAIL: 1 assertion(s) failed`，锚定红条恰 1 条且就是 12h 的 ★ 主断言（create 2 张），
+  对照组与前提条保持绿、非靶红条 0；跑完正身字节复原一致（sha 前缀 `5a4fbe859f`），866 秒。
+- **与段④的互不掩盖**（L1 审查核过）：段④变异不会红 12h（6 张小表在 blocks 口径只有 KB 级、块数够不着 170，
+  体积粗筛不参与）；段⑤变异不会红 12g（过程话语里没有 markdown 表，`cardTableCount` 为 0）。
+  两个靶各自只打一把尺，这也是"恰红 1 条"能被当作判别力证据的前提。
+
+## [0.8.19] - 2026-10-18：施工段④＝换卡粗筛只量会被渲染出去的块（缺陷 A，承 #1685）
+
+- **症状**：群聊（stable 形态）里 Agent 过程话语一多，卡片会在**载荷远未到上限**时就换成第二张，
+  第二张几乎空白。用户看到的是"群里莫名其妙多出一张卡"，不是超限被拦。
+- **根因**：换卡粗筛（省渲染的提前判据）量的是整个 `card.blocks` 的字节数与块数；
+  而渲染层 `buildCardPayload` 在 stable 下跳过三类块——note 全文、tools 整块、指路行（`CARD_LABEL_SKIP`
+  与「✅ 本卡已收口」开头的 message）。⇒ 那 146 KB 的过程话语被算进判据，却一个字节都不会发出去。
+  full（CM 私聊）下三类里只有 note 真会渲染，所以这条只在群里暴露。
+- **改法**：新增 `rulerBlocks(card)`（紧跟 `blocksBytes`），stable 时按渲染层的同一套跳过规则过滤、
+  full 时原样返回；粗筛那一段改量 `rulerBlocks(card)`，日志同时打 `rulerBlocks=`／`rawBlocks=`／`mode=`
+  （留 `rawBlocks` 是为了下次还能看出"被滤掉了多少"）。
+  符号锚代替行号指针（承段②教训：行号写下即漂）。
+- **夹具（新增用例 12g，成对跑）**：同一份"8 段过程话语"（靠目的行整批补回的保护留到约 18 KB/段）
+  分别喂给群卡与私聊卡——★ 群卡必须**不换卡**（create 1 张、无指路语），★ 对照组私聊必须**换卡**（create ≥2）。
+  前提两条自己算：夹具按 blocks 口径算出 141473 字节 > 120000 线；群卡帧载荷里确实没有那些过程话语文本。
+  不读被测代码自报的护栏日志当证据。
+- **验证**：基线全量冒烟 `SMOKE PASS (sentCards=789, sessions=79)`、锚定红条 **0**、12g 五条全绿；
+  单变量变异（`const ruler = rulerBlocks(card)` → `const ruler = card.blocks`）回
+  `SMOKE FAIL: 1 assertion(s) failed`，红条恰 1 条且就是本夹具 ★ 主断言（create 2 张），
+  对照组与前提条保持绿（＝喂量与形态没错，是判据回退了）；跑完正身字节复原一致（sha 前缀 `c4ad54d862`），863 秒。
+- **如实记两点**：① 本段基线跑批期间有一个独立审查子代理也在跑同一套冒烟（时间重叠）。
+  竞争只会让时序类用例**假红**、不会让它假绿，且两轮都拿到 0 红，故判定不受影响——但下次严格串行，不靠这个推理省事。
+  ② 同族缺陷还有一处未修：`cardTableCount` 仍按旧口径把 stable 不渲染的 note 表格计入「单卡 5 张表」额度，
+  已由本批施工段⑤（用例 12h）处理，见上一节。
+- **未验证面**：staging／生产真机复验无记录（要等 0.8.19 上生产）；「群里少发一张空卡」这类用户可见效果
+  目前没有正面取证，只有夹具级证据。
 
 ## [0.8.19] - 2026-10-18：施工段③＝卡片失败回注的合成号每轮唯一（缺陷 E，L1 复核点出的存量）
 

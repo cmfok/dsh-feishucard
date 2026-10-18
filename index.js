@@ -1589,6 +1589,25 @@ export function apply(ctx) {
     }
   }
 
+  // #1685 缺陷 A（0.8.19 施工段④）：换卡粗筛必须量**会被渲染出去的那部分 blocks**。
+  // `buildCardPayload` 在 stable（群聊／员工模式）下跳过三类块：note 全文、工具块整块、
+  // 指路行（`CARD_LABEL_SKIP`）与「✅ 本卡已收口」行（notice 醒目块照旧渲染）；旧粗筛却把整个 `card.blocks`
+  // 拿去算字节与块数 ⇒ 一条 8 段过程话语（约 146 KB 的 note 文本）在**载荷远未到线**的群卡上
+  // 就触发 `onTableBudget('size')` 提前换卡，用户看到两张卡而第二张几乎空。
+  // full（CM 私聊）不过滤 ⇒ 该函数原样返回，行为逐字不变。
+  function rulerBlocks(card) {
+    const blocks = (card && card.blocks) || []
+    if (!card || card.mode !== 'stable') return blocks
+    return blocks.filter((block) => {
+      if (!block || block.type === 'note' || block.type === 'tools') return false
+      if (block.type === 'message') {
+        const text = String(block.text || '').trim()
+        if (CARD_LABEL_SKIP.has(text) || text.indexOf('✅ 本卡已收口') === 0) return false
+      }
+      return true
+    })
+  }
+
   // 把长文本按段落边界切成 ≤ size 的块；单段本身超长则硬切。**不丢任何字符。**
   function chunkText(text, size) {
     const out = []
@@ -1703,8 +1722,11 @@ export function apply(ctx) {
   // 表格总数 = 各块表格数之和（代码块内的 `|` 不算，已有 countMarkdownTables 处理）。
   function cardTableCount(card) {
     let n = 0
-    for (const block of (card && card.blocks) || []) {
-      // 必须同时数 message 与 note：agent 的过程话语走 appendNote 存成 `type: 'note'`，
+    // 计数面＝`rulerBlocks(card)`（与换卡粗筛同一把尺）：full 下含 message 与 note，
+    // stable 下 note 已被滤掉——渲染层本来就不发它（`buildCardPayload` 的 stable 分支），
+    // 旧口径照着 note 数表格 ⇒ 群里**一张表都没显示**也能按「表格已满」换卡（#1685 缺陷 F）。
+    for (const block of rulerBlocks(card)) {
+      // full 模式必须同时数 message 与 note：agent 的过程话语走 appendNote 存成 `type: 'note'`，
       // 最终回复才会被提升成 `type: 'message'`。只数 message 会让判定永远不触发
       // （2026-09-16 实测：用例 12 换卡不生效，create 次数停在 1）。
       if (block.type !== 'message' && block.type !== 'note') continue
@@ -3166,17 +3188,23 @@ export function apply(ctx) {
             // ② 元素/体积额度（实测：200 元素、载荷 ~198.5 KB 通过）⇒ **换卡续写**：
             //    旧卡正文原样保留＋一行说明，新卡从旧卡游标接续（不重放、不丢、不重）。
             //    这样"过程文字默认可见"与"绝不撞上限"同时成立（CM 2026-10-03 口径）。
-            //    ⚠ #1685（AC-0088 方案 1）：这把尺量的是 blocks（工具块只存 toolIds、不含文本），
-            //      只能当**省渲染的粗筛**；权威判定在发送前一刻按将发出载荷判（syncCard 内，同一 'size' 处置）。
-            //      留一条日志是**判据需要**：夹具 12e 靠它钉「换卡走的是 blocks 粗筛这一支」，
-            //      否则块数下限改回 60 也会被发送尺兜住，用例失去判别力。
-            const overBlocks = card.blocks.length > CARD_ROTATE_BLOCKS
+            //    ⚠ #1685（AC-0088 方案 1 ＋ 缺陷 A/F）：这把尺量的是 `rulerBlocks(card)`——stable 下就是
+            //      渲染层真会发出去的那些块（工具块只存 toolIds、不含文本），所以只能当**省渲染的粗筛**；
+            //      权威判定在发送前一刻按将发出的完整载荷判（syncCard 内，同一 'size' 处置）。
+            //      下面那行日志只作排障线索：夹具 12g/12h **不解析它**——拿被测代码自报的护栏日志当证据
+            //      等于用被测对象的输出证明它没错，属假绿，故刻意避开（原注释写「12e 靠它钉判据」不实，已更正）。
+            const ruler = rulerBlocks(card)
+            const overBlocks = ruler.length > CARD_ROTATE_BLOCKS
+            // L1 审查 P2：体积检查的**门槛仍按原始块数**判。stable 卡滤掉 note/tools 后常态只剩一两个块，
+            // 门槛若也按过滤后的块数判，单个超长结论块（≥120 KB）会整支跳过粗筛＝漏判。
+            // `ruler ⊆ blocks`，拿原始块数当门槛只会**多查**、不会漏查，full 行为逐字不变。
             const blocksB = !overBlocks && card.blocks.length > CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK
-              ? blocksBytes(card.blocks) : 0
+              ? blocksBytes(ruler) : 0
             if (overBlocks || blocksB > CARD_ROTATE_BYTES) {
-              console.log('[fs] coarse size ruler rotate: blocks=' + card.blocks.length
+              console.log('[fs] coarse size ruler rotate: rulerBlocks=' + ruler.length
+                + ' rawBlocks=' + card.blocks.length
                 + ' blocksBytes=' + blocksB + ' limit=' + CARD_ROTATE_BYTES
-                + ' card=' + String(card.token || '-').slice(-8))
+                + ' mode=' + String(card.mode || '?') + ' card=' + String(card.token || '-').slice(-8))
               onTableBudget('size'); return
             }
           }

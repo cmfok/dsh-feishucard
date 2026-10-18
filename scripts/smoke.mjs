@@ -1361,6 +1361,152 @@ console.log('12f) 字节护栏的**量尺对象＝将发出的完整载荷**（�
   ok(allF.includes('载荷量尺换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
 }
 
+console.log('12g) stable（群聊）形态的换卡粗筛只量**会渲染出去的块**（中台 #1685 缺陷 A）：note 全文/工具块不进 stable 载荷，不得拿它们顶换卡线')
+{
+  // 判别力设计（为什么这条「不修就红」，以及为什么必须成对跑）：
+  //   渲染层 stable 下跳过三类块（note 全文、工具块整块、指路/收口行，见 buildCardPayload 的三处 continue），
+  //   而修复前的粗筛量的是**整个 card.blocks** ⇒ 同一份「8 段过程话语」（每段靠目的行保护留到约 18 KB，
+  //   合计约 146 KB，越过 CARD_ROTATE_BYTES=120000）在 p2p（full）下越线换卡＝正确，
+  //   在群里（stable）越线换卡＝**提前换卡**：那些字节根本不会发出去，用户却看到两张卡、第二张几乎空。
+  //   配对防护：对照组（p2p）修复前后都必须换卡 ⇒ 由它证明「喂的量真够触发粗筛」，
+  //   而不是读被测代码自报的 `[fs] coarse size ruler rotate` 日志（那属于用被测对象的输出证明它没错）。
+  const noteG = Array.from({ length: 30 }, (_, i) => '🎯 目的G' + i + '：' + '补'.repeat(190)).join('\n')
+  const GROUP6G = 'oc_group6g_stable'
+  // 夹具自己的算术（不依赖被测代码）：8 个 note 块的 blocks 口径字节必须越过粗筛线，否则本例失去判别力
+  const rawNoteBytesG = Buffer.byteLength(JSON.stringify(Array.from({ length: 8 }, () => ({ type: 'note', text: noteG }))), 'utf8')
+
+  // 一次回合：把 8 段过程话语塞进**正在跑**的那轮，再补一条续写，最后放行 idle 收口
+  const runTurn = async (opts, seqBase, tailText) => {
+    const mark = sentCards.length
+    let release
+    const gate = new Promise((r) => { release = r })
+    const prevIdle = agent.whenIdle.bind(agent)
+    agent.whenIdle = () => gate
+    agent.send = function (message) {
+      this.sent.push(message)
+      for (let i = 0; i < 8; i++) {
+        agentEvents.push({ type: 'assistant/message', seq: seqBase + i,
+          data: { message: { content: [{ type: 'text', text: noteG }] } } })
+      }
+    }
+    // 群聊「@ 才回复」判据需要消息级 mentions（index.js 的 evt.mentions 腿），feedInbound 不带 ⇒ 群这一路自己投原始事件
+    if (opts.chatType === 'group') {
+      fakeProc.output += JSON.stringify({
+        type: 'event', eventType: 'im.message.receive_v1',
+        data: {
+          message: {
+            message_id: opts.msgId, message_type: 'text', chat_type: 'group',
+            chat_id: opts.chatId, content: JSON.stringify({ text: opts.text }),
+            mentions: GROUP_MENTION,
+          },
+          sender: { sender_id: { open_id: 'ou_test' } },
+        },
+      }) + '\n'
+    } else {
+      feedInbound(opts.msgId, opts.text)
+    }
+    await drain()
+    agentEvents.push({ type: 'assistant/message', seq: seqBase + 90,
+      data: { message: { content: [{ type: 'text', text: tailText }] } } })
+    await drain()
+    release()
+    agent.whenIdle = prevIdle
+    await drain()
+    return { frames: cardsSince(mark).filter((c) => c.payload && c.payload.schema === '2.0'),
+      creates: cardsSince(mark).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0') }
+  }
+
+  const grp = await runTurn({ msgId: 'om_rotate_stable', text: '群里的换卡靶子', chatId: GROUP6G, chatType: 'group', openId: 'ou_test' }, 14001, '群stable不该换卡的续写段')
+  const allG = JSON.stringify(grp.frames)
+  const ctl = await runTurn({ msgId: 'om_rotate_full_ctl', text: '私聊的对照组' }, 15001, '私聊对照组的续写段')
+  const allC = JSON.stringify(ctl.frames)
+
+  ok(rawNoteBytesG > 120000, '（前提·夹具算术）8 段过程话语按 blocks 口径=' + rawNoteBytesG + ' 字节，必须越过粗筛线 120000，否则本例测不到靶')
+  ok(ctl.creates.length >= 2 && allC.includes('本卡内容已达飞书单卡上限'),
+    '★ 对照组（p2p＝full，note 会渲染）：同一份输入必须换卡（create ' + ctl.creates.length + ' 张）——证明喂量真够触发粗筛，防恒真')
+  ok(allG.includes('🎯 目的G0：') === false,
+    '（前提·形态）群卡（stable）的帧载荷里**没有**过程话语文本 ⇒ 那些字节确实不会发出去')
+  ok(grp.creates.length === 1 && !allG.includes('本卡内容已达飞书单卡上限'),
+    '★ 主断言：同一份输入在群卡上不提前换卡（create ' + grp.creates.length + ' 张、无指路语）；修复前这里必红')
+  ok(allG.includes('群stable不该换卡的续写段'), '续写内容仍落在同一张卡上（没换卡≠丢内容）')
+}
+
+console.log('12h) 表格额度同族修法（#1685 缺陷 F）：stable 群卡不许把**不渲染的 note 表格**计进「单卡 5 张表」额度')
+{
+  // 判别力设计（与 12g 同一套成对思路）：
+  //   `cardTableCount` 原先数 message 与 note 两类块（note 必须数，否则 full 模式下判定永不触发，
+  //   注释里写着 2026-09-16 的实测教训），但 stable 渲染层整块跳过 note ⇒
+  //   群里 6 段过程话语各带一张表＝卡上**一张表都没显示**却按「表格已满」换卡。
+  //   靶子＝6 个独立 note 块、每块一张 3 行 markdown 表（每张 <500 字，不会被过程话语截断吃掉）；
+  //   表格数按夹具自己的 markdown 口径算（不读被测代码的计数），对照组（p2p＝full）必须换卡。
+  const tableNote = (i) => '| 指标' + i + ' | 值 |\n| --- | --- |\n| 甲' + i + ' | 1 |'
+  const GROUP6H = 'oc_group6h_tables'
+  const runTurnH = async (opts, seqBase, tailText) => {
+    const mark = sentCards.length
+    let release
+    const gate = new Promise((r) => { release = r })
+    const prevIdle = agent.whenIdle.bind(agent)
+    agent.whenIdle = () => gate
+    agent.send = function (message) {
+      this.sent.push(message)
+      for (let i = 0; i < 6; i++) {
+        agentEvents.push({ type: 'assistant/message', seq: seqBase + i,
+          data: { message: { content: [{ type: 'text', text: tableNote(i) }] } } })
+      }
+    }
+    if (opts.chatType === 'group') {
+      fakeProc.output += JSON.stringify({
+        type: 'event', eventType: 'im.message.receive_v1',
+        data: {
+          message: {
+            message_id: opts.msgId, message_type: 'text', chat_type: 'group',
+            chat_id: opts.chatId, content: JSON.stringify({ text: opts.text }),
+            mentions: GROUP_MENTION,
+          },
+          sender: { sender_id: { open_id: 'ou_test' } },
+        },
+      }) + '\n'
+    } else {
+      feedInbound(opts.msgId, opts.text)
+    }
+    await drain()
+    agentEvents.push({ type: 'assistant/message', seq: seqBase + 90,
+      data: { message: { content: [{ type: 'text', text: tailText }] } } })
+    await drain()
+    release()
+    agent.whenIdle = prevIdle
+    await drain()
+    return { frames: cardsSince(mark).filter((c) => c.payload && c.payload.schema === '2.0'),
+      creates: cardsSince(mark).filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0') }
+  }
+
+  // 夹具自己的算术：把 6 段 note 文本拼起来按 markdown 表格口径数（连续 |…| 行算一张）
+  const tablesH = (() => {
+    let n = 0
+    let prev = false
+    for (const line of Array.from({ length: 6 }, (_, i) => tableNote(i)).join('\n\n').split('\n')) {
+      const row = /^\s*\|.*\|\s*$/.test(line)
+      if (row && !prev) n += 1
+      prev = row
+    }
+    return n
+  })()
+
+  const grpH = await runTurnH({ msgId: 'om_tables_stable', text: '群里的表格靶子', chatId: GROUP6H, chatType: 'group' }, 16001, '群stable表格不该换卡的续写段')
+  const allH = JSON.stringify(grpH.frames)
+  const ctlH = await runTurnH({ msgId: 'om_tables_full_ctl', text: '私聊的表格对照组' }, 17001, '私聊表格对照组的续写段')
+  const allCH = JSON.stringify(ctlH.frames)
+
+  ok(tablesH >= 5, '（前提·夹具算术）6 段过程话语里按 markdown 口径有 ' + tablesH + ' 张表，必须够到「单卡 5 张」额度，否则本例测不到靶')
+  ok(ctlH.creates.length >= 2 && allCH.includes('本卡表格已满'),
+    '★ 对照组（p2p＝full，note 会渲染）：同样 6 张表必须换卡并留下表格指路语（create ' + ctlH.creates.length + ' 张）——防恒真')
+  ok(!allH.includes('| 指标0 |'),
+    '（前提·形态）群卡（stable）帧里没有这些表格行 ⇒ 「表格已满」对群卡是一句事实错误')
+  ok(grpH.creates.length === 1 && !allH.includes('本卡表格已满'),
+    '★ 主断言：同样 6 张表在群卡上不触发表格额度换卡（create ' + grpH.creates.length + ' 张）；修复前这里必红')
+  ok(allH.includes('群stable表格不该换卡的续写段'), '续写内容仍落在同一张卡上')
+}
+
 console.log('13) 目标模式：goal 轮自动建卡，过程在飞书可见（2026-09-16 方案 A）')
 {
   // 背景（CM 反馈）：目标模式续轮由 @deepseek-ai/dsh-goal-round-driver 以**同会话**注入
