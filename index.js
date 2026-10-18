@@ -134,6 +134,17 @@ function buildStamp() {
   }
 }
 
+// #1685 发送闸的量尺：量「真实请求体里那段」＝double stringify（send/update 传的是
+// content: JSON.stringify(payload)，转义后比 payload 自身还大）。导出＝供冒烟直测那条
+// 从入站打不到的 fail-closed 支路（scripts/smoke.mjs 的 N4）。
+export function measurePayloadBytes (payload) {
+  try {
+    return { ok: true, bytes: Buffer.byteLength(JSON.stringify(JSON.stringify(payload)), 'utf8') }
+  } catch (error) {
+    return { ok: false, bytes: 0, error: String(error && error.message || error) }
+  }
+}
+
 export function apply(ctx) {
   if (globalThis.__dshFeishucardApplyCount === undefined) globalThis.__dshFeishucardApplyCount = 0
   globalThis.__dshFeishucardApplyCount += 1
@@ -1556,7 +1567,7 @@ export function apply(ctx) {
     return '📄 本卡内容已达飞书单卡上限（约 ' + CARD_ROTATE_BLOCKS + ' 块 / 载荷 '
       + Math.round(CARD_SEND_MAX_BYTES / 1000) + ' KB），后续内容见下方新卡；**本卡正文原样保留**。'
   }
-  const CARD_ROTATE_BYTES = 120000        // 120 KB，低于实测通过线 198.5 KB
+  const CARD_ROTATE_BYTES = 120000        // 粗筛尺（量 blocks）；注：原注「低于实测通过线 198.5 KB」已被 staging 真链证伪（拒收线≈131072），见 CHANGELOG 0.8.18 更正条
   // #1685（CM 2026-10-18 在 AC-0088 拍方案 1）：**发送前这把尺**量的是真实请求体里的载荷（与飞书
   //   拒卡同尺寸），所以可以比 blocks 粗筛贴近实测通过线——取 160 KB，给转义与封口文案增量留约 20%
   //   余量。粗筛（CARD_ROTATE_BYTES）照旧提前换卡，两把尺各司其职：粗筛省渲染、发送尺兜住真实上限。
@@ -2727,14 +2738,16 @@ export function apply(ctx) {
       //   实测插桩 490 帧里 489 帧真实载荷比护栏值大（最大差 21 KB；生产形态工具面板可达 223 KB，
       //   见本文件 CARD_ROTATE_BYTES 上方那条实测记录）⇒ 护栏放行、飞书却整卡拒收。
       //   这里按「发出即所量」判：超限就不发，改走换卡（旧卡留指路语、新卡从游标接续）。
-      let payloadBytes = 0
-      try {
-        // 量的是**真实请求体里那段**：send/update 传的是 `content: JSON.stringify(payload)`
-        //   （见 :959 / :985），转义后比 payload 自身还大——#1685 的病根就是低估，这里不留口径差。
-        //   （多算的 2 个引号字节按保守方向处理，不修。）
-        payloadBytes = Buffer.byteLength(JSON.stringify(JSON.stringify(payload)), 'utf8')
-      } catch (error) {
-        console.log('[fs] payload size guard skipped this push (measure failed): ' + String(error && error.message || error))
+      const guard = measurePayloadBytes(payload)
+      const payloadBytes = guard.bytes
+      if (!guard.ok) {
+        // 🔴 量不出来＝这帧**完全没过硬顶**，而旧写法把 0 当成「没超限」直接放行＝fail-open：
+        //   payload 里一旦有 stringify 会抛的东西（BigInt／循环引用），护栏整条静默失效。
+        //   真发出去的那次 send 自己也要 stringify，多半同样失败 ⇒ 选择不发＋响亮留痕
+        //   （CM 2026-10-04「宁可误杀不放过」同口径），不把没量过的字节推给飞书。
+        console.log('[fs] payload size guard: measure failed ⇒ 本帧不推送（fail-closed）'
+          + ' card=' + String(card.token || '-').slice(-8) + ' err=' + guard.error)
+        return
       }
       if (payloadBytes > CARD_SEND_MAX_BYTES) {
         const tail = String(card.token || '-').slice(-8)
