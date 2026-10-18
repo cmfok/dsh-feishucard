@@ -6250,9 +6250,16 @@ export function apply(ctx) {
     const label = senderMark.label
 
     // Typing reaction: added on arrival, removed after the reply is delivered.
+    // 🔴 缺陷 D（0.8.19 施工段②，2026-10-18 staging 真链日志抓到）：**内部合成轮不许打字提示**。
+    //   卡片被拒后回注的系统提示走 `handleInbound(bot, {message_id: 'cardfail-<ts>', _internal: true})`
+    //   （:2606-2612），那个 id 是合成的、飞书侧不存在 ⇒ 旧实现在这里照旧 POST reactions，
+    //   每次卡片失败都**必然**吃一发 `99992354 … Invalid ids: [cardfail-…]`（实测原样见
+    //   staging `e2e-20261018-1685/02-positive-0817-journal.log:750`）。代价两条：白烧一次 API 额度
+    //   （07-飞书API额度与最小调用口径）、日志里多一条与真实故障混在一起的 ERR 噪声（按 ERR 计数的巡检会虚报）。
+    //   只做"不打字提示"，不改注入本身——#1105 的 E4b ★ 判据要求合成轮照样带日期锚，那条路径在此之后。
     const emoji = (bot.cfg.reactionEmoji && String(bot.cfg.reactionEmoji).trim()) || 'OnIt'
     let reactionId
-    if (emoji && emoji !== 'none') {
+    if (emoji && emoji !== 'none' && !(evt && evt._internal)) {
       try {
         const r = await addReaction(bot, messageId, emoji)
         reactionId = r && r.reaction_id
