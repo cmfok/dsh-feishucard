@@ -5266,6 +5266,12 @@ console.log('66) ★ 0.7.19 RED-A 群判定不许被内部合成事件覆盖（c
     '（前提）注入轮渲染出了答复（证明卡是活的，不是死卡假绿）')
   ok(!last66b.includes('过程叙述-INJECT-丙'),
     '★ 注入轮仍按 stable 渲染：内部事件不许把群改写成 p2p（旧实现 || \'p2p\' 覆盖 ⇒ full ⇒ 红）')
+  // 缺陷 D（0.8.19 施工段②）：内部合成轮的 message_id 是假的（`cardfail-<ts>`），飞书侧不存在 ⇒
+  //   给它加打字提示＝每次卡片失败必吃一发 99992354（staging 真链日志 02-positive-0817-journal.log:750 原样），
+  //   白烧 API 额度＋日志里多一条与真实故障混在一起的 ERR 噪声。判据＝**任何** reactions 调用都不许带合成 id。
+  //   变异靶：把 `&& !(evt && evt._internal)` 摘掉 ⇒ 这条必红（前提条已确认注入真的发生了）。
+  ok(!reactionCalls.some((c) => String(c.url).includes('cardfail-')),
+    '★ 内部合成轮不给假 message_id 加打字提示（合成 id 出现在任何 reactions 请求里都算红）')
   await settle(2)
 }
 
