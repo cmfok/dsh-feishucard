@@ -14,13 +14,18 @@
 //   node scripts/sync-to-profile.mjs --profile <dir>  # explicit profile directory
 //
 // Exit code 0 = copy is byte-identical to source for every shipped file.
+// Exit code 1 = FAIL: byte mismatch after copy, stale files on --dry-run, OR
+//   dependency invariant broken (中台 #1735, fail-closed): the version Node
+//   actually resolves for every `dependencies` entry at the deployed entry
+//   must equal its package.json lock value — otherwise nothing is deployed.
 // Exit code 3 = REFUSED: the target is already a link to the source (see below).
 //
 // ⚠️ 2026-10-01 守卫：若 profile 里的这个目录已被换成**指向源码的链接**
 // （junction / symlink ＝ 免重启部署方案 A），那么 target 就是源码目录本身：
 // 再跑本脚本会把 `.bak` 备份写进源码目录、并对自己做无意义拷贝 ⇒ 直接拒绝执行。
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -65,6 +70,21 @@ const sameReal = (() => {
     return process.platform === 'win32' ? t.toLowerCase() === s.toLowerCase() : t === s
   } catch { return false }
 })()
+// ── 依赖不变式机器断言（中台 #1735，fail-closed）──────────────────────────
+// 「装机后实装版本必须等于 package.json 锁值」：以部署入口为锚、用 Node 自己
+// 的解析规则查**运行时真正会加载到的那份**依赖（链接形态锚＝源码根、实体
+// 副本形态锚＝profile 里的副本 —— realpath 一律给出真实加载目录），实装
+// version ≠ dependencies 锁值 ⇒ exit 1，本次部署不算成功（先于同步/REFUSED
+// 拦截，任何文件都不会被拷贝）。锁值必须是精确版本（8629cbb 起
+// @larksuiteoapi/node-sdk 钉 1.74.0）：范围形态（^/~/> …）与解析不到同样判红。
+let runtimeDir = ''
+try { runtimeDir = realpathSync(target) } catch { }
+if (!runtimeDir) {
+  console.error('[deps] FAIL: 无法定位运行时加载目录（realpath 失败）: ' + target)
+  process.exit(1)
+}
+assertLockedDeps(runtimeDir)
+
 // 2026-10-02 代码审查 low#3：`--dry-run` 什么都不写，是**只读诊断**入口 —— 守卫要放在它后面，
 // 否则链接形态下连"看一眼文件清单"都做不到（原来直接 exit 3）。
 if (!dryRun && (isLink || sameReal)) {
@@ -89,6 +109,51 @@ if (!dryRun && (isLink || sameReal)) {
 }
 
 const md5 = (file) => createHash('md5').update(readFileSync(file)).digest('hex')
+
+// #1735 依赖不变式断言体：逐个生产依赖比对「锁值 vs 实装」。
+// 实装的查法＝require.resolve（createRequire 以 baseDir/index.js 为锚）：
+// resolve 到哪份 node_modules，运行时就加载哪份 —— 这是装机结果的最诚实读数。
+// 子路径 '<pkg>/package.json' 被 exports 字段挡住时，退回解析 main 入口再向上
+// 找最近的 package.json；两层都失败 ⇒ 实装留空判红（不编造兜底值）。
+function assertLockedDeps(baseDir) {
+  const deps = pkg.dependencies || {}
+  const names = Object.keys(deps)
+  console.log('[deps] invariant check: ' + names.length + ' 个生产依赖，实装版本必须等于锁值（base=' + baseDir + '）')
+  if (names.length === 0) return
+  const req = createRequire(join(baseDir, 'index.js'))
+  let bad = 0
+  for (const name of names) {
+    const want = deps[name]
+    let resolved = ''
+    let got = ''
+    try {
+      resolved = req.resolve(name + '/package.json')
+      got = JSON.parse(readFileSync(resolved, 'utf8')).version || ''
+    } catch {
+      try {
+        resolved = req.resolve(name)
+        let d = dirname(resolved)
+        while (d !== dirname(d)) {
+          const m = join(d, 'package.json')
+          if (existsSync(m)) { got = JSON.parse(readFileSync(m, 'utf8')).version || ''; break }
+          d = dirname(d)
+        }
+      } catch { }
+    }
+    if (got === want) {
+      console.log('[deps] OK   ' + name + ' ' + got)
+    } else {
+      bad += 1
+      console.error('[deps] FAIL ' + name + '：锁值=' + want + ' 实装=' + (got || '（解析不到/未实装）'))
+      console.error('[deps]   resolved = ' + (resolved || '（无）'))
+    }
+  }
+  if (bad > 0) {
+    console.error('[deps] 🔴 依赖不变式被破坏（fail-closed）：实装 ≠ package.json 锁值。')
+    console.error('[deps]    本次部署**不算成功**、未拷贝任何文件；先把依赖装回锁值（package.json dependencies，精确版本）再重跑。')
+    process.exit(1)
+  }
+}
 const rows = []
 for (const rel of files) {
   const src = join(PKG_ROOT, rel)
@@ -129,6 +194,10 @@ for (const r of stale) {
     console.error('[sync] SKIP (not in source): ' + r.rel)
     continue
   }
+  // 2026-10-18 #1735 自测踩出（既有缺陷，绿向装机路径被挡）：全新装机时
+  // 目标侧没有 scripts/ 子目录，copyFileSync 直接 ENOENT。真实 profile 因
+  // 历史装机已建过目录而从未暴露。建目录是幂等的，已有目录不受影响。
+  mkdirSync(dirname(r.dst), { recursive: true })
   copyFileSync(r.src, r.dst)
   console.log('[sync] copied ' + r.rel + ' (' + statSync(r.dst).size + ' bytes)')
 }

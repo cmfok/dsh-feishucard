@@ -46,3 +46,5 @@ Thumbs.db
 # editor
 .idea/
 .vscode/
+# 施工/冒烟产物目录（selftest、smoke 运行产物）—— 不入库
+output/
