@@ -1,3 +1,5 @@
+// v3 historical message format appears in fixtures below for compatibility simulation only;
+// do not copy those fixtures into runtime code.
 // dsh-feishucard smoke test: boots the real host plugin against a mocked
 // DSH context and a mocked Feishu REST API, feeds one inbound message through
 // the helper protocol, and asserts the full turn pipeline:
