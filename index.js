@@ -1154,6 +1154,65 @@ export function apply(ctx) {
     return res
   }
 
+  function splitRescueText(text, maxBytes) {
+    const parts = []
+    let part = ''
+    let bytes = 0
+    for (const ch of String(text == null ? '' : text)) {
+      const n = Buffer.byteLength(ch, 'utf8')
+      if (part && bytes + n > maxBytes) {
+        parts.push(part)
+        part = ''
+        bytes = 0
+      }
+      part += ch
+      bytes += n
+    }
+    if (part) parts.push(part)
+    return parts
+  }
+
+  async function rescueCardBody(bot, chatId, text) {
+    const body = String(text == null ? '' : text)
+    if (!body) return
+    const parts = splitRescueText(body, CARD_RESCUE_PART_BYTES)
+    const saveFullTextAndNotify = async (why) => {
+      try {
+        const root = String((bot.cfg && bot.cfg.workspace) || workspaceRoot() || process.cwd())
+        const dir = join(root, 'output', 'dsh-feishucard-rescue')
+        mkdirSync(dir, { recursive: true })
+        const file = join(dir, 'card-rescue-' + Date.now() + '-' + randomUUID() + '.txt')
+        writeFileSync(file, body, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+        console.log('[fs] card body rescue saved: parts=' + parts.length + ' reason=' + why)
+        await sendPlainText(bot, chatId, '救援正文较长，完整内容已保存到：\n' + file)
+      } catch (error) {
+        console.log('[fs] card body rescue save failed: ' + String(error && error.message || error))
+        await sendPlainText(bot, chatId, '救援正文过长，分片发送失败且本地保存失败；请联系管理员查看日志。')
+      }
+    }
+    if (parts.length > CARD_RESCUE_MAX_PARTS) {
+      await saveFullTextAndNotify('part limit')
+      return
+    }
+    for (let i = 0; i < parts.length; i += 1) {
+      const message = parts.length > 1
+        ? '第 ' + (i + 1) + '/' + parts.length + ' 片\n\n' + parts[i]
+        : parts[i]
+      try {
+        const res = await sendPlainText(bot, chatId, message)
+        const parsed = parseJson(res && res.text)
+        if (!(res && res.status >= 200 && res.status < 300 && parsed && parsed.code === 0)) {
+          await saveFullTextAndNotify('send failed at part ' + (i + 1))
+          return
+        }
+      } catch (error) {
+        await saveFullTextAndNotify('send error at part ' + (i + 1))
+        return
+      }
+    }
+    console.log('[fs] card body rescued: parts=' + parts.length + ' chat=' + chatId)
+  }
+
   async function addReaction(bot, messageId, emoji) {
     const accessToken = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
     const res = await httpJson(
@@ -1575,10 +1634,15 @@ export function apply(ctx) {
     return '📄 本卡内容已达飞书单卡上限，后续内容见下方新卡；**本卡正文原样保留**。'
   }
   const CARD_ROTATE_BYTES = 120000        // 粗筛尺（量 blocks）；注：原注「低于实测通过线 198.5 KB」已被 staging 真链证伪（拒收线≈131072），见 CHANGELOG 0.8.18 更正条
-  // #1685（CM 2026-10-18 在 AC-0088 拍方案 1）：**发送前这把尺**量的是真实请求体里的载荷（与飞书
-  //   拒卡同尺寸），所以可以比 blocks 粗筛贴近实测通过线——取 160 KB，给转义与封口文案增量留约 20%
-  //   余量。粗筛（CARD_ROTATE_BYTES）照旧提前换卡，两把尺各司其职：粗筛省渲染、发送尺兜住真实上限。
-  const CARD_SEND_MAX_BYTES = 160000
+  // #1685 / AC-0096（CM 选项 2）：软闸按约 109 KB（约 561 行）提前换卡；force 帧另设硬顶，
+  //   不超过约 130 KB，低于 PATCH 实测拒收墙 131072 B 留 1072 B 余量。超硬顶时改走纯文本救援。
+  //   AC-0100 的分片上限属于另一裁决，不能由此推定。
+  const CARD_SEND_MAX_BYTES = 109000
+  const CARD_SEND_FORCE_MAX_BYTES = 130000
+  // AC-0100：正文救援每片约 28 KB，预留片头和 JSON 包装空间；5 片上限由 AC-0096 的
+  // force 硬顶 130000 B 推导，更长内容落文件，避免救援本身变成无界多消息发送。
+  const CARD_RESCUE_PART_BYTES = 28000
+  const CARD_RESCUE_MAX_PARTS = Math.ceil(CARD_SEND_FORCE_MAX_BYTES / CARD_RESCUE_PART_BYTES)
   // ⚠️ 体积必须按**真字节**量（审查 MED#958）：中文 1 字 ≈ 3 UTF-8 字节，用 String.length
   // 会低估到 ~1/3 —— 150000 "字符" 对 CJK 其实是 ~450 KB，早已越过实测 198.5 KB 的通过线。
   function blocksBytes(blocks) {
@@ -2791,10 +2855,20 @@ export function apply(ctx) {
       if (payloadBytes > CARD_SEND_MAX_BYTES) {
         const tail = String(card.token || '-').slice(-8)
         if (force) {
-          // 封口／换卡／托孤补发这类"最后一次机会"的推送不许被这条闸挡死，否则旧卡永远停在
-          //   超限前那一拍（换卡自己也要 force 推旧卡）。真被飞书拒时走既有 rescue 纯文本兜底。
-          console.log('[fs] payload size guard: forced push sent anyway bytes=' + payloadBytes
-            + ' limit=' + CARD_SEND_MAX_BYTES + ' card=' + tail + ' (拒收时由 sendPlainText 兜底)')
+          // force 不得绕过飞书实测 PATCH 墙：超硬顶就不发卡，明确尝试既有纯文本救援。
+          if (payloadBytes > CARD_SEND_FORCE_MAX_BYTES) {
+            const rescueText = payloadPlainText(payload)
+            console.log('[fs] payload size guard: forced push blocked bytes=' + payloadBytes
+              + ' hard_limit=' + CARD_SEND_FORCE_MAX_BYTES + ' card=' + tail + '; plain-text rescue attempted')
+            if (rescueText && !card.rescued) {
+              card.rescued = true
+              await rescueCardBody(bot, chatId, rescueText)
+            }
+            return
+          }
+          console.log('[fs] payload size guard: forced push within hard limit bytes=' + payloadBytes
+            + ' soft_limit=' + CARD_SEND_MAX_BYTES + ' hard_limit=' + CARD_SEND_FORCE_MAX_BYTES
+            + ' card=' + tail)
         } else if (card.status === 'sealed' || card.status === 'error') {
           // 换卡处置 stop() 时会撤掉回调，此时旧卡队列里还排着更早入队的非 force 任务：
           //   把超限帧推给一张**不再更新**的封口卡，只会换来拒收＋失败计数噪声，内容也早已由新卡接续。
@@ -2892,7 +2966,7 @@ export function apply(ctx) {
         //    这一步是"用户那边突然什么都不动了"的直接解药（旧实现让兜底也带着非法片段再挂一次）。
         if ((klass === 'rejected' || klass === 'toolarge') && rescueText && !card.rescued) {
           card.rescued = true
-          void sendPlainText(bot, chatId, rescueText)
+          void rescueCardBody(bot, chatId, rescueText)
             .then(() => { console.log('[fs] card body rescued chat=' + chatId) })
             .catch(() => { })
         }
@@ -4321,8 +4395,10 @@ export function apply(ctx) {
           text: '[系统回执] 用户刚在飞书执行 `' + what + '` 失败了：' + detail
             + '\n请排查原因（必要时查 dsh 日志），然后用一句人话告诉用户现在什么情况、要不要重试。',
         }],
-        // kind='plugin' + 这个前缀 ⇒ 走既有的"自动轮"通道（agent/status 会建卡/续卡）
-        source: { kind: 'plugin', plugin: 'feishu-stream' },
+        // v4 会话格式已废除 kind='plugin' 包装（写入即遭 SessionFormatError「producer-owned
+        // source kind」拒收，整轮无回复，2026-10-19 BA 池实锤）——改用生产者自有 kind；
+        // 自动轮建卡读侧只认正文白名单（NOTICE_RE），不依赖这里的 kind 取值。
+        source: { kind: 'feishu-stream' },
       }, 'next-turn', true)
     } catch (error2) {
       console.log('[fs] report command failure failed: ' + String(error2 && error2.message || error2))
@@ -6836,13 +6912,18 @@ export function apply(ctx) {
 
     let turn = await runTurn(commandHold && commandHold.agent ? commandHold.agent : agent,
       commandHold ? { skipSend: true, seqBefore: commandHold.seqBefore } : undefined)
-    if (!turn.hadOutput && turn.failure) {
+    // 会话级损坏（v4 格式校验拒收等 SessionFormatError 族）⇒ 写入通道已坏、**每轮必炸**，
+    // 重建会话正是正解——不得走下面的「上游报错不自愈」分支（2026-10-19 BA 池实锤：
+    // 该 skip 让坏会话永远不自愈，同一报错反复出现；中台 #2009/#2010）。
+    const sessionCorruptFailure = Boolean(turn.failure
+      && /format v4 message|SessionFormatError|session format/i.test(turn.failure.message))
+    if (!turn.hadOutput && turn.failure && !sessionCorruptFailure) {
       // 上游已经明确报错（402 欠费／401 密钥／429 限流…）⇒ **重建会话修不好它**。
       // 旧行为：照样重建会话＋重试一次 —— 白跑一轮、二次失败，还把真正的报错
       // 换成「已自动重建会话重试」（用户 2026-09-21：「它不会提示我欠费…就直接显示
       // 说本轮没有回复」）。现在：原因留在卡上（runTurn 已写），**不自愈**。
       console.log('[fs] skip self-heal: upstream failure (' + turn.failure.text + ')')
-    } else if (!turn.hadOutput && sessionReused) {
+    } else if (!turn.hadOutput && (sessionReused || sessionCorruptFailure)) {
       // Reused/resumed session produced nothing at all — the signature of a
       // session whose turn was killed by a dsh web restart (2026-09-08). Drop
       // it and answer from a brand-new session so the user never gets a blank
@@ -9483,10 +9564,14 @@ export function apply(ctx) {
   // #124 落地校验的参数：宿主自己的 ② 半写完后 profile 热更要一点时间 ⇒ 先短轮询；
   //   等不到才桥直存（写同值幂等无害）；直存给 4 秒上界（保存队列疑似卡死时不无限悬回执）。
   //   最坏 ~0.6s + 4s + 1s，全部有界（A19）。
+  //   #560 续段（2026-10-19）：直存写 profile 会触发宿主配置热更事务，撞上插件 HMR
+  //   热重载事务时宿主按嵌套保护拒收（「transactions cannot be nested」）——保护是瞬时的，
+  //   对这一种报错退避一次重试；别的报错照旧如实带回，不掩盖。
   const DM_LAND_POLL_TRIES = 3
   const DM_LAND_POLL_MS = 200
   const DM_LAND_RETRY_TRIES = 5
   const DM_DIRECT_SAVE_TIMEOUT_MS = 4000
+  const DM_HMR_RETRY_BACKOFF_MS = 1500
   function defaultSelectionMatches(dm, provider, model) {
     try {
       const cur = dm.currentSelection()
@@ -9510,7 +9595,7 @@ export function apply(ctx) {
         return { persisted: false, persistDetail: 'agentDefaultModel 没暴露 saveSelection，桥直存无门' }
       }
       // 桥直存：宿主 ② 半静默没跑 ⇒ 桥自己调同一个服务把它写上。
-      const saved = await Promise.race([
+      const saveOnce = async () => await Promise.race([
         (async () => {
           try { await dm.saveSelection({ provider, model }); return 'saved' } catch (error) {
             return 'error:' + String((error && error.message) || error)
@@ -9518,6 +9603,13 @@ export function apply(ctx) {
         })(),
         new Promise((r) => setTimeout(() => r('timeout'), DM_DIRECT_SAVE_TIMEOUT_MS)),
       ])
+      let saved = await saveOnce()
+      // HMR 嵌套撞车兜底：仅对宿主嵌套事务保护这一种报错退避重试一次（写同值幂等无害）。
+      if (typeof saved === 'string' && saved.startsWith('error:')
+        && /transactions cannot be nested/i.test(saved)) {
+        await new Promise((r) => setTimeout(r, DM_HMR_RETRY_BACKOFF_MS))
+        saved = await saveOnce()
+      }
       if (saved !== 'saved') {
         return {
           persisted: false, persistDetail: saved === 'timeout'

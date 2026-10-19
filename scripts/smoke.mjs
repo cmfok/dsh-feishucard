@@ -134,6 +134,8 @@ const imageUploads = []
 const fileUploads = []
 let rejectPatches = 0
 let rejectPatchesBody = null   // 0.7.9：可注入具体错误体（P5 用 11310）
+let rejectPatchContaining = '' // #1685：按 PATCH 载荷注入一次内容拒绝（230099），与 transport 失败分开
+let rejectedPatchContentInjections = 0
 // 0.8.19 缺陷 E 夹具（施工段③）：**按会话**锁定「这个会话的卡片 create 被拒一次」。
 //   为什么不复用 rejectPatches：它是**全局计数**，而纯文本提示也走 create（N5 块里那句
 //   「rejectPatches 只对 create 生效，而纯文本发送也走 create」记过这个坑），
@@ -230,6 +232,13 @@ globalThis.fetch = async (url, init) => {
       rec.msgId = msgIdOf(u)
       // 失败的那一次**不落 sentCards**：用例判的是"内容有没有真的送达"，
       //   把失败的 PATCH 也记进去会让"降级后仍只送达一次"这类断言失去意义。
+      if (rejectPatchContaining && JSON.stringify(payload).includes(rejectPatchContaining)) {
+        rejectPatchContaining = ''
+        rejectedPatchContentInjections += 1
+        return { status: 200, text: () => Promise.resolve(JSON.stringify({
+          code: 230099, msg: 'Failed to update card content (injected: content rejected)',
+        })) }
+      }
       if (failPatchContaining && JSON.stringify(payload).includes(failPatchContaining)) {
         failPatchContaining = ''
         throw new Error('smoke: patch transport failure (5xx/connection reset)')
@@ -1268,8 +1277,8 @@ console.log('12e) 字节额度换卡的**块数下限＝2**（中台 #1672 案 1
   const gateB = new Promise((r) => { releaseB = r })
   const prevIdleB = agent.whenIdle.bind(agent)
   agent.whenIdle = () => gateB
-  // 30 行互不相同的 `🎯 …`（每行约 197 字）——目的行保护会把被截掉的行整批补回块内
-  const noteB = Array.from({ length: 30 }, (_, i) => '🎯 目的' + i + '：' + '补'.repeat(190)).join('\n')
+  // 30 行互不相同的 `🎯 …`（每行约 163 字符）——目的行保护会把被截掉的行整批补回块内
+  const noteB = Array.from({ length: 30 }, (_, i) => '🎯 目的' + i + '：' + '补'.repeat(156)).join('\n')
   agent.send = function (message) {
     this.sent.push(message)
     for (let i = 0; i < 8; i++) {
@@ -1308,8 +1317,7 @@ console.log('12f) 字节护栏的**量尺对象＝将发出的完整载荷**（�
   //   靶子构成（两把尺各自只有一把够得着，否则失去判别力）：
   //   · 3 段短叙述 ＋ 1 个工具块 ⇒ blocks 里只有 toolIds（500 个 id × 约 20 字节 ≈ 10 KB 级），
   //     够不着粗筛线 CARD_ROTATE_BYTES=120000，块数也只有 4、够不着 170 ⇒ **粗筛不参与判定**；
-  //   · 500 条**失败**工具调用（渲染成 `- ❌ · 名 \`参数摘要\` · 错误≤100 字`，中文错误 90 字＝270 字节 ⇒ 单行约 330 字节）
-  //     ⇒ 真实请求体 ≈ 170 KB，越过发送闸 CARD_SEND_MAX_BYTES=160000，但**不超过**实测硬线 198.5 KB。
+  //   · 500 条**失败**工具调用 ⇒ 真实请求体约 170 KB，越过 AC-0096 软闸 109000 与 force 硬顶 130000。
   //   ⇒ 只有「量将发出的完整载荷」这一条路能触发换卡；把新增的字节闸整段删掉，本条 ★ 断言必红。
   //   另钉一条 P1 判据：换卡那一刻旧卡是 force 推送（闸放行），所以**每一帧**请求体都必须 ≤ 198.5 KB，
   //   否则指路语送不出去、旧卡停在半截——这条只能在载荷字节上判，不能靠存根（存根不按字节拒收）。
@@ -1327,7 +1335,7 @@ console.log('12f) 字节护栏的**量尺对象＝将发出的完整载荷**（�
       agentEvents.push({ type: 'tool/call', seq: 12100 + i, data: { callId: 'call_1685_' + i, name: 'probe_tool_' + i, arguments: '{"path":"/srv/aiad/x' + i + '.md"}' } })
       agentEvents.push({ type: 'tool/result', seq: 12600 + i, data: { message: {
         source: { callId: 'call_1685_' + i }, isError: true,
-        content: [{ type: 'tool-result', content: [{ type: 'text', text: '工具失败原因：' + '障'.repeat(90) }] }],
+        content: [{ type: 'tool-result', content: [{ type: 'text', text: '工具失败原因：' + '障'.repeat(60) }] }],
       } } })
     }
   }
@@ -1350,15 +1358,56 @@ console.log('12f) 字节护栏的**量尺对象＝将发出的完整载荷**（�
   const maxBodyF = Math.max.apply(null, bodyBytesF.concat([0]))
   ok(createsF.length >= 1, '（前提）载荷量尺例确实建出了回合卡')
   ok(toolLinesF >= 400, '（前提·判别形态）卡上真实渲染出 ' + toolLinesF + ' 行工具文本（＝载荷侧字节主体，blocks 里没有这些文本）')
-  ok(noteMarksF === 3 && maxBodyF > 160000 && maxBodyF <= 198500,
+  ok(noteMarksF === 3 && maxBodyF > 109000,
     '（前提·判别窗口）叙述段数=' + noteMarksF + '（⇒ blocks 只有个位数块、toolIds 撑不起 120000 粗筛线）；'
-    + '最大帧请求体=' + maxBodyF + ' 必须落在 160000–198500：既越过发送闸、又不越飞书实测硬线')
+    + '最大帧请求体=' + maxBodyF + ' 必须越过 109000 软闸')
   ok(allF.includes('本卡内容已达飞书单卡上限'),
     '★ 主断言：blocks 不越线而**将发出的载荷**越线 ⇒ 按完整载荷判、换卡并留下指路语（旧尺子量 blocks 时这一支不判定，本断言必红）')
   ok(createsF.length >= 2, '★ 主断言：载荷超限后新建了第二张卡（create 次数 ' + createsF.length + '）')
-  ok(bodyBytesF.every((b) => b <= 198500),
-    '★ 审查 P1 判据：本例发出的每一帧请求体（含换卡那一刻被放行的 force 旧卡帧）都 ≤ 实测通过线 198.5 KB，共 ' + bodyBytesF.length + ' 帧')
+  ok(bodyBytesF.every((b) => b <= 130000),
+    '★ AC-0096 硬顶反证：包括 force 旧卡帧在内，没有发送超过 130000 B 的卡片请求体，共 ' + bodyBytesF.length + ' 帧')
+  const plainRescueF = cardsSince(markF).filter((c) => c.payload && c.payload.schema !== '2.0')
+  ok(plainRescueF.length === 0,
+    '★ 109000–130000 B 的 force 帧可安全发送为卡片，不走硬顶救援')
   ok(allF.includes('载荷量尺换卡后的续写段'), '续写内容落到新卡（游标接续、不重放）')
+}
+
+console.log('12f-hard) AC-0096 硬顶救援：完整载荷超过 130000 B 时不得发卡，必须送纯文本正文')
+{
+  const markHardF = sentCards.length
+  let releaseHardF
+  const gateHardF = new Promise((r) => { releaseHardF = r })
+  const prevIdleHardF = agent.whenIdle.bind(agent)
+  agent.whenIdle = () => gateHardF
+  agent.send = function (message) {
+    this.sent.push(message)
+    for (let i = 0; i < 3; i++) {
+      agentEvents.push({ type: 'assistant/message', seq: 22001 + i,
+        data: { message: { content: [{ type: 'text', text: '硬顶救援的一轮叙述 ' + i }] } } })
+    }
+    for (let i = 0; i < 500; i++) {
+      agentEvents.push({ type: 'tool/call', seq: 22100 + i, data: { callId: 'call_1685_hard_' + i, name: 'probe_tool_' + i, arguments: '{"path":"/srv/aiad/hard' + i + '.md"}' } })
+      agentEvents.push({ type: 'tool/result', seq: 22600 + i, data: { message: {
+        source: { callId: 'call_1685_hard_' + i }, isError: true,
+        content: [{ type: 'tool-result', content: [{ type: 'text', text: '硬顶测试失败原因：' + '障'.repeat(90) }] }],
+      } } })
+    }
+  }
+  feedInbound('om_rotate_payload_hard', '载荷量尺硬顶救援')
+  await drain()
+  agentEvents.push({ type: 'assistant/message', seq: 23200, data: { message: { content: [{ type: 'text', text: '硬顶救援后的续写段' }] } } })
+  await drain()
+  releaseHardF()
+  agent.whenIdle = prevIdleHardF
+  await drain()
+
+  const hardFramesF = cardsSince(markHardF).filter((c) => c.payload && c.payload.schema === '2.0')
+  const hardRescueF = cardsSince(markHardF).filter((c) => c.payload && c.payload.schema !== '2.0')
+  const hardBodyBytesF = hardFramesF.map((c) => Buffer.byteLength(JSON.stringify(JSON.stringify(c.payload)), 'utf8'))
+  ok(hardBodyBytesF.every((b) => b <= 130000),
+    '★ AC-0096 硬顶反证：实际发送的卡片请求体均不超过 130000 B，共 ' + hardBodyBytesF.length + ' 帧')
+  ok(hardRescueF.length > 0 && JSON.stringify(hardRescueF).includes('硬顶救援的一轮叙述'),
+    '★ AC-0096 救援反证：force 帧超硬顶后实际发出包含本轮正文的纯文本卡')
 }
 
 console.log('12g) stable（群聊）形态的换卡粗筛只量**会渲染出去的块**（中台 #1685 缺陷 A）：note 全文/工具块不进 stable 载荷，不得拿它们顶换卡线')
@@ -1370,7 +1419,7 @@ console.log('12g) stable（群聊）形态的换卡粗筛只量**会渲染出去
   //   在群里（stable）越线换卡＝**提前换卡**：那些字节根本不会发出去，用户却看到两张卡、第二张几乎空。
   //   配对防护：对照组（p2p）修复前后都必须换卡 ⇒ 由它证明「喂的量真够触发粗筛」，
   //   而不是读被测代码自报的 `[fs] coarse size ruler rotate` 日志（那属于用被测对象的输出证明它没错）。
-  const noteG = Array.from({ length: 30 }, (_, i) => '🎯 目的G' + i + '：' + '补'.repeat(190)).join('\n')
+  const noteG = Array.from({ length: 30 }, (_, i) => '🎯 目的G' + i + '：' + '补'.repeat(163)).join('\n')
   const GROUP6G = 'oc_group6g_stable'
   // 夹具自己的算术（不依赖被测代码）：8 个 note 块的 blocks 口径字节必须越过粗筛线，否则本例失去判别力
   const rawNoteBytesG = Buffer.byteLength(JSON.stringify(Array.from({ length: 8 }, () => ({ type: 'note', text: noteG }))), 'utf8')
@@ -10742,6 +10791,68 @@ console.log('N6) #560 判据可达性：模型绑定行必须 create 与 resume 
   ok(!linesN6(markN6).some((l) => l.includes('读回失败')),
     '★ N6：两腿的绑定行都不许是探针自身异常兜出来的（异常要可见，但不能当达标证据）｜实得 '
     + JSON.stringify(linesN6(markN6).filter((l) => l.includes('读回失败')).map((l) => l.slice(0, 56))))
+}
+
+console.log('N7) #1685 / AC-0100：卡片救援正文顺序分片；超过分片上限落完整文件并提示路径')
+{
+  let seqN7 = 2000000
+  const rescueTextCards = (from) => cardsSince(from)
+    .filter((c) => c.op === 'create' && c.payload && Array.isArray(c.payload.elements)
+      && c.payload.elements.some((el) => el && el.tag === 'markdown'))
+    .map((c) => c.payload.elements.filter((el) => el && el.tag === 'markdown')
+      .map((el) => String(el.content || '')).join('\n'))
+  const chunkBody = 'RESCUE_CHUNK_MARKER\n' + 'A'.repeat(50000)
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: (seqN7 += 10),
+      data: { message: { content: [{ type: 'text', text: chunkBody }] } } })
+  }
+  rejectPatchContaining = 'RESCUE_CHUNK_MARKER'
+  const rejectedPatchCountBeforeN7 = rejectedPatchContentInjections
+  const chunkStart = sentCards.length
+  feedInbound('om_rescue_chunks_n7', 'AC-0100 分片回归', { chatId: 'oc_rescue_chunks_n7' })
+  await settle(5)
+  const chunkMessages = rescueTextCards(chunkStart)
+  const rescuedChunks = chunkMessages.filter((s) => /^第 \d+\/2 片/.test(s))
+  ok(rejectedPatchContentInjections === rejectedPatchCountBeforeN7 + 1,
+    '★★★ N7 确实注入一次 230099 内容拒绝，进入真实救援分支｜实得 '
+    + (rejectedPatchContentInjections - rejectedPatchCountBeforeN7))
+  ok(rescuedChunks.length === 2
+    && rescuedChunks[0].startsWith('第 1/2 片')
+    && rescuedChunks[1].startsWith('第 2/2 片')
+    && rescuedChunks[0].includes('RESCUE_CHUNK_MARKER')
+    && rescuedChunks[1].includes('A'),
+    '★★★ 救援正文 50 KB 按顺序发成 2 片，片头有序号且正文可见（移除救援调用则本条红）｜实得 '
+    + JSON.stringify(rescuedChunks.map((s) => s.slice(0, 32))))
+  ok(rescuedChunks.every((s) => Buffer.byteLength(s, 'utf8') <= 28040),
+    '★★ 每片正文约 28 KB，含片头仍不超过 28040 UTF-8 字节｜实得 '
+    + JSON.stringify(rescuedChunks.map((s) => Buffer.byteLength(s, 'utf8'))))
+
+  const fileBody = 'RESCUE_FILE_MARKER\n' + 'F'.repeat(240000)
+  agent.send = function (message) {
+    this.sent.push(message)
+    agentEvents.push({ type: 'assistant/message', seq: (seqN7 += 10),
+      data: { message: { content: [{ type: 'text', text: fileBody }] } } })
+  }
+  const fileStart = sentCards.length
+  const fileLogStart = consoleLines.length
+  feedInbound('om_rescue_file_n7', 'AC-0100 超限落文件回归', { chatId: 'oc_rescue_file_n7' })
+  await settle(6)
+  const fileNotices = rescueTextCards(fileStart)
+    .filter((s) => s.includes('完整内容已保存到：'))
+  const filePath = fileNotices.length
+    ? fileNotices[0].split('完整内容已保存到：').pop().trim()
+    : ''
+  let saved = ''
+  try { if (filePath) saved = readFileSync(filePath, 'utf8') } catch {}
+  ok(fileNotices.length === 1 && filePath.includes('output') && saved.includes(fileBody)
+    && saved.indexOf(fileBody) === saved.lastIndexOf(fileBody)
+    && Buffer.byteLength(saved, 'utf8') === Buffer.byteLength(fileBody, 'utf8') + 23,
+    '★★★ 超过 5 片上限时完整正文落文件并发送可用路径（无保存调用则本条红）｜实得 '
+    + JSON.stringify({ notice: fileNotices.length, pathProvided: Boolean(filePath), savedBytes: Buffer.byteLength(saved, 'utf8') }))
+  ok(consoleLines.slice(fileLogStart).some((l) => l.includes('card body rescue saved:') && l.includes('part limit')),
+    '★★ 超上限处置有明确日志留痕｜实得 '
+    + consoleLines.slice(fileLogStart).filter((l) => l.includes('card body rescue saved:')).length)
 }
 
 if (failures === 0) {

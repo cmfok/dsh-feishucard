@@ -363,6 +363,7 @@ npm i                          # 安装依赖 / install deps
 npm run check                  # node --check 语法检查 / syntax check
 npm run smoke                  # 冒烟测试：mock DSH ctx + mock 飞书 API，跑完整回合链路
 npm run sync                   # 同步到 profile 副本（含体检 + 校验，--dry-run 只体检）
+                               # 装机不变式（#1735）：实装依赖版本 ≠ package.json 锁值 ⇒ exit 1 拒绝部署
 ```
 
 冒烟测试覆盖 / covered by the smoke suite：helper 注册、入站消息管线（会话创建/消息投递）、流式卡片（create/PATCH/schema/工具面板/状态符号/note/seal）、命令处理、链路稳定性。Helper registration, inbound pipeline, streaming card lifecycle, commands, end-to-end stability.

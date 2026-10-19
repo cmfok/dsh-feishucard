@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased] - 2026-10-19：AC-0100 卡片救援正文分片
+
+- **改动**：内容被拒或强制推送超出 130000 B 硬顶时，救援正文按 28000 UTF-8 B 顺序分片发送；最多 5 片，超限或分片失败时保存完整可读内容并发回路径。
+- **验证**：修正 12e 字节换卡夹具（force 请求 146651 B 原会正确走救援）；N7 注入 230099 内容拒绝，验证两片顺序、单片字节上限、超限文件完整包含源正文及路径提示。`node --check scripts/smoke.mjs`、`git diff --check`、`npm run check` 通过；完整 smoke `SMOKE PASS (sentCards=814, sessions=83)`，红断言 0。
+- **范围**：本地验证通过；尚未 staging 或部署。生产当前版本与放行按 G11 审批流程处理。
+
+## [0.8.23] - 2026-10-19：自愈抑制误伤会话级损坏＝SessionFormatError 族解禁重建（中台 #2010）
+
+- **症状**：CM 19:49 报障 0.8.22 修复后仍报「format v4 … · UNKNOWN」。宿主日志（web.log）实锤完整链：turn2 19:05-19:27 正常跑 22.5 分钟后写入通道死亡（落盘停 seq323、内存 cursor330、turn/end 未落盘），19:48 CM 插话新轮 **1.7 秒即炸**（本地写入被拒，非模型/网络），且桥 `skip self-heal: upstream failure` **抑制了自愈** → 坏会话永远不自愈、同错反复。
+- **根因**：6915 自愈抑制分支设计给「402 欠费／401 密钥／429 限流」类上游错误（重建无用），但未区分**会话级损坏**——SessionFormatError 族恰是「此会话写入通道坏」，重建正是正解，被一刀切跳过。
+- **改法**：failure.message 命中 `/format v4 message|SessionFormatError|session format/i` 时照常走自愈重建（sessionCorruptFailure 例外路由）；其余上游错误维持不自愈。
+- **验证**：node --check 过；selftest-model-land PASS=10 FAIL=0；20:23 重启后新宿主拉起三 bot helper；真机终验＝CM 重发消息（若底层雷再现，最多炸一轮即自动重建恢复，不再死循环）。
+- **底层雷（未钉死，如实记）**：「19:27:47 那次写入为何被 v4 校验拒」静态穷举已尽（桥全部投递点、内核 steer/inbox、goal-round-driver、tool-jobs/rule-mount 通知的 source 构造全合法；隔离 HOME 三轮复现——deepseek/同会话/GLM/GLM+工具调用——全部通过），嫌疑收敛于 web 宿主长驻状态或完整插件栈组合，需宿主内存事件快照才能定位；挂中台 #2010 待查。
+
+## [0.8.22] - 2026-10-19：斜杠命令失败回注撞 v4 会话格式校验＝source 改 producer-owned（中台 #2009）
+
+- **症状**：CM 10-19 17:58 飞书报障，BA bot 回复卡「⚠️ 本轮没有产生回复：format v4 message requires a producer-owned source kind · UNKNOWN」；回溯凌晨 04:39 同会话（fs-main-mvf30tip）turn1 已在 step9 后无声死亡（落盘无 turn/end）。
+- **根因**：v4 会话格式校验拒收 `kind:'plugin'` 旧版 source 包装（dsh-session-format-v3-to-v4 lib/index.js:126：source 缺失／kind 空／kind=plugin 任一即抛）；桥 `reportCommandFailure`（斜杠命令失败回注，index.js:4399）仍写 `source:{kind:'plugin',plugin:'feishu-stream'}`——桥内唯一 plugin 写入点；该异常在 LLM adapter 边界被 dsh-llm lib/index.js:403 包成 code=UNKNOWN，桥 failureSummary 拼成「· UNKNOWN」上卡。
+- **改法**：source 改 `{kind:'feishu-stream'}`（v4 只要求非空非 plugin；读侧自动轮建卡靠正文白名单 NOTICE_RE，不依赖 kind 取值，无读侧回归）。备份 index.js.bak-20261019-1826-pre-v4-source-fix。
+- **验证**：node --check 过；selftest-model-land PASS=10 FAIL=0；按 H-D361 流程重启 dsh web（18:48），新宿主 PID 30844 拉起三 bot helper（18:48:31）＝生效。真机终验＝CM 飞书重发消息。
+- **范围**：本机 HOME 侧桥已生效（0.8.22 md5=3f46d510）；服务器生产桥放行按 G11 审批流程处理。
+
+## [0.8.21] - 2026-10-19：/model 桥直存撞 HMR 嵌套事务＝退避重试兜底（承 #560 续段）
+
+- **症状**：CM /model 切 zai-coding-cn/glm-5.3-flash，回执「默认值未写入（桥直存报错：HMR transactions cannot be nested）⇒ 重连/恢复后可能跳回旧默认」。
+- **根因**：#124 落地校验的桥直存（dm.saveSelection）写 profile 触发宿主配置热更事务，与插件 HMR 热重载事务撞车，被宿主嵌套事务保护拒收，默认值落空。宿主侧栈不进 web.log（logger sink 不同），精确时序钉不死；报错 message 与桥侧路径已钉死（DIAGNOSIS-2026-10-19-model直存撞HMR嵌套.md）。
+- **改法**：直存抽成 saveOnce，对 /transactions cannot be nested/i 这一种报错退避 1.5s（新常量 DM_HMR_RETRY_BACKOFF_MS）重试一次；其余报错照旧如实带回不掩盖。最坏耗时有界（~0.6+4+1.5+4+1 约 11s，A19）。
+- **验证**：新增 selftest-model-land-20261019.mjs（从 index.js 原文抽 DM 区块注入假 ctx 直测）10 断言全绿：撞嵌套后重试恰 2 次落地／非 HMR 错不重试且错误原文带回／静态标记两断言。变异自测（删重试块重跑）＝A1/A2/C1 三红 exit 1，闸有效。node --check 过；纯 CRLF 保持（12377 行零孤立 LF）；桥活体正常（保存后 web.log 持续处理消息）。真机终验＝下次 /model 切换回执 persisted=ok。
 ## [0.8.20] - 2026-10-18：施工段①＝模型绑定探针补到 resume 腿（缺陷 G，承 #560／台账 H-D14）
 
 - **症状**：桥日志里 `#350 session model binding check: <id> → provider/model（来源）` 这一行，
