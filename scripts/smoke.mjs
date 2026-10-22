@@ -2266,6 +2266,34 @@ console.log('16) 目标轮封口必须补扫：收尾汇报不能丢（CM 2026-0
   ok(body.includes('本轮结束'), '仍然写了「本轮结束」')
 }
 
+// ---- 中台 #2216 夹具：以下 17/18/19/21/21b 的回合失败可见性判据统一在 identityGuard 开 +
+//   身份表夹具下跑（ou_test＝L3 岗位；21b 另加 L1 身份）。依据工单方案 A：系统级报错按
+//   调用者档位 L3+ 处理——L3+ 只见简明人话原因（上游原文/错误码/分类不进卡面），
+//   L1/L2 或认不出身份＝统一话术＋ALERT 管理员告警，原文只进日志。
+//   收尾（21b 之后）把配置与环境变量原样还原，纪律同款用例 114。
+const CFG_PATH216 = join(process.env.FS_CONFIG_DIR, 'feishu.config.json')
+const cfgText216 = readFileSync(CFG_PATH216, 'utf8')
+const prevMap216 = process.env.MAILBOX_IDENTITY_MAP
+const prevJobs216 = process.env.MAILBOX_JOB_GRANTS
+const prevLocal216 = process.env.MAILBOX_IDENTITY_LOCAL
+const MAP216 = join(tmpdir(), 'fs-smoke-identity_map_216.json')
+const JOBS216 = join(tmpdir(), 'fs-smoke-job_grants_216.json')
+writeFileSync(MAP216, JSON.stringify({ v: 1, people: [
+  { name: '限流测试L3', status: '在职', job_id: 'J_L3', open_ids: { app_a: 'ou_test' } },
+] }))
+writeFileSync(JOBS216, JSON.stringify({ jobs: [
+  { id: 'J_L3', grants: { 系统: 'L3' }, writable_scopes: [], item_grants: {} },
+] }))
+process.env.MAILBOX_IDENTITY_MAP = MAP216
+process.env.MAILBOX_JOB_GRANTS = JOBS216
+delete process.env.MAILBOX_IDENTITY_LOCAL
+{
+  const cfg216 = JSON.parse(readFileSync(CFG_PATH216, 'utf8'))
+  cfg216.bots[0].identityGuard = true
+  writeFileSync(CFG_PATH216, JSON.stringify(cfg216, null, 2))
+}
+await settle(2)
+
 console.log('17) 本轮没有回复时必须说明原因（2026-09-18 真机事故：账户余额不足 402 → 卡片空白）')
 {
   // 背景（真机取证，会话 fs-main-mu532zzl seq=724-727）：
@@ -2273,7 +2301,8 @@ console.log('17) 本轮没有回复时必须说明原因（2026-09-18 真机事�
   //   → step/end → turn/end(reason.kind='error')，**整轮没有任何 assistant/message**。
   // 旧行为：卡片只写「（Agent 未产生文字回复）」、状态行还显示「✅ 已完成」；
   //   自愈重建会话时旧卡停在「正在工作中…」成为孤儿卡，重建提示只走纯文本兜底 → 用户看不到。
-  // 新行为（本用例固化）：① 卡面写明上游原因（**中文人话 ＋ 原文**）；
+  // 新行为（本用例固化）：① 卡面写明上游原因（**中文人话**；中台 #2216 起上游原文
+  //   不再上卡面——L3+ 只见简明原因，低档/无身份见统一话术）；
   //   ② 失败回合状态行是「失败」不是「已完成」；③ 旧卡补封、不再停在「正在工作中…」；
   //   ④ 上游已明确报错 ⇒ **不再自愈重建**（2026-09-21 用户反馈：重建修不了欠费，
   //      还把报错换成「已自动重建会话重试」）—— 自愈只留给「无产出且无失败标记」（用例 20）。
@@ -2299,14 +2328,14 @@ console.log('17) 本轮没有回复时必须说明原因（2026-09-18 真机事�
   const ops = cardsSince(mark)
   const body = JSON.stringify(ops)
   // 2026-09-21 行为变更（用户：「它不会提示我欠费…就直接显示说本轮没有回复」）：
-  //   ① 原因必须是**中文人话 ＋ 上游原文**（旧断言只查英文原文）；
+  //   ① 原因必须是**中文人话**（旧断言只查英文原文；中台 #2216 起原文不再上卡面）；
   //   ② 上游已明确报错 ⇒ **不再自愈重建**（重建修不了欠费；旧行为每条消息白跑一轮、
   //      还把报错换成「已自动重建会话重试」）⇒ 本轮**只建 1 张卡**。
   ok(ops.filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0').length === 1,
     '上游报错时不再重建会话（只 1 张卡；实际 ' + ops.filter((c) => c.op === 'create' && c.payload && c.payload.schema === '2.0').length + '）')
   ok(body.includes('账户欠费'), '卡面用中文写明"账户欠费／余额不足"（不再只甩英文）')
-  ok(body.includes('Insufficient Balance') && body.includes('QUOTA'),
-    '卡面同时保留上游原文（Insufficient Balance / QUOTA 402，便于核对）')
+  ok(!body.includes('Insufficient Balance') && !body.includes('QUOTA'),
+    '★★ 中台 #2216：L3+ 只见简明人话原因，上游原文/错误码不再上卡面（原文只进日志与管理员告警）')
   ok(!body.includes('已自动重建会话'), '不再把报错换成「已自动重建会话重试」（它修不了欠费）')
   ok(body.includes('⚠️'), '卡片带警示标记（不是一句干巴巴的占位符）')
   ok(statusShows(body, '失败'), '失败回合的状态栏写「失败」')
@@ -2351,7 +2380,8 @@ console.log('18) 有工具调用但最终失败的回合：工具面板 + 原因
     '有工具产出 → 不触发自愈重建（只 1 张卡）')
   ok(body.includes('工具调用'), '工具面板照常进卡（没被失败提示挤掉）')
   ok(body.includes('call_balance_1') || body.includes('a.md'), '工具参数摘要照常进卡')
-  ok(body.includes('Insufficient Balance'), '卡面写明失败原因')
+  ok(body.includes('账户欠费') && !body.includes('Insufficient Balance'),
+    '★★ 中台 #2216：卡面给人话原因（账户欠费／余额不足），上游原文不上卡（L3+ 亦只裁剪）')
   ok(statusShows(body, '失败'), '状态栏写「失败」')
   ok(!statusShows(body, '已完成'), '不假称「已完成」')
 }
@@ -2383,7 +2413,8 @@ console.log('19) 目标轮失败也要说原因（不再无条件写「✅ 本�
   await settle()
 
   const body = JSON.stringify(cardsSince(mark))
-  ok(body.includes('Insufficient Balance'), '目标轮卡写明失败原因')
+  ok(body.includes('账户欠费') && !body.includes('Insufficient Balance'),
+    '★★ 中台 #2216：目标轮（自动轮）同样走档位闸——L3 身份见人话，原文不上卡')
   ok(body.includes('本轮失败'), '封口写「本轮失败」')
   ok(!body.includes('本轮结束'), '失败轮不再写「✅ 本轮结束」')
   ok(statusShows(body, '失败'), '状态栏写「失败」')
@@ -2437,8 +2468,113 @@ console.log('21) 其它上游错误也翻成人话（429 限流）')
 
   const body = JSON.stringify(cardsSince(mark))
   ok(body.includes('被上游限流'), '429 → 卡面写「被上游限流（请求过快）」')
-  ok(body.includes('Too Many Requests'), '仍保留上游原文')
+  ok(!body.includes('Too Many Requests') && !body.includes('RATE_LIMIT'),
+    '★★ 中台 #2216：429 的上游原文与错误分类不再上卡面（L3+ 只见简明人话）')
 }
+
+console.log('21b) ★🔴 中台 #2216：系统级报错原文不进员工对话框——L1 只见统一话术＋ALERT 告警，L3+ 只见简明原因，原文只进日志')
+{
+  // 现象（CM 2026-10-21 员工端亲见）：DSH 回合层把上游 GLM 配额 429 的**原文**（含 JSON 报文、
+  //   request_id、内部错误码 1310、错误分类 RATE_LIMIT）拼成「本轮没有产生回复：…」，
+  //   桥当普通回复直接渲染。修复口径（工单方案 A）＝渲染入口按调用者 G9 档位降级：
+  //   ① L1/L2 或身份不可用 ⇒ fail-closed：卡面**只有**统一话术「目前服务不可用，请联系管理员」，
+  //     同一时刻打一行 `[fs] systemError ALERT[...]`（既有管理员告警通道＝journal 捞 ALERT，
+  //     与 identity ALERT 同款先例，桥侧不新建通道）；
+  //   ② L3+ ⇒ 只见简明人话（被上游限流（请求过快）），原始报文/错误码/分类一律不上卡；
+  //   ③ 日志侧 `turn sealed` 留痕与 ALERT 行完整保留原始错误，可追溯。
+  //   真实来源是**结构化字段**（turn/end data.reason.error），不是文案正则——夹具照此构造。
+  const UNIFIED216 = '目前服务不可用，请联系管理员'
+  // GLM 429 实录形态（2026-10-21 剪裁，保留 JSON/request_id/1310/RATE_LIMIT 结构）：
+  const glmErrObj = {
+    type: 'error',
+    error: {
+      type: 'rate_limit_error',
+      code: '1310',
+      message: '[1310][您已达到每周/每月使用上限，您的限额将在2026-10-22 02:33:09重置。][2026102117502752513ed1ac8b48c0]',
+    },
+    request_id: '2026102117502752513ed1ac8b48c0',
+  }
+  const GLM_RAW = '429' + JSON.stringify(glmErrObj) + 'RATE_LIMIT'
+  const LEAK_TOKENS = ['request_id', 'rate_limit_error', '1310', 'RATE_LIMIT',
+    '2026102117502752513ed1ac8b48c0', '您已达到每周', '限额将在', '本轮没有产生回复']
+  // 夹具加一位 L1 普通员工（grants 只有 财务:L1）
+  writeFileSync(MAP216, JSON.stringify({ v: 1, people: [
+    { name: '限流测试L3', status: '在职', job_id: 'J_L3', open_ids: { app_a: 'ou_test' } },
+    { name: '普通员工L1', status: '在职', job_id: 'J_L1', open_ids: { app_a: 'ou_l1_216' } },
+  ] }))
+  writeFileSync(JOBS216, JSON.stringify({ jobs: [
+    { id: 'J_L3', grants: { 系统: 'L3' }, writable_scopes: [], item_grants: {} },
+    { id: 'J_L1', grants: { 财务: 'L1' }, writable_scopes: [], item_grants: {} },
+  ] }))
+  await settle(2)
+  let seq216 = 4100
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+  agent.send = function (message) {
+    this.sent.push(message)
+    const failure = { message: GLM_RAW, code: 'RATE_LIMIT', status: 429 }
+    agentEvents.push(
+      { type: 'user/message', seq: seq216, data: { content: [{ type: 'text', text: String(message.content[0].text) }], source: { kind: 'user' } } },
+      { type: 'assistant/attempt', seq: seq216 + 1, data: { turn: 21, step: 1, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure } } }] } },
+      { type: 'turn/end', seq: seq216 + 2, data: { turn: 21, reason: { kind: 'error', error: failure } } },
+    )
+    seq216 += 10
+  }
+
+  // ── 判据① L1 员工：只有统一话术，内部字样零出现；同时 ALERT 告警＋日志留全文 ──
+  const mark216a = sentCards.length
+  const log216a = consoleLines.length
+  feedInbound('om_216_l1', '员工端报错降级测试甲', { openId: 'ou_l1_216' })
+  await settle(4)
+  const bodyA = JSON.stringify(cardsSince(mark216a))
+  ok(bodyA.includes(UNIFIED216), '★ 判据① L1 卡面出现统一话术「' + UNIFIED216 + '」')
+  ok(LEAK_TOKENS.every((t) => !bodyA.includes(t)),
+    '★★ 判据① L1 卡面无任何内部字样（JSON/request_id/1310/RATE_LIMIT/重置时间/原句前缀全不许出现；'
+    + '泄漏项 ' + JSON.stringify(LEAK_TOKENS.filter((t) => bodyA.includes(t))) + '）')
+  const segA = consoleLines.slice(log216a)
+  ok(segA.some((l) => l.includes('systemError ALERT[turn')
+    && l.includes('2026102117502752513ed1ac8b48c0')),
+    '★★ 判据② 管理员告警通道收到 ALERT 行且带原始错误全文（沿用 journal 捞 ALERT 的既有通道）')
+  ok(segA.some((l) => l.includes('turn sealed') && l.includes('request_id') && l.includes('RATE_LIMIT')),
+    '★★ 判据③ 日志侧 `turn sealed` 完整保留原始错误（可追溯）')
+
+  // ── 判据② L3+ 调用者：简明原因上卡，原始报文仍不上卡 ──
+  const mark216b = sentCards.length
+  feedInbound('om_216_l3', '管理档位限流测试乙', { openId: 'ou_test' })
+  await settle(4)
+  const bodyB = JSON.stringify(cardsSince(mark216b))
+  ok(bodyB.includes('被上游限流（请求过快）'), '★ 判据② L3+ 卡面可见简明原因「被上游限流（请求过快）」')
+  ok(!bodyB.includes('request_id') && !bodyB.includes('1310') && !bodyB.includes('RATE_LIMIT')
+    && !bodyB.includes('429{'),
+    '★★ 判据② L3+ 也不得出现原始报文/错误码/错误分类堆砌')
+
+  // ── 判据①·补：identityGuard 关（拿不到调用者档位）⇒ fail-closed 同走统一话术 ──
+  {
+    const cfg = JSON.parse(readFileSync(CFG_PATH216, 'utf8'))
+    cfg.bots[0].identityGuard = false
+    writeFileSync(CFG_PATH216, JSON.stringify(cfg, null, 2))
+    await settle(2)
+    const mark216c = sentCards.length
+    const log216c = consoleLines.length
+    feedInbound('om_216_off', '关闸降级测试丙', { openId: 'ou_test' })
+    await settle(4)
+    const bodyC = JSON.stringify(cardsSince(mark216c))
+    ok(bodyC.includes(UNIFIED216) && LEAK_TOKENS.every((t) => !bodyC.includes(t)),
+      '★★ 判据①·补 关闸（身份不可得）＝fail-closed：只有统一话术、内部字样零出现（本仓 2026-10-04 无表就拒口径同源）')
+    ok(consoleLines.slice(log216c).some((l) => l.includes('systemError ALERT[turn')),
+      '★ 判据①·补 关闸降级同样打 ALERT 告警（原文进日志不进对话框）')
+  }
+}
+
+// ---- 中台 #2216 夹具收尾：配置与环境变量原样还原（别给后面的用例埋雷，纪律同款用例 114）----
+writeFileSync(CFG_PATH216, cfgText216)
+if (prevMap216) process.env.MAILBOX_IDENTITY_MAP = prevMap216
+else delete process.env.MAILBOX_IDENTITY_MAP
+if (prevJobs216) process.env.MAILBOX_JOB_GRANTS = prevJobs216
+else delete process.env.MAILBOX_JOB_GRANTS
+if (prevLocal216) process.env.MAILBOX_IDENTITY_LOCAL = prevLocal216
+await settle(2)
+ok(JSON.parse(readFileSync(CFG_PATH216, 'utf8')).bots[0].identityGuard === undefined,
+  '（#2216 收尾）identityGuard 还原为默认关（夹具不外泄给后续用例）')
 
 console.log('22) 子代理／后台回执轮也要上卡（2026-09-21 CM：子代理回来了，我在飞书看不到你在继续干活）')
 {

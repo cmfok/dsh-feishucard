@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased] - 2026-10-23：系统级报错原文不进员工对话框——可见性按 G9 档位 L3+ 降级（中台 #2216）
+
+- **症状（CM 2026-10-21 员工端飞书亲见）**：员工提问后对话框直接出现上游 GLM 配额 429 的**报错原文**——
+  `本轮没有产生回复:被上游限流(请求过快)|429{"type":"error"…1310…request_id…}RATE_LIMIT`，
+  含 JSON 报文、request_id、内部错误码 1310、错误分类 RATE_LIMIT，且未经任何档位判定。
+- **根因边界**：该文案产生于 DSH 回合层（turn/end 显式 error 标记，桥侧 `turnFailureReason` 读出），
+  桥此前只做人话＋原文透传（`failureSummary.text` 直接上卡），**没有「系统级消息」来源标记、没有按
+  调用者档位降级**。根治应在 DSH 侧打来源标记（工单方案 B，未做）；本批按工单方案 A 在桥侧收口。
+- **改法（index.js，方案 A）**：①`failureSummary` 返回值加桥内来源标记 `systemError: true`
+  （真实来源是结构化字段，不靠文案正则猜）；②新增档位闸 `actorVisibleTier`（actor.grants
+  「类别→档位」向量按 G9「多权限链取高」取最高档；is_cm＝最高档）与渲染入口
+  `visibleFailureText`／`safeFailureReasonForViewer`；③三处员工可见渲染点改走档位闸：
+  普通回合封口（`runTurn` 的 `reply`）、自动轮封口（`closeAutoRoundCard`）、自愈提示括号原因
+  （heal notice）——L3+ 只见简明人话（如「被上游限流（请求过快）」），原始报文/错误码/分类一律不上卡；
+  L1/L2 或身份不可得（identityGuard 关＝拿不到 actor，同 2026-10-04「无表就拒」fail-closed 口径）
+  只见《插件边界与降级标准》§三 L1 统一话术「目前服务不可用，请联系管理员」（复用既有串，不新造措辞）；
+  ④降级发生时打一行 `[fs] systemError ALERT[turn/auto_round] …原文…`——沿用既有管理员告警通道
+  （G9 `g9_alert_watch.py` 捞 journal ALERT 行，与 identity ALERT 同款先例，桥侧不新建通道）；
+  ⑤原始错误全文照旧留在 `turn sealed`／`auto card sealed` 日志行，可追溯。**日志面零削减。**
+- **如实声明的口径选择**：档位取「各 grants 类别最高档」比较 L3（工单未指定类别，G9 两轴口径中
+  本条属系统类信息，取高最宽不误伤 L3+ 管理员；从严还是取高若需改，一行可改）。
+- **验证**：`node --check index.js`／`node --check scripts/smoke.mjs` 过；冒烟用例改造＋新增：
+  用例 17/18/19/21 的卡面断言从「保留上游原文」翻成「原文不上卡（#2216）」并在夹具身份
+  （ou_test＝L3）下继续钉人话可见；新增 **21b**（★🔴）：真实形态 GLM 429 报文三判据——
+  L1 只有统一话术＋内部字样零出现、同刻 `systemError ALERT` 带全文、`turn sealed` 日志留原文；
+  L3+ 见「被上游限流（请求过快）」但无 request_id/1310/RATE_LIMIT/JSON；关闸（身份不可得）
+  ＝fail-closed 同走统一话术＋ALERT。夹具收尾还原配置与环境变量（纪律同款用例 114）。
+  全量 `npm run smoke` 结果见验证文件 `output/dsh-feishucard/2216-系统级报错档位降级-验证-20261023.md`。
+- **范围**：仅本地 `dsh-feishucard` 仓改动；**未 staging、未部署、未重启桥**（生效需按铁律 1
+  走重启＋md5 核对；真机飞书端到端未测——本机无生产通道，DSH 侧打来源标记的方案 B 另单）。
+
 ## [Unreleased] - 2026-10-22：身份注入内核——本地增量表读态不再无声吞（中台 #1866 第4项）
 
 - **背景**：中台 #1866 第4项（其源 WO 属生产权限异动取证单，现场细节不在公开仓复述）点名：内核读「本地增量身份表」那处是空 `catch` 静默跳过 ⇒ 「功能缺位不打日志」，要求先定性该件该不该存在，再把静默 catch 改成显式留痕。
@@ -3512,7 +3543,7 @@ H（状态栏三模式标记）· I（计划卡两排版式 + `fs_plan_goal`）�
 
 ### Fixed（入站附件落盘：图片没有扩展名 / 时间戳是 UTC）
 
-**2026-10-03**：看到真机存下来的文件名 `P:\Qoder\work\downloaded_files\2026-10-02-15-52-19_image` 后说「修吧」。
+**2026-10-03**：看到真机存下来的文件名 `P:\Qoder\work\downloaded_files\2026-10-02-15-52-19_image` 后说「修吧」。 [HOME]
 两个毛病都在这一个文件名里：
 
 | # | 现象 | 根因 | 处置 |
@@ -3689,7 +3720,7 @@ H（状态栏三模式标记）· I（计划卡两排版式 + `fs_plan_goal`）�
 
 **旧卡为什么会歧义**：三组混排，第③组标题写"其它工作区"，列的其实是"**别的工作区里的会话**"，
 而且是**从会话 cwd 反推、从不读注册表**（旧代码 `workspaceRegistry` 零命中）⇒ 飞书与 GUI 可能各说各话。
-**实测证据**：`` 里注册了 **3 个工作区**（`P:\Qoder\work` / `P:\FU` / `P:\BA`），
+**实测证据**：`` 里注册了 **3 个工作区**（`P:\Qoder\work` / `P:\FU` / `P:\BA`）， [HOME]
 而**我们的飞书会话一个都没挂进去**（`work` 那条只有 6 个 GUI 会话）—— 正是这次要一并修掉的。
 
 **现在长这样**

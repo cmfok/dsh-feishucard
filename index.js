@@ -1411,12 +1411,17 @@ export function apply(ctx) {
     const zh = failureZh(failure)
     const raw = message + (tag ? ' · ' + tag : '')
     return {
+      // 中台 #2216：桥内**来源标记** —— 走到这里的都是 DSH 回合层的显式 error 标记
+      //   （turn/end reason.kind==='error' ／ assistant/attempt finish reason），属系统级消息；
+      //   渲染入口按此标记走档位降级（visibleFailureText），不靠文案正则猜来源。
+      systemError: true,
       message,
       code,
       status,
       zh,
       // 中文人话在前、上游原文在后（用户 2026-09-21：「它不会提示我欠费」——
       // 「Insufficient Balance · QUOTA 402」摆在卡面上等于没说）。
+      // 🔴 中台 #2216 起本字段只进日志与管理员告警，**不再直接上员工卡面**。
       text: (zh ? zh + '｜' : '') + (raw || '原因未上报（上游没有给出错误内容）'),
     }
   }
@@ -1457,6 +1462,61 @@ export function apply(ctx) {
       }
     }
     return null
+  }
+
+  // ── 中台 #2216（2026-10-23）：系统级回合失败的「员工可见性档位闸」───────────────────
+  // 背景：CM 2026-10-21 员工端亲见上游 429 报错**原文**进对话框（GLM 配额限流，含 JSON 报文、
+  //   request_id、内部错误码 1310、错误分类 RATE_LIMIT）。该文本源自 DSH 回合层的显式 error
+  //   标记（上方 turnFailureReason），桥此前只做人话＋原文透传，没有按调用者档位降级。
+  // 新口径（工单方案 A）：系统级提示按可见档位 **L3+** 处理——
+  //   · L3 及以上：只见简明原因（failureZh 人话），原始报文／错误码／错误分类一律不上卡面；
+  //   · L1/L2 或身份不可用 ⇒ fail-closed（同 CM 2026-10-04「无表就拒」口径）：只见
+  //     《插件边界与降级标准》§三 L1 统一话术「目前服务不可用，请联系管理员」，
+  //     同时打一行 ALERT 走既有管理员告警通道（G9 g9_alert_watch.py 捞 journal 的 ALERT 行，
+  //     与 identity ALERT 同一先例——桥侧不新建通道）；
+  //   · 原始错误全文只进日志（`turn sealed`／`auto card sealed` 的 failure= 字段照旧保留）。
+  // 档位判定口径（如实声明）：actor.grants 是「类别→档位」向量，按 G9「多权限链取高」
+  //   取各类别最高档与 L3 比较；is_cm 视作最高档。identityGuard 关 ⇒ actor 拿不到 ⇒ 一律降级。
+  const SYS_ERROR_UNIFIED_TEXT = '目前服务不可用，请联系管理员'
+
+  function actorVisibleTier(actor) {
+    if (!actor) return 0
+    if (actor.is_cm) return 5
+    let top = 0
+    const grants = actor.grants
+    if (grants && typeof grants === 'object') {
+      for (const value of Object.values(grants)) {
+        const m = /^L([0-5])$/.exec(String(value === null || value === undefined ? '' : value).trim())
+        if (m && Number(m[1]) > top) top = Number(m[1])
+      }
+    }
+    return top
+  }
+
+  // 渲染入口：回合失败在**员工可见文本**上的降级形态（整句）。
+  // alertInfo（可选）＝{ why, chatId, botName }：低档降级时补一行管理员 ALERT（原文只进这行日志）。
+  function visibleFailureText(failure, actor, alertInfo) {
+    if (!failure || !failure.systemError) return ''
+    if (actorVisibleTier(actor) >= 3) {
+      const zh = String(failure.zh || '').trim()
+      return '⚠️ 本轮没有产生回复：' + (zh || '上游报错（原因未归类，详情见日志）')
+        + '｜原始报文只进日志'
+    }
+    if (alertInfo) {
+      console.log('[fs] systemError ALERT[' + String(alertInfo.why || 'turn_failure') + ']'
+        + ' chat=' + String(alertInfo.chatId || '') + ' bot=' + String(alertInfo.botName || '')
+        + ' 原文（仅日志与管理员告警，不进员工对话框）: ' + String(failure.text || ''))
+    }
+    return SYS_ERROR_UNIFIED_TEXT
+  }
+
+  // 自愈提示「（原因）」括号里的短语：L3+ 给人话，其余档位给统一话术。
+  // 不在此重复打 ALERT——同一条失败在 runTurn 封口时已按档位告过一次。
+  function safeFailureReasonForViewer(failure, actor) {
+    if (!failure || !failure.systemError) return ''
+    return actorVisibleTier(actor) >= 3
+      ? (String(failure.zh || '').trim() || '上游报错（原因未归类，详情见日志）')
+      : SYS_ERROR_UNIFIED_TEXT
   }
 
   // 插话提示的醒目样式（2026-10-02 CM：「加个框，然后加粗，或者换个颜色」）。
@@ -3205,7 +3265,14 @@ export function apply(ctx) {
     // status='sealed' → 目标模式下同样"看不出为什么不动了"。失败标记只认上游显式 reason。
     const failure = turnFailureReason(sessionEvents(agent.session), openedAt || 0)
     if (failure && !closing.text) {
-      card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：' + failure.text })
+      // 中台 #2216：可见性按档位降级。自动轮（目标轮／回执轮）没有当轮入站身份，
+      //   取该 agent **最近一次入站**记进身份表的 actor；拿不到＝fail-closed 统一话术。
+      card.blocks.push({
+        type: 'message',
+        text: visibleFailureText(failure,
+          (__turnIdentity && __turnIdentity.get(agent && agent.id) || {}).actor,
+          { why: 'auto_round', chatId, botName: (bot && bot.cfg && bot.cfg.name) || '' }),
+      })
     } else if (!closing.text && card.tools.size === 0) {
       // 与普通回合同源（2026-09-21）：没有产出、也没有失败标记时，**不许**写「✅ 本轮结束」装成功。
       card.blocks.push({ type: 'message', text: '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI）' })
@@ -6638,12 +6705,14 @@ export function apply(ctx) {
       const lastSeq = replySeqs.length > 0 ? replySeqs[replySeqs.length - 1] : undefined
       // 一个字都没说出来时，卡面**必须**说清为什么（2026-09-21 用户原话：「它不会提示我欠费，
       // 它不会把报错信息报出来，就直接显示说"本轮没有回复"」）：
-      //   ① 有上游失败标记 → 写原因（中文人话 ＋ 上游原文）
+      //   ① 有上游失败标记 → **按调用者档位**给原因（中台 #2216：L3+ 简明人话、
+      //      L1/L2 或认不出身份＝统一话术＋ALERT 告警；原始报文只进日志，不进对话框）
       //   ② 没有失败标记  → 明说"原因未上报"，**不再**留下一句干巴巴的占位符
       const notSpoken = lastSeq === undefined
       const silent = notSpoken && card.tools.size === 0
       if (notSpoken && failure) {
-        reply = '⚠️ 本轮没有产生回复：' + failure.text
+        reply = visibleFailureText(failure, identityActor,
+          { why: 'turn', chatId, botName: (bot && bot.cfg && bot.cfg.name) || '' })
       } else if (silent) {
         reply = '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI 里这一轮）'
       }
@@ -6948,7 +7017,9 @@ export function apply(ctx) {
         // 提示必须**上卡**：旧实现只把它拼进 turn.reply，而卡片送达时用的是卡对象的 blocks
         // → 走卡片路径的用户根本看不到这句（只有卡片失败退化成纯文本时才带）。
         // 原因用上游给的真实原因（有的话），不再一律猜「可能被 dsh 重启打断」。
-        const why = failedTurn.failure ? '（' + failedTurn.failure.text + '）' : ''
+        // 中台 #2216：这句同样进员工对话框 ⇒ 走档位闸（L3+ 人话短语；其余统一话术，
+        //   原文只进日志——封口那行 `turn sealed` 已带 failure= 全文，ALERT 也在 runTurn 打过）。
+        const why = failedTurn.failure ? '（' + safeFailureReasonForViewer(failedTurn.failure, identityActor) + '）' : ''
         const notice = '⚠️ 上一会话本轮没有产生回复' + why + '，已自动重建会话重试。'
         turn.reply = notice + '\n\n' + turn.reply
         turn.card.blocks.unshift({ type: 'message', text: notice })
