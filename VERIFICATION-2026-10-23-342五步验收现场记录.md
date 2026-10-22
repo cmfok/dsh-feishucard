@@ -53,3 +53,20 @@
 - 载荷 `b0825-cleanup-synth-20261023.sh`（sha256 `ca457d9fbbc9c77193471e108fdf4b83703a3158bc4e91e3c71911fa94ee51b2`，bash -n 过、LF 零 CR）＋ `b0825-cleanup-MANIFEST.sha256` 已投投递口；staging 门禁真跑结论行 `GATE_CLEANUP_R1_OK`，凭证 `verify-receipt.json`（verified_on=staging）
 - 脚本六道防线：先回读 370 姓名、不含 HECHENG-TEST-001 即 fail-closed 拒绝；370 不存在即幂等退出；四表逐表 SELECT 导出 TSV 到 `/opt/.trash_prod-20261023` 后再按号 DELETE；逐表复验残留计数必须为 0；合成 PDF **移动**而非 rm 到同目录；OPS_CHANGELOG 留痕带单号
 - 申请件 `out/deploy-request.json` **尚未投递**（等审批）：05:25／05:26 两次回查实例＝PENDING，按纪律记录在案；批准后再投（一投一回查，不重投）
+
+
+## 五、清理链 r1→r4 全记录（含一次「rc=0 但零删除」的假成功，实测钉死）
+
+| 单号 | 网关回显 | 实测真值 | 根因 |
+|---|---|---|---|
+| G11#2216-synthcleanup-20261023（serial …0015） | FAILED rc=44，内层 FATAL rc=20 | 库零改动（只读复查 370 号在位） | 脚本用 `sudo /usr/bin/mysql` 直连、无凭证 |
+| …-r2-…（serial …0017，实例 6D80B7CF 之外的 AEBC0892） | **DONE rc=0** | **库零删除**，仅 PDF 移档成功；并往 OPS_CHANGELOG 写了「复验残留=0」 | 表存在性写成 `SHOW TABLES LIKE 'x' FROM db`（MySQL 不认，实测 1064），报错返回空值被脚本当成「表不存在」⇒ 逐表跳过备份与删除 |
+| …-r3-…（实例 9AAA3F72，已批不用） | 未投递 | — | 出单前落点核对闸拦下：载荷含 `/srv` 落点变量而卡面未声明 |
+| …-r4-…（serial …0018，实例 6D80B7CF） | DONE rc=0 | **真删除**：四表逐表 COUNT 1/1/1/13 → 备份 TSV → DELETE → VERIFY 全为 0（日志 /opt/.trash_prod-20261023/synthcleanup-r4-20261023055800.log） | 存在性/计数改走 information_schema 与显式 SELECT；取数非纯数字即 fail-closed |
+
+教训两条（已回写成全局闸，不再只靠自觉）：
+1. **「网关回显 DONE rc=0」不等于「动作发生」**——内层脚本把 SQL 报错当成「查无此表」就能零删除还打成功结论。
+   复验必须拿到**数字**（不能是空值），且要独立只读复查目标行确实消失。
+2. `scripts/check-deploy-readiness.py` 新增**四要素⑥**（`check_sql_failclosed`）：⑥a 拦 `SHOW TABLES LIKE … FROM` 这种不被 MySQL 支持的语序；
+   ⑥b 拦「`VAR=$(…mysql…)` 取数既无 `|| fail`、其后也无空值/非数字判定」。
+   变异反证：致祸件 r2 必红、现行件 r4 必绿，`--self-test` 全绿（SELF-TEST-OK）。
