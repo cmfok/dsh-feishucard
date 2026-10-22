@@ -1475,22 +1475,24 @@ export function apply(ctx) {
   //     同时打一行 ALERT 走既有管理员告警通道（G9 g9_alert_watch.py 捞 journal 的 ALERT 行，
   //     与 identity ALERT 同一先例——桥侧不新建通道）；
   //   · 原始错误全文只进日志（`turn sealed`／`auto card sealed` 的 failure= 字段照旧保留）。
-  // 档位判定口径（如实声明）：actor.grants 是「类别→档位」向量，按 G9「多权限链取高」
-  //   取各类别最高档与 L3 比较；is_cm 视作最高档。identityGuard 关 ⇒ actor 拿不到 ⇒ 一律降级。
+  // 档位判定口径（裁决 AC-0196 选项 B，CM 2026-10-23 04:04 看板亲点，台账 H-D546）：
+  //   **只认「系统」这一个类别**的档位 ≥ L3 才算高权限可见简明原因——不按各类别取最高档。
+  //   （选项 A＝各类别取高 曾被实现过，未获采纳，此处按裁决改回单类别判定。）
+  //   is_cm 视作最高档；identityGuard 关 ⇒ actor 拿不到 ⇒ 一律降级（fail-closed 同 2026-10-04「无表就拒」口径）。
+  //   ⚠️ 裁决附带的落地前置：多数员工与部分管理者在人员册里「系统」类别为空 ⇒ 会降到统一话术，
+  //      需先给人员册补系统类别档位（G9 侧数据活，档位取值须逐键报 CM 批，A38），本插件不自行赋档。
   const SYS_ERROR_UNIFIED_TEXT = '目前服务不可用，请联系管理员'
+  const SYS_CATEGORY_KEY = '系统'
 
   function actorVisibleTier(actor) {
     if (!actor) return 0
     if (actor.is_cm) return 5
-    let top = 0
     const grants = actor.grants
-    if (grants && typeof grants === 'object') {
-      for (const value of Object.values(grants)) {
-        const m = /^L([0-5])$/.exec(String(value === null || value === undefined ? '' : value).trim())
-        if (m && Number(m[1]) > top) top = Number(m[1])
-      }
-    }
-    return top
+    if (!grants || typeof grants !== 'object') return 0
+    // 单类别取数：类别缺失/空值/非 L0-L5 形态一律按 0 处理（判不了即拒，不猜）
+    const m = /^L([0-5])$/.exec(String(grants[SYS_CATEGORY_KEY] === null
+      || grants[SYS_CATEGORY_KEY] === undefined ? '' : grants[SYS_CATEGORY_KEY]).trim())
+    return m ? Number(m[1]) : 0
   }
 
   // 渲染入口：回合失败在**员工可见文本**上的降级形态（整句）。

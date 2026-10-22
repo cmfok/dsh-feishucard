@@ -2497,14 +2497,16 @@ console.log('21b) ★🔴 中台 #2216：系统级报错原文不进员工对话
   const GLM_RAW = '429' + JSON.stringify(glmErrObj) + 'RATE_LIMIT'
   const LEAK_TOKENS = ['request_id', 'rate_limit_error', '1310', 'RATE_LIMIT',
     '2026102117502752513ed1ac8b48c0', '您已达到每周', '限额将在', '本轮没有产生回复']
-  // 夹具加一位 L1 普通员工（grants 只有 财务:L1）
+  // 夹具加一位 L1 普通员工（grants 只有 财务:L1）＋一位「交叉档」员工（只有 销售:L3，系统类别为空）
   writeFileSync(MAP216, JSON.stringify({ v: 1, people: [
     { name: '限流测试L3', status: '在职', job_id: 'J_L3', open_ids: { app_a: 'ou_test' } },
     { name: '普通员工L1', status: '在职', job_id: 'J_L1', open_ids: { app_a: 'ou_l1_216' } },
+    { name: '交叉档销售L3', status: '在职', job_id: 'J_X3', open_ids: { app_a: 'ou_x3_216' } },
   ] }))
   writeFileSync(JOBS216, JSON.stringify({ jobs: [
     { id: 'J_L3', grants: { 系统: 'L3' }, writable_scopes: [], item_grants: {} },
     { id: 'J_L1', grants: { 财务: 'L1' }, writable_scopes: [], item_grants: {} },
+    { id: 'J_X3', grants: { 销售: 'L3' }, writable_scopes: [], item_grants: {} },
   ] }))
   await settle(2)
   let seq216 = 4100
@@ -2546,6 +2548,21 @@ console.log('21b) ★🔴 中台 #2216：系统级报错原文不进员工对话
   ok(!bodyB.includes('request_id') && !bodyB.includes('1310') && !bodyB.includes('RATE_LIMIT')
     && !bodyB.includes('429{'),
     '★★ 判据② L3+ 也不得出现原始报文/错误码/错误分类堆砌')
+
+  // ── 判据②·B：裁决 AC-0196 选 B（只认「系统」单类别）——销售 L3 但系统类别为空者，必须降到统一话术 ──
+  //   这条是 A/B 的判别格：按「各类别取高」（选项 A）此人会看到简明原因，按裁决（B）不会。
+  {
+    const mark216x = sentCards.length
+    const log216x = consoleLines.length
+    feedInbound('om_216_x3', '交叉档限流测试丁', { openId: 'ou_x3_216' })
+    await settle(4)
+    const bodyX = JSON.stringify(cardsSince(mark216x))
+    ok(bodyX.includes(UNIFIED216) && !bodyX.includes('被上游限流（请求过快）'),
+      '★★★ 判据②·B 销售 L3 而系统类别为空 ⇒ 只见统一话术、不见简明原因（AC-0196 选 B 的判别格；'
+      + '本条若绿说明判定读的是 grants.系统，若红说明还在各类别取高＝退回选项 A）')
+    ok(consoleLines.slice(log216x).some((l) => l.includes('systemError ALERT[turn')),
+      '★ 判据②·B 该降级同样打 ALERT 告警（原文只进日志与管理员告警）')
+  }
 
   // ── 判据①·补：identityGuard 关（拿不到调用者档位）⇒ fail-closed 同走统一话术 ──
   {
