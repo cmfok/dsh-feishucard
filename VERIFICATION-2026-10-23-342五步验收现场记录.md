@@ -37,3 +37,19 @@
    - 查到了 → 出删除单并跟到终态；没查到（引擎超时/失败）→ 归因按报错分层（不得把引擎失败读成「工具没修好」，#720 同款教训），判据 3 另择窗口重跑；
    - 判据 3 两条补齐后才 close #2252／#771／#1894，--landed 指本文件。
 4. 附件落盘位置：生产 `/srv/aiad/agents/hr/downloaded_files/2026-10-23-051929_synthetic-resume-HECHENG-TEST-001.pdf`（合成件，删除单一并登记处置）。
+
+
+## 三、05:22:29 该轮跑绿（追加，判据③补齐）
+
+- 05:22:22 `buildCardPayload ... tools=1`（工具调用持续可见）→ **05:22:29 `turn sealed: status=sealed silent=false failure=none reply_len=33`**，回复正文「✅ 分析完成，评分卡已发送给你（约1-3分钟内送达，请留意飞书）。」
+- 同刻 `conclusion split: agent=fs-main-mvjeb1yw elapsed=161525ms threshold=30000ms tools=1`（161 秒长回合走结论分卡路径，非失败）
+- 05:22:29–05:22:30 `card created msg=om_x100b6293a7ace0a4dea82efdd34132d` ＋ `conclusion card opened` ＋ `card reply delivered to oc_1eda77a…` ⇒ **评分卡送达 CM 飞书会话**这一条有原文实锤
+- 05:23 只读查库 `biz_g5v2_candidate`：**id=370，name＝HECHENG-TEST-001（测试文件标注名，非真实姓名），created_at＝2026-10-23 05:22:21**；`biz_g5v2_resume_analysis`：**id=87，candidate_id=370，created_at 同刻**
+⇒ 五步判据（①工具面齐全 ②resume 腿沿用原会话句柄 ③简历文件被收件 ④analyze_resume 真实调用并落库 ⑤评分卡送达）**全部为真**，#771／#1894／#2252 的验收前置达成。
+
+## 四、合成数据清理单（本单的尾巴，已按纪律出单）
+
+- 单号 **G11#2216-synthcleanup-20261023**，审批实例 `66509A4F-6CB9-4B09-B2FC-8F76DA03B06D`（serial 202610230015）
+- 载荷 `b0825-cleanup-synth-20261023.sh`（sha256 `ca457d9fbbc9c77193471e108fdf4b83703a3158bc4e91e3c71911fa94ee51b2`，bash -n 过、LF 零 CR）＋ `b0825-cleanup-MANIFEST.sha256` 已投投递口；staging 门禁真跑结论行 `GATE_CLEANUP_R1_OK`，凭证 `verify-receipt.json`（verified_on=staging）
+- 脚本六道防线：先回读 370 姓名、不含 HECHENG-TEST-001 即 fail-closed 拒绝；370 不存在即幂等退出；四表逐表 SELECT 导出 TSV 到 `/opt/.trash_prod-20261023` 后再按号 DELETE；逐表复验残留计数必须为 0；合成 PDF **移动**而非 rm 到同目录；OPS_CHANGELOG 留痕带单号
+- 申请件 `out/deploy-request.json` **尚未投递**（等审批）：05:25／05:26 两次回查实例＝PENDING，按纪律记录在案；批准后再投（一投一回查，不重投）
