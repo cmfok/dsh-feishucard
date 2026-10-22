@@ -21,6 +21,14 @@
  *      否则会把本机自己锁死（2026-10-04 实测过一次）。
  *
  * 自测：`node identity-inject.mjs --selftest`
+ *
+ * 版本：V0.8-26102201（2026-10-22）
+ * 变更记录：
+ *   V0.8-26102201 2026-10-22 —— 中台 #1866 第4项（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` §5）：
+ *     本地增量表 `identity_map.local.json` 的读态不再被空 `catch` 无声吞 ⇒ 新增 `noteLocalMapRead`
+ *     显式留痕（absent／parse_fail／unreadable 三态，只记状态＋路径＋错误码＋影响，不落文件内容）。
+ *     🔴 判定语义与降级行为不变（读不到增量照旧只用主表解析，不新增崩溃路径）。
+ *     同轮：`--selftest` 增 5c 节（四态 + 去重 + 内容零泄漏断言）。本地仓改动，未部署。
  */
 
 import { spawnSync } from 'node:child_process'
@@ -288,6 +296,49 @@ export function mapMainReadError (e) {
   }
   return msg === E_MAP_UNAVAILABLE ? E_MAP_UNAVAILABLE : 'resolver_js_failed:' + msg.slice(0, 60)
 }
+
+/**
+ * 中台 #1866 第4项（2026-10-22）：本地增量表 `identity_map.local.json` 的读态 ⇒ **显式留痕**
+ * （导出＝供 `--selftest` 直测；与上面 `mapMainReadError` 同族，都是"失败要能看见"）。
+ *
+ * 先说定性（本项要判的「真缺件 vs 设计上就不该有」）：**设计上就不是必装件**。
+ *   · 路径在 `~/.dsh-feishucard/`（`localMapPath()`，工作区**之外** ⇒ 天然不参与同步、各机各写）；
+ *   · 本仓 `.gitignore` 第 12 行明确把它排除在仓库之外 ⇒ 仓内"缺件"是设计；
+ *   · README「身份表放哪」写的是「每台机器**可**另放一份」，`INTERFACE.md` 第 3 行默认值列
+ *     「未设（用默认路径）」；它只按 name 给主表**补** `open_ids`，缺了主表照常解析。
+ *   ⇒ 生产 `/srv/aiad/.dsh-feishucard/` 没有它＝设计内状态，不是功能缺位。
+ * 但"设计内正常"不等于"出事也不许看见"：旧实现把「没有表」「表坏了」「读不了」三种情形
+ * 一并吞成同一个无声降级，真出权限/内容问题时日志零线索（WO 所说的「静默失效」）。
+ *
+ * 三态：`absent`（无此文件／不是普通文件，设计内）／`parse_fail`（内容不可用）／
+ *       `unreadable`（stat 或读失败，附错误码，EACCES/EPERM 属此类）。
+ * 🔴 只记 状态＋路径＋错误码＋影响，**绝不落文件内容**（A13/A14：那是身份映射）。
+ * 🔴 `resolve()` 是每条入站消息的热路径 ⇒ 同一（状态＋路径＋错误码）只打一次，不刷日志。
+ * 返回落账的那一行；重复（未打）返回空串 —— 供自测直接断言，摘掉留痕语句即变红。
+ */
+const LOCAL_MAP_IMPACT = {
+  absent: '本机无增量表 ⇒ 仅按主表解析（设计内状态）',
+  parse_fail: '增量表内容不可用 ⇒ 本次降级为仅主表解析（只在增量里登记的 ou 认不出）',
+  unreadable: '增量表读不了 ⇒ 本次降级为仅主表解析（只在增量里登记的 ou 认不出；查属组/权限位）',
+}
+const localMapNotes = new Set()
+
+export function noteLocalMapRead (lp, why) {
+  const isErr = why && typeof why === 'object'
+  const code = (isErr && why.code) ? String(why.code) : ''
+  const msg = isErr ? String(why.message || why) : String(why || '')
+  let state
+  if (msg === 'absent' || code === 'ENOENT' || code === 'ENOTDIR') state = 'absent'
+  else if (msg === E_MAP_UNAVAILABLE) state = 'parse_fail'
+  else state = 'unreadable'
+  const key = state + '|' + lp + '|' + code
+  if (localMapNotes.has(key)) return ''
+  localMapNotes.add(key)
+  const line = '[fs] identity-local ' + state + ' path=' + lp +
+    ' code=' + (code || 'none') + ' impact=' + LOCAL_MAP_IMPACT[state]
+  console.log(line)
+  return line
+}
 const arrCopyJs = (x) => (Array.isArray(x) ? x.slice() : [])
 const objCopyJs = (x) => (x && typeof x === 'object' && !Array.isArray(x) ? { ...x } : {})
 
@@ -471,7 +522,17 @@ export function makeResolver ({ mapPath = null,
           let local = null
           const lp = localMapPath()
           if (lp) {
-            try { if (fs.statSync(lp).isFile()) local = loadMapJs(readTextNoBom(lp)) } catch { local = null }
+            // 中台 #1866 第4项：此处原为 `catch { local = null }` 空吞（WO 原文所指的 `identity-inject.mjs:437`
+            // 静默 catch；行号系 2026-10-15 版快照，现移到本行附近）。「无表／坏表／读不了」三种情形
+            // 从前无声降级成同一副样子，真出权限或内容问题时日志零线索。现只加留痕，
+            // 🔴 **降级行为一字不改**：仍按"没有增量表"继续用主表解析，不新增抛出路径。
+            try {
+              if (fs.statSync(lp).isFile()) local = loadMapJs(readTextNoBom(lp))
+              else noteLocalMapRead(lp, 'absent')
+            } catch (e) {
+              local = null
+              noteLocalMapRead(lp, e)
+            }
           }
           const r = resolveActorJs(openId, mainMap, local, jg)
           res = { actor: r.actor || null, err: r.err || null, tableOk: true }
@@ -625,6 +686,113 @@ export function selftest () {
       const good = makeResolver({ mapPath: mapF, jobGrantsPath: jgF }).resolve('ou_1364_ok')
       ok(good.actor && good.actor.name === 'T1364', '正常场景行为不变（读得到表照常认人）')
     } finally {
+      fs.rmSync(td, { recursive: true, force: true })
+    }
+  }
+
+  console.log('── 5c) 中台#1866 第4项：本地增量表读态必须显式留痕（旧＝空 catch 无声吞）──')
+  {
+    const td = fs.mkdtempSync(path.join(os.tmpdir(), 'tbl1866-'))
+    const mapF = path.join(td, 'identity_map.json')
+    const jgF = path.join(td, 'job_grants.json')
+    // 第二个人 open_ids 为空 ＋ 名字带独特串 ⇒ ①只在增量里才认得出 ②留痕若泄漏内容立刻被抓
+    const LOCAL_NAME = '本机增量人_勿泄漏_1866'
+    const LOCAL_OU = 'ou_1866_local_view'
+    fs.writeFileSync(mapF, JSON.stringify({ v: 1, people: [
+      { union_id: 'on_1866', open_ids: { cli_main: 'ou_1866_main' }, name: 'T1866', job_id: 'J1866', status: '在职' },
+      { union_id: 'on_1866_loc', open_ids: {}, name: LOCAL_NAME, job_id: 'J1866', status: '在职' },
+    ] }))
+    fs.writeFileSync(jgF, JSON.stringify({ v: 1, jobs: [
+      { id: 'J1866', grants: {}, writable_scopes: [], item_grants: {} },
+    ] }))
+    const GOOD_LOCAL = path.join(td, 'identity_map.local.good.json')
+    const BAD_LOCAL = path.join(td, 'identity_map.local.bad.json')
+    const ACC_LOCAL = path.join(td, 'identity_map.local.eacces.json')
+    const MISSING_LOCAL = path.join(td, 'identity_map.local.missing.json')
+    const localFix = (ou) => JSON.stringify({ v: 1, people: [{ name: LOCAL_NAME, open_ids: { cli_local1866: ou } }] })
+    fs.writeFileSync(GOOD_LOCAL, localFix(LOCAL_OU))
+    fs.writeFileSync(BAD_LOCAL, '{ 这不是合法 JSON')
+    fs.writeFileSync(ACC_LOCAL, localFix(LOCAL_OU))
+
+    const prevLocal = process.env.MAILBOX_IDENTITY_LOCAL
+    // 只截留痕行，其余（含本自测自己的 ✅/❌ 行）原样输出
+    const realLog1866 = console.log
+    const capture = (fn) => {
+      const lines = []
+      console.log = (...a) => { const s = a.join(' '); if (s.includes('[fs] identity-local')) lines.push(s); else realLog1866(s) }
+      try { fn() } finally { console.log = realLog1866 }
+      return lines
+    }
+    try {
+      // ① 正常态：增量合并生效 ⇒ 认得出只在增量里的人，且一行留痕都不打（不误报）
+      process.env.MAILBOX_IDENTITY_LOCAL = GOOD_LOCAL
+      let res = null
+      let lines = capture(() => { res = makeResolver({ mapPath: mapF, jobGrantsPath: jgF }).resolve(LOCAL_OU) })
+      ok(res.actor && res.actor.name === LOCAL_NAME, '① 正常态：增量照常合并（只在增量里的 ou 认得出，语义不变）')
+      ok(lines.length === 0, '① 正常态：不打任何留痕行 ｜ 实得 ' + lines.length + ' 行')
+
+      // ② 缺失态：打且只打一行 absent，降级行为与旧实现逐字一致
+      process.env.MAILBOX_IDENTITY_LOCAL = MISSING_LOCAL
+      lines = capture(() => { res = makeResolver({ mapPath: mapF, jobGrantsPath: jgF }).resolve(LOCAL_OU) })
+      ok(lines.length === 1 && lines[0].includes('identity-local absent'),
+        '② 缺失态：留痕一行且状态=absent（旧实现此处零输出＝静默失效本体） ｜ 实得 ' + JSON.stringify(lines))
+      const L2 = lines[0] || '(无留痕行)'
+      ok(L2.includes('path=' + MISSING_LOCAL) && L2.includes('impact='),
+        '② 缺失态：留痕自带路径＋影响说明（排查者不用猜）')
+      ok(res.err === 'unknown_person' && res.actor === null,
+        '② 缺失态：降级行为不变（只在增量里的人仍认不出，fail-closed 照旧拒）')
+
+      // ③ 坏 JSON：状态必须是 parse_fail（旧实现与"无表"同一个无声形状）＋ 去重
+      process.env.MAILBOX_IDENTITY_LOCAL = BAD_LOCAL
+      let rBad = null
+      lines = capture(() => { res = (rBad = makeResolver({ mapPath: mapF, jobGrantsPath: jgF })).resolve(LOCAL_OU) })
+      ok(lines.length === 1 && lines[0].includes('identity-local parse_fail'),
+        '③ 坏 JSON：留痕状态=parse_fail（与 absent 可区分） ｜ 实得 ' + JSON.stringify(lines))
+      const L3 = lines[0] || '(无留痕行)'
+      ok(L3.includes('parse_fail') && !L3.includes(LOCAL_NAME) && !L3.includes(LOCAL_OU) && !L3.includes('这不是合法 JSON'),
+        '③ 坏 JSON：🔴 留痕不含文件内容（A13/A14，只许状态/路径/码/影响）')
+      ok(res.err === 'unknown_person', '③ 坏 JSON：不抛异常、降级为仅主表（行为不变）')
+      let ghost = null
+      const linesDup = capture(() => { ghost = rBad.resolve('ou_1866_ghost') })
+      ok(linesDup.length === 0 && ghost.err === 'unknown_person',
+        '③b 去重：同因第二次不刷日志（resolve 是每条入站消息的热路径），解析照旧降级')
+
+      // ④ 权限拒：unreadable＋错误码原文（读 leg 注入，与 5b 同款变异手法）
+      process.env.MAILBOX_IDENTITY_LOCAL = ACC_LOCAL
+      const realRead = fs.readFileSync
+      let resAcc = null
+      fs.readFileSync = (p, enc) => {
+        if (String(p) === ACC_LOCAL) throw Object.assign(new Error('permission denied, open ' + p), { code: 'EACCES' })
+        return realRead(p, enc)
+      }
+      try {
+        lines = capture(() => { resAcc = makeResolver({ mapPath: mapF, jobGrantsPath: jgF }).resolve(LOCAL_OU) })
+      } finally { fs.readFileSync = realRead }
+      ok(lines.length === 1 && lines[0].includes('identity-local unreadable') && lines[0].includes('code=EACCES'),
+        '④ 权限拒：留痕状态=unreadable＋附错误码原文（旧实现把 EACCES 也吞成"无表"） ｜ 实得 ' + JSON.stringify(lines))
+      const L4 = lines[0] || '(无留痕行)'
+      ok(L4.includes('unreadable') && !L4.includes(LOCAL_OU) && !L4.includes(LOCAL_NAME),
+        '④ 权限拒：留痕同样不含文件内容')
+      ok(resAcc.err === 'unknown_person', '④ 权限拒：降级行为不变（不崩、只用主表）')
+
+      // ⑤ 导出面直测（返回落账行本体 ＋ 分类口径）
+      let dAbsent = ''; let dAcc = ''; let dParse = ''; let dNoEnt = ''
+      const dl = capture(() => {
+        dAbsent = noteLocalMapRead(path.join(td, 'direct-absent.json'), 'absent')
+        dAcc = noteLocalMapRead(path.join(td, 'direct-eacces.json'), Object.assign(new Error('denied'), { code: 'EACCES' }))
+        dParse = noteLocalMapRead(path.join(td, 'direct-parse.json'), new Error('map_unavailable'))
+        dNoEnt = noteLocalMapRead(path.join(td, 'direct-noent.json'), Object.assign(new Error('no such file'), { code: 'ENOENT' }))
+      })
+      ok(dAbsent.startsWith('[fs] identity-local absent path=') && dl.length === 4, '⑤ 直测：absent 行本体＋每态各打一行')
+      ok(dAcc.includes('unreadable') && dAcc.includes('code=EACCES'), '⑤ 直测：EACCES ⇒ unreadable')
+      ok(dParse.includes('parse_fail'), '⑤ 直测：map_unavailable ⇒ parse_fail')
+      ok(dNoEnt.includes('absent') && dNoEnt.includes('code=ENOENT'), '⑤ 直测：ENOENT ⇒ absent（statSync 抛的"没表"不误报成故障）')
+      let dDup = 'x'
+      capture(() => { dDup = noteLocalMapRead(path.join(td, 'direct-eacces.json'), Object.assign(new Error('denied'), { code: 'EACCES' })) })
+      ok(dDup === '', '⑤ 直测：同（状态＋路径＋码）第二次返回空串＝未重复落账')
+    } finally {
+      if (prevLocal === undefined) delete process.env.MAILBOX_IDENTITY_LOCAL
+      else process.env.MAILBOX_IDENTITY_LOCAL = prevLocal
       fs.rmSync(td, { recursive: true, force: true })
     }
   }

@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] - 2026-10-22：身份注入内核——本地增量表读态不再无声吞（中台 #1866 第4项）
+
+- **背景**：中台 #1866 第4项（其源 WO 属生产权限异动取证单，现场细节不在公开仓复述）点名：内核读「本地增量身份表」那处是空 `catch` 静默跳过 ⇒ 「功能缺位不打日志」，要求先定性该件该不该存在，再把静默 catch 改成显式留痕。
+- **定性（缺件 vs 设计上就不该有）＝设计上就不该有，非功能缺位**：①`localMapPath()`（identity-inject.mjs:122-125）把路径钉在 `~/.dsh-feishucard/`（工作区之外 ⇒ 天然不参与同步、各机各写）；②本仓 `.gitignore:12` 明确排除该件；③README「身份表放哪」＝「每台机器**可**另放一份」，INTERFACE.md 第 3 行默认值＝「未设（用默认路径）」；④内核与 index.js 出站兜底都先 `statSync().isFile()` 判存在，缺表＝只用主表解析（`resolveActorJs` 的 `localMap` 传 null 是合法入参）。⇒ 生产没有它属设计内状态；本机 `~/.dsh-feishucard/identity_map.local.json` 实测存在（254 B，mtime 2026-10-04 03:04，未读内容）。
+- **改动（只加可见性，判定语义与降级行为一字未动）**：`identity-inject.mjs` 新增导出 `noteLocalMapRead(lp, why)`，把旧 `catch { local = null }` 拆成三态留痕——`absent`（无表/非普通文件/ENOENT·ENOTDIR，设计内）／`parse_fail`（内容不可用）／`unreadable`（stat 或读失败，附错误码原文），行格式 `[fs] identity-local <state> path=… code=… impact=…`；🔴 只记状态＋路径＋错误码＋影响，**绝不落文件内容**（A13/A14）；`resolve()` 是每条入站消息的热路径 ⇒ 同一（状态＋路径＋码）只打一次（`localMapNotes` 去重），不刷日志。Python 通道（`MAILBOX_RESOLVER_FORCE_PY=1`，非默认）本轮未动。
+- **验证**：`node --check identity-inject.mjs` 过；`node identity-inject.mjs --selftest` **65 通过／0 失败（改前基线 48／0，新增 5c 节 17 条）**——覆盖正常／文件缺失／坏 JSON／权限拒（readFileSync 注 EACCES，与 5b 同款手法）＋去重＋「留痕不含内容」零泄漏断言；变异反证两次均报红：摘掉 resolve 里两处留痕调用＝6 条红 rc=1，摘掉 helper 里 `console.log(line)`＝7 条红 rc=1，还原后复绿且 sha 与留痕版一致（`53438c77…`，改前 HEAD blob `4d95c820…`）；`npm run check` rc=0。
+- **范围**：仅本地 `dsh-feishucard` 仓改动＋提交，**未 staging、未部署、未重启桥**（生产/本机热重载副本经 profile junction 指向本仓，重启后才会生效——生效与否待部署轮验证，本轮不作 [已落地] 声称）。#1866 关单判据三条（生产施工回执／巡检断言入件／变异反证报红）本项只覆盖第4项的本地半边，整单保持 open。
+
 ## [Unreleased] - 2026-10-19：AC-0100 卡片救援正文分片
 
 - **改动**：内容被拒或强制推送超出 130000 B 硬顶时，救援正文按 28000 UTF-8 B 顺序分片发送；最多 5 片，超限或分片失败时保存完整可读内容并发回路径。
