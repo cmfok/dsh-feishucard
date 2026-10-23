@@ -11632,6 +11632,48 @@ export function apply(ctx) {
     if (req.method !== 'GET') return respondJson(res, 405, { ok: false, message: 'method not allowed' })
     handleStatus(res)
   })
+
+  // ---- [RC-004-20261023] 外部上下文注入端点 ----------------------------------
+  // 用途：G5 评价追问卡等「程序主动发卡」场景——发卡程序发卡成功后调用本端点，向该用户
+  //   与 bot 的会话注入一条系统上下文（handleInbound 合成消息，_internal 同先例 #3952/#2823），
+  //   让模型带着上下文接住用户的后续回复（CM 2026-10-23 拍板方向，需求卡 G5 RC-004 v2）。
+  // 鉴权：共享 token（env FEISHU_INJECT_TOKEN；未配置＝端点整体停用，fail-closed）；
+  //   外层另有宿主 web 的同源/basic auth（生产 nginx）。
+  // 取会话：遍历各 bot 的 chatPeers（chatId→open_id，入站时记录）反查该 open_id 最近会话；
+  //   查不到＝该用户从未与本桥任何 bot 私聊 ⇒ 404 如实报（不猜 chat）。
+  registerRoute('/feishu/admin/inject-context', async (req, res) => {
+    if (req.method !== 'POST') return respondJson(res, 405, { ok: false, message: 'method not allowed' })
+    const want = (process.env.FEISHU_INJECT_TOKEN || '').trim()
+    if (!want) return respondJson(res, 503, { ok: false, message: 'inject disabled (FEISHU_INJECT_TOKEN not set)' })
+    const got = String(req.headers['x-inject-token'] || '').trim()
+    if (got !== want) return respondJson(res, 403, { ok: false, message: 'bad token' })
+    const body = await readBody(req, 65536)
+    const openId = String(body.open_id || '').trim()
+    const text = String(body.text || '').trim()
+    const tag = String(body.tag || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)
+    if (!openId || !text) return respondJson(res, 400, { ok: false, message: 'open_id and text required' })
+    let hit = null
+    for (const bot of bots.values()) {
+      if (!bot.chatPeers) continue
+      for (const [chatId, ou] of bot.chatPeers) {
+        if (String(ou) === openId) { hit = { bot, chatId }; break }
+      }
+      if (hit) break
+    }
+    if (!hit) return respondJson(res, 404, { ok: false, message: 'no session for open_id (never chatted)' })
+    const seq = ((hit.bot._ctxSeq = (hit.bot._ctxSeq || 0) + 1)).toString(36)
+    const injectId = 'ctxin-' + Date.now().toString(36) + '-' + seq + (tag ? '-' + tag : '')
+    console.log('[fs] context inject queued chat=' + hit.chatId + ' id=' + injectId + ' tag=' + tag)
+    void handleInbound(hit.bot, {
+      message_id: injectId,
+      message_type: 'text',
+      chat_id: hit.chatId,
+      _internal: true,   // 内部系统上下文，不是用户在回答提问卡（同 cardfail 先例）
+      content: JSON.stringify({ text }),
+    }).catch(() => {})
+    respondJson(res, 200, { ok: true, appId: hit.bot.cfg.appId, chat_id: hit.chatId, inject_id: injectId })
+  })
+  // ---- [/RC-004-20261023] ----------------------------------------------------
   registerRoute('/feishu/admin/config', async (req, res) => {
     if (req.method === 'GET') {
       const list = await readConfig()
