@@ -1408,8 +1408,16 @@ console.log('12f-hard) AC-0096 硬顶救援：完整载荷超过 130000 B 时不
   const hardBodyBytesF = hardFramesF.map((c) => Buffer.byteLength(JSON.stringify(JSON.stringify(c.payload)), 'utf8'))
   ok(hardBodyBytesF.every((b) => b <= 130000),
     '★ AC-0096 硬顶反证：实际发送的卡片请求体均不超过 130000 B，共 ' + hardBodyBytesF.length + ' 帧')
-  ok(hardRescueF.length > 0 && JSON.stringify(hardRescueF).includes('硬顶救援的一轮叙述'),
-    '★ AC-0096 救援反证：force 帧超硬顶后实际发出包含本轮正文的纯文本卡')
+  // 0.8.25 更新（CM 拍板 1+2 的连带）：payloadPlainText 改递归抓全后，超硬顶卡的救援文本
+  // 含折叠面板内容 ⇒ 体积变大、可能超过 CARD_RESCUE_MAX_PARTS=5 片 ⇒ 按 AC-0100 既定设计
+  // **落文件**（发出「救援正文较长，完整内容已保存到 <路径>」提示）。两种形态都算「正文没丢」：
+  // ① 分片纯文本含正文；② 落文件提示消息。旧绿灯依赖「丢面板内容才把文本凑小到 5 片内」
+  // ——那正是本次修掉的缺陷，不是要保的行为。
+  const rescueOkF = hardRescueF.length > 0
+    && (JSON.stringify(hardRescueF).includes('硬顶救援的一轮叙述')
+      || JSON.stringify(hardRescueF).includes('救援正文较长，完整内容已保存到'))
+  ok(rescueOkF,
+    '★ AC-0096 救援反证：force 帧超硬顶后正文可救回（分片纯文本含正文，或 AC-0100 落文件提示——0.8.25 递归抽取后大卡走文件分支属预期）')
 }
 
 console.log('12g) stable（群聊）形态的换卡粗筛只量**会渲染出去的块**（中台 #1685 缺陷 A）：note 全文/工具块不进 stable 载荷，不得拿它们顶换卡线')
@@ -11000,9 +11008,13 @@ console.log('N7) #1685 / AC-0100：卡片救援正文顺序分片；超过分片
     : ''
   let saved = ''
   try { if (filePath) saved = readFileSync(filePath, 'utf8') } catch {}
+  // 0.8.25 更新（CM 拍板 1+2 连带）：payloadPlainText 改递归抓全后，救援正文合法包含
+  // 折叠面板标题等内容（正是本版要的「救援带上面板内容」），字节精确等式（正文+23B 尾巴）
+  // 是旧实现「只抽顶层两种 tag」的巧合锁，不再是判据。AC-0100 的本意＝**完整正文落文件、
+  // 内容不丢** ⇒ 收紧为：正文在文件中出现恰好一次，且文件不小于正文字节。
   ok(fileNotices.length === 1 && filePath.includes('output') && saved.includes(fileBody)
     && saved.indexOf(fileBody) === saved.lastIndexOf(fileBody)
-    && Buffer.byteLength(saved, 'utf8') === Buffer.byteLength(fileBody, 'utf8') + 23,
+    && Buffer.byteLength(saved, 'utf8') >= Buffer.byteLength(fileBody, 'utf8'),
     '★★★ 超过 5 片上限时完整正文落文件并发送可用路径（无保存调用则本条红）｜实得 '
     + JSON.stringify({ notice: fileNotices.length, pathProvided: Boolean(filePath), savedBytes: Buffer.byteLength(saved, 'utf8') }))
   ok(consoleLines.slice(fileLogStart).some((l) => l.includes('card body rescue saved:') && l.includes('part limit')),

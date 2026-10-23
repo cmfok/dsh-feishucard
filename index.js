@@ -2201,12 +2201,56 @@ export function apply(ctx) {
       const head = elements.slice(0, elements.length - KEEP_TAIL)
       const tail = elements.slice(elements.length - KEEP_TAIL)
       const extraLines = []
+      // 0.8.25（CM 2026-10-23 拍板 1+2；诊断 DIAGNOSIS-2026-10-23-换卡封口帧致旧卡工具面板解体）：
+      // 工具调用面板不再被窗口折叠解体成文字墙。旧实现把 head 里的「🛠️ 工具调用」折叠面板
+      // 连同正文一起抽文本进「📎 更早过程」——面板头与折叠交互全没了。换卡封口帧几乎必然过
+      // 折叠线（换卡线 170 块/109KB 与折叠线 180 元素贴合），CM 实测「一换卡，旧卡工具调用
+      // 就只剩文字」。现把工具面板的行文本单独收集，折叠后**重装回「🛠️ 工具调用 · 历史」
+      // 折叠面板**（expanded:false，与卡片正常形态一致）——「这是工具调用、可点开看」的结构保留。
+      const toolLines = []
+      const isToolPanel = (el) => el && el.tag === 'collapsible_panel' && el.expanded === false
+        && el.header && el.header.title && typeof el.header.title.content === 'string'
+        && el.header.title.content.indexOf('🛠️ 工具调用') === 0
       for (const el of head) {
+        if (isToolPanel(el)) {
+          const inner = el.elements && el.elements[0]
+          if (inner && inner.tag === 'markdown' && inner.content) toolLines.push(inner.content)
+          continue
+        }
         if (el.tag === 'markdown') {
           if (el.content) extraLines.push(el.content)
         } else {
           const inner = el.elements && el.elements[0]
           if (inner && inner.tag === 'markdown' && inner.content) extraLines.push(inner.content)
+        }
+      }
+      // 工具历史面板重装：先 unshift 进 tail 头部（倒序保持原相对顺序）；
+      // 随后「📎 更早过程」再 unshift ⇒ 视觉顺序 [更早过程, 工具历史, 最新内容]。
+      // 重装面板标题同样以「🛠️ 工具调用」开头 ⇒ 下次折叠 isToolPanel 仍认得（幂等，不重复堆积）。
+      if (toolLines.length > 0) {
+        const toolChunks = chunkText(toolLines.join('\n\n'), FOLD_CHUNK_CHARS)
+        for (let i = toolChunks.length - 1; i >= 0; i--) {
+          tail.unshift({
+            tag: 'collapsible_panel',
+            expanded: false,
+            background_color: 'grey-50',
+            border: { color: 'grey', corner_radius: '8px' },
+            padding: '8px 8px 8px 8px',
+            header: {
+              title: {
+                tag: 'plain_text',
+                content: toolChunks.length === 1
+                  ? '🛠️ 工具调用 · 历史'
+                  : '🛠️ 工具调用 · 历史 (' + (i + 1) + '/' + toolChunks.length + ')',
+              },
+              vertical_align: 'center',
+              padding: '8px 8px 8px 8px',
+              icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', color: 'grey', size: '16px 16px' },
+              icon_position: 'right',
+              icon_expanded_angle: -180,
+            },
+            elements: [{ tag: 'markdown', content: toolChunks[i] }],
+          })
         }
       }
       if (extraLines.length > 0) {
@@ -2636,15 +2680,30 @@ export function apply(ctx) {
     if (/frequency|rate limit|rate_limit|99991400/i.test(s)) return 'limited'
     return 'transport'
   }
+  // 0.8.25（CM 2026-10-23 拍板 1+2）：救援抽取改为**递归**——旧实现只看顶层 markdown/div.text
+  // 两种 tag，折叠面板（🛠️ 工具调用 / 📎 更早过程）里的文字抽不出来；换卡本就因「卡大」触发，
+  // 封口帧超硬顶走纯文本救援时，救援正文缺掉整块工具内容（同文件 #515 存档抽取器 cardArchiveTextOf
+  // 已证明必须递归抓全）。与存档版的差异：这里**保留原文换行**（救援正文是给用户读的，
+  // 存档版把空白折叠成单空格会把代码块/段落糊成一坨），且**不去重**（卡面重复行在正文里也该重复）。
   function payloadPlainText(payload) {
     try {
-      const els = (payload && payload.body && payload.body.elements) || []
       const parts = []
-      for (const el of els) {
-        if (!el) continue
-        if (el.tag === 'markdown' && typeof el.content === 'string') parts.push(el.content)
-        else if (el.tag === 'div' && el.text && typeof el.text.content === 'string') parts.push(el.text.content)
+      const walk = (node, depth) => {
+        if (!node || depth > 8) return
+        if (Array.isArray(node)) { for (const it of node) walk(it, depth + 1); return }
+        if (typeof node !== 'object') return
+        // 图片/按钮不是文字；按钮整棵跳过（label 里多为「确认/取消」噪声）
+        if (node.tag === 'img' || node.tag === 'media' || node.tag === 'button' || node.tag === 'action') return
+        if (node.tag === 'markdown' && typeof node.content === 'string') { parts.push(node.content); return }
+        if (node.tag === 'div' && node.text && typeof node.text.content === 'string') { parts.push(node.text.content); return }
+        // 面板标题（collapsible_panel.header.title / 其余 plain_text）也带上——
+        // 救援正文里能看出「这一段是工具调用」的边界。
+        if (node.tag === 'plain_text' && typeof node.content === 'string') { parts.push(node.content); return }
+        for (const k of ['elements', 'fields', 'columns', 'items', 'text', 'title', 'header', 'body']) {
+          if (node[k] && typeof node[k] === 'object') walk(node[k], depth + 1)
+        }
       }
+      walk((payload && payload.body) || payload, 0)
       return parts.join('\n\n')
     } catch { return '' }
   }
