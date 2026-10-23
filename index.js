@@ -11643,8 +11643,15 @@ export function apply(ctx) {
   //   查不到＝该用户从未与本桥任何 bot 私聊 ⇒ 404 如实报（不猜 chat）。
   registerRoute('/feishu/admin/inject-context', async (req, res) => {
     if (req.method !== 'POST') return respondJson(res, 405, { ok: false, message: 'method not allowed' })
-    const want = (process.env.FEISHU_INJECT_TOKEN || '').trim()
-    if (!want) return respondJson(res, 503, { ok: false, message: 'inject disabled (FEISHU_INJECT_TOKEN not set)' })
+    let want = (process.env.FEISHU_INJECT_TOKEN || '').trim()
+    if (!want) {
+      // RC-004 v2.1：env 未配时回退读 G5 侧共享 token 文件（同机同值，避免 systemd drop-in 依赖）
+      try {
+        const fs = require('fs')
+        want = fs.readFileSync('/opt/scripts/G5/v2/service/inject_token.txt', 'utf8').trim()
+      } catch { /* 文件不存在＝确实未配置 */ }
+    }
+    if (!want) return respondJson(res, 503, { ok: false, message: 'inject disabled (no token configured)' })
     const got = String(req.headers['x-inject-token'] || '').trim()
     if (got !== want) return respondJson(res, 403, { ok: false, message: 'bad token' })
     const body = await readBody(req, 65536)
