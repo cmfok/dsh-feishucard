@@ -79,8 +79,21 @@ export function isG3OkrWorkspace ({ env, cwd }) {
 // 进程内防抖表：fp → 上次放行时刻。模块级单例 —— 多 bot 共用一个 Map 也按 fp 隔离，不串号。
 const recentReports = new Map()
 
-// 仅测试用：清空防抖表，保证 selftest 各组断言互不污染（插件运行期不会调用）。
-export function resetG3DedupeForTest () { recentReports.clear() }
+// ---------------------------------------------------------------------------
+// 恢复钩子（#2331 第二件，G10 生产段四件之第⑦层）：失败投递后，同 workspace+工具
+// 后续成功调用时自然上报恢复，关联原 event_id。
+// 关联机制的关键事实：G10 入口 inbox_signal.post_g3_failure 的 event_id 是
+// 六字段 [agent, tool, occurred_at, exit_status, error_category, short_summary]
+// 的 sha256(json.dumps(...)) —— **确定性哈希**。因此桥侧不重算哈希（跨语言
+// isoformat 毫秒/微秒形态必漂移），只原样保存失败时的六字段，恢复时经 wrapper
+// 的 --mode recovery 传回 Python 侧，由同一公式在 Python 侧重算 ⇒ 必然同 id。
+// ---------------------------------------------------------------------------
+const RECOVERY_TTL_MS = 30 * 60 * 1000 // 失败登记 30 分钟内同工具成功才关联恢复
+// key = normCwd + '|' + toolName → { agent, tool, occurredAt, exitStatus, errorCategory, shortSummary, reportedAt }
+const pendingRecoveries = new Map()
+
+// 仅测试用：清空两张表，保证 selftest 各组断言互不污染（插件运行期不会调用）。
+export function resetG3DedupeForTest () { recentReports.clear(); pendingRecoveries.clear() }
 
 function cwdLeaf (cwd) {
   const norm = normalizeCwd(cwd)
@@ -158,6 +171,23 @@ export function reportG3Failure (agent, tool, envOverride) {
     ]
     const childEnv = { ...env, AIAD_INBOX_ROOT: decision.root }
     if (decision.fallback) childEnv.AIAD_INBOX_FALLBACK = decision.fallback
+    // 恢复钩子登记（#2331 第⑦层）：失败已投递 ⇒ 记下六字段，等同工具后续成功自然关联。
+    const recoveryKey = normalizeCwd(header.cwd) + '|' + decision.tool
+    pendingRecoveries.set(recoveryKey, {
+      agent: decision.agent,
+      tool: decision.tool,
+      occurredAt: decision.occurredAt,
+      exitStatus: decision.exitStatus,
+      errorCategory: decision.errorCategory,
+      shortSummary: decision.shortSummary,
+      reportedAt: Date.now(),
+    })
+    if (pendingRecoveries.size > 256) {
+      const nowMs = Date.now()
+      for (const [k, v] of pendingRecoveries) {
+        if (nowMs - v.reportedAt >= RECOVERY_TTL_MS) pendingRecoveries.delete(k)
+      }
+    }
     // 生产（Linux）默认 python3；本地 Windows 冒烟可注入 G3_REPORT_PYTHON=python。
     const pythonBin = String(env.G3_REPORT_PYTHON || '').trim() || 'python3'
     const child = execFile(pythonBin, args, { env: childEnv, timeout: 15000 }, (err, stdout) => {
@@ -167,6 +197,80 @@ export function reportG3Failure (agent, tool, envOverride) {
     if (child && typeof child.unref === 'function') child.unref()
   } catch (e) {
     console.log('[g3-inbox] 上报旁路异常（不影响卡片主链路）: ' + String(e && e.message || e))
+  }
+}
+
+// 恢复上报的组装（纯函数，可测）。返回 null = 本次不上报（无在窗失败记录 / 门禁未开）；
+// 非 null = 待投递恢复载荷（含回传给 wrapper 的**原失败**六字段——event_id 由 Python 侧重算）。
+export function decideG3RecoveryReport ({ env, cwd, toolName, nowMs }) {
+  const e = env || {}
+  // 门禁与失败侧同源：workspace 白名单＋写入根（空 ⇒ 全局关闭，零触发红线不变）。
+  const normCwd = normalizeCwd(cwd)
+  if (!isG3OkrWorkspace({ env: e, cwd: normCwd })) return null
+  const root = String(e.AIAD_INBOX_ROOT || '').trim()
+  if (!root) return null
+  const key = normCwd + '|' + String(toolName || '')
+  const pending = pendingRecoveries.get(key)
+  if (!pending) return null
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now()
+  if (now - pending.reportedAt >= RECOVERY_TTL_MS) {
+    pendingRecoveries.delete(key) // 过窗清理：太久之前的失败与本次成功不做关联（防误配）
+    return null
+  }
+  // 一次性：命中即取走（恢复只报一次；同工具再失败会经失败腿重新登记）。
+  pendingRecoveries.delete(key)
+  return {
+    agent: pending.agent,
+    tool: pending.tool,
+    failedOccurredAt: pending.occurredAt,
+    failedExitStatus: pending.exitStatus,
+    failedErrorCategory: pending.errorCategory,
+    failedShortSummary: pending.shortSummary,
+    recoveredAt: new Date(now).toISOString(),
+    root,
+    fallback: String(e.AIAD_INBOX_FALLBACK || '').trim(),
+  }
+}
+
+// index.js 恢复钩子调用点：scanCard 的 tool/result completed 分支。
+// 同 workspace+工具此前有已投递失败且在窗 ⇒ 自然上报恢复（wrapper --mode recovery，
+// 由 Python 侧按原六字段重算 event_id 关联原失败事件）。旁路语义与失败侧一致。
+export function reportG3Recovery (agent, tool, envOverride) {
+  try {
+    const env = envOverride || process.env
+    const header = (agent && agent.session && agent.session.header) || {}
+    const decision = decideG3RecoveryReport({
+      env,
+      cwd: header.cwd,
+      toolName: String((tool && tool.name) || 'tool'),
+      nowMs: Date.now(),
+    })
+    if (!decision) return
+    const wrapper = String(env.AIAD_G3_REPORT_WRAPPER || '').trim()
+    if (!wrapper) {
+      console.log('[g3-inbox] 恢复门禁命中但 AIAD_G3_REPORT_WRAPPER 未注入，跳过 spawn（未接线态）')
+      return
+    }
+    const args = [
+      wrapper, '--mode', 'recovery',
+      '--agent', decision.agent,
+      '--tool', decision.tool,
+      '--occurred-at', decision.failedOccurredAt,
+      '--exit-status', decision.failedExitStatus,
+      '--error-category', decision.failedErrorCategory,
+      '--short-summary', decision.failedShortSummary,
+      '--recovered-at', decision.recoveredAt,
+    ]
+    const childEnv = { ...env, AIAD_INBOX_ROOT: decision.root }
+    if (decision.fallback) childEnv.AIAD_INBOX_FALLBACK = decision.fallback
+    const pythonBin = String(env.G3_REPORT_PYTHON || '').trim() || 'python3'
+    const child = execFile(pythonBin, args, { env: childEnv, timeout: 15000 }, (err, stdout) => {
+      if (err) console.log('[g3-inbox] recovery wrapper 非零退出: ' + String(err && err.message || err).slice(0, 200))
+      else console.log('[g3-inbox] 恢复已投递 ' + String(stdout || '').trim().slice(0, 80))
+    })
+    if (child && typeof child.unref === 'function') child.unref()
+  } catch (e) {
+    console.log('[g3-inbox] 恢复旁路异常（不影响卡片主链路）: ' + String(e && e.message || e))
   }
 }
 
@@ -221,6 +325,36 @@ function selftest () {
   // 「过期」断言必须跳到续期时刻再过一个整窗口（≥ 60999+60000），否则必假红。
   ok(decideG3FailureReport({ ...base, nowMs: 1000 + 59999 + 60000 }) !== null, '窗口过期 ⇒ 放行')
   ok(decideG3FailureReport({ ...base, toolName: 'other_tool', nowMs: 1000 + 60002 }) !== null, '不同工具不互相误挡')
+
+  console.log('── 6) 恢复钩子（#2331 第⑦层）：登记→同工具成功关联→一次性→过窗→门禁 ──')
+  resetG3DedupeForTest()
+  ok(decideG3RecoveryReport({ ...base, toolName: 'query_orders', nowMs: 2000 }) === null, '无失败登记 ⇒ null（不误报恢复）')
+  // 模拟失败登记：直接调 decide 不走 spawn；登记在 reportG3Failure 内 —— selftest 用等价路径：
+  // 用 decideG3FailureReport 放行后再手工登记（与 reportG3Failure 内部逻辑同构）。
+  const d1 = decideG3FailureReport({ ...base, nowMs: 3000 })
+  ok(d1 !== null, '失败判定放行（供恢复登记）')
+  if (d1) {
+    pendingRecoveries.set('/srv/aiad/agents/analyst|query_orders', {
+      agent: d1.agent, tool: d1.tool, occurredAt: d1.occurredAt,
+      exitStatus: d1.exitStatus, errorCategory: d1.errorCategory,
+      shortSummary: d1.shortSummary, reportedAt: 3000,
+    })
+  }
+  const rec1 = decideG3RecoveryReport({ ...base, toolName: 'query_orders', nowMs: 4000 })
+  ok(rec1 !== null, '同 workspace+工具在窗成功 ⇒ 放行恢复')
+  ok(rec1 && rec1.failedOccurredAt === d1.occurredAt && rec1.failedShortSummary === d1.shortSummary, '恢复载荷带回原失败六字段（供 Python 侧重算 event_id）')
+  ok(rec1 && rec1.failedExitStatus === 'failed' && rec1.failedErrorCategory === '失败-运行错', '原失败 exit_status/error_category 原样回传')
+  ok(decideG3RecoveryReport({ ...base, toolName: 'query_orders', nowMs: 5000 }) === null, '恢复一次性（第二次 ⇒ null，不重复关联）')
+  ok(decideG3RecoveryReport({ ...base, toolName: 'other_tool', nowMs: 5000 }) === null, '不同工具名 ⇒ null（不跨工具误配）')
+  ok(decideG3RecoveryReport({ env: {}, cwd: '/srv/aiad/agents/analyst', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 1：白名单未注入 ⇒ null（零触发红线不变）')
+  ok(decideG3RecoveryReport({ env: { AIAD_G3_REPORT_CWD_ALLOW: allow }, cwd: '/srv/aiad/agents/analyst', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 2：INBOX_ROOT 未注入 ⇒ null')
+  ok(decideG3RecoveryReport({ ...base, cwd: 'P:\\Qoder\\work', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 3：cwd 不在白名单 ⇒ null（其他 workspace 零写入）')
+  // 过窗：登记 30 分钟前的失败，成功不再关联（防久远失败被无关成功误配）。
+  pendingRecoveries.set('/srv/aiad/agents/analyst|query_orders', {
+    agent: 'analyst', tool: 'query_orders', occurredAt: 'old', exitStatus: 'failed',
+    errorCategory: '失败-运行错', shortSummary: 'old', reportedAt: 1000,
+  })
+  ok(decideG3RecoveryReport({ ...base, toolName: 'query_orders', nowMs: 1000 + RECOVERY_TTL_MS + 1 }) === null, '失败超过 30 分钟窗 ⇒ 不关联（并清理过期登记）')
 
   if (failed) { console.log('SELFTEST FAIL: ' + failed + ' 条未过'); return 1 }
   console.log('SELFTEST ALL PASS')

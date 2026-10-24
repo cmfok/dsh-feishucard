@@ -30,7 +30,8 @@ import {
 } from './identity-inject.mjs'
 // G3 员工会话「工具调用失败」旁路上报（#514 / D38=H-D95 路径A）。默认零触发：
 // 白名单（AIAD_G3_REPORT_CWD_ALLOW）与写入根（AIAD_INBOX_ROOT）不注入 ⇒ 不写任何东西。
-import { isG3OkrWorkspace, reportG3Failure } from './g3-inbox-report.mjs'
+// reportG3Recovery（#2331 第⑦层）：失败投递后同工具后续成功调用时自然上报恢复（关联原 event_id）。
+import { isG3OkrWorkspace, reportG3Failure, reportG3Recovery } from './g3-inbox-report.mjs'
 
 // D5：进程内单例 —— 「本轮上下文」按 agent.id 存，所以多 bot 实例共享一个 store 也不会串号。
 // 表/resolver 路径默认取 /opt/scripts/G9/（服务器），可用 MAILBOX_IDENTITY_MAP 覆盖。
@@ -3185,6 +3186,12 @@ export function apply(ctx) {
               // reportG3Failure() 仍会重复门禁，防止未来出现绕过扫描器的直接调用。
               const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
               if (isG3OkrWorkspace({ env: process.env, cwd })) reportG3Failure(agent, tool)
+            } else {
+              // G3 恢复钩子（#2331 第⑦层）：同 workspace+工具此前有已投递失败（30 分钟窗内）
+              // ⇒ 本次成功即自然上报恢复。门禁与失败侧同源（外层精确门禁＋decide 内二道门禁）；
+              // 无失败登记时 decideG3RecoveryReport 返回 null，本分支零副作用。
+              const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
+              if (isG3OkrWorkspace({ env: process.env, cwd })) reportG3Recovery(agent, tool)
             }
             changed = true
           }
