@@ -9742,11 +9742,35 @@ export function apply(ctx) {
         })(),
         new Promise((r) => setTimeout(() => r('timeout'), DM_DIRECT_SAVE_TIMEOUT_MS)),
       ])
-      let saved = await saveOnce()
-      // HMR 嵌套撞车兜底：仅对宿主嵌套事务保护这一种报错退避重试一次（写同值幂等无害）。
-      if (typeof saved === 'string' && saved.startsWith('error:')
-        && /transactions cannot be nested/i.test(saved)) {
-        await new Promise((r) => setTimeout(r, DM_HMR_RETRY_BACKOFF_MS))
+      // V0.8.26（2026-10-29）：0.8.21 的「退避 1.5s 重试一次」实测不够——/model 直存两次
+      // 连吃「transactions cannot be nested」（web.log 实锤）。根因补全：runExclusive 的嵌套
+      // 判定走 AsyncLocalStorage，**调用方整条异步链都处在宿主 HMR 事务上下文里时，退避
+      // 多久都没用**（重试仍在同一上下文里）。宿主 dsh-hmr 自己就有出口＝`executing.exit`
+      // （内部 watchConfig 同款用法）：把直存挪到事务上下文之外，saveSelection 进
+      // runExclusive 时 getStore() 为空 ⇒ 正常排队、不再撞嵌套。特性探测，拿不到 hmr
+      // 服务就退回原路径（退避重试，见下）。
+      const hmrSvc = ctx.get('hmr')
+      const escapeSave = (hmrSvc && hmrSvc.executing && typeof hmrSvc.executing.exit === 'function')
+        ? async () => await Promise.race([
+            (async () => {
+              try { await hmrSvc.executing.exit(() => dm.saveSelection({ provider, model })); return 'saved' } catch (error) {
+                return 'error:' + String((error && error.message) || error)
+              }
+            })(),
+            new Promise((r) => setTimeout(() => r('timeout'), DM_DIRECT_SAVE_TIMEOUT_MS)),
+          ])
+        : null
+      let saved = escapeSave ? await escapeSave() : await saveOnce()
+      if (escapeSave && saved !== 'saved') {
+        console.log('[fs] /model: 直存（HMR 上下文外）未落地（' + String(saved).slice(0, 80) + '）⇒ 退回原路径退避重试')
+      }
+      // HMR 嵌套撞车兜底（0.8.21 原路径，降级保留）：仅对宿主嵌套事务保护这一种报错
+      // 退避重试，至多两轮（1.5s / 3s；写同值幂等无害）。
+      for (const backoff of [DM_HMR_RETRY_BACKOFF_MS, 3000]) {
+        if (!(typeof saved === 'string' && saved.startsWith('error:')
+          && /transactions cannot be nested/i.test(saved))) break
+        console.log('[fs] /model: HMR 嵌套拒收，退避 ' + backoff + 'ms 后重试直存')
+        await new Promise((r) => setTimeout(r, backoff))
         saved = await saveOnce()
       }
       if (saved !== 'saved') {
