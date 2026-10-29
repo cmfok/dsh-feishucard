@@ -5,9 +5,11 @@
 //
 // 覆盖的故障史（同链路三进宫）：
 //   #124（10-07 切换假成功）→ #560（10-13 新会话注入不稳）→ 10-19 直存撞 HMR 嵌套事务。
+//   2026-10-29 复发（两连拒）→ V0.8.26：直存优先走宿主 hmr 的 ALS 出口（executing.exit）。
 // 用例 A：直存第一次撞「transactions cannot be nested」被拒 → 退避重试第二次落地 ⇒ persisted=true 且 saveSelection 恰好调 2 次。
 // 用例 B：直存报非 HMR 错 → 不重试（saveSelection 只调 1 次）⇒ persisted=false，错误如实带回。
-// 用例 C：静态断言——源码含退避重试标记 + 退避常量定义。
+// 用例 C：静态断言——源码含退避重试标记 + 退避常量定义 + ALS 出口标记。
+// 用例 D：宿主 hmr 可用 ⇒ 直存走 executing.exit（事务上下文之外）路径，一次落地。
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -72,9 +74,34 @@ if (factory) {
   ok('B0 抽取成功才能跑用例B', false)
 }
 
+// ---- 用例 D：宿主 hmr 可用 ⇒ 直存走 ALS 上下文外（executing.exit）路径 -----------
+if (factory) {
+  const escaped = []
+  let inEscape = false
+  let landedD = false
+  const hmrD = {
+    executing: {
+      exit(fn) { inEscape = true; try { return fn() } finally { inEscape = false } },
+    },
+  }
+  const dmD = {
+    currentSelection() { return landedD ? { provider: 'zai', model: 'glm-5.3-flash' } : { provider: 'zai', model: 'GLM-4.5-Air' } },
+    async saveSelection() { escaped.push(inEscape); landedD = true },
+  }
+  const ctxD = { get: (k) => (k === 'agentDefaultModel' ? dmD : (k === 'hmr' ? hmrD : null)) }
+  const resD = await factory(ctxD).verifyDefaultModelLanded('zai', 'glm-5.3-flash')
+  ok('D1 hmr 可用时直存走 executing.exit（上下文外）',
+    escaped.length === 1 && escaped[0] === true, JSON.stringify({ escaped, resD }))
+  ok('D2 一次即落地（无嵌套重试）', resD.persisted === true && resD.persistDetail === '桥直存后落地',
+    JSON.stringify(resD))
+} else {
+  ok('D0 抽取成功才能跑用例D', false)
+}
+
 // ---- 用例 C：源码级静态断言 -----------------------------------------------------
 ok('C1 源码含 HMR 嵌套重试标记', /transactions cannot be nested/i.test(snippet))
 ok('C2 源码含退避常量', snippet.includes('DM_HMR_RETRY_BACKOFF_MS = 1500'))
+ok('C3 源码含 ALS 上下文外直存出口', snippet.includes("ctx.get('hmr')") && snippet.includes('executing.exit'))
 
 console.log('----')
 console.log('PASS=' + pass + ' FAIL=' + fail)

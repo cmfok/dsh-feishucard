@@ -5,6 +5,37 @@
 > （CM 2026-10-23 裁决）——旧条目用发版工具校验时报「未发过版」属预期，非异常。
 > 本口径由 AIAD 发版管理体系统管。
 
+## V0.8.26 - 2026-10-29：/model 桥直存撞 HMR 嵌套**根治**——直存改走宿主 hmr 的 ALS 出口（事务上下文外）＋退避扩两轮
+
+- **症状（CM 2026-10-29 报「总是出现这错误，修复下」）**：`/model` 回执
+  `⚠️ 下一条请求会用 zai-coding-cn/glm-5.3-flash，但默认值未写入（桥直存报错：HMR transactions cannot be nested）⇒ 重连/恢复后可能跳回旧默认`。
+- **证据**：`%WORKROOT%\output\dsh-install\web.log` 两次点击均为
+  `/model click → selectModel ok → 默认值落地 FAIL：桥直存报错：HMR transactions cannot be nested`。
+  报错源＝宿主 `dsh-hmr` 包的 `runExclusive()`：`if (this.executing.getStore()) reject(new Error('HMR transactions cannot be nested'))`（AsyncLocalStorage 保护）。
+  桥侧路径：`verifyDefaultModelLanded()`（index.js）→ 3×200ms 轮询宿主落地 → 等不到就桥直存 `dm.saveSelection()`（4s 上界）→ 宿主 `dsh-agent-default-model.saveSelection` → `editor.edit(entry, …)` → 触发 profile 配置热更事务。
+- **为什么 0.8.21 的「退避 1.5s 重试一次」不够**（本次复发根因补全）：嵌套判定读 ALS，
+  **调用方整条异步链若都在 HMR 事务上下文里，退避多久都在同一上下文，重试必然再被拒**——
+  0.8.21 假设「保护是瞬时的」，实测两次连拒。
+- **修法（桥侧，级 B，未动 DSH 本体）**：
+  1. **直存优先走宿主 hmr 的出口** `ctx.get('hmr').executing.exit(() => dm.saveSelection(...))`
+     —— 把写操作挪到事务上下文之外，让 `saveSelection → editor.edit → runExclusive` 里
+     `getStore()` 为空，从「撞嵌套被拒」变成「正常排队等当前事务收尾」。宿主内部
+     `watchConfig` 就是同款用法（`this.executing.exit(...)`），属宿主自用出口，**特性探测＋降级**：拿不到 hmr 服务或没有 `executing.exit` ⇒ 自动退回原路径。
+  2. **退避重试扩到两轮**（1.5s / 3s），并**逐轮打日志** `[fs] /model: HMR 嵌套拒收，退避 Nms 后重试直存`
+     —— 下次复发能直接从 web.log 看走了哪条路（原来重试是静默的，只有最终 FAIL 一行）。
+  3. 回执分支与文案一字未动（`modelSwitchReceipt` 四分支原样），只改落地能力与留痕。
+- **验证**：`node --check index.js` 过；`node selftest-model-land-20261019.mjs` **PASS=13 FAIL=0**
+  （原 A/B 两案不动 + 新增 D 案：hmr 可用时直存确实经 `executing.exit` 且一次落地；
+  新增 C3：源码含 `ctx.get('hmr')` 与 `executing.exit` 静态标记）；全量 `npm run smoke` 本轮**未跑**（872 秒级，见下方说明）。
+- **回滚点**：`index.js.bak-before-modelsave-hmr-20261029`（803,869 B ＝ 改动前版，
+  由当前文件反代重建并自证可逆：旧块→新块逐字复原；`node --check` 过）。首次 copy 拷成改后版，当场发现并重建。
+- **⚠️ 提交状态**：本轮**未 git commit**——工作区里有**别人在飞的未提交改动**
+  （`AGENTS.md` / `index.js` 的 H-D546 `visibleFailureText` 三态 / `scripts/smoke.mjs` / `scripts/build_identity_map.py`），
+  混提交会把两个工作流焊在一个 commit 里。回滚点走备份文件（仓规允许「备份文件或 git 提交」二选一）。
+- **配套动作（非本仓）**：`%USERPROFILE%\.dsh\profiles\web\cordis.patch.yml` 的 `agent-default-model` 块
+  直接从 `deepseek-account/deepseek-flash` 改为 `zai-coding-cn/glm-5.3-flash`（先备份 `.bak-before-glm-20261029`，
+  node 侧 YAML 解析校验）；这是 CM 报错卡里给的第二条出路，也是「重连不跳回旧默认」的兜底。
+
 ## [0.8.25] - 2026-10-23：换卡封口帧不再解体工具调用面板＋救援纯文本带上面板内容（CM 拍板 1+2）
 
 - **背景**：CM 报障「换卡时旧卡折叠的工具调用全部消失，只剩文字」。诊断（仓根
