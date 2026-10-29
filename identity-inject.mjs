@@ -22,8 +22,12 @@
  *
  * 自测：`node identity-inject.mjs --selftest`
  *
- * 版本：V0.8-26102201（2026-10-22）
+ * 版本：V0.8-26102901（2026-10-29）
  * 变更记录：
+ *   V0.8-26102901 2026-10-29 —— 中台 #1866（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` 第4项续）：
+ *     `currentPython()` 探测解释器时的静默 catch 改显式留痕——逐候选记「名称＋错误码/退出码/信号」，
+ *     三个候选全挂时向 stderr 打一条明确告警。🔴 探测结果与回退语义不变（仍 `return 'python3'`），
+ *     调用方契约不受影响；只加可见性。
  *   V0.8-26102201 2026-10-22 —— 中台 #1866 第4项（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` §5）：
  *     本地增量表 `identity_map.local.json` 的读态不再被空 `catch` 无声吞 ⇒ 新增 `noteLocalMapRead`
  *     显式留痕（absent／parse_fail／unreadable 三态，只记状态＋路径＋错误码＋影响，不落文件内容）。
@@ -443,16 +447,38 @@ export function makeResolver ({ mapPath = null,
   // python 解释器也要探测：服务器叫 `python3`，Windows 上通常只有 `python` / `py`
   //（2026-10-04 实测：写死 `python3` ⇒ 本机 `resolver_no_json`）
   let cachedPython = null
+
+  // 中台 #1866（2026-10-29）：探测失败必须留痕。
+  // 旧实现 `catch { /* 试下一个 */ }` 把「命令不存在（ENOENT）／退出码非 0／超时（ETIMEDOUT）」
+  // 一并无声吞掉，三个候选都不可用时只剩一句 `return 'python3'` —— 事后日志里只能看到
+  // `resolver_no_json`，根本不知道是解释器起不来。现逐个候选记下 名称＋错误码/退出码/信号，
+  // 全挂时向 stderr 打一条明确告警。🔴 只加可见性：返回语义不变（仍回退 `'python3'`，不新增抛出路径）。
+  function probeFailDetail (r) {
+    if (r && r.error) {
+      const code = String(r.error.code || r.error.message || r.error)
+      return 'error=' + code.slice(0, 60) + (code === 'ETIMEDOUT' ? '(超时)' : '')
+    }
+    if (r && r.signal) return 'signal=' + r.signal
+    return 'exit=' + String(r ? r.status : '?') +
+      ' stdout=' + JSON.stringify(String((r && r.stdout) || '').trim().slice(0, 20))
+  }
   function currentPython () {
     if (python) return python
     if (process.env.MAILBOX_PYTHON) return process.env.MAILBOX_PYTHON
     if (cachedPython) return cachedPython
+    const failures = []
     for (const c of ['python3', 'python', 'py']) {
       try {
         const r = spawnSync(c, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 5000 })
         if (String(r.stdout || '').trim() === '1') { cachedPython = c; return c }
-      } catch { /* 试下一个 */ }
+        failures.push(c + ':' + probeFailDetail(r))
+      } catch (e) {
+        // spawnSync 本身抛（参数非法等）也要记下，同样不许静默
+        failures.push(c + ':throw=' + String((e && e.code) || (e && e.message) || e).slice(0, 60))
+      }
     }
+    console.warn('[fs] identity-python probe_fail 候选全部不可用 ⇒ 回退 python3（原语义不变）：' +
+      failures.join('；'))
     return (cachedPython = 'python3')
   }
 
