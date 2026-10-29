@@ -22,8 +22,11 @@
  *
  * 自测：`node identity-inject.mjs --selftest`
  *
- * 版本：V0.8-26102901（2026-10-29）
+ * 版本：V0.8-26102902（2026-10-29）
  * 变更记录：
+ *   V0.8-26102902 2026-10-29 —— 中台 #1866 第4项收尾：`--selftest` parity 段自己的解释器探测
+ *     仍是空 `catch`，parity 被跳过时看不出为什么（与 `currentPython()` 同族）。改为逐候选记
+ *     退出码/抛出原因，并写进「跳过 parity」那行；只动自测输出，不改解析与判定。
  *   V0.8-26102901 2026-10-29 —— 中台 #1866（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` 第4项续）：
  *     `currentPython()` 探测解释器时的静默 catch 改显式留痕——逐候选记「名称＋错误码/退出码/信号」，
  *     三个候选全挂时向 stderr 打一条明确告警。🔴 探测结果与回退语义不变（仍 `return 'python3'`），
@@ -896,15 +899,24 @@ export function selftest () {
     const pyScript = path.join(path.dirname(fileURLToPath(import.meta.url)),
       'scripts', 'resolve_actor.py')
     let pyBin = ''
+    // #1866（2026-10-29）同族空吞：自测里的探测也要留痕，否则「跳过 parity」看不出原因
+    const pyFails = []
     for (const c of ['python3', 'python', 'py']) {
       try {
         const pr = spawnSync(c, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 5000 })
         if (String(pr.stdout || '').trim() === '1') { pyBin = c; break }
-      } catch { /* 试下一个 */ }
+        // spawnSync 不走 throw 报 ENOENT（例：PATH 里没这个命令）⇒ 先看 error.code，别只打 exit=null
+        pyFails.push(c + ':' + (pr.error
+          ? 'error=' + String(pr.error.code || pr.error.message || pr.error).slice(0, 40)
+          : pr.signal ? 'signal=' + pr.signal : 'exit=' + String(pr.status)))
+      } catch (e) {
+        pyFails.push(c + ':throw=' + String((e && e.code) || (e && e.message) || e).slice(0, 40))
+      }
     }
     if (!pyBin || !fs.existsSync(pyScript)) {
       console.log('  ⚠️ 本机没有可用的 python / resolve_actor.py ⇒ parity 对照**跳过**'
-        + '（JS 夹具断言照常全跑；服务器定版前需在有 python 的机器上补跑一次）')
+        + '（探测失败：' + (pyFails.join('；') || 'python 可执行但 resolve_actor.py 缺失') + '；'
+        + 'JS 夹具断言照常全跑；服务器定版前需在有 python 的机器上补跑一次）')
     } else {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'identity-parity-'))
       const mapFile = path.join(tmp, 'identity_map.json')
