@@ -48,3 +48,7 @@ Thumbs.db
 .vscode/
 # 施工/冒烟产物目录（selftest、smoke 运行产物）—— 不入库
 output/
+
+# 内部运维文档不入公开仓（CM 2026-10-30 令：排障/回执文档漏排查，本地保留不跟踪）
+DIAGNOSIS-*.md
+VERIFICATION-*.md
