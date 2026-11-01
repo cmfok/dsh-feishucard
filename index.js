@@ -26,7 +26,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 //    规格：NODE1 v3 §2.5 ＋ `P1.5-身份注入-按人判-施工任务书-v1.md` D5（归属：HOME）
 import {
   TurnIdentityStore, applyActorToArguments, decideAction, makeResolver, pickMapPath, localMapPath,
-  IDENTITY_KEYS,
+  IDENTITY_KEYS, GUARDOFF_IDENTITY_KEYS, identityArgKeys,
+  sanitizeSelfReported, verifiedIdField,
 } from './identity-inject.mjs'
 // G3 员工会话「工具调用失败」旁路上报（#514 / D38=需求 路径A）。默认零触发：
 // 白名单（AIAD_G3_REPORT_CWD_ALLOW）与写入根（AIAD_INBOX_ROOT）不注入 ⇒ 不写任何东西。
@@ -85,6 +86,27 @@ function conclusionSplitMinMs(bot) {
   if (Number.isFinite(cfgVal) && cfgVal >= 0) return cfgVal
   const raw = Number(process.env.DSH_FEISHU_SPLIT_MIN_MS)
   return Number.isFinite(raw) && raw >= 0 ? raw : CONCLUSION_SPLIT_DEFAULT_MS
+}
+
+// ── #2591 件2① 同步闸（2026-10-30）：疑似 维护者 裁决口径检测（关键词级，提醒非强制）──
+// 词表/句式与 内部工具/tools/mt.py RULING_UTTERANCE_WORDS/_RULING_UTTERANCE_RX 同源
+// （真相源在 mt.py，改词表须两侧同步）；桥在服务器侧跑、不依赖 mt.py 路径——检测在
+// 桥内本地做，提醒文案指路 agent 跑 mt.py CLI 闭环。误报成本低（多提醒一轮），漏报
+// 由 daily-patrol ⑥bf 24h 挂墙广播兜底。开关：bot 配置 rulingHint:false 可关（默认开）。
+const RULING_HINT_RX = /(同意|批准|不准|不允许|不行|驳回|否决|拍板|就按|定了|采纳|裁决是|确认按)|选\s*[0-9１-９一二三四五六七八九十]|方案\s*[0-9１-９一二三四五六七八九十]|[按依][^\n]{1,8}办/
+const RULING_HINT_NOTE =
+  '\n\n〔中台同步闸·桥注入〕本条疑似 维护者 裁决口径（#2591，提醒非强制）。同步动作当轮完成：' +
+  '① 先查库 python 内部工具/tools/mt.py adjcards search "<关键词>"（✅＝可用裁决照办，执行留痕引卡号/台账号）；' +
+  '② 命中挂墙待拍卡 adjcards decide AC-NNNN --ruling "<维护者原话>" --cm-quote "<维护者原话>" 代录闭环；' +
+  '③ 会话内新裁决重大事项 adjcards gen <来源> --matter … --decide-now --cm-quote "<维护者原话>"；' +
+  '小事口头指令走项目台账 ledger append 分流，不出卡。'
+function rulingHintFor(bot, text) {
+  try {
+    if (bot && bot.cfg && bot.cfg.rulingHint === false) return ''
+    const s = String(text || '')
+    if (!s || s.length > 4000 || !RULING_HINT_RX.test(s)) return ''
+    return RULING_HINT_NOTE
+  } catch { return '' }
 }
 const SESSION_GEN = 2                // session-state schema gen; gen<2 sessions predate the standard-preset mount and never saw file/shell tools
 const DRAIN_INTERVAL = 500           // helper stdout drain interval
@@ -776,6 +798,10 @@ export function apply(ctx) {
         // 0.7.18（身份闸门）：**默认关** —— 不写就是关（上游用户不一定需要这个功能；维护者 2026-10-04 定）。
         // 打开后：入站按 `open_id` 查身份表 ⇒ 工具入参里的身份字段一律被覆写成表里的真值；
         //        拿不到身份则拒绝执行（fail-closed）。
+        // 关闭时（#2626·需求 方案A 第一步起）：不判权，但**也不再原样转发模型自报身份**——
+        //        飞书回合入参里的严格身份键（open_id/union_id/person_id/sender_open_id/sender_union_id）
+        //        用入站事件权威值覆写、无真值可核则剔除＋`identity guard-off sanitize` 留痕；
+        //        非飞书回合（GUI/子代理/定时）不受影响。开闸环境见 decisions/2026-10-30-identityGuard机器开关矩阵.md。
         // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
         identityGuard: typeof bot.identityGuard === 'boolean' ? bot.identityGuard : undefined,
         // 0.8.4（A5/A6 能力审批表）：**默认关**（维护者 2026-10-06「身份闸先全关，验证时挑一个账号」）。
@@ -1497,11 +1523,18 @@ export function apply(ctx) {
   }
 
   // 渲染入口：回合失败在**员工可见文本**上的降级形态（整句）。
-  // alertInfo（可选）＝{ why, chatId, botName }：低档降级时补一行管理员 ALERT（原文只进这行日志）。
-  function visibleFailureText(failure, actor, alertInfo) {
+  // alertInfo（可选）＝{ why, chatId, botName }：降级时补一行管理员 ALERT（原文只进这行日志）。
+  // guardOn（第四参）＝该 bot 是否启用身份体系（identityGuard），由调用方传 `bot.cfg.identityGuard`。
+  //   🔴 未启用 ⇒ **无须认人，直接给人话原因**。依据（维护者 2026-10-28 口谕，需求 语境澄清）：
+  //      需求「只认系统档位 ≥ L3」的适用范围是**接了 G9 基座**的场景；
+  //      没接基座时认人没有意义，而把上游报错（限流/断 key/超时——与权限无关）藏成统一话术，
+  //      会让使用者永远查不到原因。开源分发默认形态即此类（identityGuard 默认关）。
+  //      脱敏面不变：原始报文/错误码仍只进日志。
+  function visibleFailureText(failure, actor, alertInfo, guardOn) {
     if (!failure || !failure.systemError) return ''
-    if (actorVisibleTier(actor) >= 3) {
-      const zh = String(failure.zh || '').trim()
+    const zh = String(failure.zh || '').trim()
+    const showReason = !guardOn || actorVisibleTier(actor) >= 3
+    if (showReason) {
       return '⚠️ 本轮没有产生回复：' + (zh || '上游报错（原因未归类，详情见日志）')
         + '｜原始报文只进日志'
     }
@@ -1513,13 +1546,15 @@ export function apply(ctx) {
     return SYS_ERROR_UNIFIED_TEXT
   }
 
-  // 自愈提示「（原因）」括号里的短语：L3+ 给人话，其余档位给统一话术。
+  // 自愈提示「（原因）」括号里的短语：同 visibleFailureText 的三态口径——
+  //   未启用身份体系（guardOn=false）⇒ 直接给人话原因；接了 G9 才按系统档位（需求 语境）。
   // 不在此重复打 ALERT——同一条失败在 runTurn 封口时已按档位告过一次。
-  function safeFailureReasonForViewer(failure, actor) {
+  function safeFailureReasonForViewer(failure, actor, guardOn) {
     if (!failure || !failure.systemError) return ''
-    return actorVisibleTier(actor) >= 3
-      ? (String(failure.zh || '').trim() || '上游报错（原因未归类，详情见日志）')
-      : SYS_ERROR_UNIFIED_TEXT
+    if (!guardOn || actorVisibleTier(actor) >= 3) {
+      return String(failure.zh || '').trim() || '上游报错（原因未归类，详情见日志）'
+    }
+    return SYS_ERROR_UNIFIED_TEXT
   }
 
   // 插话提示的醒目样式（2026-10-02 维护者：「加个框，然后加粗，或者换个颜色」）。
@@ -3339,7 +3374,8 @@ export function apply(ctx) {
         type: 'message',
         text: visibleFailureText(failure,
           (__turnIdentity && __turnIdentity.get(agent && agent.id) || {}).actor,
-          { why: 'auto_round', chatId, botName: (bot && bot.cfg && bot.cfg.name) || '' }),
+          { why: 'auto_round', chatId, botName: (bot && bot.cfg && bot.cfg.name) || '' },
+          Boolean(bot && bot.cfg && bot.cfg.identityGuard)),
       })
     } else if (!closing.text && card.tools.size === 0) {
       // 与普通回合同源（2026-09-21）：没有产出、也没有失败标记时，**不许**写「✅ 本轮结束」装成功。
@@ -6237,6 +6273,28 @@ export function apply(ctx) {
       } catch (error) {
         console.log('[fs] identity(steer) resolve failed (ignored): ' + String(error && error.message || error))
       }
+    } else {
+      // #2626 · 需求 方案A 第一步「插件传真实身份」：关闸＝不判权（2026-10-30 开关矩阵），
+      //   但入站事件权威字段（evt.sender.sender_id，飞书服务端填、伪造不了）仍记进本轮上下文，
+      //   供 tools/execute 关闸净化支覆写/剔除「模型自报身份」。actor=null 不判权、不查表。
+      //   仅当事件**带 sender** 才落记录：合成轮（inject-context 等 _internal 无 sender）不覆写，
+      //   保留本聊天上一真实轮真值；带 sender 但形状非法 ⇒ 落空真值＝后续调用走剔除支（fail-closed）。
+      try {
+        if (evt.sender) {
+          const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
+          idc.store.set(entry.agent.id, {
+            actor: null, chatId, messageId: evt.message_id,
+            verified: {
+              open_id: verifiedIdField(openId),
+              union_id: verifiedIdField(evt.sender && evt.sender.sender_id && evt.sender.sender_id.union_id),
+            },
+          })
+        }
+      } catch (error) {
+        // 记不上真值 ⇒ 关闸净化支会把自报身份键**剔除**（判不了不转发），不会退化成放行冒充
+        console.log('[fs] identity(steer) verified-record failed (self-reported ids will be dropped): '
+          + String(error && error.message || error))
+      }
     }
     // P0-3：label/明细统一由 senderLabelFooter 生成（与常规回合同构）。
     const senderMark = senderLabelFooter(bot, evt, identityActor)
@@ -6248,7 +6306,8 @@ export function apply(ctx) {
         id: 'fs-' + evt.message_id,
         role: 'user',
         // P0-2/P0-3：发送方明细 + @ 对象明细只进会话文本，不进卡片。
-        content: [{ type: 'text', text: label + text + senderMark.footer + (evt.mentionFooter || '') + quote }],
+        // #2591：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，插话路径）。
+        content: [{ type: 'text', text: label + text + senderMark.footer + (evt.mentionFooter || '') + quote + rulingHintFor(bot, text) }],
         source: { kind: 'user' },
       })
     } catch (error) {
@@ -6530,6 +6589,26 @@ export function apply(ctx) {
       } catch (error) {
         console.log('[fs] identity resolve failed (ignored): ' + String(error && error.message || error))
       }
+    } else {
+      // #2626 · 需求 方案A 第一步：同插话路径——关闸不判权，但入站权威值入上下文，
+      //   tools/execute 关闸净化支据此覆写/剔除模型自报身份（绝不原样转发冒充值）。
+      //   仅当**带 sender** 才落记录（合成轮 _internal 无 sender 不覆写，保留上一真实轮真值；
+      //   带 sender 但形状非法 ⇒ 空真值 ⇒ 后续调用走剔除支 fail-closed）。
+      try {
+        if (evt.sender) {
+          const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
+          idc.store.set(agent.id, {
+            actor: null, chatId, messageId,
+            verified: {
+              open_id: verifiedIdField(openId),
+              union_id: verifiedIdField(evt.sender && evt.sender.sender_id && evt.sender.sender_id.union_id),
+            },
+          })
+        }
+      } catch (error) {
+        console.log('[fs] identity verified-record failed (self-reported ids will be dropped): '
+          + String(error && error.message || error))
+      }
     }
     // P0-3：label/明细统一由 senderLabelFooter 生成（与插话路径同构）。
     // 前缀由【服务端算出的 actor】生成；guard 关时 label 只写「用户/机器人」，
@@ -6581,7 +6660,8 @@ export function apply(ctx) {
         id: 'fs-' + messageId,
         role: 'user',
         // #1105：日期锚拼在当轮消息最前（同日已注时为空串，追加式不回写历史）。
-        content: [{ type: 'text', text: dateAnchor + label + text + senderMark.footer + (evt.mentionFooter || '') + quote }],
+        // #2591：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，常规路径）。
+        content: [{ type: 'text', text: dateAnchor + label + text + senderMark.footer + (evt.mentionFooter || '') + quote + rulingHintFor(bot, text) }],
         source: { kind: 'user' },
       }
       let card = makeCardState(turnAgent)
@@ -6780,7 +6860,8 @@ export function apply(ctx) {
       const silent = notSpoken && card.tools.size === 0
       if (notSpoken && failure) {
         reply = visibleFailureText(failure, identityActor,
-          { why: 'turn', chatId, botName: (bot && bot.cfg && bot.cfg.name) || '' })
+          { why: 'turn', chatId, botName: (bot && bot.cfg && bot.cfg.name) || '' },
+          Boolean(bot && bot.cfg && bot.cfg.identityGuard))
       } else if (silent) {
         reply = '⚠️ 本轮没有产生回复：上游没有给出失败标记（原因未上报 —— 见 dsh 日志／GUI 里这一轮）'
       }
@@ -7087,7 +7168,7 @@ export function apply(ctx) {
         // 原因用上游给的真实原因（有的话），不再一律猜「可能被 dsh 重启打断」。
         // 中台 #2216：这句同样进员工对话框 ⇒ 走档位闸（L3+ 人话短语；其余统一话术，
         //   原文只进日志——封口那行 `turn sealed` 已带 failure= 全文，ALERT 也在 runTurn 打过）。
-        const why = failedTurn.failure ? '（' + safeFailureReasonForViewer(failedTurn.failure, identityActor) + '）' : ''
+        const why = failedTurn.failure ? '（' + safeFailureReasonForViewer(failedTurn.failure, identityActor, Boolean(bot && bot.cfg && bot.cfg.identityGuard)) + '）' : ''
         const notice = '⚠️ 上一会话本轮没有产生回复' + why + '，已自动重建会话重试。'
         turn.reply = notice + '\n\n' + turn.reply
         turn.card.blocks.unshift({ type: 'message', text: notice })
@@ -11224,8 +11305,55 @@ export function apply(ctx) {
     try {
       const owner = findChatForAgent(exec.agent)
       // 🔒 开关 `identityGuard` **默认关**（上游用户不一定需要这个功能；维护者 2026-10-04 定）
-      //    ⇒ 关着就直接 next()，**零开销、零副作用**（连 store 都不查）。
-      if (!(owner && owner.bot && owner.bot.cfg && owner.bot.cfg.identityGuard)) return next()
+      //    ⇒ 关着就**不做判权**（不查身份表、不拒回合——2026-10-30 开关矩阵：开发机/web gui 禁开，
+      //       全拒＝把 维护者 自己的电脑锁死，违 2026-10-04 裁决）。
+      //    ⚠️ 但 #2626（需求 方案A 第一步「插件传真实身份」）：关闸≠放任模型自报身份过关——
+      //       飞书回合的工具入参里出现严格身份键（open_id/union_id/person_id/sender_open_id/
+      //       sender_union_id）时，一律用**桥侧真值**（入站事件 sender_id，服务端填、伪造不了）覆写，
+      //       无真值可核 ⇒ 剔除（fail-closed：判不了不转发，工具如实报缺参数，好过带冒充值执行）。
+      //       非飞书回合（无 owner：GUI/子代理/定时轮）不在此面，原样放行。
+      if (!(owner && owner.bot && owner.bot.cfg && owner.bot.cfg.identityGuard)) {
+        const guardOffKeys = Object.keys(GUARDOFF_IDENTITY_KEYS)
+        const rawArgs = exec.arguments
+        if (!(owner && rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs))
+          || !guardOffKeys.some((k) => Object.prototype.hasOwnProperty.call(rawArgs, k))) return next()
+        try {
+          // 审计留痕先取「自报了什么」（覆写会改掉克隆，取证必须在覆写前）
+          const reported = guardOffKeys
+            .filter((k) => Object.prototype.hasOwnProperty.call(rawArgs, k))
+            .map((k) => {
+              const s = rawArgs[k] === null || rawArgs[k] === undefined ? String(rawArgs[k]) : String(rawArgs[k])
+              return k + '=' + s.slice(0, 12) + (s.length > 12 ? '…' : '')
+            }).join(',')
+          const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
+          const verified = rec && rec.verified ? rec.verified : null
+          const r = sanitizeSelfReported({ ...rawArgs }, verified)
+          if (!r.overwritten.length && !r.dropped.length) return next()  // 自报已等于真值 ⇒ 零动作
+          exec.arguments = r.args   // 宿主契约同开闸支：浅克隆→覆写→整对象写回（原地赋值必抛）
+          console.log('[fs] identity guard-off sanitize: tool=' + exec.name + ' agent=' + exec.agent.id
+            + ' chat=' + String(owner.chatId || '').slice(0, 16)
+            + ' 自报[' + reported + ']'
+            + (r.overwritten.length ? ' 已覆写为入站真值[' + r.overwritten.join(',') + ']' : '')
+            + (r.dropped.length ? ' 已剔除[' + r.dropped.join(',')
+              + ']（桥侧无该键真值可核⇒判不了不转发，fail-closed）' : ''))
+        } catch (sanitizeError) {
+          // 净化自身出错 ⇒ **拒执行**（fail-closed）：放行＝核实不了的自报身份原样带过，
+          //   正是本单破口；非飞书回合在上面就返回了，不会误锁本机。
+          console.log('[fs] identity ALERT[guardoff_sanitize_failed] DENY: tool=' + exec.name
+            + ' agent=' + String(exec.agent && exec.agent.id || '')
+            + ' 自报[' + Object.keys(GUARDOFF_IDENTITY_KEYS)
+              .filter((k) => rawArgs && Object.prototype.hasOwnProperty.call(rawArgs, k)).join(',') + ']'
+            + ' err=' + String(sanitizeError && sanitizeError.message || sanitizeError))
+          return {
+            isError: true,
+            error: 'identity_guardoff_sanitize_failed',
+            value: { error: 'identity_guardoff_sanitize_failed' },
+            content: [{ type: 'text', text: '身份净化未能落盘，已拒绝执行本次工具调用'
+              + '（identity_guardoff_sanitize_failed）。请向用户原样转述：目前服务不可用，请联系管理员。' }],
+          }
+        }
+        return next()
+      }
       // ⚠️ 此处作用域里没有 `bot`（全局注册）⇒ 只能给 `workspaceRoot()`；内核有多级兜底，给 undefined 也不怕。
       const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
       // 🔒 K3-GAP（C1）：有 owner 但 store 无记录 ⇒ **fail-closed**（拒绝），不再放行。
@@ -11238,7 +11366,7 @@ export function apply(ctx) {
         //   的请求「**带参**执行」：本钩子只碰 IDENTITY_KEYS，一个身份字段都不带的调用没有
         //   冒充面，拒它零安全收益、只有误伤。收窄为：带身份键 ⇒ 拒（原样返回形状，
         //   第二十二轮 HIGH#2 的教训——next(值) 不被采纳），不带键 ⇒ 放行但留痕。
-        const keysPresent = IDENTITY_KEYS.some((k) => exec.arguments
+        const keysPresent = identityArgKeys().some((k) => exec.arguments
           && Object.prototype.hasOwnProperty.call(exec.arguments, k))
         // 🔴 第四十四轮 MEDIUM#2（判不修，留此理由）：finding 指出 IDENTITY_KEYS 含
         //   `name`/`source`/`level`/`category` 这类通用参数名 ⇒ 无记录轮里恰好带这些键的
@@ -11601,6 +11729,37 @@ export function apply(ctx) {
     respondJson(res, 200, { ok: true, bots: list })
   }
 
+  // ---- [SEC-ADMIN-20261031 fix-1/fix-2] 管理面共享 token 唯一取数出口 ----------------
+  // 口径同 RC-004：env FEISHU_INJECT_TOKEN 优先；未配置时回退读同机共享 token 文件。
+  // fix-1 实锤：v2.1 回退分支曾写 `const fs = require('fs')` —— ESM 模块里没有 require，
+  //   必抛 ReferenceError 被外层空 `catch {}` 无声吞 ⇒ 回退文件**从未被读到过**。
+  //   这里改用顶层已 import 的 `readFileSync`（node:fs，index.js:18），并把「文件不存在
+  //   （ENOENT＝确实未配置，维持旧静默语义）」与「其它读取错误（权限/IO，必须可见）」区分开。
+  // fix-2：config 写端点（替换全部 bot 凭据、10 秒热生效）与 status 端点（吐
+  //   appId/workspace/lastChatId）与 inject-context 共用同一取 token 逻辑，杜绝复制粘贴漂移。
+  //   未配置 token 时 fail-closed（503），与 inject-context 同形态。
+  function getAdminSharedToken() {
+    const fromEnv = (process.env.FEISHU_INJECT_TOKEN || '').trim()
+    if (fromEnv) return fromEnv
+    try {
+      return readFileSync('/opt/scripts/G5/v2/service/inject_token.txt', 'utf8').trim()
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') {
+        console.log('[fs] ! inject-token fallback unreadable: ' + String((error && (error.code || error.message)) || error))
+      }
+      return ''
+    }
+  }
+  // true＝放行；false＝已作答（503 未配置 fail-closed / 403 token 不符）。头缺失按空串处理
+  //   （冒烟夹具的假 req 可能不带 headers，不能因此抛 TypeError）。
+  function requireAdminToken(req, res) {
+    const want = getAdminSharedToken()
+    if (!want) { respondJson(res, 503, { ok: false, message: 'admin gate disabled (no token configured)' }); return false }
+    const got = String((req.headers && req.headers['x-inject-token']) || '').trim()
+    if (got !== want) { respondJson(res, 403, { ok: false, message: 'bad token' }); return false }
+    return true
+  }
+
   // ---- lifecycle --------------------------------------------------------------
   ctx.effect(() => {
     const stopTimer = ctx.interval(() => {
@@ -11661,6 +11820,8 @@ export function apply(ctx) {
 
   registerRoute('/feishu/admin/status', (req, res) => {
     if (req.method !== 'GET') return respondJson(res, 405, { ok: false, message: 'method not allowed' })
+    // fix-2（20261031）：status 吐 appId/workspace/lastChatId，纳入与 inject-context 同规格的共享 token 门。
+    if (!requireAdminToken(req, res)) return
     handleStatus(res)
   })
 
@@ -11674,14 +11835,10 @@ export function apply(ctx) {
   //   查不到＝该用户从未与本桥任何 bot 私聊 ⇒ 404 如实报（不猜 chat）。
   registerRoute('/feishu/admin/inject-context', async (req, res) => {
     if (req.method !== 'POST') return respondJson(res, 405, { ok: false, message: 'method not allowed' })
-    let want = (process.env.FEISHU_INJECT_TOKEN || '').trim()
-    if (!want) {
-      // RC-004 v2.1：env 未配时回退读 G5 侧共享 token 文件（同机同值，避免 systemd drop-in 依赖）
-      try {
-        const fs = require('fs')
-        want = fs.readFileSync('/opt/scripts/G5/v2/service/inject_token.txt', 'utf8').trim()
-      } catch { /* 文件不存在＝确实未配置 */ }
-    }
+    // fix-1（20261031）：v2.1 回退分支原是 `require('fs')` —— ESM 无 require ⇒ 必抛 ReferenceError
+    //   被空 catch 吞，「回退读 G5 侧共享 token 文件」这条通道从未真实生效。改用统一出口
+    //   getAdminSharedToken()（顶层 node:fs 的 readFileSync；ENOENT 静默＝确未配置，其它错误打 warn 可见）。
+    const want = getAdminSharedToken()
     if (!want) return respondJson(res, 503, { ok: false, message: 'inject disabled (no token configured)' })
     const got = String(req.headers['x-inject-token'] || '').trim()
     if (got !== want) return respondJson(res, 403, { ok: false, message: 'bad token' })
@@ -11719,6 +11876,8 @@ export function apply(ctx) {
       return
     }
     if (req.method === 'POST') {
+      // fix-2（20261031）：写端点会替换全部 bot 凭据并 10 秒热生效，纳入共享 token 门（GET 读取面不变）。
+      if (!requireAdminToken(req, res)) return
       const body = await readBody(req)
       const list = normalizeConfig(body)
       try {
@@ -11739,7 +11898,7 @@ export function apply(ctx) {
     description: 'Send a text message to a Feishu chat through a configured app bot (~/.dsh-feishucard/feishu.config.json). chatId is optional: it defaults to the most recent chat that messaged the bot. appId is optional: it selects which bot to use (defaults to the bot that last received a message). NOTE: replying to the user in an ongoing Feishu conversation does NOT need this tool — the reply is delivered as a card automatically; calling it mid-conversation sends a SECOND message and duplicates the answer.',
     parameters: {
       text: { type: 'string', required: true, description: 'Text content to send.' },
-      chatId: { type: 'string', description: 'Target chat id (oc_...). Omit to send to the most recent chat that messaged the bot.' },
+      chatId: { type: 'string', description: 'Target chat id (oc_...). Omit to send to the most recent chat that messaged the bot. NOTE [fix-3]: sending to a chat the calling session does not own needs admin opt-in (env FEISHU_ALLOW_CROSS_CHAT_SEND=1); otherwise it is refused with 跨会话发送未启用.' },
       appId: { type: 'string', description: 'Bot app id (cli_...) to send through. Omit to use the bot that most recently received a message.' },
       at: { type: 'string', description: '0.8.0 互认：要 @ 的对象，逗号分隔的名字（人或另一个 bot，须能在 bot_roster.json / identity_map 解析到），或 "all"。会展开成真 @ 并唤醒被 @ 的 agent；解析不到只留原文并声明，不发幽灵 @。正文里手写 @[名字] / @「名字」 同样生效。' },
     },
@@ -11755,7 +11914,7 @@ export function apply(ctx) {
       },
       render: (args, value) => [{ type: 'text', text: 'feishu_send -> ' + JSON.stringify(value) }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       const list = await readConfig()
       const appId = typeof args.appId === 'string' && args.appId.length > 0 ? args.appId.trim() : undefined
       let bot
@@ -11817,6 +11976,23 @@ export function apply(ctx) {
           }
         }
         console.log('[fs] feishu_send NOT skipped: no targetChat 且无活跃卡')
+      }
+      // [SEC-CROSSCHAT-20261031 fix-3] 跨会话发送闸：原先任意 agent 会话可传任意 chatId 向其他员工
+      //   私聊发消息。「本会话」判据＝调用方 agent 的飞书归属会话（exec.agent → findChatForAgent，
+      //   与审批卡工具同一套既有机制，非新造）；查不到归属（GUI/子代理/定时会话）或目标 ≠ 归属会话
+      //   ⇒ 视为跨会话，须 env FEISHU_ALLOW_CROSS_CHAT_SEND=1 显式开启，否则 fail-closed 拒发
+      //   （对齐铁律 0「生产默认关」；冒烟/开发形态由 smoke 夹具显式开）。
+      const ownerChat = findChatForAgent(exec && exec.agent)
+      const isSelfChat = Boolean(ownerChat && targetChat && String(targetChat) === String(ownerChat.chatId))
+      if (!isSelfChat && process.env.FEISHU_ALLOW_CROSS_CHAT_SEND !== '1') {
+        console.log('[fs] feishu_send denied (cross-chat send disabled): target=' + String(targetChat || '-')
+          + ' owner=' + String((ownerChat && ownerChat.chatId) || '-'))
+        return {
+          ok: false, status: 0,
+          detail: '跨会话发送未启用：本会话不是目标会话的所有者，默认拒绝代发。'
+            + '若是在当前对话里回复用户，直接把内容作为最终回答输出即可（会自动进飞书卡片，无需调用本工具）；'
+            + '确需发到别的会话，须由管理员为本桥设置 FEISHU_ALLOW_CROSS_CHAT_SEND=1 后重试。',
+        }
       }
       try {
         // P1-2（0.8.0 互认）：`at` 参数换成正文前导的 @ token（`@[名]` / `@all`），
