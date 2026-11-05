@@ -22,8 +22,28 @@
  *
  * 自测：`node identity-inject.mjs --selftest`
  *
- * 版本：V0.8-26102201（2026-10-22）
+ * 版本：V0.10-26110101（2026-11-01）
  * 变更记录：
+ *   V0.10-26110101 2026-11-01 —— 中台 #2626（需求 方案 A 第一步「插件传真实身份」）：
+ *     ① 新增别名键 `IDENTITY_ALIAS_KEYS`（sender_open_id/sender_union_id → actor 真值字段）并入
+ *       `applyActorToArguments` 覆写面——开闸时模型自报的 sender_open_id 同样被覆写/剔除（此前
+ *       白名单只认 open_id 本尊，G5 约面链用的 sender_open_id 不在覆写面内，属冒充面漏项）。
+ *     ② 新增关闸侧净化 `sanitizeSelfReported`：飞书回合＋identityGuard 关 ⇒ 桥不做判权（开关矩阵），
+ *       但身份键入参**不再原样转发**——有桥侧真值 ⇒ 覆写；无真值/真值不合形状 ⇒ 剔除＋留痕。
+ *       不整体拒回合（那是开闸语义；关闸全拒＝锁 维护者 本机，违 2026-10-04 裁决）。
+ *     ③ 新增入参校验 `verifiedIdField`（类型/长度≤64/字符集 [A-Za-z0-9_-]），形状不符＝当真值缺失，
+ *       按「判不了不转发」处理，不编造兜底。`--selftest` 增第 8 节钉住以上三件。
+ *   V0.9-26103101 2026-10-31 —— fix-4（根级规则 A17 硬编码盘符）：`assetCandidates` 第③级兜底不再直接
+ *     写死 `['P:/Qoder/work','D:/Work']`，改为**优先读 `WORK_ROOT` 环境变量**；env 缺失时才回落原数组
+ *     并向 stderr 打一行提示（每进程一次，避免现网无 env 时直接坏）。判定顺序与返回值形状不变。
+ *     同文件其余盘符字面量仅存在于注释/历史来源说明（第 4、66-67、490 行），非执行路径，不改。
+ *   V0.8-26102902 2026-10-29 —— 中台 #1866 第4项收尾：`--selftest` parity 段自己的解释器探测
+ *     仍是空 `catch`，parity 被跳过时看不出为什么（与 `currentPython()` 同族）。改为逐候选记
+ *     退出码/抛出原因，并写进「跳过 parity」那行；只动自测输出，不改解析与判定。
+ *   V0.8-26102901 2026-10-29 —— 中台 #1866（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` 第4项续）：
+ *     `currentPython()` 探测解释器时的静默 catch 改显式留痕——逐候选记「名称＋错误码/退出码/信号」，
+ *     三个候选全挂时向 stderr 打一条明确告警。🔴 探测结果与回退语义不变（仍 `return 'python3'`），
+ *     调用方契约不受影响；只加可见性。
  *   V0.8-26102201 2026-10-22 —— 中台 #1866 第4项（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` §5）：
  *     本地增量表 `identity_map.local.json` 的读态不再被空 `catch` 无声吞 ⇒ 新增 `noteLocalMapRead`
  *     显式留痕（absent／parse_fail／unreadable 三态，只记状态＋路径＋错误码＋影响，不落文件内容）。
@@ -43,11 +63,58 @@ export const IDENTITY_KEYS = Object.freeze([
   'level', 'category', 'scopes', 'channels', 'grants', 'source',
 ])
 
+// ── #2626（需求 方案 A 第一步「插件传真实身份」）· 别名键与关闸净化 ──────────
+/**
+ * 别名入参键 → actor 真值字段（映射值是 actor 上的键名）。
+ * G5 约面链请求体的 `sender_open_id` 字段名即出自这类工具入参——此前白名单只认
+ * `open_id` 本尊，模型自报的 sender_open_id 桥侧**看都不看**，属冒充面漏项。
+ * 开闸支：与白名单同构——有真值覆写、无真值剔除；actor 永远带 open_id
+ * （resolveActorJs 契约「🔴 actor 必须回带 open_id」），union_id 空串 ⇒ 剔除。
+ */
+export const IDENTITY_ALIAS_KEYS = Object.freeze({
+  sender_open_id: 'open_id',
+  sender_union_id: 'union_id',
+})
+
+/**
+ * 🔴 关闸支的严格身份键（键 → verified 记录里的真值字段；'' ＝桥侧无真值来源，一律剔除）。
+ * 刻意**不含** name/level/category/scopes/channels/grants/source 这类通用名键——
+ * 单点误拒面见 index.js「第四十四轮 MEDIUM#2」注释；关闸侧只处理「谁」这几张卡。
+ * person_id 没有桥侧真值来源（要查身份表，而关闸=不查表）⇒ 判不了 ⇒ 不转发（剔除），
+ * 这正是 fail-closed：**宁可工具拿不到身份参数如实报错，也不转发一个核实不了的冒充值**。
+ */
+export const GUARDOFF_IDENTITY_KEYS = Object.freeze({
+  open_id: 'open_id',
+  union_id: 'union_id',
+  person_id: '',
+  sender_open_id: 'open_id',
+  sender_union_id: 'union_id',
+})
+
+/** 「调用是否带身份键」的完整键集＝覆写白名单＋别名键（拒集＝覆写面，口径同源，别分家） */
+export function identityArgKeys () {
+  return IDENTITY_KEYS.concat(Object.keys(IDENTITY_ALIAS_KEYS))
+}
+
+/**
+ * 桥侧真值 id 的入参校验（A18/安全基线：类型/长度/字符集）——**入站权威字段也要过这道闸**：
+ * 事件字段虽是飞书服务端填的，但它会被拼进日志、比对与转发，形状不符（超长/带空白符号/非字符串）
+ * ＝不可信来源被伪造或截断污染 ⇒ 返回 ''（按「无真值」处理 ⇒ 关闸支剔除自报键，绝不编造兜底）。
+ */
+export function verifiedIdField (raw) {
+  const s = typeof raw === 'string' ? raw.trim() : ''
+  if (!s || s.length > 64 || !/^[A-Za-z0-9_-]+$/.test(s)) return ''
+  return s
+}
+
 /** 默认表路径（服务器）；可用环境变量 MAILBOX_IDENTITY_MAP 覆盖 */
 export const DEFAULT_MAP_PATH = '/opt/scripts/G9/identity_map.json'
 export const DEFAULT_JOBGRANTS_PATH = '/opt/scripts/G9/job_grants.json'
 /** 默认 resolver 路径（服务器）；可用环境变量 MAILBOX_RESOLVER 覆盖 */
 export const DEFAULT_RESOLVER_PATH = '/opt/scripts/G9/resolve_actor.py'
+
+// fix-4（2026-10-31）：WORK_ROOT 未设置时的回落提示只打一次（每进程）
+let __warnedNoWorkRoot = false
 
 /**
  * 资产（表 / resolver）路径解析 —— **一律【跟着工作区】走，不写死机器路径**（维护者 2026-10-04 要求）。
@@ -56,8 +123,8 @@ export const DEFAULT_RESOLVER_PATH = '/opt/scripts/G9/resolve_actor.py'
  *   1. **环境变量**（`MAILBOX_IDENTITY_MAP` / `MAILBOX_RESOLVER`）—— 部署时覆盖用
  *   2. **服务器固定路径** `/opt/scripts/G9/…` —— 8 个员工 bot 的生产位置
  *   3. 🔑 **`<工作区>/output/g9-identity/…`** —— 任何开发机都成立：
- *        · HOME 工作区 `P:\Qoder\work`
- *        · 维护者-OFFICE 工作区 `D:\Work`
+ *        · 调用方传入的工作区、cwd 逐级向上，再兜底 `WORK_ROOT` 环境变量（V0.9 起，A17）
+ *        · `WORK_ROOT` 未设置时才回落到已知开发机位置（兼容旧形态，并打一次提示）
  *      ⇒ 因为表就放在**工作区里**，**Syncthing 会把它同步到各开发机** ⇒ **各机都不会被锁死**。
  *
  * ⚠️ **必须是"相对工作区"、不是"相对本文件"**：插件代码住在别人的仓库里
@@ -84,8 +151,19 @@ export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
       d = up
     }
   } catch { /* 取不到 cwd 就跳过这一级 */ }
-  // ③ **已知工作区兜底**（两台开发机的实际位置；不写死单台 ⇒ 两台都能命中）
-  for (const ws of ['P:/Qoder/work', 'D:/Work']) out.push(path.join(ws, relPath))
+  // ③ **跨机标准变量 WORK_ROOT**（根级规则 A17：work 区路径一律 env 驱动，禁写死盘符；
+  //    每机各一份用户级值，由本机环境注入）
+  const workRoot = String(process.env.WORK_ROOT || '').trim()
+  if (workRoot) out.push(path.join(workRoot, relPath))
+  else {
+    // 兜底回落：本机没配 WORK_ROOT 时用两台已知开发机位置（保留旧形态，避免现网直接坏）。
+    // 每进程只喊一次，避免每次路径解析都刷屏；提示落 stderr，不污染 stdout 契约。
+    if (!__warnedNoWorkRoot) {
+      __warnedNoWorkRoot = true
+      try { process.stderr.write('[identity-inject] WORK_ROOT 环境变量未设置，已回落到已知盘符候选（A17：建议为本机设置 WORK_ROOT）\n') } catch { /* stderr 不可写不拦路径解析 */ }
+    }
+    for (const ws of ['P:/work', 'P:/Qoder/work', 'D:/Work']) out.push(path.join(ws, relPath))
+  }
   return out
 }
 
@@ -142,7 +220,7 @@ export class TurnIdentityStore {
     this.byAgent = new Map()
   }
 
-  set (agentId, { actor, chatId, messageId, tableOk, err }) {
+  set (agentId, { actor, chatId, messageId, tableOk, err, verified }) {
     this.byAgent.set(String(agentId), {
       actor: actor || null,
       chatId: chatId || '',
@@ -151,6 +229,9 @@ export class TurnIdentityStore {
       // 工单1364（案1，2026-10-15）：resolver 错误码原文随 rec 透传，供调用侧 DENY
       // 告警行附带打印 —— tableOk 只说「stat 到文件」，读不了（EACCES/EPERM）全靠这里可见。
       err: err || null,
+      // #2626（需求 方案A）：关闸支的「桥侧真值」——入站事件 sender_id 校验后的
+      // { open_id, union_id }（不做判权、不查表，只为覆写模型自报身份提供权威值）。
+      verified: (verified && typeof verified === 'object') ? verified : null,
       at: Date.now(),
     })
   }
@@ -201,7 +282,52 @@ export function applyActorToArguments (args, actor, keys = IDENTITY_KEYS) {
       dropped.push(k)
     }
   }
+  // #2626（需求 方案 A）：别名键（sender_open_id 等）按映射字段取 actor 真值，
+  //   口径与白名单逐字一致——有真值覆写、actor 没有（空串/缺失）⇒ 剔除、不许带病过关。
+  for (const [k, field] of Object.entries(IDENTITY_ALIAS_KEYS)) {
+    if (!Object.prototype.hasOwnProperty.call(args, k)) continue
+    const truth = Object.prototype.hasOwnProperty.call(actor, field) ? actor[field] : undefined
+    if (truth !== undefined && truth !== null && truth !== '') {
+      if (args[k] !== truth) overwritten.push(k)
+      args[k] = truth
+    } else {
+      delete args[k]
+      dropped.push(k)
+    }
+  }
   return { args, overwritten, dropped, reason: null }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 2b) #2626 · 关闸侧「不采信自报身份」（需求 方案 A 第一步：插件传真实身份）
+//     飞书回合＋identityGuard 关 ⇒ 桥**不做判权**（2026-10-30 开关矩阵：开发机/web gui 禁开），
+//     但身份键入参不能再原样转发给工具：
+//       · 有桥侧真值（入站事件 sender_id 记录在册且形状合规）⇒ 覆写成真值；
+//       · 无真值（记录过期/未落/形状不符/键本身无真值来源如 person_id）⇒ 剔除。
+//     🔴 不整体拒回合——拒绝整轮是开闸语义，关闸侧照搬＝把 维护者 自己的电脑锁死
+//        （2026-10-04 实测事故口径）；也🔴不「保留自报值当兜底」——那正是本单破口本身。
+//     调用侧（index.js tools/execute）负责把 overwritten/dropped 落成中文审计留痕。
+// ───────────────────────────────────────────────────────────────────────────
+export function sanitizeSelfReported (args, verified) {
+  const overwritten = []
+  const dropped = []
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    return { args, overwritten, dropped, touched: false, reason: 'arguments-not-an-object' }
+  }
+  const v = (verified && typeof verified === 'object') ? verified : null
+  let touched = false
+  for (const [k, field] of Object.entries(GUARDOFF_IDENTITY_KEYS)) {
+    if (!Object.prototype.hasOwnProperty.call(args, k)) continue
+    touched = true
+    const truth = v && field ? v[field] : ''
+    if (truth) {
+      if (args[k] !== truth) { args[k] = truth; overwritten.push(k) }
+    } else {
+      delete args[k]
+      dropped.push(k)
+    }
+  }
+  return { args, overwritten, dropped, touched, reason: null }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -443,16 +569,38 @@ export function makeResolver ({ mapPath = null,
   // python 解释器也要探测：服务器叫 `python3`，Windows 上通常只有 `python` / `py`
   //（2026-10-04 实测：写死 `python3` ⇒ 本机 `resolver_no_json`）
   let cachedPython = null
+
+  // 中台 #1866（2026-10-29）：探测失败必须留痕。
+  // 旧实现 `catch { /* 试下一个 */ }` 把「命令不存在（ENOENT）／退出码非 0／超时（ETIMEDOUT）」
+  // 一并无声吞掉，三个候选都不可用时只剩一句 `return 'python3'` —— 事后日志里只能看到
+  // `resolver_no_json`，根本不知道是解释器起不来。现逐个候选记下 名称＋错误码/退出码/信号，
+  // 全挂时向 stderr 打一条明确告警。🔴 只加可见性：返回语义不变（仍回退 `'python3'`，不新增抛出路径）。
+  function probeFailDetail (r) {
+    if (r && r.error) {
+      const code = String(r.error.code || r.error.message || r.error)
+      return 'error=' + code.slice(0, 60) + (code === 'ETIMEDOUT' ? '(超时)' : '')
+    }
+    if (r && r.signal) return 'signal=' + r.signal
+    return 'exit=' + String(r ? r.status : '?') +
+      ' stdout=' + JSON.stringify(String((r && r.stdout) || '').trim().slice(0, 20))
+  }
   function currentPython () {
     if (python) return python
     if (process.env.MAILBOX_PYTHON) return process.env.MAILBOX_PYTHON
     if (cachedPython) return cachedPython
+    const failures = []
     for (const c of ['python3', 'python', 'py']) {
       try {
         const r = spawnSync(c, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 5000 })
         if (String(r.stdout || '').trim() === '1') { cachedPython = c; return c }
-      } catch { /* 试下一个 */ }
+        failures.push(c + ':' + probeFailDetail(r))
+      } catch (e) {
+        // spawnSync 本身抛（参数非法等）也要记下，同样不许静默
+        failures.push(c + ':throw=' + String((e && e.code) || (e && e.message) || e).slice(0, 60))
+      }
     }
+    console.warn('[fs] identity-python probe_fail 候选全部不可用 ⇒ 回退 python3（原语义不变）：' +
+      failures.join('；'))
     return (cachedPython = 'python3')
   }
 
@@ -870,15 +1018,24 @@ export function selftest () {
     const pyScript = path.join(path.dirname(fileURLToPath(import.meta.url)),
       'scripts', 'resolve_actor.py')
     let pyBin = ''
+    // #1866（2026-10-29）同族空吞：自测里的探测也要留痕，否则「跳过 parity」看不出原因
+    const pyFails = []
     for (const c of ['python3', 'python', 'py']) {
       try {
         const pr = spawnSync(c, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 5000 })
         if (String(pr.stdout || '').trim() === '1') { pyBin = c; break }
-      } catch { /* 试下一个 */ }
+        // spawnSync 不走 throw 报 ENOENT（例：PATH 里没这个命令）⇒ 先看 error.code，别只打 exit=null
+        pyFails.push(c + ':' + (pr.error
+          ? 'error=' + String(pr.error.code || pr.error.message || pr.error).slice(0, 40)
+          : pr.signal ? 'signal=' + pr.signal : 'exit=' + String(pr.status)))
+      } catch (e) {
+        pyFails.push(c + ':throw=' + String((e && e.code) || (e && e.message) || e).slice(0, 40))
+      }
     }
     if (!pyBin || !fs.existsSync(pyScript)) {
       console.log('  ⚠️ 本机没有可用的 python / resolve_actor.py ⇒ parity 对照**跳过**'
-        + '（JS 夹具断言照常全跑；服务器定版前需在有 python 的机器上补跑一次）')
+        + '（探测失败：' + (pyFails.join('；') || 'python 可执行但 resolve_actor.py 缺失') + '；'
+        + 'JS 夹具断言照常全跑；服务器定版前需在有 python 的机器上补跑一次）')
     } else {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'identity-parity-'))
       const mapFile = path.join(tmp, 'identity_map.json')
@@ -921,6 +1078,48 @@ export function selftest () {
         try { fs.rmSync(tmp, { recursive: true, force: true }) } catch { /* 临时目录留给系统回收 */ }
       }
     }
+  }
+
+  console.log('── 8) #2626（需求 方案A 第一步）：别名覆写 + 关闸净化 + 真值形状校验 ──')
+  {
+    // ① 开闸支：模型自报 sender_open_id 冒用他人 ⇒ 必须被 actor 真值覆写（旧字节＝白名单不含
+    //    该键，冒充值原样过关 ⇒ 本条红）。actor.union_id 空串 ⇒ sender_union_id 被【剔除】。
+    const actor8 = { name: '示例用户', open_id: 'ou_cm8', union_id: '', scopes: ['公司'] }
+    const evil8 = { sender_open_id: 'ou_boss8', sender_union_id: 'on_faked', query: 'SELECT 1' }
+    const r8 = applyActorToArguments(evil8, actor8)
+    ok(evil8.sender_open_id === 'ou_cm8', '① 自报 sender_open_id 被覆写为 actor 真值')
+    ok(!('sender_union_id' in evil8), '① actor 无 union_id ⇒ 自报 sender_union_id 被剔除（不转发核实不了的值）')
+    ok(evil8.query === 'SELECT 1', '① 非身份键（query）不误伤')
+    ok(r8.overwritten.includes('sender_open_id'), '① 覆写清单含别名键（审计留痕的数据源）')
+
+    // ② 关闸支·有真值：自报他人 ou ⇒ 覆写；person_id 桥侧无真值来源 ⇒ 一律剔除；name 不误伤。
+    const verified8 = { open_id: 'ou_real8', union_id: 'on_real8' }
+    const off8 = { open_id: 'ou_boss8', sender_open_id: 'ou_boss8', person_id: 'P-998', name: '老板' }
+    const s8 = sanitizeSelfReported(off8, verified8)
+    ok(off8.open_id === 'ou_real8' && off8.sender_open_id === 'ou_real8',
+      '② 关闸＋有桥侧真值 ⇒ open_id/sender_open_id 一律覆写为入站真值')
+    ok(!('person_id' in off8), '② person_id 无桥侧真值来源 ⇒ 剔除（判不了不转发，非编造兜底）')
+    ok(off8.name === '老板', '② 关闸支不碰通用名键 name（关闸＝不认人，只堵身份卡）')
+    ok(s8.overwritten.length === 2 && s8.dropped.length === 1 && s8.touched === true,
+      '② 覆写/剔除计数准确：set=[' + s8.overwritten.join(',') + '] drop=[' + s8.dropped.join(',') + ']')
+
+    // ③ 关闸支·无真值（记录缺失/过期）⇒ fail-closed＝身份键全剔除，而不是放行自报值。
+    const off3 = { open_id: 'ou_spoof3', sender_open_id: 'ou_spoof3', file_path: 'a.md' }
+    const s3 = sanitizeSelfReported(off3, null)
+    ok(!('open_id' in off3) && !('sender_open_id' in off3), '③ 无真值可核 ⇒ 自报身份键全剔除（fail-closed）')
+    ok(off3.file_path === 'a.md' && s3.touched === true, '③ 非身份键保留；touched=true ⇒ 调用侧必打审计行')
+    const s3b = sanitizeSelfReported(off3, null)
+    ok(s3b.touched === false, '③ 已净化的参数二次进入＝零触发（不重复覆写/留痕）')
+    ok(sanitizeSelfReported('nope', verified8).reason === 'arguments-not-an-object', '③ 非对象入参安全返回不抛')
+
+    // ④ 形状校验（类型/长度/字符集）：不符＝当真值缺失，绝不允许畸形串进覆写值/日志比对。
+    ok(verifiedIdField('ou_Ab9-x_123') === 'ou_Ab9-x_123', '④ 合法 ou 原样通过')
+    ok(verifiedIdField('') === '' && verifiedIdField(undefined) === '' && verifiedIdField(123) === '',
+      '④ 空/非字符串 ⇒ 拒（返回空串＝按无真值处理）')
+    ok(verifiedIdField('ou ' + 'x'.repeat(70)) === '' || verifiedIdField('ou ' + 'x'.repeat(70)).length <= 64,
+      '④ 超长 ⇒ 拒')
+    ok(verifiedIdField('ou_bad id;rm -rf') === '' && verifiedIdField('ou_中文') === '',
+      '④ 字符集外的（空格/分号/非 ASCII）⇒ 拒，杜绝注入面进日志与比对')
   }
 
   console.log('')
