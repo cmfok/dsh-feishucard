@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+_CNW = 0x08000000 if __import__("os").name == "nt" else 0
 
 MAP_PATH = "<deploy-dir>/identity_map.json"
 LARK = "/usr/local/bin/lark-cli"
@@ -115,7 +116,7 @@ def contact_get_union_id(open_id):
         "--as", "bot", "--format", "json",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, creationflags=_CNW)
     except Exception as e:                                   # noqa: BLE001
         return None, "exec_failed: " + str(e)[:80]
     out = (r.stdout or "").strip()

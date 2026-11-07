@@ -69,6 +69,10 @@ writeFileSync(join(FAKE_HOME, '.dsh-feishucard', 'feishu.config.json'),
     }],
   }, null, 2))
 process.env.FS_CONFIG_DIR = join(FAKE_HOME, '.dsh-feishucard')
+// [fix-3 20261031] 跨会话发送闸（SEC-CROSSCHAT）：冒烟/开发形态把开关全开（铁律 0「开发环境默认全开」）。
+// 历史用例（53/87/91/98 等）依赖 feishu_send 向**非归属会话**真发送（FREE_CHAT 夹具）⇒ 生产默认关、
+// 冒烟显式开；「不开就拒」这条负向路径由用例 53b 专门钉。
+process.env.FEISHU_ALLOW_CROSS_CHAT_SEND = '1'
 
 let failures = 0
 function ok(cond, label) {
@@ -2572,7 +2576,11 @@ console.log('21b) ★🔴 中台 #2216：系统级报错原文不进员工对话
       '★ 判据②·B 该降级同样打 ALERT 告警（原文只进日志与管理员告警）')
   }
 
-  // ── 判据①·补：identityGuard 关（拿不到调用者档位）⇒ fail-closed 同走统一话术 ──
+  // ── 判据①·补（维护者 2026-10-28 口谕澄清 需求 语境，非推翻）：identityGuard 关＝未接 G9 基座
+  //    ⇒ 无须认人 ⇒ 上游/系统级错误**直接给人话原因**，不降统一话术。
+  //    脱敏面不变：原始报文／错误码／错误分类仍只进日志、零上卡（LEAK_TOKENS 断言保留）。
+  //    旧口径「关闸 ⇒ fail-closed 统一话术」的吊诡处：把与权限无关的上游报错藏起来，
+  //    使用者永远查不到原因，安全上也没收益（真正该藏的技术细节本就不上卡）。
   {
     const cfg = JSON.parse(readFileSync(CFG_PATH216, 'utf8'))
     cfg.bots[0].identityGuard = false
@@ -2583,10 +2591,17 @@ console.log('21b) ★🔴 中台 #2216：系统级报错原文不进员工对话
     feedInbound('om_216_off', '关闸降级测试丙', { openId: 'ou_test' })
     await settle(4)
     const bodyC = JSON.stringify(cardsSince(mark216c))
-    ok(bodyC.includes(UNIFIED216) && LEAK_TOKENS.every((t) => !bodyC.includes(t)),
-      '★★ 判据①·补 关闸（身份不可得）＝fail-closed：只有统一话术、内部字样零出现（本仓 2026-10-04 无表就拒口径同源）')
-    ok(consoleLines.slice(log216c).some((l) => l.includes('systemError ALERT[turn')),
-      '★ 判据①·补 关闸降级同样打 ALERT 告警（原文进日志不进对话框）')
+    // 「本轮没有产生回复」是**新口径的可见文案本身**（旧设计把它也当泄漏项，因为旧口径下低档位连这句都不该看到）；
+    // 本格只校验技术细节不外泄，故从泄漏集里剔除该业务文案，其余 token 一个不放。
+    const LEAK216C = LEAK_TOKENS.filter((t) => t !== '本轮没有产生回复')
+    ok(bodyC.includes('被上游限流（请求过快）') && !bodyC.includes(UNIFIED216)
+      && LEAK216C.every((t) => !bodyC.includes(t)),
+      '★★ 判据①·补 关闸（未接 G9 基座）⇒ 直接给人话原因、不降统一话术；原始报文/错误码零出现'
+        + '（诊断 hasReason=' + bodyC.includes('被上游限流（请求过快）')
+        + ' hasUnified=' + bodyC.includes(UNIFIED216)
+        + ' leaked=' + JSON.stringify(LEAK216C.filter((t) => bodyC.includes(t))) + '）')
+    ok(!consoleLines.slice(log216c).some((l) => l.includes('systemError ALERT[turn')),
+      '★ 判据①·补 关闸时人已看到原因 ⇒ 不再走降级 ALERT（降级侧告警由判据②·B 覆盖）')
   }
 }
 
@@ -3471,8 +3486,12 @@ console.log('38) bot 配置热读通道：splitConclusionMinMs 优先级 + notif
 
 console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 非法方法拒绝（审计：这两条路由零覆盖）')
 {
+  // [fix-2 20261031] status 与 config 写端点加了共享 token 门（与 inject-context 同规格）：
+  //   夹具注入 FEISHU_INJECT_TOKEN 并带 x-inject-token 头走正路，另钉两条「不带 token ⇒ 403」负路。
+  const ADMIN_TOKEN = 'smoke-admin-token'
+  process.env.FEISHU_INJECT_TOKEN = ADMIN_TOKEN
   const routeOf = (p) => registeredRoutes.find((r) => r.path === p)
-  const callRoute = async (route, method, body) => {
+  const callRoute = async (route, method, body, token) => {
     const res = {
       headersSent: false,
       status: 0,
@@ -3482,6 +3501,7 @@ console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 
     }
     const req = new EventEmitter()
     req.method = method
+    req.headers = token ? { 'x-inject-token': token } : {}
     const pending = route.handler(req, res)
     if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
     req.emit('end')
@@ -3493,8 +3513,10 @@ console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 
 
   const statusRoute = routeOf('/feishu/admin/status')
   ok(Boolean(statusRoute && statusRoute.handler), '/feishu/admin/status 路由已注册且带 handler')
-  const st = await callRoute(statusRoute, 'GET')
-  ok(st.status === 200 && st.json && st.json.ok === true, '状态路由返回 200 + ok')
+  const stNoToken = await callRoute(statusRoute, 'GET')
+  ok(stNoToken.status === 403, '★ status 不带 token ⇒ 403（fix-2 鉴权门；实际 ' + stNoToken.status + '）')
+  const st = await callRoute(statusRoute, 'GET', undefined, ADMIN_TOKEN)
+  ok(st.status === 200 && st.json && st.json.ok === true, '状态路由带 token 返回 200 + ok')
   ok(st.json && st.json.bots && st.json.bots[0] && st.json.bots[0].hasSecret === true,
     '状态里只给 hasSecret 布尔（证明有密钥），不给密钥本身')
   ok(!st.raw.includes(APP_SECRET), '状态响应**不含 appSecret 明文**（密钥不泄露）')
@@ -3507,10 +3529,14 @@ console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 
   ok(!g.raw.includes(APP_SECRET), '配置读取响应**不含 appSecret 明文**（密钥不泄露）')
 
   // POST 写入必须走归一化（不认识的字段会被丢弃 —— 这正是本轮抓到 splitConclusionMinMs 那个 bug 的机制）
+  const pNoToken = await callRoute(cfgRoute, 'POST', {
+    bots: [{ name: 'smoke-should-not-save', workspace: WORKSPACE, appId: 'cli_noauth_1', appSecret: 'x' }],
+  })
+  ok(pNoToken.status === 403, '★ config 写不带 token ⇒ 403（fix-2 鉴权门；实际 ' + pNoToken.status + '）')
   const p = await callRoute(cfgRoute, 'POST', {
     bots: [{ name: 'smoke-posted', workspace: WORKSPACE, appId: 'cli_posted_1', appSecret: 'posted-secret', unknownField: 'x' }],
-  })
-  ok(p.status === 200 && p.json && p.json.ok === true, '配置写入返回 200 + ok')
+  }, ADMIN_TOKEN)
+  ok(p.status === 200 && p.json && p.json.ok === true, '配置写入带 token 返回 200 + ok')
   const onDisk = JSON.parse(readFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), 'utf8'))
   ok(onDisk.bots.length === 1 && onDisk.bots[0].name === 'smoke-posted', '写入落到 feishu.config.json（归一化后）')
   ok(!JSON.stringify(onDisk).includes('unknownField'), '归一化丢弃白名单外的字段（这次抓 bug 的机制）')
@@ -3522,6 +3548,8 @@ console.log('39) admin 路由：绝不泄露密钥 + 配置写入走归一化 + 
   writeFileSync(join(process.env.FS_CONFIG_DIR, 'feishu.config.json'), JSON.stringify({
     bots: [{ name: 'smoke', workspace: WORKSPACE, appId: APP_ID, appSecret: APP_SECRET, reactionEmoji: 'GLANCE', approvalForm: true, planEnabled: true, goalEnabled: true }],
   }, null, 2))
+  // [fix-2] 收回夹具 token：其余用例不再需要 admin 门（inject-context 等保持 fail-closed 原形态）
+  delete process.env.FEISHU_INJECT_TOKEN
 }
 
 console.log('40) 打字提示（reaction）生命周期 + cfg.reactionEmoji 通道（审计：零覆盖）')
@@ -5298,6 +5326,20 @@ console.log('53) F 失败可见 + G 上传：被拒必须「用户看得见 + Ag
 
   // 审查 LOW#3314/#3375：夹具在本次运行独有的目录里，跑完整目录删掉（异常退出也不会污染共享 temp）。
   try { rmSync(fixtureDir, { recursive: true, force: true }) } catch { /* 清不掉不影响结论 */ }
+}
+console.log('53b) [fix-3] 跨会话发送闸：未开 FEISHU_ALLOW_CROSS_CHAT_SEND ⇒ 非归属会话拒发（fail-closed）')
+{
+  const gateTool = toolNow('feishu_send')
+  ok(Boolean(gateTool), '（前提）当前代次注册了 feishu_send')
+  const gateMark = sentCards.length
+  process.env.FEISHU_ALLOW_CROSS_CHAT_SEND = ''
+  const denied = gateTool
+    ? await gateTool.execute({ text: '开关没开就不该发出去', chatId: 'oc_gate_crosschat_001' }, { agent, signal: undefined })
+    : { ok: true, detail: '（feishu_send 未注册——下面会判红）' }
+  process.env.FEISHU_ALLOW_CROSS_CHAT_SEND = '1'
+  ok(denied && denied.ok === false && String(denied.detail).includes('跨会话发送未启用'),
+    '★ 开关未开 ⇒ 明确拒发（实际 ' + JSON.stringify(denied && denied.detail).slice(0, 60) + '）')
+  ok(sentCards.length === gateMark, '★ 拒发零出站（实际新增 ' + (sentCards.length - gateMark) + ' 条）')
 }
 console.log('')
 console.log('53) ★ 热重载"续卡"不得接管已经过期的卡（僵尸卡源头：协作信箱 维护者-OFFICE 任务）')
@@ -10247,6 +10289,74 @@ console.log('114) ★🔴 拔件演习：权限挂统一文案「目前服务不
   await settle(2)
   ok(JSON.parse(readFileSync(CFG_PATH114, 'utf8')).bots[0].identityGuard === undefined,
     '（收尾）配置还原：identityGuard 键移除（回到默认关）')
+}
+
+console.log('115) ★🔴 #2626（需求 方案A 第一步）：关闸不采信模型自报身份——有真值覆写/无真值剔除＋审计留痕')
+{
+  // 判据来源：中台 #2626 ＋ 裁决卡 需求（采纳 A：先升级插件传真实身份→再开 identityGuard+strict）。
+  // 开关矩阵（decisions/2026-10-30）规定开发机/web-gui **禁开** identityGuard ⇒ 关闸侧不得整体拒
+  // 回合（2026-10-04「不许锁死 维护者 本机」）；但「飞书回合里模型自报的 open_id 原样转发给工具」正是
+  // 本单冒充破口 ⇒ 关闸净化＝入站权威值（evt.sender，伪造不了）覆写、无真值可核剔除＋可见留痕。
+  const nextSpy115 = () => Promise.resolve('next')
+  const capture115 = (runs) => runs.map((r) => Promise.resolve(r).then(
+    (value) => ({ value }), (error) => ({ error })))
+  const isDeny115 = (o) => Boolean(o && o.value && typeof o.value === 'object' && o.value.isError === true)
+  const brief115 = (os) => JSON.stringify(os.map((o) => (o.value === 'next' ? 'next' : 'deny')))
+
+  const CFG115 = join(process.env.FS_CONFIG_DIR, 'feishu.config.json')
+  ok(JSON.parse(readFileSync(CFG115, 'utf8')).bots[0].identityGuard === undefined,
+    '（前提）关闸形态（默认关）——本用例钉的就是**关闸侧**行为')
+
+  // ── 格① 模型自报**他人**身份 ⇒ 被入站真值覆写（绝不放行自报值）＋ person_id 无源剔除 ──
+  agent.send = function (message) { this.sent.push(message) }
+  liveAgents.length = 0
+  const log115a = consoleLines.length
+  feedInbound('om_guardoff_115a', '关闸自报身份用例：入站登记桥侧真值 ou_test')
+  await settle(4)
+  const exec115a = { name: 'read', agent, signal: undefined,
+    arguments: { file_path: 'a.md', open_id: 'ou_VICTIM', sender_open_id: 'ou_VICTIM', person_id: 'P-999' } }
+  const run115a = await Promise.all(capture115(emitCtx('tools/execute', exec115a, nextSpy115)))
+  ok(!run115a.some(isDeny115),
+    '★格① 关闸不整体拒回合（矩阵禁开环境全拒＝锁 维护者 本机）｜实得 ' + brief115(run115a))
+  ok(exec115a.arguments.open_id === 'ou_test' && exec115a.arguments.sender_open_id === 'ou_test',
+    '★★格① 自报他人 ou 被覆写为入站真值（ou_VICTIM→ou_test；sender_open_id 同一）——旧字节原样转发 ⇒ 本条必红')
+  ok(!('person_id' in exec115a.arguments),
+    '★格① person_id 桥侧无真值来源 ⇒ 剔除（判不了不转发，不编造兜底）')
+  ok(exec115a.arguments.file_path === 'a.md', '★格① 非身份键不误伤')
+  ok(consoleLines.slice(log115a).some((l) => String(l).includes('identity guard-off sanitize')
+      && String(l).includes('自报[open_id=ou_VICTIM,person_id=P-999,sender_open_id=ou_VICTIM]')
+      && String(l).includes('已覆写为入站真值') && String(l).includes('已剔除')),
+    '★★格① 中文审计留痕：谁（tool/agent/chat）＋自报了什么＋怎么处置｜实得 '
+      + JSON.stringify(consoleLines.slice(log115a).filter((l) => String(l).includes('guard-off')).map(String)))
+
+  // ── 格② 判不了＝fail-closed：入站权威字段形状非法（verifiedIdField 拒收 ⇒ 桥侧真值为空）
+  //   ⇒ 自报身份键全剔除、绝不带病过关。同时钉住「输入校验」（A18/安全基线）与「不编造兜底」。──
+  const log115b = consoleLines.length
+  feedInbound('om_guardoff_115b', '投毒真值用例：sender 形状非法（带空格分号）', { openId: 'ou bad;id' })
+  await settle(4)
+  const exec115b = { name: 'read', agent, signal: undefined,
+    arguments: { file_path: 'b.md', open_id: 'ou_SPOOF', sender_open_id: 'ou_SPOOF' } }
+  await Promise.all(capture115(emitCtx('tools/execute', exec115b, nextSpy115)))
+  ok(!('open_id' in exec115b.arguments) && !('sender_open_id' in exec115b.arguments),
+    '★★格② 无真值可核（权威字段形状非法）⇒ 自报身份键全剔除（fail-closed 不放行冒充；'
+      + '旧字节带病过关 ⇒ 本条必红）')
+  ok(exec115b.arguments.file_path === 'b.md', '★格② 只剥身份键，非身份键照常')
+  ok(consoleLines.slice(log115b).some((l) => String(l).includes('guard-off sanitize')
+      && String(l).includes('判不了不转发')),
+    '★格② 剔除支带可见告警留痕（"桥侧无该键真值可核⇒判不了不转发，fail-closed"）')
+
+  // ── 格③ 边界钉：非飞书回合（无 owner）⇒ 原样放行不净化（2026-10-04「不许锁死本机」）──
+  const exec115c = { name: 'read', agent: { id: 'agent-not-feishu-115' }, signal: undefined,
+    arguments: { open_id: 'ou_whatever' } }
+  const run115c = await Promise.all(capture115(emitCtx('tools/execute', exec115c, nextSpy115)))
+  ok(run115c.every((o) => o.value === 'next') && exec115c.arguments.open_id === 'ou_whatever',
+    '★格③ GUI/子代理/定时轮（无 owner）⇒ 不碰入参（全拒＝锁机事故的边界）｜实得 ' + brief115(run115c))
+
+  // ── 格④ 关闸＋keyless 照常直达（用例 70(4)/114③ 的同族边界，防过度收紧）──
+  const exec115d = { name: 'read', agent, signal: undefined, arguments: { file_path: 'd.md' } }
+  const run115d = await Promise.all(capture115(emitCtx('tools/execute', exec115d, nextSpy115)))
+  ok(run115d.every((o) => o.value === 'next'),
+    '★格④ 飞书回合但调用不含身份键 ⇒ 零动作直达（不新增冒充面也不误伤）｜实得 ' + brief115(run115d))
 }
 
 // 🔴 中台 #61/#62（第三十五轮）：托孤双 60 秒对撞原来让「这张卡补送到不到」听天由命
