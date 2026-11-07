@@ -2458,7 +2458,10 @@ console.log('20) 无产出且**没有**失败标记：明说「原因未上报�
   const body = JSON.stringify(ops)
   ok(body.includes('原因未上报'), '没有失败标记时，卡片明说「原因未上报」（不再只写占位符）')
   ok(statusShows(body, '失败'), '无产出的回合状态栏写「失败」，不假称完成')
-  ok(body.includes('已自动重建会话'), '僵尸会话自愈仍然保留（只在**没有**失败标记时才自愈）')
+  ok(body.includes('已自动重建会话') || body.includes('已就地恢复原会话重试'),
+    '僵尸会话自愈仍然保留（只在**没有**失败标记时才自愈；2026-11-05 起先就地恢复原会话，不再一上来就重建）')
+  ok(body.includes('已就地恢复原会话重试'),
+    '★ 2026-11-05 桥自愈-上下文交接：同一条会话能恢复时**必须**原地重试，不换会话（历史不丢）')
   ok(body.includes('自愈后的正常回复-OK'), '自愈重试的回复正常交付给用户')
 }
 
@@ -11130,6 +11133,74 @@ console.log('N7) #1685 / 需求：卡片救援正文顺序分片；超过分片�
   ok(consoleLines.slice(fileLogStart).some((l) => l.includes('card body rescue saved:') && l.includes('part limit')),
     '★★ 超上限处置有明确日志留痕｜实得 '
     + consoleLines.slice(fileLogStart).filter((l) => l.includes('card body rescue saved:')).length)
+}
+
+// ── 2026-11-05 桥自愈-上下文交接（本文件最后一组用例：它会给 state 加一条 chat，放在末尾不污染前面的用例）──
+// 实证故障：长会话 fs-main-mw0o5n0p 因「本轮无产出」被旧自愈逻辑 splice 出绑定、换空会话，
+// 13 万字级设计讨论整条断线（维护者 判「桥必须改」）。本用例钉住「真必须重建」那一条腿：
+//   ① 就地恢复也无效 ⇒ 才重建；② 重建重跑的正文必须带**交接正文摘要**（旧会话 id＋尾部正文＋原因；
+//   只给 id 没用——新会话读不到那个 id 的内容）；③ 旧条目**保留**在绑定里（/list、/switch 可回）。
+console.log('N7) 空回复自愈③：恢复也无效 ⇒ 重建必须注入交接正文摘要，旧会话条目保留')
+{
+  const HEAL_CHAT = 'oc_heal_handoff_n7'
+  // 🔴 前置：自愈只在「复用/恢复已有会话」这条腿触发
+  //   （index.js：`else if (!turn.hadOutput && (sessionReused || sessionCorruptFailure))`）。
+  //   本 chat 若全新，首条入站走 create 腿 ⇒ sessionReused=false ⇒ 自愈判据根本不进，
+  //   整套用例会「9 条全红但根因不在被测逻辑」（2026-11-05 首次落码实测就是如此：日志里
+  //   一条 `[fs] heal:` 都没有）。所以先用**原厂 send** 发一条正常入站，把会话养成可复用形态。
+  feedInbound('om_heal_seed_n7', '先建会话（自愈前置，正常产出）', { chatId: HEAL_CHAT })
+  await settle(6)
+  const mark = sentCards.length
+  const sentBefore = agent.sent.length
+  const prevSend = agent.send
+  const prevIdle = agent.whenIdle
+  let sendN = 0
+  agent.whenIdle = async () => { await new Promise((r) => setTimeout(r, 80)) }
+  agent.send = function (message) {
+    this.sent.push(message)
+    sendN += 1
+    const text = String(message && message.content && message.content[0] && message.content[0].text)
+    agentEvents.push({ type: 'user/message', seq: 6000 + sendN * 10,
+      data: { content: [{ type: 'text', text }], source: { kind: 'user' } } })
+    if (sendN <= 2) return          // ① 原轮 ② 恢复重试：两次都没有产出
+    agentEvents.push(
+      { type: 'assistant/message', seq: 6001 + sendN * 10, data: { message: { content: [{ type: 'text', text: '交接后的回复-N7-OK' }] } } },
+      { type: 'turn/end', seq: 6002 + sendN * 10, data: { turn: sendN, reason: { kind: 'completed' } } },
+    )
+  }
+  try {
+    feedInbound('om_heal_handoff_n7', '交接测试正文', { chatId: HEAL_CHAT })
+    await settle(10)
+  } finally {
+    agent.send = prevSend
+    agent.whenIdle = prevIdle
+  }
+  const bodyN7 = JSON.stringify(cardsSince(mark))
+  ok(bodyN7.includes('交接后的回复-N7-OK'), '重建重试的回复正常交付')
+  ok(bodyN7.includes('已自动重建会话'), '真重建时提示上卡（告诉用户换了会话）')
+
+  const sentN7 = agent.sent.slice(sentBefore)
+  const thirdText = sentN7.length >= 3 ? String(sentN7[2].content[0].text) : ''
+  ok(sentN7.length >= 3 && thirdText.includes('【上一会话交接'), '★★ 重建重跑的正文带「上一会话交接」前缀')
+  ok(/旧会话：fs-main-/.test(thirdText), '★★ 摘要带旧会话 id（人可 /switch 切回、日志可溯源）')
+  ok(thirdText.includes('交接测试正文'), '用户本轮正文照旧送达（交接摘要不吞掉原话）')
+  ok(thirdText.indexOf('【上一会话交接') >= 0 && thirdText.indexOf('【上一会话交接') < thirdText.indexOf('交接测试正文'),
+    '摘要在前、用户原话在后（模型读到的是"背景 → 新问题"）')
+
+  let stateN7 = null
+  try {
+    stateN7 = JSON.parse(readFileSync(join(process.env.FS_CONFIG_DIR,
+      'state-' + String(APP_ID).replace(/[^a-zA-Z0-9]/g, '') + '.json'), 'utf8'))
+  } catch { stateN7 = null }
+  const recN7 = stateN7 && stateN7.chats && stateN7.chats[HEAL_CHAT]
+  ok(recN7 && Array.isArray(recN7.sessions) && recN7.sessions.length === 2,
+    '★★ ③ 旧条目保留：这个 chat 的 sessions 落盘 2 条（旧 + 新）')
+  ok(recN7 && Array.isArray(recN7.sessions) && recN7.sessions.length === 2
+    && recN7.sessions[1].id === recN7.active && recN7.sessions[0].id !== recN7.active,
+    '③ active 指向新会话，旧会话仍留在列表里（/list 看得到、/switch 能切回）')
+  ok(recN7 && Array.isArray(recN7.sessions) && recN7.sessions.length === 2
+    && String(recN7.sessions[0].label || '').includes('已交接'),
+    '③ 旧条目打「已交接」标记，/list 里认得出是哪一条')
 }
 
 if (failures === 0) {

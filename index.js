@@ -29,6 +29,11 @@ import {
   IDENTITY_KEYS, GUARDOFF_IDENTITY_KEYS, identityArgKeys,
   sanitizeSelfReported, verifiedIdField,
 } from './identity-inject.mjs'
+// 空回复自愈的「上一会话交接摘要」构造器（2026-11-05 · 桥自愈-上下文交接）。
+// 纯逻辑、零依赖，自测：`node selftest-heal-handoff-20261105.mjs`。
+// 🔴 为什么必须注入正文：会话内容在 ~/.dsh/sessions/**.v4.jsonl.zstd 里是多条 zstd 帧拼接，
+//    Node 自带 zstdDecompressSync 只解首帧 ⇒ 光给新会话一个旧 id，它读不到那个 id 的内容。
+import { buildHealHandoff } from './heal-handoff.mjs'
 // G3 员工会话「工具调用失败」旁路上报（#514 / D38=需求 路径A）。默认零触发：
 // 白名单（AIAD_G3_REPORT_CWD_ALLOW）与写入根（AIAD_INBOX_ROOT）不注入 ⇒ 不写任何东西。
 // reportG3Recovery（#2331 第⑦层）：失败投递后同工具后续成功调用时自然上报恢复（关联原 event_id）。
@@ -1083,6 +1088,62 @@ export function apply(ctx) {
     return out
   }
 
+  // 🔴 0.8.29（2026-11-04 DSH-SP 事故②）：同一轮的长回复被封进**两张卡**，用户看到同一份正文两次。
+  //   真机帧（web.log 185599/185600）：两张卡各自收尾，reply_hash 同为 7997abec、reply_len 相同、
+  //   各 blocks=63。成因是「超限换卡」之后同一轮里存在两个收尾链（换卡卡 + 结论卡）各自封口。
+  //   处置：**后送达的为准**——本会话 20 秒内已经送过一张"含同一段正文"的卡 ⇒ 把先送的那张撤回；
+  //   撤回失败只留痕（不静默），也绝不因此少送内容。
+  //   判据是「这张卡自己真的含这段正文」，不是只看 turn.reply —— 过程卡只带一行结论指路
+  //   （CONCLUSION_POINTER），不该被当成重复卡误撤。
+  //   窗口**只留 20 秒**：真机重复帧是同一秒内两张卡各自收尾（185608/185609）；
+  //   放宽到分钟级会把"用户连问两次、agent 回了同样一句话"误判成重复卡并撤掉上一轮（丢卡）。
+  const REPLY_CARD_DEDUPE_WINDOW_MS = 20000
+  const replyCardSeen = globalThis.__fsReplyCardSeen || (globalThis.__fsReplyCardSeen = new Map())
+  async function dedupeDeliveredReplyCard(bot, chatId, card, reply) {
+    try {
+      const text = String(reply || '').trim()
+      if (!text || !card || !card.token) return
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim()
+      const probe = norm(text).slice(0, 120)
+      if (!probe) return
+      const blocksText = norm((card.blocks || []).map((b) => String((b && b.text) || '')).join('\n'))
+      if (!blocksText.includes(probe)) return
+      const key = String(chatId || '-')
+      const hash = shortHash(probe)
+      const charsNow = blocksText.length
+      const prev = replyCardSeen.get(key)
+      const now = Date.now()
+      if (prev && prev.hash === hash && prev.token && prev.token !== card.token
+        && (now - Number(prev.at || 0)) < REPLY_CARD_DEDUPE_WINDOW_MS) {
+        // 只有**体量几乎相同**才判重复：过程卡（含工具日志）与结论卡会同时含这段正文，
+        // 但两者字数差着量级 ⇒ 差得多的绝不撤（撤了就是丢正文，违 维护者 红线）。
+        const prevChars = Number(prev.chars || 0)
+        const similar = prevChars > 0 && charsNow > 0
+          && Math.abs(prevChars - charsNow) / Math.max(prevChars, charsNow) <= 0.15
+        if (similar) {
+          const recalled = await deleteMessage(bot, prev.token)
+          console.log('[fs] duplicate reply card '
+            + (recalled ? 'recalled' : 'recall FAILED (duplicate stays visible)')
+            + ': chat=' + chatId + ' kept=' + String(card.token).slice(-8)
+            + ' removed=' + String(prev.token).slice(-8) + ' hash=' + hash
+            + ' chars=' + String(charsNow))
+        } else {
+          console.log('[fs] same reply text on a differently-sized card, keep both '
+            + '(process vs conclusion): chat=' + chatId
+            + ' prev_chars=' + String(prevChars) + ' now_chars=' + String(charsNow))
+        }
+      }
+      replyCardSeen.set(key, { hash, token: card.token, at: now, chars: charsNow })
+      // 表无界增长防护：只留最近 200 个会话（与 failureNotices 同口径）
+      if (replyCardSeen.size > 200) {
+        const oldest = replyCardSeen.keys().next().value
+        replyCardSeen.delete(oldest)
+      }
+    } catch (error) {
+      console.log('[fs] duplicate reply card dedupe failed: ' + String(error && error.message || error))
+    }
+  }
+
   async function sendPlainText(bot, chatId, text) {
     const cfg = bot.cfg
     const hasCreds = typeof cfg.appId === 'string' && cfg.appId
@@ -1700,6 +1761,45 @@ export function apply(ctx) {
   //   ⇒ 折叠阈值从"凭 50 猜的 40"改为 **180**（留 20 元素余量），并对载荷字节加同样含义的护栏。
   //   这条修正直接消除"正常长回合也被折进**默认收起**面板 ⇒ 过程文字看不见"（维护者 报障的主症状）。
   const CARD_FOLD_THRESHOLD = 180
+  // 🔴 0.8.29（2026-11-04 DSH-SP 事故：卡片崩成三份）：上面那条 200 / 折叠线 180 量的是**顶层**元素数，
+  //   而飞书实际数的是**递归元素数** —— 折叠面板的 header/title/icon、面板内元素、column 都算。
+  //   事故帧实证（web.log 185481→185484）：顶层远未到 180（所以**从不触发折叠**），但 59 次工具调用
+  //   渲染成几十个「🛠️ 工具调用」折叠面板，每个面板自己就吃掉 ~4 个元素 ⇒ 递归元素数越过 200
+  //   ⇒ 整卡被拒 `code 230099 / ErrCode 11310 element exceeds the limit`，正文只能靠纯文本救援补发。
+  //   ⇒ 折叠与换卡判定一律改看**递归元素数**（偏保守：宁可早折叠，不可让整卡被拒）。
+  //   数字留余量：170 触发折叠、190 收窄保留尾巴（单卡 200 上限）。
+  const CARD_ELEMENT_DEEP_THRESHOLD = 170
+  const CARD_ELEMENT_DEEP_LIMIT = 190
+  // 递归数元素：顶层 + 面板内 elements + column_set 的 columns[].elements + 面板头 title/icon。
+  // 只用于"要不要折叠"的判定，不参与任何内容取舍 —— 算多了只会折叠更早，不会丢内容。
+  function countElementsDeep(elements) {
+    let n = 0
+    const walk = (list) => {
+      if (!Array.isArray(list)) return
+      for (const el of list) {
+        if (!el || typeof el !== 'object') continue
+        n += 1
+        const header = el.header
+        if (header && typeof header === 'object') {
+          if (header.title) n += 1
+          if (header.icon) n += 1
+        }
+        if (Array.isArray(el.elements)) walk(el.elements)
+        if (Array.isArray(el.columns)) {
+          for (const col of el.columns) {
+            if (!col || typeof col !== 'object') continue
+            n += 1
+            if (Array.isArray(col.elements)) walk(col.elements)
+          }
+        }
+        if (Array.isArray(el.fields)) {
+          for (const f of el.fields) { if (f && typeof f === 'object') n += 1 }
+        }
+      }
+    }
+    walk(elements)
+    return n
+  }
   // 超限**换卡续写**的触发线（内容原样留在旧卡、新卡接续 ⇒ 永不隐藏、也不撞上限）：
   const CARD_ROTATE_BLOCKS = 170
   // 体积护栏的**块数粗筛下限**（审查 LOW#2128）：块数不到这里就**不做** JSON.stringify 体积检查（性能）。
@@ -2232,8 +2332,11 @@ export function apply(ctx) {
     // The last KEEP_TAIL elements are never folded (2026-08-15 维护者 design).
     // 审查 MED#1362：折叠只是把文本搬进面板 —— **既不省字节也不省内容** ⇒ 体积超限不能靠它，
     // 走 watcher 里的"换卡续写"（CARD_ROTATE_*）。折叠只负责**元素个数**这条硬限制。
-    if (elements.length > CARD_FOLD_THRESHOLD) {
-      const KEEP_TAIL = 10
+    const deepCount = countElementsDeep(elements)
+    if (elements.length > CARD_FOLD_THRESHOLD || deepCount > CARD_ELEMENT_DEEP_THRESHOLD) {
+      // 0.8.29：递归元素数已经逼近硬线时，把"保留尾巴"收窄（10 → 4），让这一轮折叠压得更狠；
+      //   正常情形仍是 10（维护者 2026-08-15 设计：最新 10 个元素永远可见）。
+      const KEEP_TAIL = deepCount > CARD_ELEMENT_DEEP_LIMIT ? 4 : 10
       const head = elements.slice(0, elements.length - KEEP_TAIL)
       const tail = elements.slice(elements.length - KEEP_TAIL)
       const extraLines = []
@@ -2347,6 +2450,7 @@ export function apply(ctx) {
           + ' panels=' + panels.length
           + ' collapsed=' + panels.filter((p) => p.expanded !== true).length
           + ' visible_chars=' + visible.length
+          + ' elements_deep=' + countElementsDeep(elements)
           + ' payload_md5=' + createHash('md5').update(JSON.stringify({ elements })).digest('hex').slice(0, 8))
       } catch { /* 指纹只用于留痕，绝不影响发卡 */ }
     }
@@ -3108,6 +3212,9 @@ export function apply(ctx) {
         }
         card.failCount += 1
         const klass = classifyCardFailure(message)
+        // 0.8.29：记下"这张卡是被元素/体积上限整卡拒掉的"——换卡那一刻老卡要写清原因，
+        //   读者才知道自己看到的是一张**被截断**的卡，而不是内容本来就到此为止。
+        if (klass === 'toolarge') card.failedTooLarge = true
         if (!wasPatch) card.createFailed = true   // 建卡失败 → 放弃该卡，交给兜底纯文本
         const delay = CARD_RETRY_BASE * 2 ** (card.failCount - 1)
         if (card.failCount >= CARD_MAX_FAILURES) {
@@ -3611,7 +3718,14 @@ export function apply(ctx) {
         oldCard.sealing = true
         oldCard.status = 'sealed'
         dropWorkingPlaceholder(oldCard)
-        oldCard.blocks.push({ type: 'message', text: '✅ 本卡已收口，后续内容见下方新卡。' })
+        // 0.8.29：这张卡是被上限整卡拒掉时才说明"是超限换卡"，普通收口用原来那句 ——
+        //   事故帧里读者只看到「✅ 本卡已收口」，完全不知道自己刚被截断。
+        oldCard.blocks.push({
+          type: 'message',
+          text: oldCard.failedTooLarge
+            ? rotateNoticeSize()
+            : '✅ 本卡已收口，后续内容见下方新卡。',
+        })
         try { void syncCard(old.bot, old.chatId, oldCard, true).catch(() => { }) } catch { }
       }
       // 0.7.13（TODO-0710 #1）：token 首次 sync 成功才有值 ⇒ 真机打出 old=- new=-（web.log L80023）。
@@ -4144,6 +4258,18 @@ export function apply(ctx) {
     }
   }
 
+  // 会话实际落在哪个工作区：显式 override > bot.cfg.workspace > 当前工作区根。
+  // 🔴 2026-11-05（维护者 报「出错新建会话后，旧会话在 DSH GUI 里不见了」）：这个值必须跟会话条目
+  //   一起落盘（persistChats 的 cwd 字段），重建会话时再继承回来。否则重建只能退回 cfg.workspace
+  //   —— bot 的 workspace 一经改过（实证：P:\Qoder\work → P:\work），新旧会话就分属两个 GUI 工作区
+  //   分组，旧会话在列表里"凭空消失"，只能去 sessions 目录里翻（实证：237 个旧会话被移进
+  //   sessions-archive\20261105-oldzone\--P-Qoder-work--）。
+  function effectiveSessionCwd(bot, cwdOverride) {
+    const cfg = bot.cfg || {}
+    return (cwdOverride && String(cwdOverride).trim())
+      || (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined
+  }
+
   async function createDedicated(bot, sessionId, cwdOverride) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
@@ -4159,8 +4285,7 @@ export function apply(ctx) {
     const agentOptions = await agentOptionsWithRetry('创建', true, true)
     const handle = await agents.create({
       sessionId,
-      meta: { cwd: (cwdOverride && String(cwdOverride).trim())
-        || (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined },
+      meta: { cwd: effectiveSessionCwd(bot, cwdOverride) },
       ...(agentOptions ? { agentOptions } : {}),
       setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
@@ -4183,6 +4308,67 @@ export function apply(ctx) {
     return handle
   }
 
+  // ---- 空回复自愈：就地恢复 + 交接摘要（2026-11-05 · 桥自愈-上下文交接）------------
+  // 实证故障（维护者 判「桥必须改」）：私聊 oc_36ed7c029a778c13f01823ba439a6ca6 的长会话
+  //   fs-main-mw0o5n0p（11-03 建、当天 13 万字级设计讨论）在 11-05 14:08 被旧自愈逻辑判
+  //   「本轮无产出」⇒ splice 掉绑定、新建空会话 fs-main-mw35addq ⇒ 整条上下文断线，只能人工
+  //   从磁盘会话文件里捞回来。三条口径（缺一不闭环）：
+  //   ① 先**就地恢复旧会话**、在同一上下文上重试一次（旧会话文件通常完好，直接判死＝白扔一段历史）；
+  //   ② 真的必须新建时，把旧会话尾部正文拼成「上一会话交接」前缀注入首条消息
+  //      （只给 id 没用：见顶部 import 处 zstd 首帧那条注释）；
+  //   ③ 旧条目**不再 splice** —— 留在 chat.sessions 里，/list 看得到、/switch 能切回。
+  // 🔴 防无限重建：重建额度挂在 bot 上（进程内），连续 2 次仍无产出就停手，成功一轮即回满；
+  //    ③ 之后旧条目不再自删，若不设额度，病态 chat 会一次一条地把 sessions 撑爆。
+  const HEAL_REBUILD_MAX = 2
+  const HEAL_OLD_LABEL = '｜已交接'
+  function healBudgetOf(bot) {
+    if (!bot.healRebuilds) bot.healRebuilds = new Map()
+    return bot.healRebuilds
+  }
+  function canRebuildAfterHeal(bot, chatId) {
+    return Number(healBudgetOf(bot).get(String(chatId)) || 0) < HEAL_REBUILD_MAX
+  }
+  function noteHealRebuild(bot, chatId) {
+    const key = String(chatId)
+    const used = Number(healBudgetOf(bot).get(key) || 0) + 1
+    healBudgetOf(bot).set(key, used)
+    return used
+  }
+  function resetHealBudget(bot, chatId) {
+    healBudgetOf(bot).delete(String(chatId))
+  }
+  // 「恢复」的两种形态：本进程已有活句柄 ⇒ 就是它（同一上下文，直接重试）；
+  // 句柄不在（重启后首条、或上一代实例已死）⇒ 真 resume 落盘会话。
+  // ⚠️ 不无条件调 resumeDedicated：会话在本进程活着时 DSH 会以
+  //   「cannot prepare session while it is live」拒收，那样每次恢复都必然落进重建腿 —— 等于没做 ①。
+  async function reviveSessionForRetry(bot, entry, prevAgent) {
+    if (prevAgent && prevAgent.session) return { agent: prevAgent, via: 'live' }
+    if (entry && entry.handle && entry.handle.agent) return { agent: entry.handle.agent, via: 'handle' }
+    const handle = await resumeDedicated(bot, entry && entry.id)
+    if (entry) entry.handle = handle
+    return { agent: handle.agent, via: 'resume' }
+  }
+  // 交接摘要：只读旧会话的**事件流**（正文以 text 块存在 events 里；工具明细与 reasoning
+  // 不是 text 块 ⇒ 天然不进摘要）；取不到就返回带 id/原因的骨架，绝不让新会话连"有个前任"都不知道。
+  // opts.keptInBinding=false ⇒ 旧条目已不在绑定里（loadChats 按世代丢弃的 legacy 会话），
+  //   交接骨架里就不许再写「/switch 可切回」（A18 禁编造兜底：话术必须与实际状态一致）。
+  function healHandoffText(sourceAgent, oldSessionId, reason, opts) {
+    const o = opts || {}
+    const keptInBinding = o.keptInBinding !== false
+    let events = []
+    try {
+      events = sourceAgent && sourceAgent.session ? sessionEvents(sourceAgent.session) : []
+    } catch (e) {
+      console.log('[fs] heal: handoff events read failed: ' + String(e && e.message || e))
+    }
+    try {
+      return buildHealHandoff({ events, oldSessionId, reason, keptInBinding, footerStripRe: FOOTER_STRIP_RE })
+    } catch (e) {
+      console.log('[fs] heal: handoff build failed, using skeleton: ' + String(e && e.message || e))
+      return buildHealHandoff({ events: [], oldSessionId, reason, keptInBinding })
+    }
+  }
+
   // ---- chat/session bookkeeping ---------------------------------------------
   function loadChats(bot) {
     const state = readState(bot.cfg.appId)
@@ -4197,6 +4383,10 @@ export function apply(ctx) {
       if (legacy.length > 0) {
         console.log('[fs] dropping ' + legacy.length + ' legacy session(s) created without standard tools: '
           + legacy.map((s) => s.id).join(', '))
+        // 2026-11-05：被丢弃的 id 记一手 —— 本进程随后若给该 chat 自动新建会话，交接摘要里
+        //   至少能交代「上一次是哪个会话、为什么没了」（不再静默清空）。
+        if (!bot.droppedLegacyIds) bot.droppedLegacyIds = new Map()
+        bot.droppedLegacyIds.set(chatId, legacy.map((s) => String((s && s.id) || '')).filter(Boolean))
         sessions = sessions.filter((s) => !(s && s.type === 'dedicated' && s.gen !== SESSION_GEN))
       }
       const activeId = record && record.active
@@ -4207,9 +4397,10 @@ export function apply(ctx) {
       }
       chats.set(chatId, {
         sessions, activeIndex,
-        // #771 熔断计数挂在 **chat 记录**上，不挂在会话条目上：heal（空回复自愈）会
-        // `chat.sessions.splice(chat.activeIndex, 1)` 再 push 新条目（:6537-6543），per-entry
-        // 计数必然被抹平＝熔断形同虚设（2026-10-17 全量冒烟 N3 实测：第二次仍重建，日志两条）。
+        // #771 熔断计数挂在 **chat 记录**上进落盘，不挂在会话条目上：heal（空回复自愈）会
+        // **换掉当前 active 条目**（旧实现是 splice 掉再 push；2026-11-05 起改为 push 新条目、
+        // 旧条目保留、只移动 active —— 见 handleInbound 自愈块），per-entry 计数要么被抹平、
+        // 要么跟着被保留的旧条目一起失效 ＝ 熔断形同虚设（2026-10-17 全量冒烟 N3 实测：第二次仍重建，日志两条）。
         // 旧 state 没这个字段 ⇒ 0。
         remounts: Number(record && record.remounts) || 0,
       })
@@ -4247,6 +4438,10 @@ export function apply(ctx) {
         // 所以在这里落盘 —— 重启后 /list、/switch 仍能显示真名而不是「主会话 / 会话 N」。
         sessions: chat.sessions.map((s) => ({
           id: s.id, label: s.label, title: s.title, type: s.type, gen: s.gen,
+          // 2026-11-05：会话所属工作区（= 会话首帧 meta.cwd）随条目落盘。GUI 就是按它分组列会话；
+          //   不存的话，bot 的 workspace 一改就再也找不回「旧会话该归到哪个分组」，重建只能退回
+          //   当前 cfg.workspace ⇒ 旧会话在 GUI 列表里消失（实证见 effectiveSessionCwd 处注释）。
+          cwd: s.cwd,
         })),
         // #771 熔断计数（挂 chat 级，见 loadChats :3725-3731 的说明）：0 次不写字段，
         // 与 kind/peer 同规则（undefined 被 JSON 丢弃）；跨进程重启靠它继续拦住第二次重建。
@@ -4348,7 +4543,8 @@ export function apply(ctx) {
   //   永久丢失；label 无限累加；每轮一次 persistChats 写盘。故**同一条聊天**最多自动重建一次，
   //   第二次仍判定缺失只留日志、原 agent 带病放行（保持既有 fail-open 语义，不新增拒答）。
   //   计数落在 chat 记录（chat.remounts）并经 persistChats 落盘 ⇒ 跨进程重启同样生效，
-  //   且不会被 heal 的「splice 旧条目＋push 新条目」抹掉（挂 entry 上必失效，见 :3725 说明）。
+  //   且不会因为 heal 换掉 active 条目（旧实现 splice＋push，2026-11-05 起改为 push 新条目＋
+  //   保留旧条目，见 handleInbound 自愈块）而失效（挂 entry 上必失效，见 loadChats 处说明）。
   const REMOUNT_LABEL = '（挂载丢失已自动重建）'
 
   async function ensurePresetTools(bot, chat, agent) {
@@ -4367,7 +4563,7 @@ export function apply(ctx) {
         + ' 的预设不在册（配置无效，不是挂载丢失），请先改 bot 的 agentPreset 配置')
       return agent
     }
-    // 🔴 计数读 chat 级（不是 entry 级）：heal 会 splice 掉当前条目，per-entry 计数活不过
+    // 🔴 计数读 chat 级（不是 entry 级）：heal 会换掉 active 指向的条目，per-entry 计数活不过
     //   下一条消息 ⇒ 熔断失效（2026-10-17 冒烟 N3 实测「第二次仍重建、日志两条」即此）。
     if (Number(chat.remounts) >= 1) {
       console.log('[fs] #771 preset tools still missing on ' + entry.id
@@ -6490,19 +6686,37 @@ export function apply(ctx) {
     let chat = bot.chats.get(chatId)
     let agent
     let sessionReused = false
+    // 🆕 2026-11-05（维护者 判「新会话必须主动附上一次会话的 id」）：「自动新建会话」时带给新会话的交接前缀。
+    //   上一版只有**空回复自愈**那条腿（:73xx）会注入交接，于是「重启/热重载后旧会话不可恢复 ⇒
+    //   自动新建」这条腿新会话什么都不知道（只留一行 `old session not resumable` 日志，用户莫名其妙
+    //   到了空会话）。两条自动新建腿在这里统一补上：① 无任何可复用条目（加载期丢过 legacy 会话）；
+    //   ② resolveAgent 失败（宿主拒收仍标 live 的会话，重启后最常见）。用户主动 /new、/switch 不注入
+    //   （那是他自己选的，不是"错误导致丢上下文"）。
+    let autoHandoff = ''
     if (!chat || chat.sessions.length === 0) {
-      // #771 熔断额度必须**跨「chat 对象重建」保留**：heal 失败支路（:6531 已 splice 掉条目、
-      // createDedicated 又抛错）会把 sessions 留成空数组 ⇒ 下一条入站整个 chat 对象被重建，
-      // 额度若跟着归零＝每条入站又能各重建一次（审查 2026-10-17 第 3 条）。
+      const dropped = bot.droppedLegacyIds && bot.droppedLegacyIds.get(chatId)
+      const droppedId = Array.isArray(dropped) && dropped.length > 0
+        ? String(dropped[dropped.length - 1] || '') : ''
+      // #771 熔断额度必须**跨「chat 对象重建」保留**：heal 失败支路（旧实现 splice 掉条目、
+      // createDedicated 又抛错；2026-11-05 起条目不再删，但「sessions 为空 ⇒ 整个 chat 对象重建」
+      // 这条路径仍在）会把额度归零 ⇒ 每条入站又能各重建一次（审查 2026-10-17 第 3 条）。
       chat = { sessions: [], activeIndex: 0, remounts: Number(chat && chat.remounts) || 0 }
       bot.chats.set(chatId, chat)
       const sessionId = 'fs-main-' + Date.now().toString(36)
       try {
         const handle = await createDedicated(bot, sessionId)
-        chat.sessions = [{ id: sessionId, label: '主会话', type: 'dedicated', gen: SESSION_GEN, handle }]
+        chat.sessions = [{
+          id: sessionId, label: '主会话', type: 'dedicated', gen: SESSION_GEN, handle,
+          cwd: effectiveSessionCwd(bot),
+        }]
         chat.activeIndex = 0
         persistChats(bot, bot.chats)
         agent = handle.agent
+        if (droppedId) {
+          autoHandoff = healHandoffText(null, droppedId,
+            '旧会话是上一代格式（缺标准工具挂载），已在启动加载时丢弃', { keptInBinding: false })
+          console.log('[fs] handoff on auto-create: old legacy ' + droppedId)
+        }
       } catch (error) {
         console.log('[fs] auto-create agent failed: ' + String(error && error.stack || error))
         await sendPlainText(bot, chatId, '创建 Agent 会话失败：'
@@ -6511,6 +6725,12 @@ export function apply(ctx) {
       }
     } else {
       sessionReused = true
+      // 「上一会话」＝当前 active 条目：它可能正是马上要失败的那条（resolveAgent 拒收）
+      const prevEntry = chat.sessions[chat.activeIndex]
+      const prevId = prevEntry && prevEntry.id ? String(prevEntry.id) : ''
+      // 旧会话所属工作区：重建时必须继承它，否则新会话落到当前 cfg.workspace，
+      // 与旧会话分属两个 GUI 工作区分组 ⇒ 旧会话"消失"（2026-11-05 维护者 报障的桥侧成因）。
+      const prevCwd = prevEntry && prevEntry.cwd ? String(prevEntry.cwd) : ''
       agent = await resolveAgent(bot, chat)
       if (!agent) {
         // The previous session could not be resumed (DSH refuses to prepare a
@@ -6519,13 +6739,30 @@ export function apply(ctx) {
         // always gets a reply; keep the old entry in the list for reference.
         const sessionId = 'fs-main-' + Date.now().toString(36)
         try {
-          const handle = await createDedicated(bot, sessionId)
-          chat.sessions.push({ id: sessionId, label: '会话 ' + (chat.sessions.length + 1), type: 'dedicated', gen: SESSION_GEN, handle })
+          const handle = await createDedicated(bot, sessionId, prevCwd || undefined)
+          chat.sessions.push({
+            id: sessionId,
+            label: '会话 ' + (chat.sessions.length + 1),
+            type: 'dedicated',
+            gen: SESSION_GEN,
+            handle,
+            cwd: prevCwd || effectiveSessionCwd(bot),
+          })
           chat.activeIndex = chat.sessions.length - 1
           persistChats(bot, bot.chats)
           sessionReused = false
           agent = handle.agent
           console.log('[fs] old session not resumable (live), created fallback ' + sessionId)
+          // 2026-11-05（维护者 判「出错后新会话必须主动附上一次会话 id」）：这条腿是重启/热重载后
+          //   最常走到的自动新建路径。旧条目**仍 push 在 chat.sessions 里**（下面没删它），
+          //   所以 keptInBinding 保持 true（/switch 真能切回去）。
+          //   正文取不到是常态（agent 根本没恢复起来）⇒ 骨架里至少有旧 id + 原因。
+          if (prevId) {
+            autoHandoff = healHandoffText(
+              prevEntry && prevEntry.handle && prevEntry.handle.agent, prevId,
+              '旧会话在本进程里已不可恢复（多半是 dsh web 重启/热重载中断后，宿主拒收仍标记为 live 的会话）')
+            console.log('[fs] handoff on fallback create: old ' + prevId)
+          }
         } catch (error) {
           console.log('[fs] fallback create failed: ' + String(error && error.stack || error))
           await sendPlainText(bot, chatId, '会话创建失败：'
@@ -6661,7 +6898,10 @@ export function apply(ctx) {
         role: 'user',
         // #1105：日期锚拼在当轮消息最前（同日已注时为空串，追加式不回写历史）。
         // #2591：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，常规路径）。
-        content: [{ type: 'text', text: dateAnchor + label + text + senderMark.footer + (evt.mentionFooter || '') + quote + rulingHintFor(bot, text) }],
+        // 桥自愈-上下文交接（2026-11-05）：`opts.prefix`＝旧会话交接摘要，只在**自愈重建**那一次
+        //   重试上传入；与日期锚共用同一个"拼在最前"的通道（比走 /feishu/admin/inject-context
+        //   外挂 HTTP 更小：同步、不另起回合、不依赖共享 token）。
+        content: [{ type: 'text', text: dateAnchor + (opts && opts.prefix ? opts.prefix : '') + label + text + senderMark.footer + (evt.mentionFooter || '') + quote + rulingHintFor(bot, text) }],
         source: { kind: 'user' },
       }
       let card = makeCardState(turnAgent)
@@ -7128,8 +7368,14 @@ export function apply(ctx) {
       }
     }
 
-    let turn = await runTurn(commandHold && commandHold.agent ? commandHold.agent : agent,
-      commandHold ? { skipSend: true, seqBefore: commandHold.seqBefore } : undefined)
+    // 2026-11-05：自动新建会话的那一轮，把「上一会话交接」拼进首条消息（与自愈重建共用
+    //   `opts.prefix` 通道：同步、不另起回合、不依赖共享 token）。只在本轮注入一次，后续轮次不再重复。
+    const leadOpts = Object.assign(
+      {},
+      commandHold ? { skipSend: true, seqBefore: commandHold.seqBefore } : {},
+      autoHandoff ? { prefix: autoHandoff } : {},
+    )
+    let turn = await runTurn(commandHold && commandHold.agent ? commandHold.agent : agent, leadOpts)
     // 会话级损坏（v4 格式校验拒收等 SessionFormatError 族）⇒ 写入通道已坏、**每轮必炸**，
     // 重建会话正是正解——不得走下面的「上游报错不自愈」分支（2026-10-19 BA 池实锤：
     // 该 skip 让坏会话永远不自愈，同一报错反复出现；中台 #2009/#2010）。
@@ -7142,39 +7388,97 @@ export function apply(ctx) {
       // 说本轮没有回复」）。现在：原因留在卡上（runTurn 已写），**不自愈**。
       console.log('[fs] skip self-heal: upstream failure (' + turn.failure.text + ')')
     } else if (!turn.hadOutput && (sessionReused || sessionCorruptFailure)) {
-      // Reused/resumed session produced nothing at all — the signature of a
-      // session whose turn was killed by a dsh web restart (2026-09-08). Drop
-      // it and answer from a brand-new session so the user never gets a blank
-      // reply; keep the old entry's history in DSH storage, just unbind it.
+      // 复用/恢复来的会话这一轮一个字都没产出 —— 典型是 dsh web 重启/热重载把回合打断
+      // （2026-09-08 首见）。旧实现直接 `splice` 掉旧条目、换空会话重试：用户拿到回复，但
+      // **整段历史被摘出绑定**（2026-11-05 14:08 实证：13 万字级长会话被摘，新会话什么都看不到，
+      // 只能人工从磁盘会话文件里捞回来）。现在的顺序：
+      //   ① 先就地恢复旧会话、在同一上下文上重试本轮；
+      //   ② 真不行才新建，且**注入「上一会话交接」正文摘要**；
+      //   ③ 旧条目**保留**（/list 看得到、/switch 能切回），只把 active 指到新会话。
       const failedTurn = turn
       const stale = chat.sessions[chat.activeIndex]
-      console.log('[fs] session ' + (stale && stale.id || '?') + ' produced no output; recreating session and retrying once')
+      const staleId = String((stale && stale.id) || '')
+      // 重建必须落在旧会话同一个工作区（GUI 按 cwd 分组，换组＝旧会话在列表里消失）
+      const staleCwd = stale && stale.cwd ? String(stale.cwd) : ''
+      const guardOn = Boolean(bot && bot.cfg && bot.cfg.identityGuard)
+      console.log('[fs] session ' + (staleId || '?') + ' produced no output; trying in-place resume retry before any rebuild')
       // 旧卡不能停在「正在工作中…」：它已经被 runTurn 封口（状态 + 失败原因都在卡对象里），
       // 但旧的调用路径只在**重试后的**新卡上 sync → 旧卡在飞书里永远转圈（真机 14:35:28 那张）。
       // 这里把它封口后的状态推上去；建卡本来就失败（createFailed/无 token）时 syncCard 会自行跳过。
       try { await syncCard(bot, chatId, failedTurn.card, true) } catch { /* 推送失败不影响重试 */ }
-      chat.sessions.splice(chat.activeIndex, 1)
-      if (chat.sessions.length === 0) chat.activeIndex = 0
-      else if (chat.activeIndex >= chat.sessions.length) chat.activeIndex = chat.sessions.length - 1
-      const sessionId = 'fs-main-' + Date.now().toString(36)
-      try {
-        const handle = await createDedicated(bot, sessionId)
-        chat.sessions.push({ id: sessionId, label: '主会话（自愈）', type: 'dedicated', gen: SESSION_GEN, handle })
-        chat.activeIndex = chat.sessions.length - 1
-        persistChats(bot, bot.chats)
-        turn = await runTurn(handle.agent)
-        // 提示必须**上卡**：旧实现只把它拼进 turn.reply，而卡片送达时用的是卡对象的 blocks
-        // → 走卡片路径的用户根本看不到这句（只有卡片失败退化成纯文本时才带）。
-        // 原因用上游给的真实原因（有的话），不再一律猜「可能被 dsh 重启打断」。
-        // 中台 #2216：这句同样进员工对话框 ⇒ 走档位闸（L3+ 人话短语；其余统一话术，
-        //   原文只进日志——封口那行 `turn sealed` 已带 failure= 全文，ALERT 也在 runTurn 打过）。
-        const why = failedTurn.failure ? '（' + safeFailureReasonForViewer(failedTurn.failure, identityActor, Boolean(bot && bot.cfg && bot.cfg.identityGuard)) + '）' : ''
-        const notice = '⚠️ 上一会话本轮没有产生回复' + why + '，已自动重建会话重试。'
-        turn.reply = notice + '\n\n' + turn.reply
-        turn.card.blocks.unshift({ type: 'message', text: notice })
-        console.log('[fs] heal: recreated session ' + sessionId + ' and retried the message')
-      } catch (error) {
-        console.log('[fs] heal create failed: ' + String(error && error.message || error))
+
+      // ── ① resume 兜底：在**旧会话**上再试一次本轮（不重建、不摘绑定、上下文原样保留）──
+      // 交接摘要从**旧会话**的 agent 上读：重建之后它就不在链路里了，务必抓在手里。
+      let digestSource = agent
+      if (!sessionCorruptFailure && stale) {
+        try {
+          const revived = await reviveSessionForRetry(bot, stale, agent)
+          if (revived && revived.agent) {
+            digestSource = revived.agent
+            const retried = await runTurn(revived.agent)
+            if (retried.hadOutput) {
+              turn = retried
+              const notice = '🔁 本会话这一轮原先没有产出，已就地恢复原会话重试（历史上下文仍在）。'
+              turn.reply = notice + '\n\n' + turn.reply
+              turn.card.blocks.unshift({ type: 'message', text: notice })
+              resetHealBudget(bot, chatId)
+              console.log('[fs] heal(resume): session ' + staleId + ' recovered in place via ' + revived.via
+                + ' (context preserved, no rebuild)')
+            } else {
+              try { await syncCard(bot, chatId, retried.card, true) } catch { /* 同上 */ }
+              turn = retried
+              console.log('[fs] heal(resume): retry on ' + staleId + ' still produced no output; rebuild is the last resort')
+            }
+          }
+        } catch (error) {
+          console.log('[fs] heal(resume) failed for ' + (staleId || '?') + ': ' + String(error && error.message || error))
+        }
+      }
+
+      // ── ②③ 仍无产出 ⇒ 新建会话（注入交接摘要）＋ 旧条目保留、只移动 active ──────────
+      if (!turn.hadOutput) {
+        if (!canRebuildAfterHeal(bot, chatId)) {
+          console.log('[fs] heal: rebuild budget exhausted for chat ' + chatId + ' (used='
+            + Number(healBudgetOf(bot).get(String(chatId)) || 0) + '/' + HEAL_REBUILD_MAX
+            + ') — keeping the failed turn as-is, will not create yet another session')
+        } else {
+          // 原因用上游给的真实原因（有的话），不再一律猜「可能被 dsh 重启打断」。
+          // 中台 #2216：这句同样进员工对话框 ⇒ 走档位闸（L3+ 人话短语；其余统一话术，
+          //   原文只进日志——封口那行 `turn sealed` 已带 failure= 全文，ALERT 也在 runTurn 打过）。
+          const why = failedTurn.failure
+            ? safeFailureReasonForViewer(failedTurn.failure, identityActor, guardOn)
+            : '本轮没有产出（上游没有给出失败标记，多半是回合被重启/中断打断）'
+          const digest = healHandoffText(digestSource, staleId, why)
+          const sessionId = 'fs-main-' + Date.now().toString(36)
+          try {
+            const handle = await createDedicated(bot, sessionId, staleCwd || undefined)
+            // ③ 旧条目留着：/list 里看得到、/switch 能切回去把上下文接回来（label 打标记便于认）
+            if (stale && !String(stale.label || '').includes(HEAL_OLD_LABEL)) {
+              stale.label = String(stale.label || '主会话') + HEAL_OLD_LABEL
+            }
+            chat.sessions.push({
+              id: sessionId, label: '主会话（自愈重建）', type: 'dedicated', gen: SESSION_GEN, handle,
+              cwd: staleCwd || effectiveSessionCwd(bot),
+            })
+            chat.activeIndex = chat.sessions.length - 1
+            persistChats(bot, bot.chats)
+            const usedNow = noteHealRebuild(bot, chatId)
+            // ② 重跑首条消息时带上「上一会话交接」前缀：正文摘要（不是 id —— 只给 id 新会话读不到内容）
+            turn = await runTurn(handle.agent, { prefix: digest })
+            // 提示必须**上卡**：旧实现只把它拼进 turn.reply，而卡片送达时用的是卡对象的 blocks
+            // → 走卡片路径的用户根本看不到这句（只有卡片失败退化成纯文本时才带）。
+            const notice = '⚠️ 上一会话本轮没有产生回复（' + why + '），已自动重建会话重试；旧会话 '
+              + (shortSessionId(staleId) || '?') + ' 已保留在绑定里（/switch 可切回），'
+              + '本轮已把旧会话最近几轮正文作为「交接」注入新会话。'
+            turn.reply = notice + '\n\n' + turn.reply
+            turn.card.blocks.unshift({ type: 'message', text: notice })
+            console.log('[fs] heal: recreated session ' + sessionId + ' (old ' + (staleId || '?')
+              + ' kept in binding, handoff digest len=' + String(digest.length)
+              + ', rebuild ' + usedNow + '/' + HEAL_REBUILD_MAX + ')')
+          } catch (error) {
+            console.log('[fs] heal create failed: ' + String(error && error.message || error))
+          }
+        }
       }
     }
     if (turn.waitError) {
@@ -7198,6 +7502,7 @@ export function apply(ctx) {
         console.log('[fs] send failed for ' + messageId + ': ' + String(error && error.message || error))
       }
     } else {
+      await dedupeDeliveredReplyCard(bot, chatId, turn.card, turn.reply)
       console.log('[fs] card reply delivered to ' + chatId)
     }
     removeReactionOnce()
@@ -9272,6 +9577,7 @@ export function apply(ctx) {
         type: 'dedicated',
         gen: SESSION_GEN,
         handle,
+        cwd: effectiveSessionCwd(bot, cwd),
       })
       chat.activeIndex = chat.sessions.length - 1
       persistChats(bot, bot.chats)
@@ -9299,6 +9605,7 @@ export function apply(ctx) {
       type: 'resumed',
       gen: SESSION_GEN,
       handle,
+      cwd: effectiveSessionCwd(bot, cwd),
     })
     chat.activeIndex = chat.sessions.length - 1
     persistChats(bot, bot.chats)
