@@ -3502,6 +3502,18 @@ export function apply(ctx) {
       + ' closing_hash=' + shortHash(String(closing.text || '')) + ' closing_len=' + String(closing.text || '').length
       + ' card=' + (card.token || '-') + ' blocks=' + card.blocks.length)
     try { void syncCard(bot, chatId, card, true).catch(() => { }) } catch { }
+    // 🔴 #E12（2026-11-07，维护者 报障「两套机制……会有重复」的真正落点）：
+    //   自动轮／回执轮卡也是**桥自己投递出去的一条回复**，但它不走 `runTurn`
+    //   ⇒ 下面 mirrorTick 的「防自环①」（只在 runTurn 收尾推进基线，见 activeTurns.delete 之后那段）
+    //   完全看不到它。于是 15s 后的镜像轮询把这个 already-delivered 的回合当成「GUI 回合」，
+    //   用 `💬 正文` 再把同一段话发一遍 —— 真机实证（web.log）：
+    //     `auto card sealed … kind=notice … closing_len=930`
+    //     `mirror: GUI turn reply -> chat oc_ebe4ef87b len=930`   ← 同一段、差 3 行
+    //   所以桥的每一处投递收尾都必须推进镜像基线（runTurn 一处 + 这里一处）。
+    try {
+      const seq = mirrorTurnEndSeq(sessionEvents(agent.session))
+      if (seq >= 0) mirrorSeen.set(String(agent && agent.id), seq)
+    } catch { /* 推进失败不影响封口；mirrorTick 另按 autoCards 判据兜一层 */ }
   }
 
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
@@ -4283,17 +4295,23 @@ export function apply(ctx) {
     // ③创建后读回校验落库并打日志（saveSelection 无门、补写做不到——见
     // verifyDefaultModelLanded 的记录；留痕即 #339 探针：卡上写 X 实际用 Y 即复现证据）。
     const agentOptions = await agentOptionsWithRetry('创建', true, true)
+    // #E10 出生即挂工作区（维护者 2026-11-07 拍板方案A）：cwd 与 meta.cwd 同源同值，attach 的
+    // realpath 全等校验（dsh-workspace entity.js:80）必过；attachSessionToWorkspace 内部
+    // 全 try/catch fail-open，挂载失败绝不影响创建本身。失败形态＝日志 workspace registry
+    // attach skipped，会话照旧能用、只是落 GUI「未分组」。
+    const cwd = effectiveSessionCwd(bot, cwdOverride)
     const handle = await agents.create({
       sessionId,
-      meta: { cwd: effectiveSessionCwd(bot, cwdOverride) },
+      meta: { cwd },
       ...(agentOptions ? { agentOptions } : {}),
       setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
     logModelBinding('', sessionId, handle && handle.agent)
+    await attachSessionToWorkspace({ workspace: cwd }, sessionId)
     return handle
   }
 
-  async function resumeDedicated(bot, sessionId) {
+  async function resumeDedicated(bot, sessionId, cwdHint) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
     const agentOptions = await agentOptionsWithRetry('恢复', false, false)
@@ -4305,6 +4323,13 @@ export function apply(ctx) {
     // 与 create 腿对称的读回（#560 判据可达性）：这一行以前不存在，
     // 所以"resume 后首条没模型"只能靠新建会话的偶然样本去抓。
     logModelBinding('resume', sessionId, handle && handle.agent)
+    // #E10 恢复腿同补挂载：cwdHint 须是非空字符串才采用（4629 调用点历史上传的第三参
+    // mainAgent 是对象，不做类型防护会被拼成 "[object Object]" 去建垃圾工作区）；
+    // 无 hint 回落 bot 工作区；attach 的 realpath 校验用会话 header.cwd 判，目标选偏即静默
+    // 跳过（fail-open），不影响恢复。
+    const attachCwd = (typeof cwdHint === 'string' && cwdHint.trim())
+      ? cwdHint : (bot.cfg && bot.cfg.workspace) || ''
+    await attachSessionToWorkspace({ workspace: attachCwd }, sessionId)
     return handle
   }
 
@@ -4344,7 +4369,7 @@ export function apply(ctx) {
   async function reviveSessionForRetry(bot, entry, prevAgent) {
     if (prevAgent && prevAgent.session) return { agent: prevAgent, via: 'live' }
     if (entry && entry.handle && entry.handle.agent) return { agent: entry.handle.agent, via: 'handle' }
-    const handle = await resumeDedicated(bot, entry && entry.id)
+    const handle = await resumeDedicated(bot, entry && entry.id, entry && entry.cwd)
     if (entry) entry.handle = handle
     return { agent: handle.agent, via: 'resume' }
   }
@@ -5304,6 +5329,11 @@ export function apply(ctx) {
       root_id: message.root_id,
       thread_id: message.thread_id,
       sender,
+      // #E12（2026-11-07）：把**事件幂等键**带下来。飞书的幂等粒度是信封里的
+      //   `header.event_id`，归一化层原来把它整个丢掉 ⇒ 下游只能用 message_id 判重，
+      //   拦不住"同一 event 换信封重投"（卡片回调重投更是完全没判据）。原样留一份 raw。
+      event_id: String((d.header && d.header.event_id) || d.event_id || ''),
+      __raw: d,
     }
   }
 
@@ -6381,6 +6411,56 @@ export function apply(ctx) {
     return id ? seenInboundIds.has(id) : false
   }
 
+  // ---- 事件级幂等闸（#E12，2026-11-07 · 维护者 报障「两套机制重复」配套）-----------------
+  // 为什么还要这一层：上面 `seenInboundIds` 只按 `appId|message_id` 拦**消息事件**，
+  //   而飞书的幂等键是事件信封里的 `header.event_id`：
+  //   · `card.action.trigger` 此前**一点幂等都没有** —— 飞书回调 3 秒内没拿到响应会重投
+  //     （同一 event_id 2~3 次），重投就把同一次点击再执行一遍（二次回执/二次改卡）；
+  //   · 长连接 at-least-once + 同 app 双 helper 时，同一 event 也可能到两次。
+  // 口径（照 维护者 要求的三条）：
+  //   · key ＝ `appId|e|header.event_id`；事件没带 event_id 才回落 `appId|m|message_id`，
+  //     卡片回调再退到 `appId|c|token`（token 是卡自己的唯一量）；三者都没有才放弃（返回空）。
+  //   · **只在真正要派发的那一刻认领**；派发/处理抛错必须 `releaseEvent(key)` 把 key 还回去
+  //     —— 提前写死会让"真失败"永远回不来（A52 口径）。
+  //   · 命中判重**必须留痕**（含 key 与通道），不许静默丢弃。
+  //   · 有界：TTL 30 分钟 + LRU 500（桥奔着连跑几天，无界集合＝慢速内存泄漏）。
+  const EVENT_SEEN_TTL_MS = 30 * 60 * 1000
+  const EVENT_SEEN_MAX = 500
+  const eventSeen = new Map()   // key -> 认领时刻(ms)
+  function eventIdempotencyKey(bot, evt, data) {
+    const who = String((bot && bot.cfg && bot.cfg.appId) || (bot && bot.name) || '')
+    const header = (data && data.header) || {}
+    const eid = String(header.event_id || (data && data.event_id) || '').trim()
+    if (eid) return who + '|e|' + eid
+    // 只有**消息事件**才有真正的 message_id 幂等语义。
+    // 🔴 卡片回调**绝不**拿"卡 token / 卡片消息 id"当幂等键：同一张卡上的不同按钮
+    //   本来就是多次合法点击（`/model` 连点、审批先改选项再确认…），拿卡当键会把
+    //   真实操作吞掉（本版第一轮回退实测：10 条 `/model` 断言全红、实得 {}）。
+    //   拿不到 `event_id` 就不去重 —— 宁可少拦一次，不可吞掉一次真实点击。
+    const mid = String((evt && evt.message_id) || '').trim()
+    if (mid) return who + '|m|' + mid
+    return ''
+  }
+  // 认领成功＝这条事件归我处理；返回 { key, duplicate }。
+  function claimEvent(bot, evt, data, channel) {
+    const key = eventIdempotencyKey(bot, evt, data)
+    if (!key) return { key: '', duplicate: false }
+    const at = eventSeen.get(key)
+    const now = Date.now()
+    if (at !== undefined && (now - at) < EVENT_SEEN_TTL_MS) {
+      // 留痕可审计（key 只含 appId/事件 id，不含任何凭据 — A13）
+      console.log('[fs] duplicate event suppressed (pre-delivery): key=' + key
+        + ' channel=' + channel + ' age_ms=' + String(now - at))
+      return { key, duplicate: true }
+    }
+    eventSeen.set(key, now)
+    while (eventSeen.size > EVENT_SEEN_MAX) eventSeen.delete(eventSeen.keys().next().value)
+    return { key, duplicate: false }
+  }
+  function releaseEvent(key) {
+    if (key) eventSeen.delete(key)
+  }
+
   // 🔴 第五十轮 LOW#5（核对为真）：上面的窥探**只认"已经认领过的"**，而认领发生在下游
   //   handleInbound/steer（5342/5382）。0.8.4 把 post 附件改成"先下载完再派发"之后，认领被推到
   //   下载完成**之后**（最长可达整个有界窗口）⇒ 重投的第二份落在"第一份还在下载"这个窗口里，
@@ -6551,10 +6631,16 @@ export function apply(ctx) {
     // 入站去重：飞书长连接是 at-least-once，重连后会重投未 ack 的事件；
     // 进程内也可能有两份 helper 订阅同一 app。没有去重时同一条消息会跑两整轮、
     // 产出两张内容相同的卡（2026-09-15 维护者 反馈"同一段东西分两个卡片发"）。
+    // #E12（2026-11-07）：再叠一层**事件幂等**（`header.event_id`）—— message_id 判重
+    //   只能拦"同一条消息"，拦不住"同一 event 换了信封"的形态；两层都留痕、都带通道。
     if (isDuplicateInbound(bot, evt.message_id)) {
-      console.log('[fs] duplicate inbound skipped: ' + String(evt.message_id || ''))
+      console.log('[fs] duplicate inbound suppressed (pre-delivery): key='
+        + inboundKey(bot, evt.message_id) + ' channel=im.message.receive_v1'
+        + ' message_id=' + String(evt.message_id || ''))
       return
     }
+    const evtClaim = claimEvent(bot, evt, evt.__raw, 'im.message.receive_v1')
+    if (evtClaim.duplicate) return
     bot.lastChatId = chatId
     // 0.7.17（两模式）：记录 chat 类型（入站事件自带的 chat_type，p2p|group）——
     // 群判据**不信 oc_ 前缀**（2030：飞书单聊与群聊都用 oc_）⇒ 群一律 stable（见 resolveCardMode）。
@@ -7013,6 +7099,13 @@ export function apply(ctx) {
       // 只有"表里还是我这条"才删 —— 跨代共享后，新实例可能已经登记了它自己的 entry，
       // 无条件 delete 会把**别人正在跑的回合**从表里摘掉（又一次"两张卡"）。
       if (activeTurns.get(turnAgent.id) === entry) activeTurns.delete(turnAgent.id)
+      // #E11 防自环①：桥回合结束即推进镜像基线。turn/end 先落、whenIdle 后 resolve，
+      // 轮询若跑在「已 end、未收尾」窗口会把桥回合误判成 GUI 回合重推；这里主动推进堵死。
+      try {
+        const evs = sessionEvents(turnAgent.session)
+        const s = mirrorTurnEndSeq(evs)
+        if (s >= 0) mirrorSeen.set(String(turnAgent.id), s)
+      } catch { /* 镜像基线推进失败不影响回合收尾（下一 tick 有双保险②） */ }
       if (waitError) {
         card.status = 'error'
         // 中断同样要把原因说清楚，并且**不能把「正在工作中…」留在卡上**
@@ -8015,9 +8108,14 @@ export function apply(ctx) {
       // Card clicks MUST bypass the serial chain: the chain is held by the
       // turn waiting on the approval, so a queued click would only be
       // processed after the approval times out (2026-08-16).
+      // #E12（2026-11-07）：飞书回调 3 秒超时会**重投同一 event_id** ⇒ 判重必须在
+      //   真正执行点击动作之前；处理抛错则把 key 还回去（真失败要能被下一次重投救回来）。
+      const claim = claimEvent(bot, undefined, msg.data, 'card.action.trigger')
+      if (claim.duplicate) return
       try {
         handleCardAction(msg.data, bot)
       } catch (error) {
+        releaseEvent(claim.key)
         console.log('[fs] card action error: ' + String(error && error.stack || error))
       }
       return
@@ -9503,8 +9601,13 @@ export function apply(ctx) {
   }
 
   // 把会话挂进 DSH 的工作区注册表（best-effort）——**"与 GUI 同源"的关键一步**：
-  // 不挂的话，我们新建的会话在 GUI 侧边栏看不到（`sessionIds` 是落盘列表，只在 bootstrap 重建）。
-  // 任何失败都不影响切换本身（注册表不在、路径不是目录、会话 header 还没 cwd 都会抛）。
+  // 不挂的话，会话在 GUI 侧边栏落「未分组」（2026-11-07 实测：GUI 按 workspace.json 注册表
+  // 的挂载关系分组，不挂载的会话显示为 Ungrouped；旧版 GUI 不显示未挂载会话，「看不到」与
+  // 「未分组」是同一缺挂载的两个时代表现）。#E10 起 createDedicated/resumeDedicated 出生腿
+  // 统一调本函数；/switch 两处调用保留（attachSession 幂等，已在列表即跳过，重复无害）。
+  // 任何失败都不影响聊天主流程（注册表不在、路径不是目录、会话 header 还没 cwd 都会抛）。
+  // ⚠️ cwd 全等校验：会话 header.cwd realpath 后必须与工作区 path 全等 → 挂载目标的
+  // workspace 路径必须与会话出生 cwd 同源（#E10 的 create 腿用同一变量 cwd 传给两处）。
   async function attachSessionToWorkspace(row, sessionId) {
     try {
       // 门槛第二轮 medium#3：**服务名要与 registryEntities() 用同一套**（宿主侧 workspaceRegistry、
@@ -9598,7 +9701,7 @@ export function apply(ctx) {
         + '等它结束再来；或者重新发 `/switch`，在该工作区用「新建」开一个新会话。', 'warn')
       return
     }
-    const handle = await resumeDedicated(bot, row.sessionId)
+    const handle = await resumeDedicated(bot, row.sessionId, cwd || row.workspace || row.path)
     chat.sessions.push({
       id: String(row.sessionId),
       label: row.title || row.summary || shortSessionId(row.sessionId),
@@ -11607,7 +11710,7 @@ export function apply(ctx) {
   //     早先写成 `identityCtx()` ⇒ 构造器抛错被 catch 吞掉 ⇒ **注入静默失效**（日志里全是
   //     `workspaceRoot is not defined`，但外面看起来"没锁死"，很安全 —— 其实根本没认人）。
   //  ② 表路径**不许依赖运行时那个值**（`workspaceRoot()` 取 `ctx.get('sandboxPolicy')`，常为 undefined）
-  //     ⇒ 内核已加"cwd 逐级向上 6 层 ＋ 已知工作区兜底（P:/Qoder/work、D:/Work）"。
+  //     ⇒ 内核已加"cwd 逐级向上 6 层 ＋ 已知工作区兜底（P:/work、P:/Qoder/work）"。
   ctx.on('tools/execute', async (exec, next) => {
     try {
       const owner = findChatForAgent(exec.agent)
@@ -13076,4 +13179,103 @@ export function apply(ctx) {
   // 上一代若因热重载打断了回合，这里立刻在**该会话里**说明白（见 announceReloadInterrupts）。
   announceReloadInterrupts(0)
   void ensureHelpers()
+
+  // ---- #E11 GUI 回复飞书镜像（2026-11-07，维护者 需求：同一会话电脑/手机任一入口聊，飞书都收到）----
+  // 口径（B18 备案）：只镜像**桥绑定表里的会话**（chat.sessions 里有 id 的）；GUI 新建、
+  //   飞书从没聊过的会话不推（无目的地，不猜）。实现＝15s 轮询 live agent 事件流，
+  //   发现非桥驱动的已完成 turn → 取 seen 之后最后一条 assistant/message 文本推回原绑定 chat。
+  //   全用已验证路径（liveAgentsById :8759 / sessionEvents :3258 / sendPlainText :1147），
+  //   弃 ctx.on('emit') 低层实时钩子（carrier 形状未实机验证，深夜不赌）。
+  // 防自环双保险：
+  //   ① 桥回合收尾（runTurn 末段 activeTurns.delete 处）主动推进 mirrorSeen —— turn/end 先落、
+  //      whenIdle 后 resolve，轮询若跑在「已 end、未收尾」窗口会把桥回合误推，收尾推进堵死该洞；
+  //   ② tick 对 activeTurns 里（桥回合进行中）的 agent 跳过并推进 seen（turn/end 可能已落）。
+  // v1 口径：seen 以来多轮 GUI 交互只推最后一轮的最终回复（15s 轮询下实际逐轮捕获；
+  //   连续多轮合并推送留 v2）。重启后首轮只建基线不推历史（防重启洪水）。
+  const MIRROR_INTERVAL_MS = 15000
+  const MIRROR_MAX_CHARS = 4000
+  const mirrorSeen = new Map()   // String(agentId) -> 已处理的最大 turn/end 事件 seq
+  function mirrorTurnEndSeq(events) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]
+      if (ev && ev.type === 'turn/end') return Number(ev.seq)
+    }
+    return -1
+  }
+  function mirrorLastAssistantText(events, fromSeq) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]
+      if (!ev || Number(ev.seq) <= fromSeq) break
+      if (ev.type !== 'assistant/message') continue
+      const parts = (ev.data && ev.data.message && Array.isArray(ev.data.message.content))
+        ? ev.data.message.content : []
+      const text = parts
+        .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+        .map((p) => p.text).join('\n').trim()
+      if (text) return text
+    }
+    return ''
+  }
+  function mirrorLocateBinding(agentId) {
+    const want = String(agentId)
+    for (const bot of bots.values()) {
+      const chats = bot.chats || new Map()
+      for (const [chatId, chat] of chats) {
+        const sessions = Array.isArray(chat && chat.sessions) ? chat.sessions : []
+        const mine = sessions.find((s) => s && String(s.id) === want)
+        if (mine) return { bot, chatId, label: String((mine && mine.label) || '') }
+      }
+    }
+    return null
+  }
+  function mirrorTick() {
+    try {
+      const live = liveAgentsById()
+      for (const [agentId, agent] of live) {
+        const binding = mirrorLocateBinding(agentId)
+        if (!binding) continue                  // 桥不认识（GUI 新建/换代后无绑定）不推
+        if (!agent || !agent.session) continue
+        const events = sessionEvents(agent.session)
+        if (!events.length) continue
+        const endSeq = mirrorTurnEndSeq(events)
+        if (endSeq < 0) continue                // 还没有任何完成的回合
+        const seen = mirrorSeen.get(agentId)
+        if (seen === undefined) { mirrorSeen.set(agentId, endSeq); continue }   // 首见建基线不推
+        if (endSeq <= seen) continue
+        mirrorSeen.set(agentId, endSeq)         // 先推进再推送：失败也不重推（A52 单次尽力）
+        if (activeTurns.has(agentId)) continue  // 桥回合进行中（endSeq 已见，双保险②）
+        // #E12（2026-11-07）：桥的**自动轮／回执轮**（agent/status 建卡）同样在投递这一轮的正文，
+        //   它们不在 activeTurns 里 ⇒ 单靠上面那条会漏，镜像又把同一段话用纯文本发第二遍。
+        //   `autoCards` 有条目＝这一轮的可见性已经由桥自己负责 ⇒ 镜像让路（留痕可审计）。
+        if (autoCards.has(agentId)) {
+          console.log('[fs] mirror skipped (bridge owns this turn): agent=' + agentId
+            + ' seq=' + String(endSeq) + ' via=auto-card')
+          continue
+        }
+        const text = mirrorLastAssistantText(events, seen)
+        if (!text) continue
+        const shown = text.length > MIRROR_MAX_CHARS
+          ? text.slice(0, MIRROR_MAX_CHARS) + '…（镜像截断）'
+          : text
+        console.log('[fs] mirror: GUI turn reply -> chat ' + String(binding.chatId).slice(0, 12)
+          + ' len=' + shown.length)
+        void Promise.resolve(sendPlainText(binding.bot, binding.chatId,
+          '💬 ' + (binding.label ? '「' + binding.label + '」' : '') + shown))
+          .catch((e) => console.log('[fs] mirror push failed: ' + String(e && e.message || e)))
+      }
+    } catch (error) {
+      console.log('[fs] mirror tick error: ' + String(error && error.message || error))
+    }
+  }
+  // #E12（2026-11-07）：镜像轮询原来用裸 `setInterval(...).unref()` —— **热重载时没人清**，
+  //   而这个插件一天要热重载上千次（web.log 里 `dispose(热重载)` 1359 行）⇒ 定时器逐代叠加，
+  //   同一段回复会被 N 个旧代的 mirrorTick 各推一次（重复的第二个来源）。
+  //   改成 ctx.effect 托管：dispose 即 clearInterval。刻意**不用 ctx.interval** ——
+  //   冒烟夹具的 drain() 会把 ctx.interval 注册的回调全跑一遍，让 15s 人工节拍插进每个用例，
+  //   既有断言会被镜像推送污染（这不是"顺手改测试"，是不该让节拍进夹具）。
+  ctx.effect(() => {
+    const timer = setInterval(() => { mirrorTick() }, MIRROR_INTERVAL_MS)
+    if (timer && typeof timer.unref === 'function') timer.unref()
+    return () => { try { clearInterval(timer) } catch { /* 已停 */ } }
+  })
 }
