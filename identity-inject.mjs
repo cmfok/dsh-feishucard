@@ -162,7 +162,7 @@ export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
       __warnedNoWorkRoot = true
       try { process.stderr.write('[identity-inject] WORK_ROOT 环境变量未设置，已回落到已知盘符候选（A17：建议为本机设置 WORK_ROOT）\n') } catch { /* stderr 不可写不拦路径解析 */ }
     }
-    for (const ws of ['P:/work', 'P:/Qoder/work']) out.push(path.join(ws, relPath))
+    for (const ws of ['P:/work', 'P:/Qoder/work', 'D:/Work']) out.push(path.join(ws, relPath))
   }
   return out
 }

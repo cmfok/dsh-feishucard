@@ -4136,7 +4136,18 @@ export function apply(ctx) {
     const selection = ctx.get('agentDefaultModel')
     const selected = selection && typeof selection.currentSelection === 'function'
       ? selection.currentSelection() : undefined
-    return selected ? { provider: selected.provider, model: selected.model } : undefined
+    if (!selected) return undefined
+    // 🔴 2026-11-12（维护者 令「默认思考强度＝max」）：默认选择是**三项** {provider, model,
+    //   reasoningEffort}，这里原来只透传前两项 ⇒ 宿主按「只选了模型」建 agent，思考强度
+    //   落回模型自身默认档。实证：GUI 会话 cb153775… 的 request/header 是
+    //   {"provider":"opencode-go","model":"deepseek-v4.1-flash","reasoningEffort":"max"}，
+    //   而飞书会话的 header 只有前两项（缺 reasoningEffort）——同一个宿主、同一份 profile 默认，
+    //   差别只在桥这行少抄了第三项。补上；默认值没有强度时照旧不带（模型自己决定）。
+    return {
+      provider: selected.provider,
+      model: selected.model,
+      ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
+    }
   }
 
   // Compose the standard agent preset (fs/bash/web/... bundles) onto an agent
@@ -10167,7 +10178,17 @@ export function apply(ctx) {
     }
     // agent.id 就是 sessionId（宿主 `ctx.sessions.get(agent.id) === agent.session`；
     // 本机 ~/.dsh/sessions/--P-Qoder-work--/fs-main-muv8bkcg/ 与日志里的 agent=fs-main-muv8bkcg 同名可证）。
-    const res = await sc.selectModel({ sessionId: agent.id, provider, model })
+    // 🔴 2026-11-12（维护者 令「默认思考强度＝max」）· 切换腿同族修正：宿主 `selectModel`
+    //   用请求值**整条覆盖** profile 默认（内部 `agentDefaultModel.saveSelection(selected)`，
+    //   selected 就是请求里那几项）⇒ 请求不带 reasoningEffort 时，一次 `/model` 切换会把
+    //   profile 里配好的 `reasoningEffort: max` **静默抹掉**（而切换还显示成功）。
+    //   口径（B18 自决备案）：沿用当前默认选择里的强度，**仅当目标模型确实支持该档才带**；
+    //   不支持就不带（宿主按模型默认处理）——硬塞会让整条切换被 UNSUPPORTED_REASONING_EFFORT 拒掉。
+    const effort = await switchEffortFor(provider, model)
+    const res = await sc.selectModel({
+      sessionId: agent.id, provider, model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    })
     // 🔴 第十四轮门槛 MEDIUM：宿主 resolve 了但**没回带 `selected`** 时，原来这里把
     //   **请求值**当成**宿主确认的结果**回显（日志打 `selectModel ok`、卡片回「✅ 已切换为 …」）
     //   —— 正是本轮要消灭的"假成功"形状；宿主若做了归一化（把请求的 model 归到别的 id），
@@ -10180,14 +10201,40 @@ export function apply(ctx) {
     console.log('[fs] /model: selectModel ' + (out.confirmed ? 'ok' : 'ok-but-unconfirmed')
       + ' ' + String(out.provider) + '/' + String(out.model)
       + ' session=' + String(agent.id)
+      + (effort === undefined ? '' : ' effort=' + String(effort))
       + (out.confirmed ? '' : '（宿主响应里没有 selected，回显的是请求值）'))
     // #124 落地校验（回读→直存→再回读），结果并进返回值供两条通道回执分支使用。
-    const pf = await verifyDefaultModelLanded(out.provider, out.model)
+    const pf = await verifyDefaultModelLanded(out.provider, out.model, effort)
     console.log('[fs] /model: 默认值落地 ' + (pf.persisted ? 'ok' : 'FAIL')
       + ' ' + String(out.provider) + '/' + String(out.model) + '：' + pf.persistDetail)
     return {
-      provider: out.provider, model: out.model, confirmed: out.confirmed,
+      provider: out.provider, model: out.model, effort, confirmed: out.confirmed,
       persisted: pf.persisted, persistDetail: pf.persistDetail,
+    }
+  }
+
+  // 切换时该带的思考强度（见 switchModelForAgent 里的口径注释）：读当前 profile 默认选择里的
+  // 强度；只有目标模型清单里确实列了这一档才返回，其余一律 undefined（不带）。
+  // llm 服务缺失/查询失败 ⇒ 按不带处理（绝不因为拿不到清单就把切换整条搞失败）。
+  async function switchEffortFor(provider, model) {
+    let wanted
+    try {
+      const dm = ctx.get('agentDefaultModel')
+      const cur = dm && typeof dm.currentSelection === 'function' ? dm.currentSelection() : undefined
+      wanted = cur && cur.reasoningEffort
+    } catch { wanted = undefined }
+    if (!wanted) return undefined
+    try {
+      const llm = ctx.get('llm')
+      const info = llm && typeof llm.resolveModelInfo === 'function'
+        ? await llm.resolveModelInfo(provider, model) : undefined
+      const efforts = info && info.reasoning && Array.isArray(info.reasoning.efforts)
+        ? info.reasoning.efforts : []
+      return efforts.some((e) => e && e.id === wanted) ? wanted : undefined
+    } catch (error) {
+      console.log('[fs] /model: 读目标模型思考强度失败（本切按不带处理）：'
+        + String((error && error.message) || error).slice(0, 120))
+      return undefined
     }
   }
 
@@ -10202,20 +10249,23 @@ export function apply(ctx) {
   const DM_LAND_RETRY_TRIES = 5
   const DM_DIRECT_SAVE_TIMEOUT_MS = 4000
   const DM_HMR_RETRY_BACKOFF_MS = 1500
-  function defaultSelectionMatches(dm, provider, model) {
+  function defaultSelectionMatches(dm, provider, model, reasoningEffort) {
     try {
       const cur = dm.currentSelection()
-      return Boolean(cur) && cur.provider === provider && cur.model === model
+      if (!cur || cur.provider !== provider || cur.model !== model) return false
+      // 调用方显式给了强度就一并比（否则「切了强度但默认没写上」会被判成落地）；
+      // 没给强度时维持原口径，只比路由。
+      return reasoningEffort === undefined || cur.reasoningEffort === reasoningEffort
     } catch { return false }
   }
-  async function verifyDefaultModelLanded(provider, model) {
+  async function verifyDefaultModelLanded(provider, model, reasoningEffort) {
     try {
       const dm = ctx.get('agentDefaultModel')
       if (!dm || typeof dm.currentSelection !== 'function') {
         return { persisted: false, persistDetail: '宿主没暴露 agentDefaultModel 读回口' }
       }
       for (let i = 0; ; i++) {
-        if (defaultSelectionMatches(dm, provider, model)) {
+        if (defaultSelectionMatches(dm, provider, model, reasoningEffort)) {
           return { persisted: true, persistDetail: i === 0 ? '宿主即时落地' : '宿主半拍后落地（第 ' + i + ' 拍读到）' }
         }
         if (i >= DM_LAND_POLL_TRIES) break
@@ -10227,7 +10277,7 @@ export function apply(ctx) {
       // 桥直存：宿主 ② 半静默没跑 ⇒ 桥自己调同一个服务把它写上。
       const saveOnce = async () => await Promise.race([
         (async () => {
-          try { await dm.saveSelection({ provider, model }); return 'saved' } catch (error) {
+          try { await dm.saveSelection({ provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }); return 'saved' } catch (error) {
             return 'error:' + String((error && error.message) || error)
           }
         })(),
@@ -10244,7 +10294,7 @@ export function apply(ctx) {
       const escapeSave = (hmrSvc && hmrSvc.executing && typeof hmrSvc.executing.exit === 'function')
         ? async () => await Promise.race([
             (async () => {
-              try { await hmrSvc.executing.exit(() => dm.saveSelection({ provider, model })); return 'saved' } catch (error) {
+              try { await hmrSvc.executing.exit(() => dm.saveSelection({ provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) })); return 'saved' } catch (error) {
                 return 'error:' + String((error && error.message) || error)
               }
             })(),
@@ -10272,7 +10322,7 @@ export function apply(ctx) {
         }
       }
       for (let i = 0; ; i++) {
-        if (defaultSelectionMatches(dm, provider, model)) {
+        if (defaultSelectionMatches(dm, provider, model, reasoningEffort)) {
           return { persisted: true, persistDetail: '桥直存后落地' }
         }
         if (i >= DM_LAND_RETRY_TRIES) break
@@ -11710,7 +11760,7 @@ export function apply(ctx) {
   //     早先写成 `identityCtx()` ⇒ 构造器抛错被 catch 吞掉 ⇒ **注入静默失效**（日志里全是
   //     `workspaceRoot is not defined`，但外面看起来"没锁死"，很安全 —— 其实根本没认人）。
   //  ② 表路径**不许依赖运行时那个值**（`workspaceRoot()` 取 `ctx.get('sandboxPolicy')`，常为 undefined）
-  //     ⇒ 内核已加"cwd 逐级向上 6 层 ＋ 已知工作区兜底（P:/work、P:/Qoder/work）"。
+  //     ⇒ 内核已加"cwd 逐级向上 6 层 ＋ 已知工作区兜底（P:/Qoder/work、D:/Work）"。
   ctx.on('tools/execute', async (exec, next) => {
     try {
       const owner = findChatForAgent(exec.agent)

@@ -11203,6 +11203,57 @@ console.log('N7) 空回复自愈③：恢复也无效 ⇒ 重建必须注入交�
     '③ 旧条目打「已交接」标记，/list 里认得出是哪一条')
 }
 
+// ---- #E12 事件级幂等闸（A42 机器检查点，2026-11-07）------------------------------
+// 约束：同一个飞书 `header.event_id` 被投两次（长连接至少一次投递 / 卡片回调 3s 超时重投），
+//   **只能出去一次**；命中判重必须留一行带 key 与通道的可审计日志。
+// 可证伪性：把 handleHelperMessage 里那句 `claimEvent(...)` 与 `if (claim.duplicate) return`
+//   删掉 ⇒ 第二次 `card action event received` 会照旧出现 ⇒ 本用例转红（不是恒真断言）。
+console.log('120) #E12 事件幂等：同一 event_id 的卡片回调投两次只执行一次（A42 检查点）')
+{
+  const EVT_DUP_ID = 'evt_dupguard_card_001'
+  const cloneLine = (l) => consoleLines.filter((x) => x.includes(l)).length
+  const mkTap = () => JSON.stringify({
+    type: 'event',
+    eventType: 'card.action.trigger',
+    data: {
+      header: { event_id: EVT_DUP_ID },
+      action: { tag: 'button', value: {} },          // 无已知分支 ⇒ 只走入口留痕，不产生副作用
+      context: { open_chat_id: CHAT_ID },
+    },
+  }) + '\n'
+
+  const before = cloneLine('card action event received')
+  fakeProc.output += mkTap()
+  await drain()
+  const afterFirst = cloneLine('card action event received')
+  ok(afterFirst - before === 1, '第一份事件被执行（入口留痕 +1）')
+
+  fakeProc.output += mkTap()
+  await drain()
+  const afterSecond = cloneLine('card action event received')
+  ok(afterSecond === afterFirst,
+    '★ 同一 event_id 的第二份**没有再执行**（实得 +' + (afterSecond - afterFirst) + '，期望 +0）')
+
+  ok(consoleLines.some((l) => l.includes('duplicate event suppressed (pre-delivery): key=')
+    && l.includes('|e|' + EVT_DUP_ID) && l.includes('channel=card.action.trigger')),
+  '★ 判重命中留了可审计日志（含 key 与来源通道，不静默丢弃）')
+
+  // 反向：不同 event_id 的点击**必须**照常执行（去重不能吞掉真实的不同操作）
+  const EVT_OTHER_ID = 'evt_dupguard_card_002'
+  fakeProc.output += JSON.stringify({
+    type: 'event',
+    eventType: 'card.action.trigger',
+    data: {
+      header: { event_id: EVT_OTHER_ID },
+      action: { tag: 'button', value: {} },
+      context: { open_chat_id: CHAT_ID },
+    },
+  }) + '\n'
+  await drain()
+  ok(cloneLine('card action event received') === afterSecond + 1,
+    '★ 换一个 event_id 的点击照常执行（去重没吞真实操作）')
+}
+
 if (failures === 0) {
   console.log('SMOKE PASS (sentCards=' + sentCards.length + ', sessions=' + createdSessions + ')')
   process.exit(0)
