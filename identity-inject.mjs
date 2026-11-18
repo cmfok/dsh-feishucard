@@ -162,7 +162,7 @@ export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
       __warnedNoWorkRoot = true
       try { process.stderr.write('[identity-inject] WORK_ROOT 环境变量未设置，已回落到已知盘符候选（A17：建议为本机设置 WORK_ROOT）\n') } catch { /* stderr 不可写不拦路径解析 */ }
     }
-    for (const ws of ['P:/work', 'P:/Qoder/work', 'D:/Work']) out.push(path.join(ws, relPath))
+    for (const ws of ['<workspace>', 'P:/Qoder/work', 'D:/Work']) out.push(path.join(ws, relPath))
   }
   return out
 }
@@ -798,7 +798,7 @@ export function selftest () {
   ok(mapMainReadError(eAcc).includes('map_unreadable') &&
      mapMainReadError(eAcc).includes('表存在但不可读') &&
      mapMainReadError(eAcc).includes('非未登记'),
-    'EACCES ⇒ map_unreadable 显式标注（表在但读不了 ≠ 未登记，#1130 误判根因封堵）')
+    'EACCES ⇒ map_unreadable 显式标注（表在但读不了 ≠ 未登记， 误判根因封堵）')
   ok(mapMainReadError(eAcc).includes('EACCES'), '标注附错误码原文（排查者直接读码）')
   ok(mapMainReadError(Object.assign(new Error('x'), { code: 'EPERM' })).includes('map_unreadable'), 'EPERM 同判')
   ok(mapMainReadError(new Error('map_unavailable')) === 'map_unavailable', '坏 JSON 仍原样吐 map_unavailable（JS/Py 两通道口径等价不回归）')
@@ -838,7 +838,7 @@ export function selftest () {
     }
   }
 
-  console.log('── 5c) 中台#1866 第4项：本地增量表读态必须显式留痕（旧＝空 catch 无声吞）──')
+  console.log('── 5c) 中台 第4项：本地增量表读态必须显式留痕（旧＝空 catch 无声吞）──')
   {
     const td = fs.mkdtempSync(path.join(os.tmpdir(), 'tbl1866-'))
     const mapF = path.join(td, 'identity_map.json')
@@ -1080,7 +1080,7 @@ export function selftest () {
     }
   }
 
-  console.log('── 8) #2626（AC-0250 方案A 第一步）：别名覆写 + 关闸净化 + 真值形状校验 ──')
+  console.log('── 8) （需求 方案A 第一步）：别名覆写 + 关闸净化 + 真值形状校验 ──')
   {
     // ① 开闸支：模型自报 sender_open_id 冒用他人 ⇒ 必须被 actor 真值覆写（旧字节＝白名单不含
     //    该键，冒充值原样过关 ⇒ 本条红）。actor.union_id 空串 ⇒ sender_union_id 被【剔除】。

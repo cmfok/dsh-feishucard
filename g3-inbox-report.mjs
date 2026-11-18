@@ -326,7 +326,7 @@ function selftest () {
   ok(decideG3FailureReport({ ...base, nowMs: 1000 + 59999 + 60000 }) !== null, '窗口过期 ⇒ 放行')
   ok(decideG3FailureReport({ ...base, toolName: 'other_tool', nowMs: 1000 + 60002 }) !== null, '不同工具不互相误挡')
 
-  console.log('── 6) 恢复钩子（#2331 第⑦层）：登记→同工具成功关联→一次性→过窗→门禁 ──')
+  console.log('── 6) 恢复钩子（ 第⑦层）：登记→同工具成功关联→一次性→过窗→门禁 ──')
   resetG3DedupeForTest()
   ok(decideG3RecoveryReport({ ...base, toolName: 'query_orders', nowMs: 2000 }) === null, '无失败登记 ⇒ null（不误报恢复）')
   // 模拟失败登记：直接调 decide 不走 spawn；登记在 reportG3Failure 内 —— selftest 用等价路径：

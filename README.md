@@ -47,14 +47,14 @@ dsh plugin --profile web add dsh-feishucard
 
 ```json
 {
-  "bots": [
-    {
-      "name": "我的飞书机器人",
-      "workspace": "/absolute/path/to/your/workspace",
-      "appId": "cli_xxxxxxxxxxxxxxxx",
-      "appSecret": "your_app_secret"
-    }
-  ]
+ "bots": [
+ {
+ "name": "我的飞书机器人",
+ "workspace": "/absolute/path/to/your/workspace",
+ "appId": "cli_xxxxxxxxxxxxxxxx",
+ "appSecret": "your_app_secret"
+ }
+ ]
 }
 ```
 
@@ -98,8 +98,8 @@ dsh plugin --profile web add dsh-feishucard
 ## 开发 / Development
 
 ```sh
-npm run check     # 语法检查
-npm run smoke     # 全量冒烟
+npm run check # 语法检查
+npm run smoke # 全量冒烟
 ```
 
 ## 许可 / License

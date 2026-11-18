@@ -32,13 +32,13 @@ ok('S0 抽取标记存在（chunkText 区块）', chunkStart >= 0 && chunkEnd > 
 const chunkSnippet = chunkStart >= 0 && chunkEnd > chunkStart ? src.slice(chunkStart, chunkEnd) : ''
 
 const foldStart = src.indexOf('    if (elements.length > CARD_FOLD_THRESHOLD) {')
-const foldEnd = src.indexOf("    // 观测指纹（CM 2026-10-03 §3")
+const foldEnd = src.indexOf("    // 观测指纹（维护者 2026-10-03 §3")
 ok('S1 抽取标记存在（窗口折叠区块）', foldStart >= 0 && foldEnd > foldStart,
   'start=' + foldStart + ' end=' + foldEnd)
 const foldSnippet = foldStart >= 0 && foldEnd > foldStart ? src.slice(foldStart, foldEnd) : ''
 
 const pptStart = src.indexOf('  function payloadPlainText(payload) {')
-const pptEnd = src.indexOf('  // #515 存档抽取器')
+const pptEnd = src.indexOf('  //  存档抽取器')
 ok('S2 抽取标记存在（payloadPlainText 区块）', pptStart >= 0 && pptEnd > pptStart)
 const pptSnippet = pptStart >= 0 && pptEnd > pptStart ? src.slice(pptStart, pptEnd) : ''
 

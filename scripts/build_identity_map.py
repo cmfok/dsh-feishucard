@@ -10,7 +10,7 @@
 - 凭证一律不写进映射表（app_id/ou_/union_id 是标识符不是凭证）
 
 ────────────────────────────────────────────────────────────────────────────
-2026-10-04 修改记录（改：<home-maintainer>，经 CM 当日改派「身份表归我」）
+2026-10-04 修改记录（改：<home-maintainer>，经 维护者 当日改派「身份表归我」）
 原作者：<original-author>（01:14 首版，md5 215afec955f685fc19241f90a7f8ee9d）
 改前备份：<deploy-dir>/build_identity_map.py.bak-20261004-0127-before-home-fix
 
@@ -31,7 +31,7 @@
   ⑦ 新增 `--max-calls`（默认 3，日常 cron 用；**首次建表传 40**）：
      首版把 3 写死，导致一次性建表根本跑不完。日常靠「已有 union_id 就跳过」保持 0~3 次。
 ────────────────────────────────────────────────────────────────────────────
-2026-10-09 契约 V1.2 实施收口（中台 #158，验收＝身份-授权契约-v1 §七）：
+2026-10-09 契约 V1.2 实施收口（中台 ，验收＝身份-授权契约-v1 §七）：
   ⑧ 人级 entry 去 `grants`（挂岗位 ⇒ grants 只从岗位表现取，§四 连带改动）；
     限期键统一为 `extra_grants_until`（旧裸名全仓废弃，V2 机验零残留）；新增 `is_cm`（契约 §2.1，X3 主数据搬运）。
   ⑨ 存量主表如带人级 grants / 旧裸名限期键 ⇒ 用 --migrate-contract-v12 一次性清洗
@@ -69,7 +69,7 @@ def save(m):
 
 
 def _ensure_consumable_group():
-    """落盘后属组校正（#928②，2026-10-14 HR bot EACCES 事故防复发）。
+    """落盘后属组校正（②，2026-10-14 HR bot EACCES 事故防复发）。
 
     表的消费方＝生产桥 dsh-feishu-aiad（aiad 用户，属组 agtagents）。规格要求
     root:agtagents 0640（P1.5-D1 施工记录:98）；任何以 ubuntu/root 身份重写本表的
@@ -137,13 +137,13 @@ def contact_get_union_id(open_id):
 
 
 def migrate_contract_v12(m):
-    """契约 V1.2 收口迁移（中台 #158）：存量主表一次性清洗，只删键/搬键，不改任何判定数据。
+    """契约 V1.2 收口迁移（中台 ）：存量主表一次性清洗，只删键/搬键，不改任何判定数据。
 
     ① 人级 `grants` 整键删除（契约 §四：挂岗位 ⇒ grants 只从岗位表现取；
        残留人级 grants 不会被新版 resolve_actor 读到，留着只会误导排障）。
     ② 旧裸名限期键整体改名 `extra_grants_until`（值原样搬运）——
        🔴 不搬 ＝ 第 3 层限期数据【静默失效】（新版只读新键 ⇒ 永远空 dict），V2 点名的失效模式。
-    ③ 补 `is_cm` 默认 False（契约 §2.1；CM 本人一行由人工/主数据置 true）。
+    ③ 补 `is_cm` 默认 False（契约 §2.1；维护者 本人一行由人工/主数据置 true）。
     返回 (迁移人数, 限期搬运条数)。
     """
     n_people = 0
@@ -241,7 +241,7 @@ def main():
                 "status": person.get("status", ""),
                 "aliases": [nm],                      # 规格 §2.2；自助兜底靠它
                 "scopes": person.get("scopes", []),
-                # 🔴 契约 §四（2026-10-09 收口 #158）：挂岗位 ⇒ 人级【不许再存 grants】——
+                # 🔴 契约 §四（2026-10-09 收口 ）：挂岗位 ⇒ 人级【不许再存 grants】——
                 #    grants/writable_scopes/item_grants 一律由 resolve_actor 按 job_id
                 #    从 job_grants.json 现取；改一个岗位不用重刷全表，也不会出现
                 #    「表说批了 L1、这人还带着 L2」的人级漂移。人级只留第 3 层（个人叠加）。

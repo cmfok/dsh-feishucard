@@ -1,53 +1,53 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+ push:
+ pull_request:
 
 permissions:
-  contents: read
+ contents: read
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+ check:
+ runs-on: ubuntu-latest
+ steps:
+ - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          # Node >=22.15 才有 zlib.zstdDecompressSync（index.js 顶层就用它读 .zstd 会话日志）；
-          # 本机生产运行时是 v24 ⇒ CI 与生产对齐。
-          # 真因记录：Node 20 上 `import { zstdDecompressSync } from 'node:zlib'` 直接
-          # SyntaxError（does not provide an export named ...）⇒ 此前每一次 push 的 CI 都是红的。
-          node-version: 24
+ - uses: actions/setup-node@v4
+ with:
+ # Node >=22.15 才有 zlib.zstdDecompressSync（index.js 顶层就用它读 .zstd 会话日志）；
+ # 本机生产运行时是 v24 ⇒ CI 与生产对齐。
+ # 真因记录：Node 20 上 `import { zstdDecompressSync } from 'node:zlib'` 直接
+ # SyntaxError（does not provide an export named ...）⇒ 此前每一次 push 的 CI 都是红的。
+ node-version: 24
 
-      - name: Syntax check
-        run: node --check index.js && node --check helper.cjs
+ - name: Syntax check
+ run: node --check index.js && node --check helper.cjs
 
-      - name: Install deps
-        run: npm i --no-save
+ - name: Install deps
+ run: npm i --no-save
 
-      # 发布物 ≠ 本地：`files` 漏掉一个被相对 import 的文件时，**本地冒烟照样全绿**，
-      # 而别人 `npm i` 装上去会直接 `failed to import`（现场实证过一次）。
-      # 这一步把它挡在 push / PR 阶段，而不是等发版时才拦。
-      - name: Packaging integrity
-        run: node scripts/check-packaging.mjs --repo .
+ # 发布物 ≠ 本地：`files` 漏掉一个被相对 import 的文件时，**本地冒烟照样全绿**，
+ # 而别人 `npm i` 装上去会直接 `failed to import`（现场实证过一次）。
+ # 这一步把它挡在 push / PR 阶段，而不是等发版时才拦。
+ - name: Packaging integrity
+ run: node scripts/check-packaging.mjs --repo .
 
-      # 闸门自己也要能证明「会红」——不会红的闸门等于没有（本项目在检查器上栽过一次）。
-      # 这一行造一个漏文件的夹具，断言闸门 exit 1 且**点名缺的文件**；补齐后必须放行。
-      - name: Packaging gate self-test
-        run: node scripts/check-packaging.selftest.mjs
+ # 闸门自己也要能证明「会红」——不会红的闸门等于没有（本项目在检查器上栽过一次）。
+ # 这一行造一个漏文件的夹具，断言闸门 exit 1 且**点名缺的文件**；补齐后必须放行。
+ - name: Packaging gate self-test
+ run: node scripts/check-packaging.selftest.mjs
 
-      - name: Smoke test
-        run: npm run smoke
+ - name: Smoke test
+ run: npm run smoke
 
-      - name: Secret scan
-        run: |
-          if grep -rEn 'cli_[a-zA-Z0-9]{16,}|sk-[a-zA-Z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE|ghp_[a-zA-Z0-9]{20,}' \
-            --include='*.js' --include='*.cjs' --include='*.mjs' \
-            --include='*.json' --include='*.md' --include='*.yml' --include='*.yaml' . \
-            | grep -vE 'cli_xxxxxxxxxxxxxxxx|your_app_secret' ; then
-            echo "::error::Potential secret found in repository"
-            exit 1
-          fi
-          echo "Secret scan clean"
+ - name: Secret scan
+ run: |
+ if grep -rEn 'cli_[a-zA-Z0-9]{16,}|sk-[a-zA-Z0-9]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE|ghp_[a-zA-Z0-9]{20,}' \
+ --include='*.js' --include='*.cjs' --include='*.mjs' \
+ --include='*.json' --include='*.md' --include='*.yml' --include='*.yaml' . \
+ | grep -vE 'cli_xxxxxxxxxxxxxxxx|your_app_secret' ; then
+ echo "::error::Potential secret found in repository"
+ exit 1
+ fi
+ echo "Secret scan clean"

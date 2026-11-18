@@ -98,8 +98,8 @@ if (!dryRun && (isLink || sameReal)) {
     // 若 target 本身就是实体目录、只是 realpath 恰好等于源码根（例如两者就是同一条路径），
     // 那就没有链接可删，"删掉该链接"会把人带沟里。
     console.error(isLink
-      ? '[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 CM 授权后重启 dsh web。'
-      : '[sync]   若要退回实体副本：把它换成独立副本（或改用指向源码的链接）→ 重跑本脚本 → 经 CM 授权后重启 dsh web。')
+      ? '[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 维护者 授权后重启 dsh web。'
+      : '[sync]   若要退回实体副本：把它换成独立副本（或改用指向源码的链接）→ 重跑本脚本 → 经 维护者 授权后重启 dsh web。')
   } else {
     // 2026-10-02 代码审查 low#1：链接指向的是**别处**时，"link to the source"是错的，
     // 而照旧建议"删掉该链接"可能毁掉一个刻意搭的暂存检出 —— 先把真实目标打出来再让人决定。
@@ -212,7 +212,7 @@ for (const r of rows) {
 }
 // ---- 触发一次 profile 重新组合（2026-11-16：这才是本机「热重载」真正的开关）----------------
 // 为什么需要（实测取证，别删这段，删了下一个接手的人会重复踩）：
-//   宿主 HMR 的 `root` 只监听**源码目录**（日志：`hmr watching [ 'P:/work/dsh-feishucard' ]`），
+//   宿主 HMR 的 `root` 只监听**源码目录**（日志：`hmr watching [ '<workspace>/dsh-feishucard' ]`），
 //   而运行时加载的是 profile 里的**实体副本**（pnpm 对 file: 依赖做真目录拷贝）⇒ 改源码产生的
 //   文件事件映射不到任何已加载模块，等于空转；这也解释了"改源码没反应"的老结论。
 //   宿主导读（@deepseek-ai/dsh-hmr README.zh「热重载的边界」）写明：HMR 还会在**profile 重新
@@ -248,9 +248,9 @@ if (bad === 0) {
     if (r.ok) {
       console.log('[sync] 已触发 profile 重新组合（改写 ' + r.patch + ' 里的标记注释）')
       console.log('[sync] 预期：几秒内 HMR 换上新副本，飞书桥日志出现 `plugin apply #N v<版本> md5=…` + helper 重连。')
-      console.log('[sync] 若日志里 30 秒内**没有** plugin apply ⇒ 这次退化为「待生效」，需 CM 授权重启（不许自行重启）。')
+      console.log('[sync] 若日志里 30 秒内**没有** plugin apply ⇒ 这次退化为「待生效」，需 维护者 授权重启（不许自行重启）。')
     } else {
-      console.log('[sync] ⚠ 重组触发失败（' + r.why + '）⇒ 本次改动为「待生效」，需 CM 授权重启。')
+      console.log('[sync] ⚠ 重组触发失败（' + r.why + '）⇒ 本次改动为「待生效」，需 维护者 授权重启。')
     }
   }
 } else {

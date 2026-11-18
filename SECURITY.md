@@ -43,25 +43,25 @@ default) against the identity map; a recognizable name, a roster hit, or a known
 Two side effects worth knowing before enabling things:
 
 - An outbound `@` really notifies a human and really wakes another bot's agent
-  turn. Unresolvable or ambiguous names are therefore left as plain text with an
-  explicit `（未能 @ 出：X）` note rather than guessed at.
+ turn. Unresolvable or ambiguous names are therefore left as plain text with an
+ explicit `（未能 @ 出：X）` note rather than guessed at.
 - `groupRelay` is `self_only` by default, i.e. group messages that do not mention
-  this bot are ignored. Opening it (per bot or per chat) is how two agents end up
-  talking to each other; measured blow-up without limits was 3666 events in 5
-  minutes between two bots in one group, so the three-tier budget (per-pair 3/90s
-  → 10-minute freeze, per-chat 8/60s → drop, any human message re-arms) is
-  always on for relayed traffic. Human messages never consume budget.
+ this bot are ignored. Opening it (per bot or per chat) is how two agents end up
+ talking to each other; measured blow-up without limits was 3666 events in 5
+ minutes between two bots in one group, so the three-tier budget (per-pair 3/90s
+ → 10-minute freeze, per-chat 8/60s → drop, any human message re-arms) is
+ always on for relayed traffic. Human messages never consume budget.
 
 Ids in logs and cards are truncated (10/12/8 chars by context); full ids stay in
 the session context the agent reads, not on the card face.
 
 ## Supported Versions
 
-| Version | Supported          |
+| Version | Supported |
 |---------|--------------------|
-| 0.8.x   | ✅ Yes             |
-| 0.7.x   | ✅ Yes             |
-| 0.3.x   | ✅ Yes             |
-| 0.2.x   | ✅ Yes             |
-| 0.1.x   | ❌ No              |
-| < 0.1   | ❌ No              |
+| 0.8.x | ✅ Yes |
+| 0.7.x | ✅ Yes |
+| 0.3.x | ✅ Yes |
+| 0.2.x | ✅ Yes |
+| 0.1.x | ❌ No |
+| < 0.1 | ❌ No |

@@ -4,5 +4,5 @@
 # must be unique per profile (do not install together with dsh-feishu-connect
 # or any other bundle registering the same id).
 - insert:
-    - id: feishu-stream
-      name: dsh-feishucard
+ - id: feishu-stream
+ name: dsh-feishucard

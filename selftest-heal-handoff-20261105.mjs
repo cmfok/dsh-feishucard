@@ -121,14 +121,14 @@ ok('2c 同一条 assistant 里的 text 正文照样进摘要', noTool.includes('
 
 // ---- 3. 剥掉桥自己加的投递前缀（日期锚 / [飞书 x] / 【发送方】明细行）----------------
 const envelopeEvents = [
-  userEv('【日期锚】2026-11-03 星期一\n[飞书 CM] 帮我看下热加载为什么没生效\n【发送方】kind=user name=CM open_id=ou_123\n'),
+  userEv('【日期锚】2026-11-03 星期一\n[飞书 维护者] 帮我看下热加载为什么没生效\n【发送方】kind=user name=维护者 open_id=ou_123\n'),
   asstEv('查了日志，是 HMR 静默未载。'),
 ]
 const stripped = buildHealHandoff({
   events: envelopeEvents, oldSessionId: 'fs-main-env', reason: 'x', footerStripRe: FOOTER_STRIP_RE,
 })
 ok('3a 日期锚不占摘要', !stripped.includes('【日期锚】'))
-ok('3b [飞书 姓名] 前缀不占摘要', !stripped.includes('[飞书 CM]'))
+ok('3b [飞书 姓名] 前缀不占摘要', !stripped.includes('[飞书 维护者]'))
 ok('3c 【发送方】明细行（含 open_id）不占摘要',
   !stripped.includes('【发送方】') && !stripped.includes('ou_123'))
 ok('3d 正文本身保留', stripped.includes('帮我看下热加载为什么没生效'))

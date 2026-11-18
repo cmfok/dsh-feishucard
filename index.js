@@ -115,7 +115,7 @@ function conclusionSplitMinMs(bot) {
 const RULING_HINT_RX = /(同意|批准|不准|不允许|不行|驳回|否决|拍板|就按|定了|采纳|裁决是|确认按)|选\s*[0-9１-９一二三四五六七八九十]|方案\s*[0-9１-９一二三四五六七八九十]|[按依][^\n]{1,8}办/
 const RULING_HINT_NOTE =
   '\n\n〔同步闸·桥注入〕本条疑似决策口径（提醒非强制）。同步动作当轮完成：' +
-  '① 先查库 python 信息中台/tools/mt.py adjcards search "<关键词>"（✅＝可用裁决照办，执行留痕引卡号/台账号）；' +
+  '① 先查库 python 内部工具/tools/mt.py adjcards search "<关键词>"（✅＝可用裁决照办，执行留痕引卡号/台账号）；' +
   '② 命中挂墙待拍卡 adjcards decide AC-NNNN --ruling "<决策人原话>" --cm-quote "<决策人原话>" 代录闭环；' +
   '③ 会话内新裁决重大事项 adjcards gen <来源> --matter … --decide-now --cm-quote "<决策人原话>"；' +
   '小事口头指令走项目台账 ledger append 分流，不出卡。'
@@ -4292,14 +4292,14 @@ export function apply(ctx) {
     if (!agentOptions) {
       const dm = ctx.get('agentDefaultModel')
       if (!dm && strictThrow) {
-        throw new Error('agentDefaultModel 服务不可用（重试 3×500ms 仍拿不到）——拒绝创建无模型会话（中台 #350 fail-loud）')
+        throw new Error('agentDefaultModel 服务不可用（重试 3×500ms 仍拿不到）——拒绝创建无模型会话（中台  fail-loud）')
       }
       if (!dm) {
-        console.log('[fs] ⚠️ #350: 默认模型拿不到（agentDefaultModel 服务不在）——不带 agentOptions 继续'
+        console.log('[fs] ⚠️ : 默认模型拿不到（agentDefaultModel 服务不在）——不带 agentOptions 继续'
           + label + '（此处不抛：抛会被判成恢复失败并自动新建会话），落库校验见下一行')
         return agentOptions
       }
-      console.log('[fs] ⚠️ #350: 默认模型选择为空（服务在、无默认配置或未就绪）——按宿主回落继续'
+      console.log('[fs] ⚠️ : 默认模型选择为空（服务在、无默认配置或未就绪）——按宿主回落继续'
         + label + '，落库校验见下一行')
     }
     return agentOptions
@@ -4308,7 +4308,7 @@ export function apply(ctx) {
   // 原先这里是个空 catch：探针自身出问题时**整行消失**，读的人以为是"没建会话"。
   // 改成把吞掉的原因打出来——宁可多一行噪音，也不要再造一次假零条。
   function logModelBinding(legTag, sessionId, agent) {
-    const head = '[fs] #350 session model binding check' + (legTag ? ' (' + legTag + ')' : '') + ': ' + sessionId
+    const head = '[fs]  session model binding check' + (legTag ? ' (' + legTag + ')' : '') + ': ' + sessionId
     try {
       const landed = currentModelOf(agent)
       console.log(head + ' → '
@@ -4566,7 +4566,7 @@ export function apply(ctx) {
     try {
       tools = ctx.get('tools')
     } catch (error) {
-      console.log('[fs] #771 preset tools probe failed (no rebuild): ' + String(error && error.message || error))
+      console.log('[fs]  preset tools probe failed (no rebuild): ' + String(error && error.message || error))
       return false
     }
     if (!tools || typeof tools.get !== 'function') {
@@ -4642,12 +4642,12 @@ export function apply(ctx) {
     // 🔴 计数读 chat 级（不是 entry 级）：heal 会换掉 active 指向的条目，per-entry 计数活不过
     //   下一条消息 ⇒ 熔断失效（2026-10-17 冒烟 N3 实测「第二次仍重建、日志两条」即此）。
     if (Number(chat.remounts) >= 1) {
-      console.log('[fs] #771 preset tools still missing on ' + entry.id
+      console.log('[fs]  preset tools still missing on ' + entry.id
         + ' — auto-rebuild already attempted ' + Number(chat.remounts) + ' time(s), skipping (fail-open)')
       return agent
     }
     const oldId = entry.id
-    console.log('[fs] #771 preset tools missing on ' + oldId + ' (mount lost) — rebuilding session')
+    console.log('[fs]  preset tools missing on ' + oldId + ' (mount lost) — rebuilding session')
     try {
       const sessionId = 'fs-main-' + Date.now().toString(36)
       // 0.8.16（修法 4）：重建必须**沿用原会话的 cwd**，不能用默认工作目录。
@@ -4667,11 +4667,11 @@ export function apply(ctx) {
       entry.gen = SESSION_GEN
       entry.handle = handle
       persistChats(bot, bot.chats)
-      console.log('[fs] #771 rebuilt session ' + sessionId + ' replacing ' + oldId
+      console.log('[fs]  rebuilt session ' + sessionId + ' replacing ' + oldId
         + ' cwd=' + (originalCwd || '（未取到，按默认工作区）'))
       return handle.agent
     } catch (error) {
-      console.log('[fs] #771 rebuild failed, falling back to original agent ' + oldId + ': '
+      console.log('[fs]  rebuild failed, falling back to original agent ' + oldId + ': '
         + String(error && error.message || error))
       return agent
     }
@@ -10299,7 +10299,7 @@ export function apply(ctx) {
     const cur = current ? current.provider + '/' + current.model : '未知'
     const elements = [{
       tag: 'div',
-      text: { tag: 'lark_md', content: '🧠 **切换模型**（点一下即切；落地校验通过会记为默认，后续每条消息/重连都按它走·中台#124）\n当前：`' + cur + '`' },
+      text: { tag: 'lark_md', content: '🧠 **切换模型**（点一下即切；落地校验通过会记为默认，后续每条消息/重连都按它走·中台）\n当前：`' + cur + '`' },
     }]
     if (choices.length === 0) {
       elements.push({ tag: 'div', text: { tag: 'lark_md', content: '拿不到模型清单（宿主没暴露 `llm` 服务）。可以直接发：`/model provider/model`' } })
