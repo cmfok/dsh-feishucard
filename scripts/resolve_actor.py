@@ -16,8 +16,8 @@ duplicate_open_id / open_id_missing / job_not_granted / not_active /
 unknown_status / (自助兜底另记 identity.unverified)
 
 ────────────────────────────────────────────────────────────────────
-2026-10-15 契约 V1.1（minor）实施（维护者 台账 H 系列裁决 · identity_map 自助称呼列）：
-  ① identity_map 人级新增 display_name（纯显示字段：全员默认=name，维护者 行=「维护者」）
+2026-10-15 契约 V1.1（minor）实施（CM 台账 H 系列裁决 · identity_map 自助称呼列）：
+  ① identity_map 人级新增 display_name（纯显示字段：全员默认=name，CM 行=「CM」）
   ② ACTOR_KEYS 13→14 字段：输出加 display_name（表缺该键/为空时兜底 = name），
     判权路径（open_id/job_id/status）零改动 —— display_name 不参与任何判定
   ③ 判权逻辑、错误码、在职口径与 V1.2 完全一致；旧表（v1 无 display_name）照常可读
@@ -25,11 +25,11 @@ unknown_status / (自助兜底另记 identity.unverified)
 2026-10-09 契约 V1.2 实施收口（中台 #158 · 验收＝身份-授权契约-v1 §七 V1-V10）：
   ① 裸名 grants_until ⇒ extra_grants_until（契约 §2.1 键名以 policy_axis.py 为准）
   ② 人级不再存/输出 grants —— 挂岗位后 grants 只从 job_grants.json 按 job_id 现取（契约 §四）
-  ③ 兼职/待入职 ⇒ unknown_status 拒（维护者 2026-10-05 V1.2 裁决：均不可上岗；原「放行断言」已翻转）
+  ③ 兼职/待入职 ⇒ unknown_status 拒（CM 2026-10-05 V1.2 裁决：均不可上岗；原「放行断言」已翻转）
   ④ unknown_status 门禁：status 既非「在职」也不在明确不可上岗清单 ⇒ 拒
      （补 §五第 3 条的 fail-open 洞：新状态/未填不再自动获得权限）
   ⑤ job_id 真查 job_grants["jobs"][].id（原「非空即过」是空判；审批卡号 ≠ 岗位，V3/V4）
-  ⑥ 输出补 writable_scopes / item_grants / is_cm（原断供 ⇒ R5 可写/子项例外/维护者 特判全失效）
+  ⑥ 输出补 writable_scopes / item_grants / is_cm（原断供 ⇒ R5 可写/子项例外/CM 特判全失效）
   ⑦ 输出收窄为契约 §二 的 13 字段（channels 移除 —— policy_axis.User 无此字段、全仓无消费方）
 ────────────────────────────────────────────────────────────────────
 """
@@ -46,7 +46,7 @@ E_NOT_ACTIVE      = "not_active"      # 离职/终止办理/兼职终止 —— 
 E_UNKNOWN_STATUS  = "unknown_status"  # 兼职/待入职（V1.2 裁决不可上岗）＋ 清单外新状态/未填
 
 # ── 在职口径（契约 §五，V1.2 定死）────────────────────────────────────
-# 「可上岗」只含 在职（X3 枚举口径，维护者 2026-10-05 裁决）；
+# 「可上岗」只含 在职（X3 枚举口径，CM 2026-10-05 裁决）；
 # 离职三态 = not_active（正常拒绝，上层不得对它走「问姓名」兜底 —— 那是给 unknown_person 的）；
 # 其余一切（兼职 / 待入职 / 未填 / 未来新状态）= unknown_status 拒并报警 —— fail-closed。
 _ACTIVE_STATUS = ("在职",)
@@ -125,7 +125,7 @@ def resolveActor(open_id, identity_map, job_grants=None):
     # ④ 在职校验 —— 契约 §五（V1.2 定死，2026-10-09 收口）
     #
     #    离职三态 ⇒ not_active（正常拒绝，≠「不认识」）；
-    #    其余一切 ⇒ 必须是「在职」才放行：兼职/待入职（维护者 V1.2 裁决均不可上岗）
+    #    其余一切 ⇒ 必须是「在职」才放行：兼职/待入职（CM V1.2 裁决均不可上岗）
     #    与清单外的新状态/未填一律 unknown_status 拒 —— 原「反向排除其余一律放行」
     #    是 fail-open（HRM 冒出任何新状态 ⇒ 这人自动获得权限），本行把洞钉死（V10）。
     st = str(person.get("status", "") or "").strip()
@@ -187,7 +187,7 @@ if __name__ == "__main__":
     MAP = {
         "v": 1, "people": [
             {"union_id": "on_cm", "open_ids": {"cli_main": "ou_cm_main", "cli_hr": "ou_cm_hr"},
-             "person_id": "P-001", "name": "示例用户", "job_id": "电商运营助理",
+             "person_id": "P-001", "name": "陈明", "job_id": "电商运营助理",
              "channels": ["main"], "is_cm": True,
              "status": "在职", "scopes": ["公司"],
              "extra_grants": {}, "extra_grants_until": {}},
@@ -218,8 +218,8 @@ if __name__ == "__main__":
         ],
     }
     cases = [
-        ("ou_cm_main",  "OK:示例用户"),      # 命中
-        ("ou_cm_hr",    "OK:示例用户"),      # 跨 app 命中同一 union_id
+        ("ou_cm_main",  "OK:陈明"),      # 命中
+        ("ou_cm_hr",    "OK:陈明"),      # 跨 app 命中同一 union_id
         ("ou_pt_main",  E_UNKNOWN_STATUS),   # 🔴 兼职 ⇒ 拒（V1.2 裁决；旧版固化放行已翻转）
         ("ou_pre_main", E_UNKNOWN_STATUS),   # 🔴 待入职 ⇒ 拒（同上）
         ("ou_new_main", E_UNKNOWN_STATUS),   # 🔴 清单外新状态 ⇒ 拒（V10，堵 fail-open 洞）
@@ -262,11 +262,11 @@ if __name__ == "__main__":
     _, err = resolveActor("ou_nobody_main", MAP, JG)
     print(("✅" if err == E_UNKNOWN_PERSON else "❌") + " 陌生人 → " + str(err))
     # V1.1：display_name 优先（有 display_name 的行取之）＋ 无该键的行兜底 name
-    m_dn = dict(MAP); m_dn["people"] = [dict(MAP["people"][0], display_name="维护者")] + MAP["people"][1:]
+    m_dn = dict(MAP); m_dn["people"] = [dict(MAP["people"][0], display_name="CM")] + MAP["people"][1:]
     a_dn, _e2 = resolveActor("ou_cm_main", m_dn, JG)
-    print(("✅" if (a_dn or {}).get("display_name") == "维护者" else "❌") + " V1.1 display_name 优先 → " + str((a_dn or {}).get("display_name")))
+    print(("✅" if (a_dn or {}).get("display_name") == "CM" else "❌") + " V1.1 display_name 优先 → " + str((a_dn or {}).get("display_name")))
     a_fb, _e3 = resolveActor("ou_cm_main", MAP, JG)
-    print(("✅" if (a_fb or {}).get("display_name") == "示例用户" else "❌") + " V1.1 display_name 兜底 name → " + str((a_fb or {}).get("display_name")))
+    print(("✅" if (a_fb or {}).get("display_name") == "陈明" else "❌") + " V1.1 display_name 兜底 name → " + str((a_fb or {}).get("display_name")))
     # 画像层：`open_id` 必须**回带**；14 字段不多不少（契约 §二，V1.1 起）
     a, _e = resolveActor("ou_cm_main", MAP, JG)
     _got = (a or {}).get("open_id")

@@ -1,10 +1,10 @@
 {
   "name": "dsh-feishucard",
-  "version": "0.8.34",
+  "version": "0.8.43",
   "engines": {
     "node": ">=22.15.0"
   },
-  "description": "DeepSeek Harness <-> Feishu (Lark) bridge with a streaming reply card: official-SDK long connection (no public URL), per-chat dedicated agent sessions, /new /switch /list /help commands, collapsible tool-call panels with status symbols, inline agent notes, rate-limit / backoff / circuit-breaker / text fallback. Self-developed (not a fork).",
+  "description": "Feishu / Lark bridge for DeepSeek Harness (dsh, deepseek-harness) with a streaming-card reply: official-SDK long connection (no public URL), many bots in one instance, per-chat agent sessions, /new /switch /list /help /model commands, collapsible tool-call panels, approval cards, rate-limit backoff and plain-text fallback.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cmfok/dsh-feishucard.git"
@@ -22,6 +22,7 @@
   },
   "files": [
     "index.js",
+    "evalchat-route.mjs",
     "identity-inject.mjs",
     "heal-handoff.mjs",
     "g3-inbox-report.mjs",
@@ -32,13 +33,17 @@
     "scripts/collect_bot_roster.mjs",
     "README.md",
     "CHANGELOG.md",
+    "llms.txt",
     "LICENSE",
     "SECURITY.md"
   ],
   "scripts": {
     "check": "node --check index.js && node --check helper.cjs",
     "smoke": "node scripts/smoke.mjs",
-    "sync": "node scripts/sync-to-profile.mjs"
+    "scrub": "node scripts/pre-publish-scrub.mjs",
+    "sync": "node scripts/sync-to-profile.mjs",
+    "smoke:quick": "node scripts/smoke.mjs --quick",
+    "smoke:list": "node scripts/smoke.mjs --list"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.74.0"

@@ -1,4 +1,4 @@
-// 工具面板保结构 selftest（2026-10-23，维护者 拍板 1+2）——只依赖 Node 内建模块，不启桥本体。
+// 工具面板保结构 selftest（2026-10-23，经评审确定 1+2）——只依赖 Node 内建模块，不启桥本体。
 // 方法：从 index.js **原文**抽出真实的窗口折叠段 + payloadPlainText，用 new Function 注入
 // 假常量后直测（不是抄副本）；另做源码级静态断言。全绿 exit 0；任何一条失败 exit 1。
 //
@@ -32,7 +32,7 @@ ok('S0 抽取标记存在（chunkText 区块）', chunkStart >= 0 && chunkEnd > 
 const chunkSnippet = chunkStart >= 0 && chunkEnd > chunkStart ? src.slice(chunkStart, chunkEnd) : ''
 
 const foldStart = src.indexOf('    if (elements.length > CARD_FOLD_THRESHOLD) {')
-const foldEnd = src.indexOf("    // 观测指纹（维护者 2026-10-03 §3")
+const foldEnd = src.indexOf("    // 观测指纹（CM 2026-10-03 §3")
 ok('S1 抽取标记存在（窗口折叠区块）', foldStart >= 0 && foldEnd > foldStart,
   'start=' + foldStart + ' end=' + foldEnd)
 const foldSnippet = foldStart >= 0 && foldEnd > foldStart ? src.slice(foldStart, foldEnd) : ''

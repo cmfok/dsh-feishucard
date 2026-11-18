@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // V0.1.3-26100801 — collect_bot_roster.mjs 的写盘判据守护用例（dsh-feishucard 0.8.4）
-// 变更：-26100801 第四十二轮 LOW#7 + 第五十一轮 LOW#3/#4 —— ①新增 S11（people 行"新值赢陈旧
+// 变更：-26100801 第四十二轮 审查项 + 第五十一轮 审查项/#4 —— ①新增 S11（people 行"新值赢陈旧
 //       种子"的正向半边）；②新增 S12 驱动 `token-stream-error` 出口（此前该出口无任何格子演到，
 //       删掉它整套照样绿 ⇒ 补驱动并断 `code=9999996`）；③加 `collectorRunning` 串行护栏
 //       （桩按模块级 `mode` 路由，两格并发会互相串味＝误导性绿灯）；④陈旧/种子身份守卫的
@@ -36,15 +36,15 @@
 //      没有 libuv 断言（MEDIUM#2 与 `bots 为空` 那处的同源修法）。
 //   S6 open 遍失败 + union 遍成功 ⇒ people/bot 行的 views 旧为底合并、新值赢同名键（C4/M3）。
 //   S7 双 bot 同群：A union 失败 + B 全成功 ⇒ 已退群者不被并回（C4/M1 群级正向标记）。
-//   S8 token 请求体被弄坏 ⇒ 桩的"缺 app_id ⇒ 显式失败"分支被真的演到（第二十三轮 LOW#2）。
+//   S8 token 请求体被弄坏 ⇒ 桩的"缺 app_id ⇒ 显式失败"分支被真的演到（第二十三轮 审查项）。
 //   S9 单 bot union 遍失败 ⇒ 旧群名单**并回来**（第二十六轮 MEDIUM#1：S7 只钉"不许并"，
 //      并回那条正向分支删掉也全绿 ⇒ 这里补正向对照，判别力闭环到 collect 侧合并处）。
 //   S10 bot appId 不以 cli_ 开头 ⇒ 桩的"bearer 推不出身份 ⇒ 9999994 显式失败"分支被演到
-//      （第二十六轮 LOW#6：该分支是"删静默降级"的替代品，没格子驱动＝回退也不会红）。
-//   S11 people 行两遍采全 ⇒ 同键**新值赢**陈旧种子、他键存活（第四十二轮 LOW#7：S6 只演了
+//      （第二十六轮 审查项：该分支是"删静默降级"的替代品，没格子驱动＝回退也不会红）。
+//   S11 people 行两遍采全 ⇒ 同键**新值赢**陈旧种子、他键存活（第四十二轮 审查项：S6 只演了
 //      "旧为底不被抹"半边，"新赢旧"对 people 行从没被驱动——方向放反（旧赢）整套照样绿）。
 //   S12 token 请求**流中途 error**（桩在 `res.end` 之前 `req.emit('error')`）⇒ 采集脚本按
-//      `code=9999996` 显式失败、非零退出、旧文件字节不动（第五十一轮 LOW#3：这个出口此前
+//      `code=9999996` 显式失败、非零退出、旧文件字节不动（第五十一轮 审查项：这个出口此前
 //      没有任何格子演到 ⇒ 删掉它（等于恢复"请求永不应答、整轮等 30 秒护栏"的挂死形状）
 //      十一格照样全绿。补驱动是为了让**桩的每条出口都有格子负责**，不是为新增业务判据）。
 //
@@ -61,7 +61,7 @@ import { writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from 'node
 const HERE = dirname(fileURLToPath(import.meta.url))
 const COLLECTOR = join(HERE, 'collect_bot_roster.mjs')
 const DIR = join(tmpdir(), 'dsh-roster-guard-' + process.pid)
-// 🔴 第四十一轮门槛 LOW#1（核对为真，**按建议改 unconditional**）：上一轮的 exit 兜底带
+// 🔴 第四十一轮门槛 审查项（核对为真，**按建议改 unconditional**）：上一轮的 exit 兜底带
 //   `!setupOk` 门——setupOk 置真后只剩主 try 的 finally 护着，而**桩回调里的抛错**
 //   （双 send/流分支）与任何旁路 process.exit 都不走 finally，凭证形状配置照样泄漏。
 //   rmSync(force) 幂等，兜底改**无条件**：exit 就清，finally 清过也是空转；
@@ -70,14 +70,14 @@ process.on('exit', () => { try { rmSync(DIR, { recursive: true, force: true }) }
 mkdirSync(DIR, { recursive: true })
 const CFG = join(DIR, 'feishu.config.json')
 const OUT = join(DIR, 'bot_roster.json')
-// 🔴 第三十六轮门槛 LOW#1（核对为真）：同一组夹具标识符原来在桩应答、种子、断言三处
+// 🔴 第三十六轮门槛 审查项（核对为真）：同一组夹具标识符原来在桩应答、种子、断言三处
 //   **各抄一份字面量**——改一处忘别处 ⇒ 桩载荷和格子判定的对象悄悄错开，红了指向错误
 //   根因（甚至把要演分支洗成恒真）。与本文件 TOKEN_PREFIX/openIdOf 的单一来源纪律对齐。
 const APP_GUARD = 'cli_guard_bot'
 const CHAT_LIVE = 'oc_guard_live'
 const MEMBER_UNION = 'on_guardmember'
 const MEMBER_OPEN = 'ou_guardmember'
-// 🔴 第三十七轮门槛 MEDIUM#2/LOW#2（核对为真）：种子与判据共享的其余标识符同样收源；
+// 🔴 第三十七轮门槛 MEDIUM#2/审查项（核对为真）：种子与判据共享的其余标识符同样收源；
 //   两个"陈旧值"**必须**与当场新采值不相等（S6 靠差值判别"新赢旧"，写成 openIdOf(APP_GUARD)
 //   同值就把合并方向判别洗成恒真——改名/漂移时这里先红）。
 const STALE_OPEN_GUARD = 'ou_guardbot'
@@ -85,11 +85,11 @@ const STALE_KEY = 'cli_other_bot'
 const STALE_OTHER_OPEN = 'ou_stale_other'
 const MEMBER_LEFT = 'on_already_left'
 const MEMBER_KEEP = 'on_left_but_keep'
-// 🔴 第四十二轮门槛 LOW#3（核对为真）：ghost 夹具身份原来只在内联字面量里活着——本文件
+// 🔴 第四十二轮门槛 审查项（核对为真）：ghost 夹具身份原来只在内联字面量里活着——本文件
 //   的单一来源纪律（APP_GUARD/MEMBER_OPEN/openIdOf 全收源）不该有例外，将来任何种子/
 //   断言复用这个值时字面量必漂移。收源。
 const GHOST_MEMBER_ID = 'ou_ghost_a'
-// 🔴 第四十二轮门槛 LOW#7（核对为真）：people 行的**陈旧种子值**——原来 S6 直接拿
+// 🔴 第四十二轮门槛 审查项（核对为真）：people 行的**陈旧种子值**——原来 S6 直接拿
 //   MEMBER_OPEN（open 遍新采值）当种子，"保留旧值"和"新值写入"在这个形状里同值不可分；
 //   且"新赢旧"方向对 people 行从来没被任何格子演过。单立种子值并补 S11 正向格。
 const STALE_PEOPLE_OPEN = 'ou_stale_person'
@@ -105,32 +105,32 @@ const TWO_BOTS = [
   { name: 'botA', appId: 'cli_a1', appSecret: 'secret-a' },
   { name: 'botB', appId: 'cli_b1', appSecret: 'secret-b' },
 ]
-// 🔴 第二十八轮门槛 LOW#1：token 的**签发形状**收单一来源——桩签发（`tenant_access_token`）
+// 🔴 第二十八轮门槛 审查项：token 的**签发形状**收单一来源——桩签发（`tenant_access_token`）
 //   与 bot A 的 bearer 都由 TOKEN_PREFIX 拼出，改签名格式只会两边同改，不会让 S7 的
 //   ghost 判定静默失配（失配＝union 失败分支没被演、断言退化成恒真）。
 const TOKEN_PREFIX = 't_'
 const BOT_A_AUTH = 'Bearer ' + TOKEN_PREFIX + TWO_BOTS[0].appId
-// 🔴 第三十一轮门槛 LOW#2（核对为真）：两个桩处理分支（bot/v3/info 的身份正则、members 的
+// 🔴 第三十一轮门槛 审查项（核对为真）：两个桩处理分支（bot/v3/info 的身份正则、members 的
 //   ghost 判定）原本各抄一份同款取值表达式——本文件对共享值讲究单一来源，header 取值也一样，
 //   收进 authOf 一处。
 const authOf = (req) => String((req.headers && req.headers.authorization) || '')
-// 🔴 第三十三轮门槛 LOW#1（核对为真）：bot 身份形状（`ou_`/`on_` + appId）此前**桩与断言各抄
+// 🔴 第三十三轮门槛 审查项（核对为真）：bot 身份形状（`ou_`/`on_` + appId）此前**桩与断言各抄
 //   一份字面量**——默认 appId 或前缀哪天改名，断言红得与它测的东西无关。与本文件
 //   TOKEN_PREFIX/authOf/ERR 同一套单一来源纪律：形状只在这两个 helper 里定义。
 const openIdOf = (appId) => 'ou_' + appId
 const unionIdOf = (appId) => 'on_' + appId
 // 🔴 第三十七轮门槛 MEDIUM#2：判别力前提机器化——陈旧种子值一旦和新采值同形，
 //   S6"新赢旧"就退化成恒真；当场拦下（放在 helper 之后，之前踩过 TDZ 引用坑）。
-// 🔴 第三十八轮门槛 LOW#1（核对为真）：原第二子句 `STALE_OTHER_OPEN === openIdOf(STALE_KEY)`
+// 🔴 第三十八轮门槛 审查项（核对为真）：原第二子句 `STALE_OTHER_OPEN === openIdOf(STALE_KEY)`
 //   防的是**不存在的碰撞**（STALE_KEY 从来不是被采集的 appId）。真不变量＝陈旧键不许和
 //   任何**真被采集**的 appId 撞车——按真实不变量改写，不留假保险。
-// 🔴 第四十一轮门槛 LOW#3（核对为真）：S7 的新种子 MEMBER_LEFT 同属"必须与新采值相异"
+// 🔴 第四十一轮门槛 审查项（核对为真）：S7 的新种子 MEMBER_LEFT 同属"必须与新采值相异"
 //   的判别力前提——它与 MEMBER_UNION 撞车时 S7 首条判据当场退化；同口径一并机器化。
-// 🔴 第四十二轮门槛 LOW#2 的 MEMBER_KEEP 子句已由第四十六轮 LOW#3 删除（核对为真）：
+// 🔴 第四十二轮门槛 审查项 的 MEMBER_KEEP 子句已由第四十六轮 审查项 删除（核对为真）：
 //   S9 走 fail-union，union 遍恒空 ⇒ "并回"的新采侧**没有任何值**可能满足 includes(MEMBER_KEEP)，
 //   撞车也不退化——这条防的是不存在的碰撞，属第三十八轮钉过的"假保险"同类，不留。
 //   STALE_PEOPLE_OPEN（撞 open 遍新采值 MEMBER_OPEN 时 S6/S11 双双退化成恒真）是真前提，保留。
-//   第三十九轮 LOW#2 的原地 rmSync 已删：exit 兜底改无条件后 process.exit(2) 必触发它。
+//   第三十九轮 审查项 的原地 rmSync 已删：exit 兜底改无条件后 process.exit(2) 必触发它。
 if (STALE_OPEN_GUARD === openIdOf(APP_GUARD)
   || STALE_KEY === APP_GUARD || TWO_BOTS.some((b) => b.appId === STALE_KEY)
   || MEMBER_LEFT === MEMBER_UNION
@@ -142,7 +142,7 @@ const CFG2 = join(DIR, 'feishu.two-bots.json')
 writeFileSync(CFG2, JSON.stringify({
   bots: TWO_BOTS,
 }))
-// S10（第二十六轮 LOW#6）需要一个 **appId 不以 cli_ 开头**的 bot：token 分支照样签发
+// S10（第二十六轮 审查项）需要一个 **appId 不以 cli_ 开头**的 bot：token 分支照样签发
 //   `t_zz_notcli`，但 bot/v3/info 的 `/^Bearer t_(cli_.+)$/` 不命中 ⇒ 桩显式 9999994。
 //   这一格专吃"删掉静默降级后新加的身份守卫"——没有它，守卫被回退也不会红。
 const CFG3 = join(DIR, 'feishu.noncli.json')
@@ -163,7 +163,7 @@ writeFileSync(CFG3, JSON.stringify({
 //   内联枚举——和 mode 语义分居两处，新增需要群的 mode 一旦忘了登记，格子静默不演目标分支。
 //   收成唯一来源：mode 文档改一处 + Set 加一项，chats 分支只查集合。
 const CHAT_MODES = new Set(['one-chat', 'fail-open', 'm1-two-bot', 'fail-union'])
-// 🔴 第二十七轮门槛 LOW#1：桩的"显式失败"错误码在 handler 与格子 logIn 断言两处各写一遍
+// 🔴 第二十七轮门槛 审查项：桩的"显式失败"错误码在 handler 与格子 logIn 断言两处各写一遍
 //   字面量 ⇒ 收成命名常量，断言由**同一常量**拼出，改号必同改、漂移当场红。
 const ERR = {
   missingAppId: 9999990,   // token 请求体没有 app_id（S8 驱动）
@@ -172,14 +172,14 @@ const ERR = {
   ghostUnionA: 9999993,    // m1-two-bot：仅 bot A 的 union 遍失败（S7 前提）
   underivableBearer: 9999994, // bearer 推不出身份（S10 驱动）
   forcedUnionPass: 9999995, // fail-union：union 遍恒失败（S9 前提）
-  // 🔴 第四十轮门槛 LOW#2（核对为真）：流中断支原来借 9999990（missingAppId）作答——
+  // 🔴 第四十轮门槛 审查项（核对为真）：流中断支原来借 9999990（missingAppId）作答——
   //   两个不同成因共用一个码，将来哪格真演流中断，logIn 判据在"缺 app_id"支下也照样绿，
   //   违反本文件"一分支一码、断言可判别"的 ERR 纪律。单立一号。
-  // 🔴 第四十三轮门槛 LOW#2 曾"判不修、如实挂账"说这个出口从 harness 侧够不着；
-  //   第五十一轮 LOW#3 **改判并已驱动**（桩在 data/end 之前同步 emit error，S12 钉 code=9999996）。
-  tokenStreamError: 9999996, // token 请求流中途 error（S12 驱动，第五十一轮 LOW#3）
+  // 🔴 第四十三轮门槛 审查项 曾"判不修、如实挂账"说这个出口从 harness 侧够不着；
+  //   第五十一轮 审查项 **改判并已驱动**（桩在 data/end 之前同步 emit error，S12 钉 code=9999996）。
+  tokenStreamError: 9999996, // token 请求流中途 error（S12 驱动，第五十一轮 审查项）
 }
-// 🔴 第二十八轮门槛 LOW#2：采集器的"成员拉取失败(idType)"留痕文案被 S6/S7/S9 三格当**前提断言**
+// 🔴 第二十八轮门槛 审查项：采集器的"成员拉取失败(idType)"留痕文案被 S6/S7/S9 三格当**前提断言**
 //   逐字重复——采集侧改一个词三格同红但没人知道该改哪。收成一份，断言由它拼出。
 const LOG_MEMBER_FAIL = '成员拉取失败'
 let mode = 'no-chats'
@@ -202,15 +202,15 @@ const srv = createServer((req, res) => {
   // token 按 app_id 签发（`t_<appId>`），让桩能区分"是哪个 bot 在调成员接口"——
   //   S7 需要 A 失败、B 成功，单 token 分不开两个 bot。
   if (/^\/open-apis\/auth\/v3\/tenant_access_token\/internal/.test(u)) {
-    // 🔴 第三十九轮门槛 LOW#1（核对为真）：①原来只挂 data/end——请求流中途 error ⇒ 这一路
+    // 🔴 第三十九轮门槛 审查项（核对为真）：①原来只挂 data/end——请求流中途 error ⇒ 这一路
     //   **永不作答**，采集器干等 30 秒护栏，CI 红得看不懂；补 error 出口。
     //   ②`body += chunk` 逐块 toString，UTF-8 多字节被块边界劈开会碎码（当前 body 是
     //   ASCII 碰不到，但属埋雷）；改成攒块、end 时**一次**解码。
     const chunks = []
     req.on('data', (chunk) => { chunks.push(chunk) })
     req.on('error', () => send({ code: ERR.tokenStreamError, msg: 'stub: token request stream errored' }, 400))
-    // 🔴 第五十一轮 LOW#3（核对为真，**改判**第四十三轮那条"判不修挂账"）：这个出口一直没有
-    //   格子驱动＝把 `req.on('error')` 整行删掉全套照样绿（第二十三轮 LOW#1 立的
+    // 🔴 第五十一轮 审查项（核对为真，**改判**第四十三轮那条"判不修挂账"）：这个出口一直没有
+    //   格子驱动＝把 `req.on('error')` 整行删掉全套照样绿（第二十三轮 审查项 立的
     //   "新加的显式失败分支若没格子驱动，回退掉也不会红"）。驱动方式其实够得着：
     //   在 data/end 之前**同步**把 error 事件打出来（监听器已挂上、请求体还没开始流），
     //   桩就按单立的 9999996 作答 ⇒ S12 钉的是**具体错误码**（不是泛用失败文案，24 轮 MEDIUM#2 口径）。
@@ -218,12 +218,12 @@ const srv = createServer((req, res) => {
     if (mode === 'token-stream-error') req.emit('error', new Error('stub: forced token stream error'))
     req.on('end', () => {
       let body = Buffer.concat(chunks).toString('utf8')
-      // 🔴 第二十三轮门槛 LOW#2：`bad-token` 格故意弄坏请求体 ⇒ 真正走到下面"缺 app_id ⇒ 显式
+      // 🔴 第二十三轮门槛 审查项：`bad-token` 格故意弄坏请求体 ⇒ 真正走到下面"缺 app_id ⇒ 显式
       //   失败"那条分支（S8 钉它；此前这条守卫没被任何格子演过，回退掉也没人变红）。
       if (mode === 'bad-token') body = '{broken'
       let appId = ''
       try { appId = String(JSON.parse(body).app_id || '') } catch { appId = '' }
-      // 🔴 第二十二轮门槛 LOW#1（核对为真）：原注释说"坏 body 让脚本自己报"，实际是
+      // 🔴 第二十二轮门槛 审查项（核对为真）：原注释说"坏 body 让脚本自己报"，实际是
       //   appId 留空 ⇒ 回 `t_` ⇒ bot/info 的 `/^Bearer t_(cli_.+)$/` 不命中 ⇒ 静默降级回
       //   ou_guardbot 形状，采集器哪天不发 app_id 都不会有人发现。改成桩显式失败。
       if (!appId) return send({ code: ERR.missingAppId, msg: 'stub: token request missing app_id' })
@@ -239,7 +239,7 @@ const srv = createServer((req, res) => {
     // 🔴 第二十九轮门槛 MEDIUM#1（核对为真）：这里曾是 TOKEN_PREFIX 的**第三份未同步拷贝**
     //   （字面 `t_` 焊在正则里）——前缀哪天改了，普通 cli_ bot 反而全被打成 9999994，
     //   S6/S7 红得与它们测的东西毫无关系。正则由 TOKEN_PREFIX 构造，签名只此一处。
-    // 🔴 第三十轮门槛 LOW#1（核对为真）：TOKEN_PREFIX 嵌进正则前必须**转义**——它一旦含
+    // 🔴 第三十轮门槛 审查项（核对为真）：TOKEN_PREFIX 嵌进正则前必须**转义**——它一旦含
     //   正则元字符（`.` `+` `(` …），身份守卫会静默错配/漏配，所有 cli_ bot 被打成
     //   9999994，恰好砸掉这块想保的健壮性。
     const bearerRe = new RegExp('^Bearer ' + TOKEN_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(cli_.+)$')
@@ -256,7 +256,7 @@ const srv = createServer((req, res) => {
   }
   if (/^\/open-apis\/im\/v1\/chats\/[^/]+\/members(\?|$)/.test(u)) {
     const idType = /member_id_type=union_id/.test(u) ? 'union_id' : 'open_id'
-    // 🔴 第二十九轮门槛 LOW#2 ⇒ 第三十一轮 LOW#2：取值收进 authOf（两处共用一个来源）。
+    // 🔴 第二十九轮门槛 审查项 ⇒ 第三十一轮 审查项：取值收进 authOf（两处共用一个来源）。
     const auth = authOf(req)
     const isGhost = mode === 'm1-two-bot' && auth === BOT_A_AUTH
     if (mode === 'fail-open' && idType === 'open_id') return send({ code: ERR.forcedOpenPass, msg: 'stub forced open-pass failure' })
@@ -268,9 +268,9 @@ const srv = createServer((req, res) => {
     }
     // 🔴 第二十二轮门槛 MEDIUM#1（核对为真）：拆开 (mode, auth) 判定，消掉嵌套三元与
     //   重复字面量——同一份成员对象只在一处构造，改夹具时不会静默翻转某个分支。
-    // 🔴 同轮 LOW#2：A 的 union 遍已在上面提前返回 ⇒ 走到这里的 A 只可能是 open 遍。
-    // 🔴 第三十轮门槛 LOW#2（核对为真）：ghost 分支改为**提前返回**——旧写法在 ternary 外
-    //   恒计算 liveMemberId，ghost 支路根本用不到，与第二十七轮 LOW#2 注释（"身份值只在
+    // 🔴 同轮 审查项：A 的 union 遍已在上面提前返回 ⇒ 走到这里的 A 只可能是 open 遍。
+    // 🔴 第三十轮门槛 审查项（核对为真）：ghost 分支改为**提前返回**——旧写法在 ternary 外
+    //   恒计算 liveMemberId，ghost 支路根本用不到，与第二十七轮 审查项 注释（"身份值只在
     //   非 ghost 分支内算"）相矛盾。提前返回让代码与注释一致，顺带消掉外层三元。
     if (isGhost) {
       // A 的 open 遍：给一个**无 name** 的成员 ⇒ 即使并 view 也因无名而落不进 byName，
@@ -300,7 +300,7 @@ const srv = createServer((req, res) => {
 //   拿到 `address() === null` 而抛 TypeError）。
 let BASE = ''
 
-// 🔴 第五十一轮 LOW#4（核对为真）：桩的路由读的是**模块级 `mode`**（由 cell() 在 spawn 前设置）、
+// 🔴 第五十一轮 审查项（核对为真）：桩的路由读的是**模块级 `mode`**（由 cell() 在 spawn 前设置）、
 //   且所有格子共用同一个 server 实例 ⇒ 两格并发就会让其中一格拿另一格的 mode 作答，
 //   红/绿都不可信。现在每格确实 `await cell(...)`，但那是**约定**不是**约束**——
 //   加一道闸：同一时刻只许有一个采集子进程，违者当场 exit 2（响亮失败，别等漂移后静默冒名）。
@@ -418,7 +418,7 @@ try {
   await cell('S6 open 遍失败 + union 遍成功 ⇒ people views 旧为底不被抹掉',
     JSON.stringify({
       generated_at: 'x',
-      // 🔴 第二十二轮门槛 LOW#3（核对为真）：桩按 app_id 签发身份 ⇒ 新采到的 guard bot
+      // 🔴 第二十二轮门槛 审查项（核对为真）：桩按 app_id 签发身份 ⇒ 新采到的 guard bot
       //   union 是 `on_cli_guard_bot`。旧种子写 `on_guardbot` 永不匹配，bot 行合并根本没被
       //   这一格演到（孤儿重复进 merged.bots）。对齐种子身份。
       bots: [{ name: 'guard bot', app_id: APP_GUARD, union_id: unionIdOf(APP_GUARD),
@@ -436,7 +436,7 @@ try {
         const bs = (roster && roster.bots) || []
         const b0 = bs.find((b) => b.app_id === APP_GUARD)
         return [
-          // 🔴 第四十二轮门槛 LOW#7（核对为真）：种子原来直接拿 MEMBER_OPEN——它同时是
+          // 🔴 第四十二轮门槛 审查项（核对为真）：种子原来直接拿 MEMBER_OPEN——它同时是
           //   open 遍的**新采值**，"旧值保留"与"新值恰好写入"同形不可分，判别全靠 logIn 前提。
           //   种子改用相异的 STALE_PEOPLE_OPEN（setup 守卫钉两值不等）：本格只证"旧为底不被抹"，
           //   "同键新赢旧"的正向半边由新格子 S11 补演。
@@ -448,7 +448,7 @@ try {
             roster && roster.chats && roster.chats[CHAT_LIVE]],
           // 🔴 第二十三轮门槛 LOW（核对为真）：种子身份对齐让 bot 行**逐行合并**真的被演到了，
           //   那就把它钉住——只许有一行（不许孤儿重复），且 views 必须是新采值赢过种子旧值。
-          // 🔴 第二十六轮门槛 LOW#1（核对为真）：种子 views 补一个**陈旧他键** cli_other_bot——
+          // 🔴 第二十六轮门槛 审查项（核对为真）：种子 views 补一个**陈旧他键** cli_other_bot——
           //   同名键"新赢旧"对整行覆盖（M3 修前的旧 bug）同样成立、不判别；只有"旧为底"
           //   才留得住这个键 ⇒ 把它删干净才是真合并，整行覆盖在此必红。
           ['★★★ bot 行合并成一行；同名键取新采值、种子他键存活（旧为底+新覆盖同名键＝M3 语义，整行覆盖必红）',
@@ -461,7 +461,7 @@ try {
   // S7（0.8.4 C4，钉第十五轮 M1 的群级正向标记）：
   //   同群两 bot：A 的 union 遍失败、B 的 union 遍成功 ⇒ 名单是**群级**的，B 已采全，
   //   合并**不许**再把旧名单里已退群的人并回来。旧写法（标记只置不清）这一格必红。
-  // 🔴 第三十一轮门槛 LOW#1（核对为真）：标题原来写「不退群者不并回」，与本文件头部（§S7）
+  // 🔴 第三十一轮门槛 审查项（核对为真）：标题原来写「不退群者不并回」，与本文件头部（§S7）
   //   和下方形状断言的口径**反义**——这一格守的是"已退群的人没有被并回"。
   await cell('S7 双 bot 同群：A union 失败 + B 全成功 ⇒ 已退群者不被并回',
     JSON.stringify({
@@ -470,7 +470,7 @@ try {
       chats: {
         [CHAT_LIVE]: {
           name: '本次群', bot_app_ids: [TWO_BOTS[0].appId],
-          // 🔴 第三十八轮门槛 LOW#4（核对为真）：种子里原来同时放 MEMBER_UNION——它正是
+          // 🔴 第三十八轮门槛 审查项（核对为真）：种子里原来同时放 MEMBER_UNION——它正是
           //   本遍新采的人，"本次采到的人仍在"拿种子自身就能满足＝恒真。种子只留**已退群者**，
           //   MEMBER_UNION 只能由新采集进来 ⇒ 正向判据真的有判别力。
           member_unions: [MEMBER_LEFT],
@@ -485,12 +485,12 @@ try {
         const c = roster && roster.chats && roster.chats[CHAT_LIVE]
         const unions = (c && c.member_unions) || []
         return [
-          // 🔴 第四十二轮门槛 LOW#1（核对为真）：上一轮把第二条强化成"恰好只剩新采者"后，
+          // 🔴 第四十二轮门槛 审查项（核对为真）：上一轮把第二条强化成"恰好只剩新采者"后，
           //   第一条反被它**反向蕴含**（同值碰撞已由 setup 守卫拦下）——留两条就是互含的
           //   假双保险。合成一条 ★★★：M1 语义（不并旧）+ 名单恰好新采一人。
           ['★★★ 已退群的人没有被并回、名单**恰好只剩**新采者（M1 群级采全不并旧）',
             !!c && unions.length === 1 && unions[0] === MEMBER_UNION, unions],
-          // 🔴 第四十七轮 LOW#2（核对为真）：标签原本写"无幽灵"，但判据只看 `member_unions`
+          // 🔴 第四十七轮 审查项（核对为真）：标签原本写"无幽灵"，但判据只看 `member_unions`
           //   ——它只由 union 遍填充，而幽灵（GHOST_MEMBER_ID，A 的 open 遍、无 name）既进不了
           //   这条名单、也落不进 people ⇒ 夹具惰性、宣称大于断言。补一条真判据把"幽灵泄漏"
           //   钉住：将来采集器若把无名 open 遍成员也出行（按 open_id 建 people 行），本条必红。
@@ -506,7 +506,7 @@ try {
         ]
       },
     })
-  // S8（第二十三轮门槛 LOW#2）：钉住桩自己那条"缺 app_id ⇒ 9999990 显式失败"的守卫——
+  // S8（第二十三轮门槛 审查项）：钉住桩自己那条"缺 app_id ⇒ 9999990 显式失败"的守卫——
   //   此前没有任何格子走到它，回退成静默空 app_id 也不会红。bad-token 格把请求体弄坏，
   //   采集器拿不到 token ⇒ 走既有失败出口（不写文件、干净 rc=1）。
   await cell('S8 token 请求体被弄坏 ⇒ 桩显式拒绝、采集失败不写盘', VALID_OLD, 'bad-token', {
@@ -520,7 +520,7 @@ try {
     JSON.stringify({
       generated_at: 'x', bots: [], people: [],
       chats: { [CHAT_LIVE]: { name: '本次群', bot_app_ids: [APP_GUARD],
-        // 🔴 第四十一轮门槛 LOW#5（核对为真）：旧种子原来是**单条** [KEEP]——并回循环至多
+        // 🔴 第四十一轮门槛 审查项（核对为真）：旧种子原来是**单条** [KEEP]——并回循环至多
         //   push 一次，幂等断言拿不到第二次迭代**恒真**（去重守卫删掉也不会红）。
         //   留一份重复项驱动 `!includes(u)` 守卫：守卫在 ⇒ 并回后恰好一条；守卫删 ⇒ 塞两遍当场红。
         member_unions: [MEMBER_KEEP, MEMBER_KEEP] } },
@@ -538,13 +538,13 @@ try {
         ]
       },
     })
-  // S10（第二十六轮门槛 LOW#6）：驱动桩自己的"bearer 推不出身份 ⇒ 9999994 显式失败"守卫——
+  // S10（第二十六轮门槛 审查项）：驱动桩自己的"bearer 推不出身份 ⇒ 9999994 显式失败"守卫——
   //   非 cli_ 前缀的 appId 让 token 照常签发、但身份正则不命中。旧写法（静默兜回
   //   guard-bot 形状）在这一格会**洗成成功**（rc=0 写盘）⇒ 本格同时钉住"降级不许复发"。
   await cell('S10 非 cli_ 前缀 appId ⇒ 桩身份守卫显式拒绝、采集失败不写盘', VALID_OLD, 'no-chats', {
     rc: 1, cfgPath: CFG3, logIn: 'code=' + ERR.underivableBearer, unchanged: true, cleanExit: true,
   })
-  // S11（第四十二轮门槛 LOW#7；🔴 第四十四轮 LOW#3 更正引文）：people 行合并的**另一半**——
+  // S11（第四十二轮门槛 审查项；🔴 第四十四轮 审查项 更正引文）：people 行合并的**另一半**——
   //   "同键新赢旧"。S6 里 open 遍恒失败、people 行拿不到新值，方向判别只演了"旧为底"；
   //   把 `cur.views = Object.assign({}, cur.views, row.views)`（旧值最后盖回＝**旧赢**；
   //   注意生产正确式是 `Object.assign({}, row.views, cur.views)`＝新赢，别引反）这类
@@ -569,9 +569,9 @@ try {
         ]
       },
     })
-  // S12（第五十一轮 LOW#3，改判第四十三轮的挂账）：驱动 token 请求的**流中途 error** 出口。
+  // S12（第五十一轮 审查项，改判第四十三轮的挂账）：驱动 token 请求的**流中途 error** 出口。
   //   此前那条 `req.on('error')` 没有任何格子演过——把它整行删掉，采集器就退回"这一路永不作答、
-  //   干等 30 秒护栏"的形状，而全套照样绿（第二十三轮 LOW#1 立的"新分支必须有驱动格"口径）。
+  //   干等 30 秒护栏"的形状，而全套照样绿（第二十三轮 审查项 立的"新分支必须有驱动格"口径）。
   //   判据钉**具体错误码 9999996**（不是泛用失败文案，24 轮 MEDIUM#2）＋ 失败不许动旧文件。
   await cell('S12 token 请求流中途 error ⇒ 按 9999996 显式失败、不写盘（驱动此前无人演过的出口）',
     VALID_OLD, 'token-stream-error', {

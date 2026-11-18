@@ -1,10 +1,10 @@
-// #560 续段自测（2026-10-19）——只依赖 Node 内建模块，不启桥本体。
+// 内部记录 续段自测（2026-10-19）——只依赖 Node 内建模块，不启桥本体。
 // 方法：从 index.js **原文**抽出真实的 DM 常量区 + defaultSelectionMatches + verifyDefaultModelLanded
 // 源码，用 new Function 注入假 ctx（agentDefaultModel 假服务）后直测（不是抄副本）；
 // 另做源码级静态断言（HMR 嵌套重试标记存在）。全绿 exit 0；任何一条失败 exit 1。
 //
 // 覆盖的故障史（同链路三进宫）：
-//   #124（10-07 切换假成功）→ #560（10-13 新会话注入不稳）→ 10-19 直存撞 HMR 嵌套事务。
+//   内部记录（10-07 切换假成功）→ 内部记录（10-13 新会话注入不稳）→ 10-19 直存撞 HMR 嵌套事务。
 //   2026-10-29 复发（两连拒）→ V0.8.26：直存优先走宿主 hmr 的 ALS 出口（executing.exit）。
 // 用例 A：直存第一次撞「transactions cannot be nested」被拒 → 退避重试第二次落地 ⇒ persisted=true 且 saveSelection 恰好调 2 次。
 // 用例 B：直存报非 HMR 错 → 不重试（saveSelection 只调 1 次）⇒ persisted=false，错误如实带回。

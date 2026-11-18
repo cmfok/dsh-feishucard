@@ -8,12 +8,12 @@
  *   · 入站：handleInbound 取 event.sender.sender_id.open_id → resolveActor → 存【本轮上下文】
  *   · 工具：ctx.on('tools/execute') 把 agent 传来的任何身份字段【覆写】成该 actor
  *
- * 🔴 安全边界（维护者 2026-10-04 亲自定，三条）：
+ * 🔴 安全边界（2026-10-04 亲自定，三条）：
  *   1. **身份识别不发审批卡**（"你是谁"不问 维护者；"你能看什么"才问）
- *   2. **认不出不弹卡片、不问姓名** —— AI 自己解决（维护者 原话：
+ *   2. **认不出不弹卡片、不问姓名** —— AI 自己解决（需求原文：
  *      「不弹卡片啊，你现在都不会认不出人，而且这个链路已经通了，应该直接 ai 处理啊，
  *        为什么还是想着人来介入」）
- *   3. **表不可达 ＝ 认不出 ⇒ 拒**（fail-closed）。维护者 原话：
+ *   3. **表不可达 ＝ 认不出 ⇒ 拒**（fail-closed）。需求原文：
  *      「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」。
  *      ⚠️ 本条原先写的是"表不可达**必须降级放行**" —— 那是**裁决之前**的旧口径；
  *      它留在这里会与下文「§3 无 actor 怎么办」的 fail-closed 说明**直接矛盾**，故删。
@@ -24,7 +24,7 @@
  *
  * 版本：V0.10-26110101（2026-11-01）
  * 变更记录：
- *   V0.10-26110101 2026-11-01 —— 中台 #2626（需求 方案 A 第一步「插件传真实身份」）：
+ *   V0.10-26110101 2026-11-01 —— 内部记录（配套改动 方案 A 第一步「插件传真实身份」）：
  *     ① 新增别名键 `IDENTITY_ALIAS_KEYS`（sender_open_id/sender_union_id → actor 真值字段）并入
  *       `applyActorToArguments` 覆写面——开闸时模型自报的 sender_open_id 同样被覆写/剔除（此前
  *       白名单只认 open_id 本尊，G5 约面链用的 sender_open_id 不在覆写面内，属冒充面漏项）。
@@ -37,14 +37,14 @@
  *     写死 `['P:/Qoder/work','D:/Work']`，改为**优先读 `WORK_ROOT` 环境变量**；env 缺失时才回落原数组
  *     并向 stderr 打一行提示（每进程一次，避免现网无 env 时直接坏）。判定顺序与返回值形状不变。
  *     同文件其余盘符字面量仅存在于注释/历史来源说明（第 4、66-67、490 行），非执行路径，不改。
- *   V0.8-26102902 2026-10-29 —— 中台 #1866 第4项收尾：`--selftest` parity 段自己的解释器探测
+ *   V0.8-26102902 2026-10-29 —— 内部记录 第4项收尾：`--selftest` parity 段自己的解释器探测
  *     仍是空 `catch`，parity 被跳过时看不出为什么（与 `currentPython()` 同族）。改为逐候选记
  *     退出码/抛出原因，并写进「跳过 parity」那行；只动自测输出，不改解析与判定。
- *   V0.8-26102901 2026-10-29 —— 中台 #1866（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` 第4项续）：
+ *   V0.8-26102901 2026-10-29 —— 内部记录（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` 第4项续）：
  *     `currentPython()` 探测解释器时的静默 catch 改显式留痕——逐候选记「名称＋错误码/退出码/信号」，
  *     三个候选全挂时向 stderr 打一条明确告警。🔴 探测结果与回退语义不变（仍 `return 'python3'`），
  *     调用方契约不受影响；只加可见性。
- *   V0.8-26102201 2026-10-22 —— 中台 #1866 第4项（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` §5）：
+ *   V0.8-26102201 2026-10-22 —— 内部记录 第4项（WO `output/工单/wo-feishu-config-world-readable-and-eacces-20261015.md` §5）：
  *     本地增量表 `identity_map.local.json` 的读态不再被空 `catch` 无声吞 ⇒ 新增 `noteLocalMapRead`
  *     显式留痕（absent／parse_fail／unreadable 三态，只记状态＋路径＋错误码＋影响，不落文件内容）。
  *     🔴 判定语义与降级行为不变（读不到增量照旧只用主表解析，不新增崩溃路径）。
@@ -63,7 +63,7 @@ export const IDENTITY_KEYS = Object.freeze([
   'level', 'category', 'scopes', 'channels', 'grants', 'source',
 ])
 
-// ── #2626（需求 方案 A 第一步「插件传真实身份」）· 别名键与关闸净化 ──────────
+// ── 内部记录（配套改动 方案 A 第一步「插件传真实身份」）· 别名键与关闸净化 ──────────
 /**
  * 别名入参键 → actor 真值字段（映射值是 actor 上的键名）。
  * G5 约面链请求体的 `sender_open_id` 字段名即出自这类工具入参——此前白名单只认
@@ -117,18 +117,18 @@ export const DEFAULT_RESOLVER_PATH = '/opt/scripts/G9/resolve_actor.py'
 let __warnedNoWorkRoot = false
 
 /**
- * 资产（表 / resolver）路径解析 —— **一律【跟着工作区】走，不写死机器路径**（维护者 2026-10-04 要求）。
+ * 资产（表 / resolver）路径解析 —— **一律【跟着工作区】走，不写死机器路径**（2026-10-04 要求）。
  *
  * 候选顺序（取第一个存在的）：
  *   1. **环境变量**（`MAILBOX_IDENTITY_MAP` / `MAILBOX_RESOLVER`）—— 部署时覆盖用
- *   2. **服务器固定路径** `/opt/scripts/G9/…` —— 8 个员工 bot 的生产位置
+ *   2. **服务器固定路径** `服务器脚本` —— 8 个员工 bot 的生产位置
  *   3. 🔑 **`<工作区>/output/g9-identity/…`** —— 任何开发机都成立：
  *        · 调用方传入的工作区、cwd 逐级向上，再兜底 `WORK_ROOT` 环境变量（V0.9 起，A17）
  *        · `WORK_ROOT` 未设置时才回落到已知开发机位置（兼容旧形态，并打一次提示）
  *      ⇒ 因为表就放在**工作区里**，**Syncthing 会把它同步到各开发机** ⇒ **各机都不会被锁死**。
  *
  * ⚠️ **必须是"相对工作区"、不是"相对本文件"**：插件代码住在别人的仓库里
- *    （`Ai100/projects/dsh-feishucard/`），而**工作区根才是被同步的那一层**。
+ *    （`内部项目`），而**工作区根才是被同步的那一层**。
  * ⚠️ **也不写死盘符**（`P:` / `D:`）—— 两台开发机的盘符不同，写死等于只在其中一台上有效。
  */
 export function assetCandidates (workspaceRoot, envName, serverPath, relPath) {
@@ -203,7 +203,7 @@ export function pickJobGrantsPath (workspaceRoot) {
 //    每台一份，**放在工作区之外**（`~/.dsh-feishucard/`）⇒ **天然不参与 Syncthing**
 //    ⇒ HOME / 维护者-OFFICE **各写各的**（两台 bot 的 app_id 不同），**不会互相覆盖**
 //      （主表是共享的、只读；增量只补 `open_ids{本机 bot 的 app_id}`）。
-//    维护者 2026-10-04 关切：「表放工作区会同步到公司电脑，那公司和服务器也不会被锁死」——
+//    2026-10-04 关切：「表放工作区会同步到公司电脑，那公司和服务器也不会被锁死」——
 //    主表共享解决"读得到"，本地增量解决"各自认得出"。
 export function localMapPath () {
   if (process.env.MAILBOX_IDENTITY_LOCAL) return process.env.MAILBOX_IDENTITY_LOCAL
@@ -229,7 +229,7 @@ export class TurnIdentityStore {
       // 工单1364（案1，2026-10-15）：resolver 错误码原文随 rec 透传，供调用侧 DENY
       // 告警行附带打印 —— tableOk 只说「stat 到文件」，读不了（EACCES/EPERM）全靠这里可见。
       err: err || null,
-      // #2626（需求 方案A）：关闸支的「桥侧真值」——入站事件 sender_id 校验后的
+      // 内部记录（配套改动 方案A）：关闸支的「桥侧真值」——入站事件 sender_id 校验后的
       // { open_id, union_id }（不做判权、不查表，只为覆写模型自报身份提供权威值）。
       verified: (verified && typeof verified === 'object') ? verified : null,
       at: Date.now(),
@@ -282,7 +282,7 @@ export function applyActorToArguments (args, actor, keys = IDENTITY_KEYS) {
       dropped.push(k)
     }
   }
-  // #2626（需求 方案 A）：别名键（sender_open_id 等）按映射字段取 actor 真值，
+  // 内部记录（配套改动 方案 A）：别名键（sender_open_id 等）按映射字段取 actor 真值，
   //   口径与白名单逐字一致——有真值覆写、actor 没有（空串/缺失）⇒ 剔除、不许带病过关。
   for (const [k, field] of Object.entries(IDENTITY_ALIAS_KEYS)) {
     if (!Object.prototype.hasOwnProperty.call(args, k)) continue
@@ -299,7 +299,7 @@ export function applyActorToArguments (args, actor, keys = IDENTITY_KEYS) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 2b) #2626 · 关闸侧「不采信自报身份」（需求 方案 A 第一步：插件传真实身份）
+// 2b) 内部记录 · 关闸侧「不采信自报身份」（配套改动 方案 A 第一步：插件传真实身份）
 //     飞书回合＋identityGuard 关 ⇒ 桥**不做判权**（2026-10-30 开关矩阵：开发机/web gui 禁开），
 //     但身份键入参不能再原样转发给工具：
 //       · 有桥侧真值（入站事件 sender_id 记录在册且形状合规）⇒ 覆写成真值；
@@ -331,9 +331,9 @@ export function sanitizeSelfReported (args, verified) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 3) 🔴「无 actor 怎么办」—— 维护者 2026-10-04 亲自裁决：**一律拒绝（fail-closed）**
+// 3) 🔴「无 actor 怎么办」—— 2026-10-04 亲自裁决：**一律拒绝（fail-closed）**
 //
-//    **维护者 原话**：「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」
+//    **需求原文：「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」
 //    救急手段（维护者 同日给出）：①「主 A 准」这个不公开的身份可临时救急
 //                            ② 我可以 SSH 上服务器直接修表
 //    ⇒ **所以「表不可达」不再是放行理由** —— 它只是"确认不了身份"的一种情形。
@@ -346,8 +346,8 @@ export function sanitizeSelfReported (args, verified) {
 //    hasOwner=true  ＋ 无 actor（**无论表在不在**）          ⇒ deny  ← 维护者 裁决
 // ───────────────────────────────────────────────────────────────────────────
 /**
- * 🔴 维护者 2026-10-04 裁决：**无表就拒**（fail-closed）。
- *    维护者 原话：「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」
+ * 🔴 2026-10-04 裁决：**无表就拒**（fail-closed）。
+ *    需求原文：「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」
  *    救急手段（维护者 同日给出）：①「主 A 准」这个不公开的身份可临时救急；
  *                            ② 可以 SSH 上服务器直接修表。
  *
@@ -387,7 +387,7 @@ const E_MISSING = 'open_id_missing'
 const E_NOT_GRANTED = 'job_not_granted'
 const E_NOT_ACTIVE = 'not_active'
 const E_UNKNOWN_STATUS = 'unknown_status'
-// 在职口径（契约 §五 V1.2 定死，2026-10-09 收口 #158；与 resolve_actor.py 逐字一致）：
+// 在职口径（契约 §五 V1.2 定死，2026-10-09 收口 内部记录；与 resolve_actor.py 逐字一致）：
 //   离职三态 ⇒ not_active（正常拒绝，≠ 不认识）；
 //   「可上岗」只含 在职 —— 兼职/待入职（维护者 V1.2 裁决均不可上岗）与其余一切状态
 //   （未填 / 未来新状态）⇒ unknown_status 拒。旧版「其余一律正常」是 fail-open：
@@ -409,7 +409,7 @@ function loadMapJs (raw) {
  *
  * EACCES/EPERM ＝ 表文件**在**但读不了（属组/权限位问题）——此前只会吐
  * `resolver_js_failed:EACCES: permission…`，而 tableOk 仍是 true ⇒ DENY 告警打
- * person_unknown，排查者误判「表在、人不在册」去走「补人」方向（中台 #1130 实证中招）。
+ * person_unknown，排查者误判「表在、人不在册」去走「补人」方向（内部记录 实证中招）。
  * 此处显式标注「表存在但不可读…非未登记」并附错误码原文（DENY 行由调用侧附带打印）。
  *
  * 🔴 只改失败文案，**不改 tableOk 返回语义**（案2 会改语义影响下游告警文案，弃用待另批）。
@@ -424,7 +424,7 @@ export function mapMainReadError (e) {
 }
 
 /**
- * 中台 #1866 第4项（2026-10-22）：本地增量表 `identity_map.local.json` 的读态 ⇒ **显式留痕**
+ * 内部记录 第4项（2026-10-22）：本地增量表 `identity_map.local.json` 的读态 ⇒ **显式留痕**
  * （导出＝供 `--selftest` 直测；与上面 `mapMainReadError` 同族，都是"失败要能看见"）。
  *
  * 先说定性（本项要判的「真缺件 vs 设计上就不该有」）：**设计上就不是必装件**。
@@ -432,7 +432,7 @@ export function mapMainReadError (e) {
  *   · 本仓 `.gitignore` 第 12 行明确把它排除在仓库之外 ⇒ 仓内"缺件"是设计；
  *   · README「身份表放哪」写的是「每台机器**可**另放一份」，`INTERFACE.md` 第 3 行默认值列
  *     「未设（用默认路径）」；它只按 name 给主表**补** `open_ids`，缺了主表照常解析。
- *   ⇒ 生产 `/srv/app/.dsh-feishucard/` 没有它＝设计内状态，不是功能缺位。
+ *   ⇒ 生产 `<配置目录>/` 没有它＝设计内状态，不是功能缺位。
  * 但"设计内正常"不等于"出事也不许看见"：旧实现把「没有表」「表坏了」「读不了」三种情形
  * 一并吞成同一个无声降级，真出权限/内容问题时日志零线索（WO 所说的「静默失效」）。
  *
@@ -570,7 +570,7 @@ export function makeResolver ({ mapPath = null,
   //（2026-10-04 实测：写死 `python3` ⇒ 本机 `resolver_no_json`）
   let cachedPython = null
 
-  // 中台 #1866（2026-10-29）：探测失败必须留痕。
+  // 内部记录（2026-10-29）：探测失败必须留痕。
   // 旧实现 `catch { /* 试下一个 */ }` 把「命令不存在（ENOENT）／退出码非 0／超时（ETIMEDOUT）」
   // 一并无声吞掉，三个候选都不可用时只剩一句 `return 'python3'` —— 事后日志里只能看到
   // `resolver_no_json`，根本不知道是解释器起不来。现逐个候选记下 名称＋错误码/退出码/信号，
@@ -606,7 +606,7 @@ export function makeResolver ({ mapPath = null,
 
   // **动态取路径**：显式入参 ＞ 环境变量 ＞ 服务器固定路径 ＞ `<工作区>/output/g9-identity/`
   // ⇒ 每次调用都重新判 ⇒ 表放进来 / 移走立刻生效，不必等热重载；
-  // ⇒ **跟着工作区走**，所以 HOME(`P:\Qoder\work`) 与 维护者-OFFICE(`D:\Work`) 都能找到（维护者 2026-10-04 要求）。
+  // ⇒ **跟着工作区走**，所以 HOME(`P:\Qoder\work`) 与 维护者-OFFICE(`D:\Work`) 都能找到（2026-10-04 要求）。
   function currentMapPath () {
     if (mapPath) return mapPath
     if (process.env.MAILBOX_IDENTITY_MAP) return process.env.MAILBOX_IDENTITY_MAP
@@ -638,7 +638,7 @@ export function makeResolver ({ mapPath = null,
       if (forcePy && !fs.existsSync(rp)) return { actor: null, err: 'resolver_missing', tableOk: true }
       // 表换了（mtime 变）⇒ 清缓存，避免"旧身份"
       // 输入换了 ⇒ 清缓存，避免"旧身份"。签名要覆盖**四样**：主表 mtime、本地增量 mtime、
-      // 岗位表 mtime、forcePy。（岗位表进签名：改岗位授权必须在换缓存前生效，#158 真查链路）
+      // 岗位表 mtime、forcePy。（岗位表进签名：改岗位授权必须在换缓存前生效，内部记录 真查链路）
       try {
         let sig = String(fs.statSync(mp).mtimeMs)
         const lp0 = localMapPath()
@@ -670,7 +670,7 @@ export function makeResolver ({ mapPath = null,
           let local = null
           const lp = localMapPath()
           if (lp) {
-            // 中台 #1866 第4项：此处原为 `catch { local = null }` 空吞（WO 原文所指的 `identity-inject.mjs:437`
+            // 内部记录 第4项：此处原为 `catch { local = null }` 空吞（WO 原文所指的 `identity-inject.mjs:437`
             // 静默 catch；行号系 2026-10-15 版快照，现移到本行附近）。「无表／坏表／读不了」三种情形
             // 从前无声降级成同一副样子，真出权限或内容问题时日志零线索。现只加留痕，
             // 🔴 **降级行为一字不改**：仍按"没有增量表"继续用主表解析，不新增抛出路径。
@@ -685,7 +685,7 @@ export function makeResolver ({ mapPath = null,
           const r = resolveActorJs(openId, mainMap, local, jg)
           res = { actor: r.actor || null, err: r.err || null, tableOk: true }
         } catch (e) {
-          // 🔴 错误码归一（第十一轮门槛 LOW#2）：`loadMapJs` 抛的就是文档里的
+          // 🔴 错误码归一（第十一轮门槛 审查项）：`loadMapJs` 抛的就是文档里的
           //   `map_unavailable`（README「解析接口」错误码清单）。原来无条件加前缀 ⇒
           //   同一份坏主表，JS 通道吐 `resolver_js_failed:map_unavailable`、
           //   Python 通道吐 `map_unavailable`，两条通道的口径**不等价**。
@@ -749,21 +749,21 @@ export function selftest () {
   let pass = 0; let fail = 0
   const ok = (c, label) => { if (c) { pass++; console.log('  ✅ ' + label) } else { fail++; console.log('  ❌ ' + label) } }
 
-  console.log('── 1) decideAction：维护者 2026-10-04 裁决「无表就拒」──')
+  console.log('── 1) decideAction：无表就拒（2026-10-04 定案）──')
   ok(decideAction({ hasOwner: false, actor: null }) === 'pass-through',
-    '非飞书回合（GUI/子代理）⇒ 放行（**不许把 维护者 自己的电脑锁死** —— 2026-10-04 实测过一次）')
+    '非飞书回合（GUI/子代理）⇒ 放行（**不许把维护者自己的电脑锁死** —— 2026-10-04 实测过一次）')
   ok(decideAction({ hasOwner: true, actor: { name: 'x' } }) === 'overwrite', '飞书回合 ＋ 有 actor ⇒ 覆写')
   ok(decideAction({ hasOwner: true, actor: null }) === 'deny', '🔴 飞书回合 ＋ 无 actor ⇒ 拒绝')
   ok(decideAction({ hasOwner: true, actor: null, tableOk: false }) === 'deny',
-    '🔴 **表不可达也照样拒**（维护者：执行不了总比泄露好；救急走主 A 准 / SSH 修表）')
+    '🔴 **表不可达也照样拒**（执行不了总比泄露好；救急走主 A 准 / SSH 修表）')
   ok(decideAction({ hasOwner: true, actor: null, tableOk: true }) === 'deny',
     '🔴 表可达但认不出这个人 ⇒ 同样拒（两者本质一样：拿不到身份）')
 
   console.log('── 2) applyActorToArguments：核心自证「塞别人身份必被覆写」──')
-  const actor = { name: '示例用户', display_name: '维护者', open_id: 'ou_cm', union_id: 'on_cm', scopes: ['公司'] }
+  const actor = { name: '示例用户', display_name: '示例称呼', open_id: 'ou_cm', union_id: 'on_cm', scopes: ['公司'] }
   const evil = { name: '老板', open_id: 'ou_boss', scopes: ['全部'], query: 'SELECT 1' }
   const r1 = applyActorToArguments(evil, actor)
-  ok(evil.name === '维护者', '① 伪造的 name 被覆写，且取 display_name 优先（V1.1）——注入 name=称呼')
+  ok(evil.name === '示例称呼', '① 伪造的 name 被覆写，且取 display_name 优先（V1.1）——注入 name=称呼')
   ok(evil.open_id === 'ou_cm', '① 伪造的 open_id 被覆写')
   ok(JSON.stringify(evil.scopes) === JSON.stringify(['公司']), '① 伪造的 scopes 被覆写')
   ok(evil.query === 'SELECT 1', '① 非身份字段（query）原样保留 —— 不误伤工具入参')
@@ -989,7 +989,7 @@ export function selftest () {
     ok(resolveActorJs('ou_cm_main', dup, null, JOBG).err === 'duplicate_open_id', 'JS 镜像：两人共用 open_id ⇒ duplicate_open_id（判表损坏）')
     const withOpenId = resolveActorJs('ou_cm_main', cloneFix(), null, JOBG)
     ok(withOpenId.actor.open_id === 'ou_cm_main', 'JS 镜像：🔴 actor 必须回带 open_id（不带会被内核【删除】而非覆写）')
-    // #158 收口 13 字段 ＋ V1.1 display_name ⇒ 14 字段不多不少（契约 §二；channels 已移除）
+    // 内部记录 收口 13 字段 ＋ V1.1 display_name ⇒ 14 字段不多不少（契约 §二；channels 已移除）
     ok(Object.keys(withOpenId.actor).length === 14 &&
        withOpenId.actor.writable_scopes.length === 0 &&
        withOpenId.actor.is_cm === true &&
@@ -1018,7 +1018,7 @@ export function selftest () {
     const pyScript = path.join(path.dirname(fileURLToPath(import.meta.url)),
       'scripts', 'resolve_actor.py')
     let pyBin = ''
-    // #1866（2026-10-29）同族空吞：自测里的探测也要留痕，否则「跳过 parity」看不出原因
+    // 内部记录（2026-10-29）同族空吞：自测里的探测也要留痕，否则「跳过 parity」看不出原因
     const pyFails = []
     for (const c of ['python3', 'python', 'py']) {
       try {
@@ -1080,7 +1080,7 @@ export function selftest () {
     }
   }
 
-  console.log('── 8) #2626（需求 方案A 第一步）：别名覆写 + 关闸净化 + 真值形状校验 ──')
+  console.log('── 8) #2626（AC-0250 方案A 第一步）：别名覆写 + 关闸净化 + 真值形状校验 ──')
   {
     // ① 开闸支：模型自报 sender_open_id 冒用他人 ⇒ 必须被 actor 真值覆写（旧字节＝白名单不含
     //    该键，冒充值原样过关 ⇒ 本条红）。actor.union_id 空串 ⇒ sender_union_id 被【剔除】。

@@ -11,6 +11,13 @@
 // Config: ~/.dsh-feishucard/feishu.config.json  ({ bots: [...] }).
 // State:  ~/.dsh-feishucard/state-<appId>.json  (per-bot chat/session map).
 // A one-time migration copies a legacy config from ~/.cc-connect if present.
+//
+// 生效链路（2026-11-16 实测，别再按老结论"必须重启"办事）：
+//   宿主 HMR 的 root 只监听**源码目录**，而运行时加载的是 profile 里的**实体副本**
+//   （pnpm 对 file: 依赖做真目录拷贝）⇒ 改源码的文件事件映射不到任何已加载模块，等于空转。
+//   正解是触发一次 **profile 重新组合**：改一行 cordis.patch.yml 注释即可，
+//   重组时 HMR 会替换"profile 目录下磁盘文件已变"的插件（宿主导读原话：不要求通过 root 监听源码）。
+//   `npm run sync` 已内置这一步（改 # hmr-sync-trigger 标记行触发），所以标准流＝改码 → sync → 生效。
 
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
@@ -34,13 +41,20 @@ import {
 // 🔴 为什么必须注入正文：会话内容在 ~/.dsh/sessions/**.v4.jsonl.zstd 里是多条 zstd 帧拼接，
 //    Node 自带 zstdDecompressSync 只解首帧 ⇒ 光给新会话一个旧 id，它读不到那个 id 的内容。
 import { buildHealHandoff } from './heal-handoff.mjs'
-// G3 员工会话「工具调用失败」旁路上报（#514 / D38=需求 路径A）。默认零触发：
+// G3 员工会话「工具调用失败」旁路上报（内部记录 / D38=内部记录 路径A）。默认零触发：
 // 白名单（AIAD_G3_REPORT_CWD_ALLOW）与写入根（AIAD_INBOX_ROOT）不注入 ⇒ 不写任何东西。
-// reportG3Recovery（#2331 第⑦层）：失败投递后同工具后续成功调用时自然上报恢复（关联原 event_id）。
+// reportG3Recovery（内部记录 第⑦层）：失败投递后同工具后续成功调用时自然上报恢复（关联原 event_id）。
 import { isG3OkrWorkspace, reportG3Failure, reportG3Recovery } from './g3-inbox-report.mjs'
+// [RC-004-F085-20261117] 评价追问回复路由内核（可独立单测，见 evalchat-route.mjs --selftest）：
+// 「注入即声明回填通道」——inject-context 载荷带 route_* ⇒ 登记该用户回填通道；其下一条 p2p
+// 文本由桥以真值 sender_open_id 优先调 v2 evaluation_chat（非空=回执，空=原对话，失败=降级留痕）。
+// 桥不查任何业务库、不认识卡型（通道由发卡程序自声明）——通用性与 RC-004 v2 注入方向兼容。
+import {
+  EvalRouteRegistry, sanitizeRoutePayload, isAllowedEndpoint, callEvalChat, decideRouteAction,
+} from './evalchat-route.mjs'
 
 // D5：进程内单例 —— 「本轮上下文」按 agent.id 存，所以多 bot 实例共享一个 store 也不会串号。
-// 表/resolver 路径默认取 /opt/scripts/G9/（服务器），可用 MAILBOX_IDENTITY_MAP 覆盖。
+// 表/resolver 路径默认取 服务器脚本），可用 MAILBOX_IDENTITY_MAP 覆盖。
 let __turnIdentity = null
 let __identityResolver = null
 // ⚠️ `workspaceRoot` 是 `apply()` 内的局部（index.js:356），**模块级的本函数访问不到** ——
@@ -50,8 +64,8 @@ let __identityResolver = null
 //    ⇒ **必须由调用方把工作区传进来**（三个调用点都在 `apply()` 作用域内，拿得到）。
 function identityCtx (ws) {
   if (!__turnIdentity) __turnIdentity = new TurnIdentityStore()
-  // 🔑 表/resolver 的路径**跟着工作区走**（维护者 2026-10-04 要求）：
-  //    服务器 `/opt/scripts/G9/` 优先，其次 `<工作区>/output/g9-identity/`。
+  // 🔑 表/resolver 的路径**跟着工作区走**（2026-10-04 要求）：
+  //    服务器 `服务器脚本` 优先，其次 `<工作区>/output/g9-identity/`。
   //    ⇒ 表放在工作区里 ⇒ **Syncthing 会把它同步到各开发机** ⇒ HOME(`P:\Qoder\work`) 与
   //      维护者-OFFICE(`D:\Work`) 都找得到，**两台都不会被锁死**。不写死任何盘符。
   if (!__identityResolver) __identityResolver = makeResolver({ workspaceRoot: ws || process.cwd() })
@@ -79,7 +93,7 @@ const CARD_MAX_FAILURES = 5          // consecutive failures before breaker
 const CARD_TIMEOUT = 15000           // single card request timeout
 const CARD_POLL_INTERVAL = 300       // agent event poll interval
 const NOTICE_POLL_MS = 1000          // 子代理回执轮询间隔（改造①，必须独立于回合状态）
-// 维护者 2026-10-01 B 方案（同日 17:3x 修正一次口径）：本轮耗时 ≥ 此阈值 ⇒ **结论独立成一张新卡**
+// 2026-10-01 B 方案（同日 17:3x 修正一次口径）：本轮耗时 ≥ 此阈值 ⇒ **结论独立成一张新卡**
 // （新卡＝新消息 ⇒ 飞书会提醒；过程卡退化成"工作日志"）。
 // ⚠️ 修正原因（真机实测）：原规则还带一条"有工具调用就分卡"，但实测**几乎每一轮都有工具调用**
 //    ⇒ 该条件形同虚设，12 秒的短任务也被分成两张卡（维护者：「短任务都变了两张卡了」）。
@@ -93,17 +107,17 @@ function conclusionSplitMinMs(bot) {
   return Number.isFinite(raw) && raw >= 0 ? raw : CONCLUSION_SPLIT_DEFAULT_MS
 }
 
-// ── #2591 件2① 同步闸（2026-10-30）：疑似 维护者 裁决口径检测（关键词级，提醒非强制）──
-// 词表/句式与 内部工具/tools/mt.py RULING_UTTERANCE_WORDS/_RULING_UTTERANCE_RX 同源
+// ── 内部记录 件2① 同步闸（2026-10-30）：疑似 维护者 裁决口径检测（关键词级，提醒非强制）──
+// 词表/句式与内部中台脚本 RULING_UTTERANCE_WORDS/_RULING_UTTERANCE_RX 同源
 // （真相源在 mt.py，改词表须两侧同步）；桥在服务器侧跑、不依赖 mt.py 路径——检测在
 // 桥内本地做，提醒文案指路 agent 跑 mt.py CLI 闭环。误报成本低（多提醒一轮），漏报
 // 由 daily-patrol ⑥bf 24h 挂墙广播兜底。开关：bot 配置 rulingHint:false 可关（默认开）。
 const RULING_HINT_RX = /(同意|批准|不准|不允许|不行|驳回|否决|拍板|就按|定了|采纳|裁决是|确认按)|选\s*[0-9１-９一二三四五六七八九十]|方案\s*[0-9１-９一二三四五六七八九十]|[按依][^\n]{1,8}办/
 const RULING_HINT_NOTE =
-  '\n\n〔中台同步闸·桥注入〕本条疑似 维护者 裁决口径（#2591，提醒非强制）。同步动作当轮完成：' +
-  '① 先查库 python 内部工具/tools/mt.py adjcards search "<关键词>"（✅＝可用裁决照办，执行留痕引卡号/台账号）；' +
-  '② 命中挂墙待拍卡 adjcards decide AC-NNNN --ruling "<维护者原话>" --cm-quote "<维护者原话>" 代录闭环；' +
-  '③ 会话内新裁决重大事项 adjcards gen <来源> --matter … --decide-now --cm-quote "<维护者原话>"；' +
+  '\n\n〔同步闸·桥注入〕本条疑似决策口径（提醒非强制）。同步动作当轮完成：' +
+  '① 先查库 python 信息中台/tools/mt.py adjcards search "<关键词>"（✅＝可用裁决照办，执行留痕引卡号/台账号）；' +
+  '② 命中挂墙待拍卡 adjcards decide AC-NNNN --ruling "<决策人原话>" --cm-quote "<决策人原话>" 代录闭环；' +
+  '③ 会话内新裁决重大事项 adjcards gen <来源> --matter … --decide-now --cm-quote "<决策人原话>"；' +
   '小事口头指令走项目台账 ledger append 分流，不出卡。'
 function rulingHintFor(bot, text) {
   try {
@@ -162,7 +176,7 @@ function buildStamp() {
   }
 }
 
-// #1685 发送闸的量尺：量「真实请求体里那段」＝double stringify（send/update 传的是
+// 内部记录 发送闸的量尺：量「真实请求体里那段」＝double stringify（send/update 传的是
 // content: JSON.stringify(payload)，转义后比 payload 自身还大）。导出＝供冒烟直测那条
 // 从入站打不到的 fail-closed 支路（scripts/smoke.mjs 的 N4）。
 export function measurePayloadBytes (payload) {
@@ -182,6 +196,9 @@ export function apply(ctx) {
   let lastConfigCheck = 0
   let lastSpawnAt = 0
   const bots = new Map()             // appId -> Bot runtime
+  // [RC-004-F085-20261117] 回填通道登记表：挂 globalThis 跨代（同 activeTurns 先例）——热重载后
+  //   登记不丢；桥重启丢登记＝下次 a4 发卡/催办重登记（evaluation 数据在 v2 库，不受影响）。
+  const evalRoutes = globalThis.__fsEvalRoutes || (globalThis.__fsEvalRoutes = new EvalRouteRegistry())
 
   // Agent -> live streaming-card context of its current turn. Lets the
   // ask_user_question flow freeze the *old* card (the one sitting above the
@@ -200,7 +217,7 @@ export function apply(ctx) {
   //   所以跨代条目一律先问 `closuresAreOurs(entry)`（见下），不是本代的就换成本代等价通道。
   const activeTurns = globalThis.__fsActiveTurns
     || (globalThis.__fsActiveTurns = new Map())   // agentId -> { card, bot, chatId, gen, rotate, split }
-  // 0.7.16（审查 MED#2）：**代际旗**取代按卡对象登记 —— 0.7.15 的 WeakSet 只能拦 dispose 时**已存在**的卡；
+  // 0.7.16（审查 审查项）：**代际旗**取代按卡对象登记 —— 0.7.15 的 WeakSet 只能拦 dispose 时**已存在**的卡；
   // dispose 之后本代 runTurn 还会**新建**卡（拆结论卡 makeCardState / 换卡 rotateAdoptedCard），那些新对象
   // 不在集合里、照发（= 野卡漏洞）。旗按「代」判定：dispose 之后本代**一切**推送（封口/新建卡/入队后才执行的
   // 任务体）全部拦下；新代 apply 是新闭包、旗=false ⇒ 接管/续卡照常（无按对象簿记，也无全局累积）。
@@ -272,7 +289,7 @@ export function apply(ctx) {
   const hasRelayFor = (card) => Boolean(card) && cardRelay.some((it) => it.card === card
     && (it.card.token ? !it.card.circuitOpen : it.card.createOnRelay === true))
   // 建卡意图到期仍建不出来 ⇒ 结论**写回过程卡**（与 runTurn 的单卡回退同一口径：摘掉指路语、
-  //   摆上状态栏），这样任何时刻都不会出现"指着一张永远不存在的卡"（smoke 用例 76 的红线）。
+  //   摆上状态栏），这样任何时刻都不会出现"指着一张永远不存在的卡"（smoke 用例 76 的关键约束）。
   //   连过程卡都没有可写回时才退化成纯文本。
   // ⚠️ 0.7.22（独立审查 HIGH）：bot **由调用方传入**，不在这里重新解析 —— 旧实现在这里
   //   再查一次 findBotForChat，而唯一调用点上一行刚按 `!bot` 分支进来（同拍必然还是 undefined），
@@ -383,7 +400,7 @@ export function apply(ctx) {
         // 🔒 C2：TTL 检查跳过正在退避的条目 —— 退避窗口内不该被 TTL 误杀。
         // 🔴 中台 #61/#62（第三十五轮）：起算口径同步改为 relayTtlFrom（首次可重推时刻），
         //   否则退避一到期的第一拍仍会因「it.at 起算已超 60s」当场丢弃＝边界对撞没修干净。
-        //   （第三十五轮门槛 LOW#3：在 relayTtlFrom 之下这个前置合取在数学上已被包含，
+        //   （第三十五轮门槛 审查项：在 relayTtlFrom 之下这个前置合取在数学上已被包含，
         //   保留它是把 C2 的口径**显式**钉住——relayTtlFrom 定义若漂移，这道闸不会静默失效。）
         if (now >= Number(it.card.retryUntil || 0) && now - relayTtlFrom > CARD_RELAY_TTL_MS) {
           console.log('[fs] relayed card push dropped (card never existed in this chat): chat=' + it.chatId)
@@ -403,7 +420,7 @@ export function apply(ctx) {
         // 本代解析不到这个会话的 bot ⇒ 通道是真坏着：不许把后面的卡继续硬塞，整批停下等下一拍。
         //   0.7.22（独立审查 HIGH）：这里**不做降级** —— 连 bot 都拿不到就没有任何发送通道，
         //   降级照样发不出去；能救结论的是下面"有 bot 但这次建卡失败"那条路。
-        // 🔒 C2（第二十六轮门槛 LOW#7 纠偏）：原来这里补的 `now >= retryUntil` 子句是**恒真死码**——
+        // 🔒 C2（第二十六轮门槛 审查项 纠偏）：原来这里补的 `now >= retryUntil` 子句是**恒真死码**——
         //   上面 344 行退避闸门已把仍在退避窗口的条目整条 continue 掉，能走到本分支的条目
         //   必然已过退避。保护由 344 给，不在这里重复表达"保险"（上面 334 行那处不同：
         //   无 token 无建卡意图的条目**到不了** 344，那处的子句是有效判据，保留）。
@@ -416,7 +433,7 @@ export function apply(ctx) {
         break
       }
       const push = syncCard(bot, it.chatId, it.card, true).catch(() => { })
-      // 0.7.22（独立审查 HIGH+MED#2）：建卡意图**必须看结果**。旧实现 fire-and-forget 后无条件
+      // 0.7.22（独立审查 HIGH+审查项）：建卡意图**必须看结果**。旧实现 fire-and-forget 后无条件
       //   splice ⇒ 新代这次 POST 若因网络/限流/5xx 失败（不属于 rejected/toolarge 那两类、
       //   不会触发 syncCard 内部的 rescueText 救援），卡被永久放弃而队列条目已删，
       //   结论连一个字都没到 —— 正是本次修复要消灭的"内容静默丢失"。
@@ -502,7 +519,7 @@ export function apply(ctx) {
     return h.toString(16).padStart(8, '0')
   }
 
-  // #1532（2026-10-16）：回调动作令牌（审批卡 fs_approval / 审批单 fs_form / 问题卡 fs_question /
+  // 内部记录（2026-10-16）：回调动作令牌（审批卡 fs_approval / 审批单 fs_form / 问题卡 fs_question /
   //   能力申请 fs_cap_grant / 计划卡 fs_plan_goal 的 randomUUID）**不整串进日志**——日志只留
   //   sha256 前 10 位短摘要：排障要的是「两行日志能不能对上同一张卡」，摘要可关联、不可逆推原文。
   //   与 shortHash（djb2 载荷指纹）分工：令牌摘要必须走密码学散列，不能用可碰撞的指纹凑数。
@@ -512,7 +529,7 @@ export function apply(ctx) {
 
   // 找出某个会话当前正在跑的、还没封口的卡片（用于让 feishu_send 知道"这个对话正在被回复"）。
   // 2026-09-15：agent 在活跃对话里调 feishu_send 会另发一条消息，与卡片里的回复重复
-  //（维护者 反馈"同一段东西分两个卡片发"）——有活跃卡时应当跳过。
+  //（用户反馈"同一段东西分两个卡片发"）——有活跃卡时应当跳过。
   function findActiveCardForChat(chatId) {
     if (!chatId) return null
     for (const entry of activeTurns.values()) {
@@ -521,7 +538,7 @@ export function apply(ctx) {
     return null
   }
 
-  // ---- 消息索引（改造⑤ 引用透传，维护者 2026-10-01 定）----------------------------
+  // ---- 消息索引（改造⑤ 引用透传，2026-10-01 定）----------------------------
   // 飞书入站消息带 `parent_id`（维护者 引用的是哪一条），旧实现只取正文 ⇒ agent 看不出
   // 维护者 回的是哪张卡、哪条消息。这里把"发出去的卡片/消息"和"维护者 发来的消息"登记成
   // message_id -> 摘要；入站命中 parent_id 时把摘要随正文一起注入会话。
@@ -529,10 +546,10 @@ export function apply(ctx) {
   // 当前应用没开；本地表覆盖"引用我们自己的卡片/消息"这一主场景）。
   const recentMessages = new Map()      // messageId -> { label, at, full }
   const RECENT_MESSAGE_MAX = 300        // 只留最近若干条，避免长跑内存无界增长
-  // #515 存档反查 TTL：7 天。占位卡反查的价值窗口＝「刚发完被同群/同会话的另一个 bot 看到」；
+  // 内部记录 存档反查 TTL：7 天。占位卡反查的价值窗口＝「刚发完被同群/同会话的另一个 bot 看到」；
   // 过期条目在 loadMessageIndex 时就地淘汰，防 message-index.json 无限膨胀。
   const CARD_ARCHIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000
-  // #515 存档正文上限：一张卡的全文（含工具面板/表格等所有文字）超过这个数就截断——
+  // 内部记录 存档正文上限：一张卡的全文（含工具面板/表格等所有文字）超过这个数就截断——
   // 喂给 agent 的正文本身也不宜过长；300 条 × 8KB ≤ 2.4MB 落盘，体量可控。
   const CARD_ARCHIVE_TEXT_MAX = 8000
   // ⚠️ 2026-10-01 真机实证（维护者 引用一张卡片，卡面回「内容未登记，可能是更早的消息」）：
@@ -573,7 +590,7 @@ export function apply(ctx) {
       const now = Date.now()
       for (const [id, value] of Object.entries(obj || {})) {
         if (!id || !value || typeof value.label !== 'string') continue
-        // #515 存档 TTL：7 天前的条目不再加载（发卡存档的价值窗口就是「刚发完被同群 bot 看到」，
+        // 内部记录 存档 TTL：7 天前的条目不再加载（发卡存档的价值窗口就是「刚发完被同群 bot 看到」，
         // 旧档只会让 message-index.json 无限膨胀）。at 缺失的旧格式条目按 0 ⇒ 视为过期，不加载。
         if (!Number(value.at) || now - Number(value.at) > CARD_ARCHIVE_TTL_MS) continue
         // 2026-10-02 代码审查 low#10：**内存里已有的条目不许被盘上的旧值盖回去**。
@@ -599,7 +616,7 @@ export function apply(ctx) {
   function rememberMessage(messageId, label, full) {
     const id = String(messageId || '')
     if (!id) return
-    // 中台 #515（维护者 2026-10-12 拍板「做」）：存档反查 —— full＝卡片正文全文。
+    // 内部记录（2026-10-12 确定「做」）：存档反查 —— full＝卡片正文全文。
     // **merge 语义**：同一 message_id 的后续登记（如入口 :6684 把收到的占位卡记成「维护者 的消息」）
     // 不带 full ⇒ 必须继承旧值，否则发卡时存的全文会被收件时的重登记抹掉，反查永远 miss。
     const prev = recentMessages.get(id)
@@ -642,7 +659,7 @@ export function apply(ctx) {
     return 'bot 的回复卡片：' + String(best).replace(/\s+/g, ' ').slice(0, 60)
   }
 
-  // 未命中的哨兵文案：**惟一定义**（日志判定也用它，避免"改文案就静默把 miss 判成 hit"，审查 LOW#281）
+  // 未命中的哨兵文案：**惟一定义**（日志判定也用它，避免"改文案就静默把 miss 判成 hit"，审查 审查项）
   const QUOTE_MISS_SENTINEL = '（内容未登记，可能是更早的消息）'
   function quoteHintFor(parentId) {
     if (!parentId) return ''
@@ -650,7 +667,7 @@ export function apply(ctx) {
     let hit = recentMessages.get(key)
     if (!hit) {
       // 未命中 ⇒ 再读一次落盘索引：重启前登记的卡片就在那里（**不许猜内容**，
-      // 读不到就照实写「未登记」——见 ~/.dsh/AGENTS.md A24 禁无出处断言）。
+      // 读不到就照实写「未登记」——见 A24 禁无出处断言）。
       loadMessageIndex()
       hit = recentMessages.get(key)
     }
@@ -658,7 +675,7 @@ export function apply(ctx) {
     return '\n\n（你在引用这条消息' + what + '）'
   }
 
-  // 维护者 2026-10-03（P1）：引用透传必须**可判定** —— 命中 / 未命中 / **字段为空** 三种都留痕。
+  // 2026-10-03（P1）：引用透传必须**可判定** —— 命中 / 未命中 / **字段为空** 三种都留痕。
   // 背景：helper 原样转发整包 data（helper.cjs），所以字段有就一定到得了这里；"什么都没有"
   // 只可能是飞书没带 parent_id/root_id ⇒ 必须有日志，否则只能靠猜（A24 禁无出处断言）。
   function logQuoteState(evt, hint) {
@@ -704,8 +721,8 @@ export function apply(ctx) {
   }
   migrateLegacyConfig()
 
-  // ---- #1105 日期锚注入器（维护者 2026-10-14 定稿，双条件 ≤1次/天/会话，追加式）--------
-  // 背景：长会话跨天续跑、内核与桥都不注入日期、get_now 授权断裂（G9 #1089）⇒ 模型只能
+  // ---- 内部记录 日期锚注入器（2026-10-14 定稿，双条件 ≤1次/天/会话，追加式）--------
+  // 背景：长会话跨天续跑、内核与桥都不注入日期、get_now 授权断裂（G9 内部记录）⇒ 模型只能
   // 从历史旧日期「猜今天」（实锤：10-14 当天日报被记成 10-10）。判据一行话：state.last
   // 不等于今天 ⇒ 注（首次出现＝无记录；跨天＝日期变了）；同日 ⇒ 不注（天然去重）。
   // 锚是纯数据一行、拼在当轮消息最前（**追加式不回写历史**——改历史=缓存失效，维护者 明确关注点）；
@@ -732,7 +749,7 @@ export function apply(ctx) {
   // 用服务器本地时区（生产 CST）。
   // 0.8.16 更正（修法 7）：旧注释举的三个例子里**只有一个仍成立**——「卡片失败回执」那条
   //   `handleInbound(bot, {…, _internal: true, …})`（卡片被拒后回注的系统提示）至今在跑，且与本判断
-  //   同径：#1105 端到端 E4b ★判别条实测过「某 chat 当天首进 agent 的是这条合成轮 ⇒ 它照样带锚并写状态」。
+  //   同径：内部记录 端到端 E4b ★判别条实测过「某 chat 当天首进 agent 的是这条合成轮 ⇒ 它照样带锚并写状态」。
   //   「热重载续跑」的注入腿 2026-10-04 已整段删除（见本文件 hot reload notice 处说明），「归档调度」代码里从来没有。
   //   另记一条边界：命令失败回注那条走 `agent.send`、不经 `handleInbound` ⇒ **天然不带锚**，别把它算进"合成轮"。
   function dateAnchorFor(bot, chatId) {
@@ -800,16 +817,16 @@ export function apply(ctx) {
         // 0.7.17（两模式）：full（缺省＝现状行为）| stable（员工显示层收起）。热读，10 秒生效。
         // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
         mode: (typeof bot.mode === 'string' && bot.mode.toLowerCase() === 'stable') ? 'stable' : undefined,
-        // 0.7.18（身份闸门）：**默认关** —— 不写就是关（上游用户不一定需要这个功能；维护者 2026-10-04 定）。
+        // 0.7.18（身份闸门）：**默认关** —— 不写就是关（上游用户不一定需要这个功能；2026-10-04 定）。
         // 打开后：入站按 `open_id` 查身份表 ⇒ 工具入参里的身份字段一律被覆写成表里的真值；
         //        拿不到身份则拒绝执行（fail-closed）。
-        // 关闭时（#2626·需求 方案A 第一步起）：不判权，但**也不再原样转发模型自报身份**——
+        // 关闭时（内部记录·配套改动 方案A 第一步起）：不判权，但**也不再原样转发模型自报身份**——
         //        飞书回合入参里的严格身份键（open_id/union_id/person_id/sender_open_id/sender_union_id）
         //        用入站事件权威值覆写、无真值可核则剔除＋`identity guard-off sanitize` 留痕；
         //        非飞书回合（GUI/子代理/定时）不受影响。开闸环境见 decisions/2026-10-30-identityGuard机器开关矩阵.md。
         // ⚠️ 必须进白名单：本函数是白名单归一化，漏在这里 ⇒ 配置里写了也被丢（splitConclusionMinMs 同坑）。
         identityGuard: typeof bot.identityGuard === 'boolean' ? bot.identityGuard : undefined,
-        // 0.8.4（A5/A6 能力审批表）：**默认关**（维护者 2026-10-06「身份闸先全关，验证时挑一个账号」）。
+        // 0.8.4（A5/A6 能力审批表）：**默认关**（2026-10-06「身份闸先全关，验证时挑一个账号」）。
         // 打开后：切模型/目标模式/计划模式/答复审批单这四类动作先查 `capability_grants.json`，
         //        无有效授权 ⇒ 拒 + 向审批人私聊发申请卡（有效期三档由审批人选）。
         // 审批人 open_id 不写则回落 `ownerOpenId`。⚠️ 白名单坑同 splitConclusionMinMs。
@@ -822,7 +839,7 @@ export function apply(ctx) {
         // ⚠️ 白名单坑同 splitConclusionMinMs。
         planEnabled: typeof bot.planEnabled === 'boolean' ? bot.planEnabled : undefined,
         goalEnabled: typeof bot.goalEnabled === 'boolean' ? bot.goalEnabled : undefined,
-        // 0.8.0（P0-6 可选接力）：**默认 self_only = 现状门一字不动**（维护者 2026-10-04 防互刷裁决）。
+        // 0.8.0（P0-6 可选接力）：**默认 self_only = 现状门一字不动**（2026-10-04 防互刷裁决）。
         // mentions_any=转"@了任意其它 bot"的消息；all=全部群消息转发；off=全部丢弃。
         // groupRelayChats 按群覆盖（oc_x -> 模式）。⚠️ 白名单坑同 splitConclusionMinMs。
         groupRelay: ['mentions_any', 'all', 'off', 'self_only'].includes(bot.groupRelay)
@@ -832,7 +849,7 @@ export function apply(ctx) {
             .filter(([, v]) => ['mentions_any', 'all', 'off', 'self_only'].includes(String(v)))
             .map(([k, v]) => [String(k), String(v)]))
           : undefined,
-        // 0.8.5（中台 #171 per-bot 预设）：**默认不写＝挂全局默认预设（现行为一字不动）**。
+        // 0.8.5（内部记录 per-bot 预设）：**默认不写＝挂全局默认预设（现行为一字不动）**。
         // 写了 ⇒ 该 bot 的 create/resume 会话按 id 挂载指定 agent 预设（registry `mount(ctx, id?)`
         // 官方通道）；id 不存在 ⇒ registry 抛 agent-preset/not-found ⇒ mount 失败日志可见，
         // **不做静默回落**（回落＝把配置错误捂成正常）。用途：把第三方工具只挂进专用预设、
@@ -903,7 +920,7 @@ export function apply(ctx) {
     const tmp = p + '.tmp-' + process.pid
     try {
       mkdirSync(configDir(), { recursive: true })
-      // 🔴 第二十四轮门槛 LOW#7：state 现在带 `peer`/`peerUnion`（按人身份），与同批的
+      // 🔴 第二十四轮门槛 审查项：state 现在带 `peer`/`peerUnion`（按人身份），与同批的
       //   capability_grants.json 同口径收到 0600（同机多账号共存，见 README 账号台账）。
       // 🔴 第三十三轮门槛 MEDIUM#1（核对为真）：直写**先截断再写满**——中间断电/SIGKILL 会留
       //   半截 JSON ⇒ 下次 readState 走 catch 返回 `{ chats:{} }`，**该 bot 的全部会话与身份
@@ -913,7 +930,7 @@ export function apply(ctx) {
       renameSync(tmp, p)
       try { chmodSync(p, 0o600) } catch { /* 同上 */ }
     } catch (error) {
-      // 🔴 第三十四轮门槛 LOW#1（核对为真）：writeGrants 失败时清 tmp，writeState 原来只记日志
+      // 🔴 第三十四轮门槛 审查项（核对为真）：writeGrants 失败时清 tmp，writeState 原来只记日志
       //   ——半截 `*.tmp-<pid>` 留在配置目录里（同形状已发生漂移）。清理口径对齐。
       //   抽公共 atomicWriteJson 判**不修**：两处载荷形状不同（裸对象 vs version 包装）、返回契约
       //   不同（writeGrants 要 ok 旗标供调用方拒写），两处各自有冒烟流水兜行为，合并的反证成本大于收益。
@@ -923,7 +940,7 @@ export function apply(ctx) {
   }
 
   // ---- outbound HTTP -------------------------------------------------------
-  // #1533（2026-10-16）：**所有外呼带有限时限**。旧实现只有调用方传 signal 才有中止
+  // 内部记录（2026-10-16）：**所有外呼带有限时限**。旧实现只有调用方传 signal 才有中止
   //   （全文件只有卡片同步链传），其余调用一旦对端不响应就无限挂起（undici 默认要等
   //   好几分钟），且 httpJson 把异常吞成 `{status:0}` 后表面看只是「慢」。现在统一套
   //   AbortSignal.timeout 兜底：不传 signal ⇒ 默认 15s；已传 signal（卡片同步自带
@@ -1007,7 +1024,7 @@ export function apply(ctx) {
       throw new Error('create card failed: ' + (res.text || JSON.stringify(res)))
     }
     const createdId = parsed.data && parsed.data.message_id
-    // #515 存档反查：本桥发出的每一张卡都按 message_id 存全文 —— 另一个 bot 在群里/会话里
+    // 内部记录 存档反查：本桥发出的每一张卡都按 message_id 存全文 —— 另一个 bot 在群里/会话里
     // 收到这张卡的**占位替身**（飞书对 2.0 卡只给「占位图＋请升级文案」）时，凭同一条 message_id
     // 反查此处即可还原原文。登记失败绝不影响发卡本身（try 包住）。
     try {
@@ -1032,7 +1049,7 @@ export function apply(ctx) {
     if (!(res.status >= 200 && res.status < 300) || !parsed || parsed.code !== 0) {
       throw new Error('update card failed: ' + (res.text || JSON.stringify(res)))
     }
-    // #515：PATCH 成功＝卡内容变了 ⇒ 存档同步刷新（流式卡随回合推进更新，反查要给到最新正文）。
+    // 内部记录：PATCH 成功＝卡内容变了 ⇒ 存档同步刷新（流式卡随回合推进更新，反查要给到最新正文）。
     try {
       const archText = cardArchiveTextOf(payload)
       if (archText) rememberMessage(messageId, archText.slice(0, 60), archText)
@@ -1076,7 +1093,7 @@ export function apply(ctx) {
   //    之前那个坑是**跨标签嵌套**（`<font>**X**</font>`），那个在 P1-5 的发卡链里按"已知好形态"修正。
   // 卡片 markdown **不支持**的 HTML 标签（会整卡被拒 / 把标签原文漏给用户）——
   // **一处定义**：stripUnsendable（纯文本兜底）与 sanitizeMarkdownForFeishu（发卡前清洗）共用，
-  // 免得两份黑名单各改各的（独立审查 LOW#1576）。
+  // 免得两份黑名单各改各的（独立审查 审查项）。
   const UNSUPPORTED_HTML_TAG_RE = /<\/?(?:div|span|table|thead|tbody|tr|td|th|html|body|script|style|iframe)\b[^>]*>/gi
   function stripUnsendable(text) {
     let out = String(text == null ? '' : text)
@@ -1116,7 +1133,7 @@ export function apply(ctx) {
       if (prev && prev.hash === hash && prev.token && prev.token !== card.token
         && (now - Number(prev.at || 0)) < REPLY_CARD_DEDUPE_WINDOW_MS) {
         // 只有**体量几乎相同**才判重复：过程卡（含工具日志）与结论卡会同时含这段正文，
-        // 但两者字数差着量级 ⇒ 差得多的绝不撤（撤了就是丢正文，违 维护者 红线）。
+        // 但两者字数差着量级 ⇒ 差得多的绝不撤（撤了就是丢正文，违 维护者 关键约束）。
         const prevChars = Number(prev.chars || 0)
         const similar = prevChars > 0 && charsNow > 0
           && Math.abs(prevChars - charsNow) / Math.max(prevChars, charsNow) <= 0.15
@@ -1208,7 +1225,7 @@ export function apply(ctx) {
       rememberMessage(parsed && parsed.data && parsed.data.message_id, 'bot 的一条消息：' + String(text))
     } catch {}
     // F（2026-10-03）：**纯文本兜底自己失败也要可见** —— 旧实现只打一行日志，
-    //   用户那边就是"什么都没有"（维护者 原话："干着干着突然停了"）。
+    //   用户那边就是"什么都没有"（需求原文："干着干着突然停了"）。
     //   这里的处置：① 留痕（可日志复验）② 用**最保守的纯文本**再试一次（去掉所有 markdown
     //   语法与链接，只剩单行字）—— 因为整卡被拒的头号原因就是里面的非法片段/语法。
     let parsedRes = parseJson(res.text)
@@ -1333,7 +1350,7 @@ export function apply(ctx) {
   // 不传 agent 时保持 null：buildCardPayload 见到 null 就整块跳过（优雅降级）。
   // 建卡那一刻的**计划模式真值**：回扫会话事件里最后一条 `plan/mode`（一条都没有 ⇒ false）。
   // 计划模式是**会话级**、跨回合存活，而 `plan/mode` 只在"开关那一刻"落一条 ⇒
-  // 只按新事件更新会让"开关之后才建的卡"一直显示普通模式（独立审查 MED#645）。
+  // 只按新事件更新会让"开关之后才建的卡"一直显示普通模式（独立审查 审查项）。
   function lastPlanModeActive(agent) {
     try {
       const events = agent && agent.session ? sessionEvents(agent.session) : []
@@ -1356,7 +1373,7 @@ export function apply(ctx) {
   }
   const WORKING_PLACEHOLDER = '正在工作中…'
   // 封口/换卡前必须摘掉"正在工作中…"占位符（本文件多处已明令：封口后的卡不许留着它）。
-  // 审查 MED#7095：换卡路径（rotateTables / openGoalCard.rotate / rotateAdoptedCard）漏了这一步。
+  // 审查 审查项：换卡路径（rotateTables / openGoalCard.rotate / rotateAdoptedCard）漏了这一步。
   function dropWorkingPlaceholder(card) {
     if (!card || !Array.isArray(card.blocks)) return 0
     const before = card.blocks.length
@@ -1369,7 +1386,7 @@ export function apply(ctx) {
   function makeCardState(agent, from) {
     return {
       agent: agent || null,
-      // 底部状态栏形态（维护者 2026-10-01 定 A 方案）：
+      // 底部状态栏形态（2026-10-01 定 A 方案）：
       //   'full' = 灰底那条（状态 ｜ 目标 ｜ 上下文占比 ｜ 缓存命中）—— **结论卡 / 自动卡**用
       //   'bare' = 只有一行裸状态（运行中… / ✅ 已完成）—— **普通回合的过程卡**用（工作日志不摆状态栏）
       // 分卡只有到**封口时**才知道 ⇒ 过程卡先设 bare；若不满足分卡条件（短任务），
@@ -1383,7 +1400,7 @@ export function apply(ctx) {
       failCount: 0,
       circuitOpen: false,
       retryUntil: 0,
-      // #1685（需求 方案 1）发送前字节闸用的两个字段：换卡处置回调（由 startCardWatcher 挂上、
+      // 内部记录（配套改动 方案 1）发送前字节闸用的两个字段：换卡处置回调（由 startCardWatcher 挂上、
       //   stop 时撤）与喊话去抖时刻。登记在这里，是为了「卡上有哪些可变状态」仍有一份完整清单可读。
       onSizeBudget: null,
       sizeGuardAt: 0,
@@ -1391,7 +1408,7 @@ export function apply(ctx) {
       // 2026-09-15 修复：一卡一游标 + 已消费事件去重。
       // 旧实现的 seal 前补扫用 `{from: seqBefore}`（本轮起点）重放整轮，而 appendNote 无去重
       // → split 之后新卡会把 split 前的内容再写一遍、split 后的内容写两遍
-      //   （维护者 反馈的"同一段东西分两个卡片发、内容大量重复"）。
+      //   （用户反馈的"同一段东西分两个卡片发、内容大量重复"）。
       cursor: 0,           // 本卡已消费到的事件下标（== seq）
       seenSeqs: new Set(), // 已写入卡片的 assistant/message seq（防重放重复）
       createFailed: false, // 建卡失败过 → 不再重复建卡（防超时导致的孤儿卡与多张卡）
@@ -1440,7 +1457,7 @@ export function apply(ctx) {
     // （从 approvalReasonFor 里抄过来的"联网/外发命令"判断），但本函数作用域内没有 cmd，
     // 且该插入同时删掉了 `const joined = ...` 一行 → 本函数**每次调用必抛
     // ReferenceError: cmd is not defined**，导致卡片工具面板构建失败、
-    // 流式更新整条链路崩掉，只能退化成最后一条纯文本回复（维护者 反馈"隔很久才回、看不到进度"）。
+    // 流式更新整条链路崩掉，只能退化成最后一条纯文本回复（用户反馈"隔很久才回、看不到进度"）。
     // 现按 git 历史（5c800e5 等提交）还原为已知正确实现；"联网/外发命令"提示由
     // approvalReasonFor（第 ~1868 行，那里的 cmd 有正确定义）负责，职责不重复。
     const joined = picks.join(' ').replace(/\s+/g, ' ').trim()
@@ -1499,7 +1516,7 @@ export function apply(ctx) {
     const zh = failureZh(failure)
     const raw = message + (tag ? ' · ' + tag : '')
     return {
-      // 中台 #2216：桥内**来源标记** —— 走到这里的都是 DSH 回合层的显式 error 标记
+      // 内部记录：桥内**来源标记** —— 走到这里的都是 DSH 回合层的显式 error 标记
       //   （turn/end reason.kind==='error' ／ assistant/attempt finish reason），属系统级消息；
       //   渲染入口按此标记走档位降级（visibleFailureText），不靠文案正则猜来源。
       systemError: true,
@@ -1509,7 +1526,7 @@ export function apply(ctx) {
       zh,
       // 中文人话在前、上游原文在后（用户 2026-09-21：「它不会提示我欠费」——
       // 「Insufficient Balance · QUOTA 402」摆在卡面上等于没说）。
-      // 🔴 中台 #2216 起本字段只进日志与管理员告警，**不再直接上员工卡面**。
+      // 🔴 内部记录 起本字段只进日志与管理员告警，**不再直接上员工卡面**。
       text: (zh ? zh + '｜' : '') + (raw || '原因未上报（上游没有给出错误内容）'),
     }
   }
@@ -1552,18 +1569,18 @@ export function apply(ctx) {
     return null
   }
 
-  // ── 中台 #2216（2026-10-23）：系统级回合失败的「员工可见性档位闸」───────────────────
-  // 背景：维护者 2026-10-21 员工端亲见上游 429 报错**原文**进对话框（GLM 配额限流，含 JSON 报文、
+  // ── 内部记录（2026-10-23）：系统级回合失败的「员工可见性档位闸」───────────────────
+  // 背景：2026-10-21 员工端亲见上游 429 报错**原文**进对话框（GLM 配额限流，含 JSON 报文、
   //   request_id、内部错误码 1310、错误分类 RATE_LIMIT）。该文本源自 DSH 回合层的显式 error
   //   标记（上方 turnFailureReason），桥此前只做人话＋原文透传，没有按调用者档位降级。
   // 新口径（工单方案 A）：系统级提示按可见档位 **L3+** 处理——
   //   · L3 及以上：只见简明原因（failureZh 人话），原始报文／错误码／错误分类一律不上卡面；
-  //   · L1/L2 或身份不可用 ⇒ fail-closed（同 维护者 2026-10-04「无表就拒」口径）：只见
+  //   · L1/L2 或身份不可用 ⇒ fail-closed（同 2026-10-04「无表就拒」口径）：只见
   //     《插件边界与降级标准》§三 L1 统一话术「目前服务不可用，请联系管理员」，
   //     同时打一行 ALERT 走既有管理员告警通道（G9 g9_alert_watch.py 捞 journal 的 ALERT 行，
   //     与 identity ALERT 同一先例——桥侧不新建通道）；
   //   · 原始错误全文只进日志（`turn sealed`／`auto card sealed` 的 failure= 字段照旧保留）。
-  // 档位判定口径（裁决 需求 选项 B，维护者 2026-10-23 04:04 看板亲点，台账 需求）：
+  // 档位判定口径（裁决 配套改动 选项 B，2026-10-23 04:04 看板亲点，台账 内部记录）：
   //   **只认「系统」这一个类别**的档位 ≥ L3 才算高权限可见简明原因——不按各类别取最高档。
   //   （选项 A＝各类别取高 曾被实现过，未获采纳，此处按裁决改回单类别判定。）
   //   is_cm 视作最高档；identityGuard 关 ⇒ actor 拿不到 ⇒ 一律降级（fail-closed 同 2026-10-04「无表就拒」口径）。
@@ -1586,8 +1603,8 @@ export function apply(ctx) {
   // 渲染入口：回合失败在**员工可见文本**上的降级形态（整句）。
   // alertInfo（可选）＝{ why, chatId, botName }：降级时补一行管理员 ALERT（原文只进这行日志）。
   // guardOn（第四参）＝该 bot 是否启用身份体系（identityGuard），由调用方传 `bot.cfg.identityGuard`。
-  //   🔴 未启用 ⇒ **无须认人，直接给人话原因**。依据（维护者 2026-10-28 口谕，需求 语境澄清）：
-  //      需求「只认系统档位 ≥ L3」的适用范围是**接了 G9 基座**的场景；
+  //   🔴 未启用 ⇒ **无须认人，直接给人话原因**。依据（2026-10-28 口谕，内部记录 语境澄清）：
+  //      内部记录「只认系统档位 ≥ L3」的适用范围是**接了 G9 基座**的场景；
   //      没接基座时认人没有意义，而把上游报错（限流/断 key/超时——与权限无关）藏成统一话术，
   //      会让使用者永远查不到原因。开源分发默认形态即此类（identityGuard 默认关）。
   //      脱敏面不变：原始报文/错误码仍只进日志。
@@ -1608,7 +1625,7 @@ export function apply(ctx) {
   }
 
   // 自愈提示「（原因）」括号里的短语：同 visibleFailureText 的三态口径——
-  //   未启用身份体系（guardOn=false）⇒ 直接给人话原因；接了 G9 才按系统档位（需求 语境）。
+  //   未启用身份体系（guardOn=false）⇒ 直接给人话原因；接了 G9 才按系统档位（内部记录 语境）。
   // 不在此重复打 ALERT——同一条失败在 runTurn 封口时已按档位告过一次。
   function safeFailureReasonForViewer(failure, actor, guardOn) {
     if (!failure || !failure.systemError) return ''
@@ -1628,7 +1645,7 @@ export function apply(ctx) {
   const MAX_NOTE_CHARS = 500
 
   // 2026-10-01（改造② 中文目的行）：维护者 要求「每个工具调用前能看到一行中文目的」。
-  // 目的行由约定层产出（agent 每次调工具前写一行 `🎯 …`，**不带"目的："前缀** —— 维护者 2026-10-01 当场改的口径），
+  // 目的行由约定层产出（agent 每次调工具前写一行 `🎯 …`，**不带"目的："前缀** —— 2026-10-01 当场改的口径），
   // 落成 assistant/message 的 text 块 → 走 extractProcessText → appendNote。它只有一行、信息密度最高，
   // 但可能跟在长过程话语里被 500 字截断切掉 ⇒ 这里单独保护：截断后若目的行丢了就补回来。
   // 只做"保留"，不做"拆块"——拆块会让封口时"最后一段话提升为正式回复"的替换出现两份。
@@ -1663,7 +1680,7 @@ export function apply(ctx) {
     const trimmed = String(text || '').trim()
     if (!trimmed) return
     // 同一 seq 只写一次：补扫与 watcher 会扫到重叠区间，旧实现没有去重 → 卡上出现重复段落
-    // （2026-09-15 维护者 反馈"内容大量重复"）。
+    // （2026-09-15 用户反馈"内容大量重复"）。
     if (seq !== undefined && seq !== null) {
       if (!card.seenSeqs) card.seenSeqs = new Set()
       if (card.seenSeqs.has(seq)) return
@@ -1802,56 +1819,56 @@ export function apply(ctx) {
   }
   // 超限**换卡续写**的触发线（内容原样留在旧卡、新卡接续 ⇒ 永不隐藏、也不撞上限）：
   const CARD_ROTATE_BLOCKS = 170
-  // 体积护栏的**块数粗筛下限**（审查 LOW#2128）：块数不到这里就**不做** JSON.stringify 体积检查（性能）。
+  // 体积护栏的**块数粗筛下限**（审查 审查项）：块数不到这里就**不做** JSON.stringify 体积检查（性能）。
   // 必须 <= CARD_ROTATE_BLOCKS —— 否则体积检查会在"真超限"的卡上被跳过、护栏静默失效。
-  // 🔴 0.8.16（中台 #1672 选项 1，维护者 2026-10-17 11:28 拍板）：60 → 2。
+  // 🔴 0.8.16（内部记录 选项 1，2026-10-17 11:28 确定）：60 → 2。
   // 为什么：这道粗筛把「工具多、正文短」的回合整体放过了——工具文本只在渲染时从 card.tools 取，
   // blocksBytes(blocks) 量不到它（实测一次整卡 223763 B 里面板占 223524 B），块数够不着 60 就连查都不查。
   // 付价：块数 ≥2 的卡每次更新都会多做一次 JSON.stringify(blocks)（原本是为省这笔而设的下限），
   // 换来的是字节线在低块数也能参与判定。量尺本身的修正另挂第 ⑧ 项（改按渲染后载荷计量）。
   const CARD_ROTATE_MIN_BLOCKS_FOR_BYTE_CHECK = 2
-  // 换卡/侧消息的**共享文案**（审查 MED#2246：三处近乎逐字重复、且硬编码 "约 200 元素 / 200 KB"
+  // 换卡/侧消息的**共享文案**（审查 审查项：三处近乎逐字重复、且硬编码 "约 200 元素 / 200 KB"
   // 与真实阈值 170 块 / 120 KB 矛盾 ⇒ 抽常量并把数字**从阈值派生**）。
   // ⚠️ 0.8.19 收紧：**换卡文案一律不写数字**（见下方 `rotateNoticeSize()` 注释）——派生数字仍会把内部尺度讲成
   // 平台上限。表格那条的"5 张"是平台硬限制（ErrCode 11310），不是我们的阈值，照旧保留。
-  // 0.7.9（维护者 2026-10-03 ③ 拍板）：**指路语写在旧卡**（读者就在这张卡上）⇒ 文案用旧卡视角。
-  // ⚠️ 这**作废**了 0.7.8 按审查 MED#967/MED#2272 改成"新卡视角"的方向 —— 以 维护者 最新口径为准。
+  // 0.7.9（2026-10-03 ③ 确定）：**指路语写在旧卡**（读者就在这张卡上）⇒ 文案用旧卡视角。
+  // ⚠️ 这**作废**了 0.7.8 按审查 审查项/审查项 改成"新卡视角"的方向 —— 以 维护者 最新口径为准。
   const ROTATE_NOTICE_TABLES = '📊 本卡表格已满（飞书单卡最多 5 张），后续内容见下方新卡；**本卡正文原样保留**。'
   // 侧消息（看门狗/失败提示）是**另发的一条消息**，它排在旧卡**下面**、新卡**上面**。
-  // 0.7.9（维护者 2026-10-03 ③ 拍板）：**指路语写在旧卡**（读者正看着旧卡）⇒ 必须说"下面那条"。
+  // 0.7.9（2026-10-03 ③ 确定）：**指路语写在旧卡**（读者正看着旧卡）⇒ 必须说"下面那条"。
   const SIDE_NOTICE_OLD = '⬇️ 下面那条是**另发的**提示；后续内容见下方新卡，**本卡正文原样保留**。'
   function rotateNoticeSize() {
-    // #1685 缺陷 C（0.8.19 施工段①）＋L1 审查复核后定稿：这句**不写任何数字**。两层原因：
+    // 内部记录 缺陷 C（0.8.19 施工段①）＋L1 审查复核后定稿：这句**不写任何数字**。两层原因：
     //   ① 旧写法插的是**我们自己的内部常量**（`CARD_ROTATE_BLOCKS` 块数线、`CARD_SEND_MAX_BYTES` 软闸值），
     //      等于把软闸值当飞书平台上限讲给读者；阈值一按裁决卡调整，文案就跟着变成不对应任何真实限制的数字。
     //   ② 就算换成"实测墙 131072"也不对：换卡有**两把尺**触发——块数/元素数线（`CARD_ROTATE_BLOCKS`→粗筛，
     //      平台侧对应单卡元素数约束）与载荷墙（`CARD_SEND_MAX_BYTES`→发送闸），而 131072 只在**卡片更新
-    //      （PATCH）**侧实测过（通过帧 128340／被拒帧 131048–131075，见 CHANGELOG 0.8.18 更正条与 #1685 史段），
+    //      （PATCH）**侧实测过（通过帧 128340／被拒帧 131048–131075，见 CHANGELOG 0.8.18 更正条与 内部记录 史段），
     //      **建卡/发消息（POST）**侧的单条上限本次没有取证。低载荷、高块数的换卡印"载荷约 128 KB"仍是错话。
     //   ⇒ 只说"已达飞书单卡上限"这条**两把尺都成立**的事实，具体尺度留在日志（payload size guard 行）。
     return '📄 本卡内容已达飞书单卡上限，后续内容见下方新卡；**本卡正文原样保留**。'
   }
   const CARD_ROTATE_BYTES = 120000        // 粗筛尺（量 blocks）；注：原注「低于实测通过线 198.5 KB」已被 staging 真链证伪（拒收线≈131072），见 CHANGELOG 0.8.18 更正条
-  // #1685 / 需求（维护者 选项 2）：软闸按约 109 KB（约 561 行）提前换卡；force 帧另设硬顶，
+  // 内部记录 / 配套改动（维护者 选项 2）：软闸按约 109 KB（约 561 行）提前换卡；force 帧另设硬顶，
   //   不超过约 130 KB，低于 PATCH 实测拒收墙 131072 B 留 1072 B 余量。超硬顶时改走纯文本救援。
-  //   需求 的分片上限属于另一裁决，不能由此推定。
+  //   配套改动 的分片上限属于另一裁决，不能由此推定。
   const CARD_SEND_MAX_BYTES = 109000
   const CARD_SEND_FORCE_MAX_BYTES = 130000
-  // 需求：正文救援每片约 28 KB，预留片头和 JSON 包装空间；5 片上限由 需求 的
+  // 配套改动：正文救援每片约 28 KB，预留片头和 JSON 包装空间；5 片上限由 配套改动 的
   // force 硬顶 130000 B 推导，更长内容落文件，避免救援本身变成无界多消息发送。
   const CARD_RESCUE_PART_BYTES = 28000
   const CARD_RESCUE_MAX_PARTS = Math.ceil(CARD_SEND_FORCE_MAX_BYTES / CARD_RESCUE_PART_BYTES)
-  // ⚠️ 体积必须按**真字节**量（审查 MED#958）：中文 1 字 ≈ 3 UTF-8 字节，用 String.length
+  // ⚠️ 体积必须按**真字节**量（审查 审查项）：中文 1 字 ≈ 3 UTF-8 字节，用 String.length
   // 会低估到 ~1/3 —— 150000 "字符" 对 CJK 其实是 ~450 KB，早已越过实测 198.5 KB 的通过线。
   function blocksBytes(blocks) {
     try { return Buffer.byteLength(JSON.stringify(blocks || []), 'utf8') } catch (error) {
-      // 审查 LOW#965：静默返回 0 会让"体积护栏"**悄悄失效**（卡越长越炸）⇒ 必须留痕
+      // 审查 审查项：静默返回 0 会让"体积护栏"**悄悄失效**（卡越长越炸）⇒ 必须留痕
       console.log('[fs] blocksBytes failed (byte guard disabled this tick): ' + String(error && error.message || error))
       return 0
     }
   }
 
-  // #1685 缺陷 A（0.8.19 施工段④）：换卡粗筛必须量**会被渲染出去的那部分 blocks**。
+  // 内部记录 缺陷 A（0.8.19 施工段④）：换卡粗筛必须量**会被渲染出去的那部分 blocks**。
   // `buildCardPayload` 在 stable（群聊／员工模式）下跳过三类块：note 全文、工具块整块、
   // 指路行（`CARD_LABEL_SKIP`）与「✅ 本卡已收口」行（notice 醒目块照旧渲染）；旧粗筛却把整个 `card.blocks`
   // 拿去算字节与块数 ⇒ 一条 8 段过程话语（约 146 KB 的 note 文本）在**载荷远未到线**的群卡上
@@ -1910,7 +1927,7 @@ export function apply(ctx) {
     return s.split('|').map((c) => c.trim())
   }
   // 把 markdown 表格行转成**可读清单**（降级用）：
-  // 维护者 2026-09-16 反馈"超出限额后表格只剩一堆 | 符号" —— 旧的降级方式是包成 ``` 代码块，
+  // 2026-09-16 反馈"超出限额后表格只剩一堆 | 符号" —— 旧的降级方式是包成 ``` 代码块，
   // 代码块里就是原始竖线，纯属把问题换个地方展示。
   // 现在改成 `- **列名**：值 ｜ **列名**：值`，人一眼能读，且一个字符都不丢。
   function demoteTableToLines(rows) {
@@ -1956,8 +1973,8 @@ export function apply(ctx) {
   }
 
   // 卡片级表格配额：按遍历顺序，第 6 张起的表格降级成可读清单（不再用代码块）。
-  // 0.7.9（维护者 2026-10-03 P4，BA 回合 11310 实证 web.log 79604）先改成"递归"；
-  // 0.7.10（独立审查 LOW#1096 修正）：**不再手维护键白名单** —— 改为复用本文件既有的通用遍历器
+  // 0.7.9（2026-10-03 P4，BA 回合 11310 实证 web.log 79604）先改成"递归"；
+  // 0.7.10（独立审查 审查项 修正）：**不再手维护键白名单** —— 改为复用本文件既有的通用遍历器
   //   `walkContentHolders`（它对**所有**键递归、且有环保护，见其定义处的真机事故注释）。
   //   旧白名单只覆盖"今天用到的键"：任何没列上的容器（1.0 风格 `div.text`、未来新增的包裹层）
   //   都会让 countPayloadTables **静默返回 0** ⇒ 护栏看着"通过"、而飞书那边照样 11310。
@@ -1978,7 +1995,7 @@ export function apply(ctx) {
     return elements
   }
 
-  // 本卡**当前累计**的 markdown 表格数 —— 「表格额度换卡」的判定依据（维护者 2026-09-16 方案）。
+  // 本卡**当前累计**的 markdown 表格数 —— 「表格额度换卡」的判定依据（2026-09-16 方案）。
   // 为什么按 message 块数、而不是数渲染后的 elements：换卡判定发生在扫描新事件**之前**，
   // 此时还没生成 elements；而 buildCardPayload 里各 message 块是各自独立渲染的，
   // 表格总数 = 各块表格数之和（代码块内的 `|` 不算，已有 countMarkdownTables 处理）。
@@ -1986,7 +2003,7 @@ export function apply(ctx) {
     let n = 0
     // 计数面＝`rulerBlocks(card)`（与换卡粗筛同一把尺）：full 下含 message 与 note，
     // stable 下 note 已被滤掉——渲染层本来就不发它（`buildCardPayload` 的 stable 分支），
-    // 旧口径照着 note 数表格 ⇒ 群里**一张表都没显示**也能按「表格已满」换卡（#1685 缺陷 F）。
+    // 旧口径照着 note 数表格 ⇒ 群里**一张表都没显示**也能按「表格已满」换卡（内部记录 缺陷 F）。
     for (const block of rulerBlocks(card)) {
       // full 模式必须同时数 message 与 note：agent 的过程话语走 appendNote 存成 `type: 'note'`，
       // 最终回复才会被提升成 `type: 'message'`。只数 message 会让判定永远不触发
@@ -2016,7 +2033,7 @@ export function apply(ctx) {
   // 阈值更低（3 分钟），同一种静默**最多每 10 分钟播一条**（防刷屏）。
   const DSH_TOOL_NOTICE_MIN = 3
   const DSH_NOTICE_REPEAT_MS = 10 * 60 * 1000
-  // 0.7.20（维护者 2026-10-04 报障「365/375/385/395/405 分钟一直刷」）：**同一轮最多播 2 次**。
+  // 0.7.20（2026-10-04 报障「365/375/385/395/405 分钟一直刷」）：**同一轮最多播 2 次**。
   //   计数按「卡」存放，但**换卡时从上一张继承**（见 makeCardState 的 from 参数）——
   //   因为每次播报都会换一张新卡，不继承的话封顶会被自己的换卡动作绕过。
   //   真卡住也只需提醒两次；第三次起只会把会话刷成噪声，而 维护者 该做的动作（/stop 或回一句）已经知道。
@@ -2026,7 +2043,7 @@ export function apply(ctx) {
   //   （见本文件 runTurn 收尾那段，删除拥有者与封口之间只有几行代码），
   //   不留宽限就可能抢在它前面封口、把「✅ 本轮结束」写两遍。
   //   阈值取 3000ms = **10 拍轮询**（CARD_POLL_INTERVAL 300ms）：远大于上面那几行的间隔，
-  //   又不至于让真孤儿卡多挂太久（2026-10-04 独立审查 MED#1 要求加大余量；
+  //   又不至于让真孤儿卡多挂太久（2026-10-04 独立审查 审查项 要求加大余量；
   //   原先写 1200ms 只是"连续 3 拍"，余量偏薄）。
   const CARD_ORPHAN_SEAL_MS = 3000
   // H（2026-10-03 维护者）：「状态栏这里应该变成三个不同的状态：**普通模式 / 计划模式 / 目标模式**」。
@@ -2057,7 +2074,7 @@ export function apply(ctx) {
     return '_' + mode + ' · 运行中…_'
   }
 
-  // ---- 底部「目标条」＋ 上下文/缓存（改造③，维护者 2026-10-01 定稿）-----------------
+  // ---- 底部「目标条」＋ 上下文/缓存（改造③，2026-10-01 定稿）-----------------
   // 数据全部来自本会话已有的事件与服务；**任何一项读不到就整块不显示**，
   // 绝不让卡片因为读状态失败而炸掉（services 缺失/投影未注册都会抛）。
   function contextSnapshot(agent) {
@@ -2111,7 +2128,7 @@ export function apply(ctx) {
     }
   }
 
-  // 状态文案：维护者 2026-10-01 定稿。`activation !== 'armed'` 是最关键的一格 ——
+  // 状态文案：2026-10-01 定稿。`activation !== 'armed'` 是最关键的一格 ——
   // 每次 dsh 重启，活跃 goal 的续行都会被驱动插件解除武装（disarm），
   // 卡面上必须能直接看出"目标还在、但续行停了"。
   function goalStateText(view) {
@@ -2119,7 +2136,7 @@ export function apply(ctx) {
     const phase = String(view.phase || '')
     if (phase === 'complete') return '✅ 已完成 · 共 ' + (Number(view.roundsStarted) || 0) + ' 轮'
     if (phase === 'paused') return '⏸️ 已暂停（发 /goal resume 恢复）· ' + rounds
-    // 维护者 2026-10-01：**状态栏只写「已阻塞」** —— 长原因会把 `🧠 上下文/占比`、`💾 缓存命中`
+    // 2026-10-01：**状态栏只写「已阻塞」** —— 长原因会把 `🧠 上下文/占比`、`💾 缓存命中`
     // 两栏挤断；原因一律放到**展开面板**的「阻塞原因」一行（见 goalFooterElements 的 detail）。
     if (phase === 'blocked') return '🚫 已阻塞 · ' + rounds
     if (phase === 'active' && String(view.activation || '') !== 'armed') {
@@ -2131,20 +2148,27 @@ export function apply(ctx) {
   function goalFooterElements(card) {
     const agent = card && card.agent
     if (!agent) return []
-    // A 方案（维护者 2026-10-01）：过程卡**不摆状态栏**，只留一条灰线 ＋ 一行裸状态。
+    // A 方案（2026-10-01）：过程卡**不摆状态栏**，只留一条灰线 ＋ 一行裸状态。
     if (card && card.footerMode === 'bare') {
       return [{ tag: 'hr' }, { tag: 'markdown', content: statusTextFor(card) }]
     }
     const snap = contextSnapshot(agent)
     const view = goalSnapshot(agent)
-    // 中台 #496（维护者 2026-10-11）：状态栏追加「🤖 现在在用的模型」。这一行容量有限
-    //（:1680 注释、header :1759 的 200 字符截断都是先例）⇒ 只写**模型名**、超长截断，
-    // provider 全名与取值来源放展开面板（#497：来源小字给 #339 当探针）。
-    // 读不到就不追加（:1619 既有纪律），绝不让状态栏因取数失败而炸。
+    // 内部记录（2026-10-11）：状态栏追加「🤖 现在在用的模型」。
+    // 2026-11-16 维护者 追加（原话）：「在用模型的话，它只显示了模型名称，没有显示提供商。帮我把
+    // 提供商的名字也加进去那个模型名称前面」⇒ 状态栏改成 `提供商/模型名` 形态
+    // （例：opencode-go/deepseek-v4.1-flash）。原来「只写模型名」是怕把这一行挤断，
+    // 但提供商通常才十来个字符，挤断风险远小于"看不出跑的是哪家路由"。
+    // 取值来源（全局默认／会话指定…）仍只放展开面板（内部记录：给 内部记录 当探针的小字）。
+    // 超长时整体截到 60 字并加省略号；读不到就不追加（:1619 既有纪律），绝不因取数失败炸状态栏。
     let modelOfFooter = null
     try { modelOfFooter = currentModelOf(agent) } catch { }
-    const modelShort = modelOfFooter && modelOfFooter.model
-      ? '🤖 ' + String(modelOfFooter.model).slice(0, 40) : ''
+    const modelName = modelOfFooter && modelOfFooter.model ? String(modelOfFooter.model) : ''
+    const providerName = modelOfFooter && modelOfFooter.provider ? String(modelOfFooter.provider) : ''
+    const modelLabel = modelName ? (providerName ? providerName + '/' : '') + modelName : ''
+    const modelShort = modelLabel
+      ? '🤖 ' + (modelLabel.length > 60 ? modelLabel.slice(0, 59) + '…' : modelLabel)
+      : ''
     let metric = snap
       ? '🧠 ' + humanTokens(snap.ctx) + (snap.windowSize ? '/' + humanTokens(snap.windowSize) : '')
         + (snap.windowSize ? '（' + (100 * snap.ctx / snap.windowSize).toFixed(1) + '%）' : '')
@@ -2154,7 +2178,7 @@ export function apply(ctx) {
     // 2026-10-01 维护者：「目标条上面加一条灰色分隔线，不然它跟正文会混到一起」。
     // 飞书 `hr` 组件就是那条灰色横线（JSON 2.0 结构组件；真机已发卡验证 schema 合法）。
     const rule = { tag: 'hr' }
-    // 维护者 2026-10-01：把「进行中／已完成」并进这条状态栏（不再单独占一行）。
+    // 2026-10-01：把「进行中／已完成」并进这条状态栏（不再单独占一行）。
     const status = statusTextFor(card).replace(/_/g, '')
     if (!view) {
       // 2026-10-01 维护者：「未激活的时候能不能也加一个灰色底，这样好看一点」。
@@ -2172,13 +2196,13 @@ export function apply(ctx) {
           padding: '6px 8px 6px 8px',
           elements: [{
             tag: 'markdown',
-            // 维护者 2026-10-01 选定 **V3**（三张预览卡里挑的）：灰底 + 斜体一行 —— 与正文区分、又不抢眼
+            // 2026-10-01 选定 **V3**（三张预览卡里挑的）：灰底 + 斜体一行 —— 与正文区分、又不抢眼
             content: '_' + status + (metric ? '  ｜  ' + metric : '') + '_',
           }],
         }],
       }]
     }
-    // 0.7.9（维护者 2026-10-03 ①）：**一行只允许一个模式位**。statusTextFor 已经写了模式，
+    // 0.7.9（2026-10-03 ①）：**一行只允许一个模式位**。statusTextFor 已经写了模式，
     // 所以这里只补"目标状态短语"；且**计划模式优先**时不再显示目标短语（否则又出现两个模式）。
     const planActive = Boolean(card && card.planActive)
     const goalPart = planActive ? '' : goalStateText(view)
@@ -2194,7 +2218,7 @@ export function apply(ctx) {
             ? String(view.blockedReason.message || view.blockedReason.reason || view.blockedReason.code || '（未给原因）')
             : String(view.blockedReason))
           : ''),
-      // 中台 #496/#497：状态栏那行只放得下模型名，provider 全名＋取值来源放这里。
+      // 内部记录/内部记录：状态栏那行只放得下模型名，provider 全名＋取值来源放这里。
       modelOfFooter && modelOfFooter.provider
         ? '**模型**：`' + modelOfFooter.provider + '/' + modelOfFooter.model + '`'
           + (modelSourceText(modelOfFooter.source) ? '（' + modelSourceText(modelOfFooter.source) + '）' : '')
@@ -2252,7 +2276,7 @@ export function apply(ctx) {
         if (text) elements.push(...renderMessageElements(text))
         continue
       }
-      // 插话提示：**醒目块**（维护者 2026-10-02：与普通正文同款渲染时"堆在下面看不出来"）。
+      // 插话提示：**醒目块**（2026-10-02：与普通正文同款渲染时"堆在下面看不出来"）。
       // 结构 = hr + 彩色 column_set 底块 + hr，把提示从上下文里框出来。
       // 该块类型**不参与** cardTableCount（只数 message/note）与结论摘要提取，天然隔离。
       if (block.type === 'notice') {
@@ -2280,11 +2304,11 @@ export function apply(ctx) {
         continue
       }
       if (block.type === 'tools') {
-        // 0.8.8（维护者 2026-10-10）：stable 显示层连工具折叠面板也不再渲染 ——
+        // 0.8.8（2026-10-10）：stable 显示层连工具折叠面板也不再渲染 ——
         // 旧实现渲染 expanded:false 的「🛠️ 工具调用 (N)」面板，面板头在群/员工卡上仍可见
         //（维护者 报「折叠没把工具调用做好，还是会显示」）。stable 下整块跳过，连面板头都不出。
         // 数据层 blocks/tools 一字不动（与 note/message 同策略：过滤只发生在渲染层）；
-        // full 模式（维护者 本人私聊）照旧显示。取代 10-03 旧拍板「stable 保留工具面板」。
+        // full 模式（维护者 本人私聊）照旧显示。取代 10-03 旧确定「stable 保留工具面板」。
         if (card.mode === 'stable') continue
         const lines = []
         for (const id of block.toolIds) {
@@ -2313,7 +2337,7 @@ export function apply(ctx) {
     // 表格配额：飞书单卡最多 5 张表，超出的改成代码块（**不删内容**）。
     // 必须在折叠之前做 —— 折叠把文本挪进面板并不会减少表格数。
     demoteOverflowTables(elements, CARD_MAX_TABLES)
-    // 0.7.10（独立审查 MED#1413 修正）：这里原先是"再降一次"的第二遍 —— 但两遍用**同一遍历、
+    // 0.7.10（独立审查 审查项 修正）：这里原先是"再降一次"的第二遍 —— 但两遍用**同一遍历、
     // 同一上限**，第二遍不可能再降（第一遍之后剩下的表要么在前 5 张之内、要么 demoteTablesInText
     // 根本转不了，例如单行/只有分隔线的"伪表"），等于**空转**，还打印了误导性的 `demoted=` 计数。
     // 现在改成**诚实复检**：只报告"降级之后还剩几张表"；若仍超上限 ⇒ 说明有转不了的表格
@@ -2330,20 +2354,20 @@ export function apply(ctx) {
     // Window fold: keep the NEWEST content visible (live progress + conclusion
     // at the bottom), fold the ALREADY-SEEN history into panel(s) at the TOP.
     // The last KEEP_TAIL elements are never folded (2026-08-15 维护者 design).
-    // 审查 MED#1362：折叠只是把文本搬进面板 —— **既不省字节也不省内容** ⇒ 体积超限不能靠它，
+    // 审查 审查项：折叠只是把文本搬进面板 —— **既不省字节也不省内容** ⇒ 体积超限不能靠它，
     // 走 watcher 里的"换卡续写"（CARD_ROTATE_*）。折叠只负责**元素个数**这条硬限制。
     const deepCount = countElementsDeep(elements)
     if (elements.length > CARD_FOLD_THRESHOLD || deepCount > CARD_ELEMENT_DEEP_THRESHOLD) {
       // 0.8.29：递归元素数已经逼近硬线时，把"保留尾巴"收窄（10 → 4），让这一轮折叠压得更狠；
-      //   正常情形仍是 10（维护者 2026-08-15 设计：最新 10 个元素永远可见）。
+      //   正常情形仍是 10（2026-08-15 设计：最新 10 个元素永远可见）。
       const KEEP_TAIL = deepCount > CARD_ELEMENT_DEEP_LIMIT ? 4 : 10
       const head = elements.slice(0, elements.length - KEEP_TAIL)
       const tail = elements.slice(elements.length - KEEP_TAIL)
       const extraLines = []
-      // 0.8.25（维护者 2026-10-23 拍板 1+2；诊断 DIAGNOSIS-2026-10-23-换卡封口帧致旧卡工具面板解体）：
+      // 0.8.25（2026-10-23 确定 1+2；诊断 DIAGNOSIS-2026-10-23-换卡封口帧致旧卡工具面板解体）：
       // 工具调用面板不再被窗口折叠解体成文字墙。旧实现把 head 里的「🛠️ 工具调用」折叠面板
       // 连同正文一起抽文本进「📎 更早过程」——面板头与折叠交互全没了。换卡封口帧几乎必然过
-      // 折叠线（换卡线 170 块/109KB 与折叠线 180 元素贴合），维护者 实测「一换卡，旧卡工具调用
+      // 折叠线（换卡线 170 块/109KB 与折叠线 180 元素贴合），实测「一换卡，旧卡工具调用
       // 就只剩文字」。现把工具面板的行文本单独收集，折叠后**重装回「🛠️ 工具调用 · 历史」
       // 折叠面板**（expanded:false，与卡片正常形态一致）——「这是工具调用、可点开看」的结构保留。
       const toolLines = []
@@ -2404,7 +2428,7 @@ export function apply(ctx) {
         for (let i = count - 1; i >= 0; i--) {
           tail.unshift({
             tag: 'collapsible_panel',
-            // 0.7.9（维护者 2026-10-03 ②）：**默认展开** —— 折叠只用来省"元素个数"，
+            // 0.7.9（2026-10-03 ②）：**默认展开** —— 折叠只用来省"元素个数"，
             // 而 expanded:false 会让读者以为"过程文字突然消失了"（要手动点开才看得到）。
             expanded: true,
             background_color: 'grey-50',
@@ -2430,7 +2454,7 @@ export function apply(ctx) {
       elements.length = 0
       for (const el of tail) elements.push(el)
     }
-    // 观测指纹（维护者 2026-10-03 §3 指出"看不到日志就没法判定"）：
+    // 观测指纹（2026-10-03 §3 指出"看不到日志就没法判定"）：
     //   封口那一帧打印 elements/panels/collapsed/可见字数/payload 指纹 ——
     //   下次任何"文字不见了"都能**一条日志**判定是折叠、换卡还是回退路径。
     if (card && card.status === 'sealed') {
@@ -2455,7 +2479,7 @@ export function apply(ctx) {
       } catch { /* 指纹只用于留痕，绝不影响发卡 */ }
     }
     if (elements.length === 0) elements.push({ tag: 'markdown', content: ' ' })
-    // 底部状态栏：上下文占比/缓存命中/目标状态 + **运行状态**都收在这一块里（改造③ + 维护者 2026-10-01）
+    // 底部状态栏：上下文占比/缓存命中/目标状态 + **运行状态**都收在这一块里（改造③ + 2026-10-01）
     let footerDrawn = false
     try {
       const footer = goalFooterElements(card)
@@ -2478,7 +2502,7 @@ export function apply(ctx) {
   // 权限：上传走 `im:resource`（本机 work bot 已实测具备）。
   const IMAGE_MAX_BYTES = 10 * 1024 * 1024            // 官方限制：图片 ≤10MB
   const LOCAL_IMAGE_RE = /!\[([^\]]*)\]\(\s*((?:[A-Za-z]:[\\/]|file:\/\/|\/|\\)[^)]*)\)/g
-  // G-文件（2026-10-03 独立审查 MED#1410 后补线）：正文里的**本地文件链接** `[报告](D:\x.pdf)`
+  // G-文件（2026-10-03 独立审查 审查项 后补线）：正文里的**本地文件链接** `[报告](D:\x.pdf)`
   //   —— 卡片发不了文件，改走"先上传换 `file_key`，再作为**文件消息**发出"。
   //   `(?<!!)` 排除图片写法（图片走 LOCAL_IMAGE_RE，别重复处理）。
   const LOCAL_FILE_RE = /(?<!!)\[([^\]\n]*)\]\(\s*((?:file:\/\/|[A-Za-z]:[\\/]|\/|\\)[^)\n]*)\)/g
@@ -2494,8 +2518,8 @@ export function apply(ctx) {
   // 单数 secret-budget.md 却放行）。**唯一信源 = SENSITIVE_STEM**。
   const SENSITIVE_PATH_RE = /(^|[\\/_.-])(id_rsa|id_dsa|id_ecdsa|id_ed25519|\.env|apikey|api[_-]?key|keychain|private[_-]?key|\.ssh|\.aws|\.dsh)([\\/_.-]|$)/i
   // 最松的几个词（key/env/pwd…）只在**文件名主干完全等于它**时才算敏感 ——
-  // 否则 `key-notes.pdf` / `env-diff.md` 这类正常文件会被误当成凭证（独立审查 LOW#1412）。
-  // ⚠️ 单复数都要在（审查 MED#1412：把松词从正则里挪走后，只剩单数会造成
+  // 否则 `key-notes.pdf` / `env-diff.md` 这类正常文件会被误当成凭证（独立审查 审查项）。
+  // ⚠️ 单复数都要在（审查 审查项：把松词从正则里挪走后，只剩单数会造成
   // `secrets.txt` / `tokens.txt` / `cookies.txt` **两道闸都过**、真的会被上传）。
   const SENSITIVE_STEM = new Set(['key', 'keys', 'env', 'pwd', 'secret', 'secrets', 'token', 'tokens',
     'password', 'passwords', 'passwd', 'credential', 'credentials', 'cookie', 'cookies'])
@@ -2515,7 +2539,7 @@ export function apply(ctx) {
   }
   function looksLikePrivateKey(buf) {
     // 任何 PEM 私钥标签都拦：含 `BEGIN ENCRYPTED PRIVATE KEY`（openssl pkcs8 -topk8 的产物）
-    // 与 `BEGIN SSH2 ENCRYPTED PRIVATE KEY`（审查 MED#1431 指出原先只认 RSA/OPENSSH/EC/DSA/PGP）。
+    // 与 `BEGIN SSH2 ENCRYPTED PRIVATE KEY`（审查 审查项 指出原先只认 RSA/OPENSSH/EC/DSA/PGP）。
     return /BEGIN(?: [A-Z0-9]+)* PRIVATE KEY/.test(buf.slice(0, 4096).toString('latin1'))
   }
   function assertSafeAttachment(filePath, kind) {
@@ -2526,7 +2550,7 @@ export function apply(ctx) {
       throw new Error('疑似凭证/密钥类文件（' + baseNameOf(p) + '），按 A13 规矩不上传')
     }
     // ⚠️ A29 是**图片**规矩（授权二维码不发图、改发链接）；普通文档叫 `login-notes.md` 不该被拒
-    //（独立审查 MED#1436：原来对文件也套这条，理由文案还是错的）。
+    //（独立审查 审查项：原来对文件也套这条，理由文案还是错的）。
     if (kind === 'image' && looksLikeAuthArtifact(p)) {
       throw new Error('授权类的图（疑似二维码）按规矩不发图，请改发可点击的授权链接')
     }
@@ -2548,7 +2572,7 @@ export function apply(ctx) {
   function baseNameOf(p) {
     return String(p || '').replace(/^file:\/\//i, '').split(/[\\/]/).filter(Boolean).pop() || ''
   }
-  // `file://` 形式在 existsSync/readFileSync 里**永远失败**（独立审查 LOW#1614）⇒ 统一先归一化成真实路径。
+  // `file://` 形式在 existsSync/readFileSync 里**永远失败**（独立审查 审查项）⇒ 统一先归一化成真实路径。
   function localPathOf(p) {
     let s = String(p || '')
     if (/^file:\/\//i.test(s)) {
@@ -2558,7 +2582,7 @@ export function apply(ctx) {
     return s
   }
   function looksLikeAuthArtifact(filePath) {
-    // A29 防呆（维护者 2026-10-03 明确规矩）：授权类（二维码等）**不自动上传成图片**，
+    // A29 防呆（2026-10-03 明确规矩）：授权类（二维码等）**不自动上传成图片**，
     // 应该发**可点击的授权链接**。这里挡一道，避免"规矩靠自觉"。
     return /(^|[\\/_.-])(qr|qrcode|auth|login|oauth|scan)([\\/_.-]|$)/i.test(String(filePath || ''))
   }
@@ -2574,7 +2598,7 @@ export function apply(ctx) {
     const form = new FormData()
     form.append('image_type', 'message')
     form.append('image', new Blob([buf]), baseNameOf(filePath) || 'image.png')
-    // #1533：上传类走 60s 宽限（大图/大文件在慢链路上合法地慢），超时抛带「超时」字样的错。
+    // 内部记录：上传类走 60s 宽限（大图/大文件在慢链路上合法地慢），超时抛带「超时」字样的错。
     const res = await fetchWithDeadline('https://open.feishu.cn/open-apis/im/v1/images', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
@@ -2598,7 +2622,7 @@ export function apply(ctx) {
     if (looksLikePrivateKey(buf)) {
       throw new Error('内容疑似私钥（BEGIN … PRIVATE KEY），按 A13 规矩不上传')
     }
-    // ⚠️ 类型必须跟随**真实文件**的后缀（审查 LOW#1513：agent 写 `[报告.exe](D:\a.pdf)` 时，
+    // ⚠️ 类型必须跟随**真实文件**的后缀（审查 审查项：agent 写 `[报告.exe](D:\a.pdf)` 时，
     // 用显示名判类型会把 pdf 发成 stream，与真实文件不符）；显示名只影响用户看到的文件名。
     const realName = baseNameOf(filePath) || ('file' + safeExt)
     const rawName = String(displayName || '').trim()
@@ -2612,7 +2636,7 @@ export function apply(ctx) {
     form.append('file_type', FILE_TYPES[ext] || 'stream')
     form.append('file_name', name)
     form.append('file', new Blob([buf]), name)
-    // #1533：上传类走 60s 宽限（与 uploadImage 同口径）。
+    // 内部记录：上传类走 60s 宽限（与 uploadImage 同口径）。
     const res = await fetchWithDeadline('https://open.feishu.cn/open-apis/im/v1/files', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret) },
@@ -2654,7 +2678,7 @@ export function apply(ctx) {
     for (const m of matches) {
       try {
         // 键里带**内容身份**（大小+修改时间）：同一路径的图被重画后必须重新上传，
-        // 否则卡上会一直显示**旧图**（审查 LOW#1564）。
+        // 否则卡上会一直显示**旧图**（审查 审查项）。
         let cacheKey = cachePrefix + m[2]
         try {
           const st = statSync(m[2])
@@ -2682,7 +2706,7 @@ export function apply(ctx) {
   }
   // **通用递归遍历**：对每个含字符串 `content` 的节点调用 `fn`（对象只访问一次，防环）。
   // 为什么必须递归：笔记/字段/工具面板可能被包在 column_set / collapsible_panel / div.fields 里，
-  // 浅层遍历会漏（A29 真机事故 + 独立审查 MED#1582 两次栽在同一处）。
+  // 浅层遍历会漏（A29 真机事故 + 独立审查 审查项 两次栽在同一处）。
   function walkContentHolders(node, fn, seen) {
     if (!node || typeof node !== 'object') return seen
     const memo = seen || new Set()
@@ -2730,7 +2754,7 @@ export function apply(ctx) {
       const label = String(m[1] || '').trim() || baseNameOf(target)
       if (!existsSync(target)) { skipped += 1; continue }
       // ⚠️ 键里要带**文件身份**（大小+修改时间）：否则同一路径的文件**内容更新后**会被永久
-      // 当成"已发过"而不再送达（审查 MED#1634）。同一份文件在多次卡同步中仍只发一次。
+      // 当成"已发过"而不再送达（审查 审查项）。同一份文件在多次卡同步中仍只发一次。
       // ⚠️ 2026-10-05：键里**还要带 appId** —— 7 个 bot 收进 1 个进程后这条 Set 是实例级的，
       //   同一群里 A、B 两个 bot 发同一个文件时，B 会被判"已发过"而**不发**（多 bot 单实例串扰第二类）。
       let dedupeKey = String((bot && bot.cfg && bot.cfg.appId) || '') + '|' + String(chatId || '') + '|' + target
@@ -2803,10 +2827,10 @@ export function apply(ctx) {
     // ① 内容类（写了卡片不支持的写法 / 无效 image key）⇒ 才走"摘掉片段抢救正文"那条路
     if (/230099|invalid image|200570|200861/i.test(s)) return 'rejected'
     // ② **体积类**：内容本身没毛病，但"整卡太长/元素太多" ⇒ 纯文本只有 1 个元素、通常发得出去，
-    //    所以照样要**抢救正文**（审查 MED#1676：并进限流类会让用户一直看不到东西）。
+    //    所以照样要**抢救正文**（审查 审查项：并进限流类会让用户一直看不到东西）。
     // 11310 = card table number over limit（见本文件 ~934 行的真机记录）⇒ 属**数量/体积**类，不是写法错。
     // ⚠️ 不能只写 `exceed`：`timeout exceeded` / `retries exceeded` 都会被误判成体积类
-    // 并触发"正文抢救"（审查 LOW#1711）⇒ 必须紧跟 limit 才算体积。
+    // 并触发"正文抢救"（审查 审查项）⇒ 必须紧跟 limit 才算体积。
     // 0.8.16（修法 6，A3 缺陷）：真机字节超限那次的原文是 `code=200860 card over max size`
     //   （见本文件 CARD_FOLD_THRESHOLD 上方那条实测记录「198.5 KB 通过；983 KB → 200860」），
     //   上面几道**字面都不命中** ⇒ 旧字节落到末尾默认 `transport` ⇒ 救援纯文本与用户可见说明
@@ -2816,13 +2840,13 @@ export function apply(ctx) {
     //   数字就会被误判成体积类、白跑一次摘片段抢救 ⇒ 要求前面带 `code` 字样（`code=200860`／
     //   `"code":200860` 两种真形都命中）。`over max size` 本身无歧义，保持字面直判。
     if (/too large|exceed\w*.{0,20}limit|element.*limit|content.*limit|11310|over max size|code[^0-9]{0,3}200860/i.test(s)) return 'toolarge'
-    // ③ **限流类**：重发也会被限 ⇒ 走退避/熔断，别谎报"摘掉片段就好了"（审查 MED#1513）
+    // ③ **限流类**：重发也会被限 ⇒ 走退避/熔断，别谎报"摘掉片段就好了"（审查 审查项）
     if (/frequency|rate limit|rate_limit|99991400/i.test(s)) return 'limited'
     return 'transport'
   }
-  // 0.8.25（维护者 2026-10-23 拍板 1+2）：救援抽取改为**递归**——旧实现只看顶层 markdown/div.text
+  // 0.8.25（2026-10-23 确定 1+2）：救援抽取改为**递归**——旧实现只看顶层 markdown/div.text
   // 两种 tag，折叠面板（🛠️ 工具调用 / 📎 更早过程）里的文字抽不出来；换卡本就因「卡大」触发，
-  // 封口帧超硬顶走纯文本救援时，救援正文缺掉整块工具内容（同文件 #515 存档抽取器 cardArchiveTextOf
+  // 封口帧超硬顶走纯文本救援时，救援正文缺掉整块工具内容（同文件 内部记录 存档抽取器 cardArchiveTextOf
   // 已证明必须递归抓全）。与存档版的差异：这里**保留原文换行**（救援正文是给用户读的，
   // 存档版把空白折叠成单空格会把代码块/段落糊成一坨），且**不去重**（卡面重复行在正文里也该重复）。
   function payloadPlainText(payload) {
@@ -2848,7 +2872,7 @@ export function apply(ctx) {
     } catch { return '' }
   }
 
-  // #515 存档抽取器：**递归**抓卡片 JSON 里全部可读文字（header 标题、嵌套 column_set/
+  // 内部记录 存档抽取器：**递归**抓卡片 JSON 里全部可读文字（header 标题、嵌套 column_set/
   // collapsible_panel、表格单元格都算）——payloadPlainText 只看顶层两种 tag，存档要的是
   // 「另一个 agent 反查时能还原卡上说了什么」，必须抓全。纯显示层，不影响发卡本身。
   function cardArchiveTextOf(payload) {
@@ -2882,7 +2906,7 @@ export function apply(ctx) {
     walk(payload, 0)
     return out.join('\n').slice(0, CARD_ARCHIVE_TEXT_MAX)
   }
-  // 四类失败的文案**集中在这一张表**（审查 MED#1733/#1745：嵌套三元会随类别增多越写越乱，
+  // 四类失败的文案**集中在这一张表**（审查 审查项/内部记录：嵌套三元会随类别增多越写越乱，
   // 而且"给用户看的"与"给 Agent 看的"两处必须同步 ⇒ 一张表解决，两处都从这里取）。
   function failureWordings(klass) {
     if (klass === 'rejected') {
@@ -2919,14 +2943,14 @@ export function apply(ctx) {
       const key = String(chatId || '-') + '|' + klass
       const seen = failureNotices()
       const nowMs = Date.now()
-      // 审查 LOW#1510：这个 Map 从不清理 ⇒ 进程活久了会随会话数无界增长；顺手淘汰过期项。
+      // 审查 审查项：这个 Map 从不清理 ⇒ 进程活久了会随会话数无界增长；顺手淘汰过期项。
       for (const [k, t] of seen) {
         if (nowMs - Number(t || 0) > FAILURE_NOTICE_WINDOW_MS) seen.delete(k)
       }
       if (nowMs - Number(seen.get(key) || 0) < FAILURE_NOTICE_WINDOW_MS) return
       seen.set(key, Date.now())
       const words = failureWordings(klass)
-      // 0.7.9（维护者 2026-10-03 P5）：**toolarge（11310 表格/元素超限）不再发用户可见的失败提示** ——
+      // 0.7.9（2026-10-03 P5）：**toolarge（11310 表格/元素超限）不再发用户可见的失败提示** ——
       //   正文已经在 syncCard 的 rescue 路径里用纯文本送达（那条是必要的），再叠一条"卡片发送失败"
       //   就变成"通知 + 抢救 + 换卡"三连 ⇒ 用户看到的就是"卡片乱发"（BA 回合实证 web.log 79605-79619）。
       //   Agent 侧的系统回执（下面 note）保留 —— 它不占用户版面，但能让模型知道输出没送达。
@@ -2937,7 +2961,7 @@ export function apply(ctx) {
         const tip = '⚠️ **卡片发送失败**（' + klass + '）' + (code ? '｜飞书 code=' + code : '') + '\n'
           + '原因：' + reason.slice(0, 220) + '\n'
           + words.tip
-        // P2（审查 MED#1841）：同样**等提示发出去之后**再换卡（顺序不保证 = 新卡落到提示上方）
+        // P2（审查 审查项）：同样**等提示发出去之后**再换卡（顺序不保证 = 新卡落到提示上方）
         void sendPlainText(bot, chatId, tip)
           .catch(() => {})
           .then(() => rotateLiveCardForChat(chatId, SIDE_NOTICE_OLD))
@@ -2964,7 +2988,7 @@ export function apply(ctx) {
         message_id: injectId,
         message_type: 'text',
         chat_id: chatId,
-        _internal: true,   // 审查 LOW#1555：内部系统提示**不是**用户在回答提问卡
+        _internal: true,   // 审查 审查项：内部系统提示**不是**用户在回答提问卡
         content: JSON.stringify({ text: note }),
       }).catch(() => {})
     } catch (error) {
@@ -2990,7 +3014,7 @@ export function apply(ctx) {
     let touched = 0
     // **递归**（复用 walkContentHolders）：旧实现只看顶层 + el.text/el.fields，
     // 而 agent 正文常常在 collapsible_panel / column_set 里 ⇒ 恰好漏掉要治的内容，
-    // 非法标签照样进飞书、照样**整张卡被拒**（独立审查 MED#1582）。
+    // 非法标签照样进飞书、照样**整张卡被拒**（独立审查 审查项）。
     for (const el of elements || []) {
       if (!el || typeof el !== 'object') continue
       walkContentHolders(el, (h) => {
@@ -3043,7 +3067,7 @@ export function apply(ctx) {
 
   function syncCard(bot, chatId, card, force) {
     // 0.7.14（TASK v3 §4 / H3）：**本代已 dispose ⇒ 本代（旧实例）不许再推任何卡**。
-    // 0.7.16（审查 MED#2）：判据改**代际旗** —— 按对象登记拦不住 dispose 后本代新建的卡；
+    // 0.7.16（审查 审查项）：判据改**代际旗** —— 按对象登记拦不住 dispose 后本代新建的卡；
     //   旗拦本代一切推送，新代 apply 是新闭包、旗=false ⇒ 接管/续卡照常。留痕不抛错。
     if (card && generationDisposed) {
       console.log('[fs] card sync skipped: generation disposed (interrupted card left for new instance)')
@@ -3097,7 +3121,7 @@ export function apply(ctx) {
       } catch (error) {
         console.log('[fs] inline images failed: ' + String(error && error.message || error))
       }
-      // #1685（维护者 2026-10-18 在 需求 拍方案 1）：字节护栏改量**将要发出的完整载荷**，判定挪到发送前一刻。
+      // 内部记录（2026-10-18 在 配套改动 拍方案 1）：字节护栏改量**将要发出的完整载荷**，判定挪到发送前一刻。
       //   旧尺子量的是 card.blocks —— 工具块只存 toolIds、不含文本，工具行要到渲染才生成，
       //   实测插桩 490 帧里 489 帧真实载荷比护栏值大（最大差 21 KB；生产形态工具面板可达 223 KB，
       //   见本文件 CARD_ROTATE_BYTES 上方那条实测记录）⇒ 护栏放行、飞书却整卡拒收。
@@ -3108,7 +3132,7 @@ export function apply(ctx) {
         // 🔴 量不出来＝这帧**完全没过硬顶**，而旧写法把 0 当成「没超限」直接放行＝fail-open：
         //   payload 里一旦有 stringify 会抛的东西（BigInt／循环引用），护栏整条静默失效。
         //   真发出去的那次 send 自己也要 stringify，多半同样失败 ⇒ 选择不发＋响亮留痕
-        //   （维护者 2026-10-04「宁可误杀不放过」同口径），不把没量过的字节推给飞书。
+        //   （2026-10-04「宁可误杀不放过」同口径），不把没量过的字节推给飞书。
         console.log('[fs] payload size guard: measure failed ⇒ 本帧不推送（fail-closed）'
           + ' card=' + String(card.token || '-').slice(-8) + ' err=' + guard.error)
         return
@@ -3277,7 +3301,7 @@ export function apply(ctx) {
   // 重放一遍、split 之后的写两遍（appendNote 无去重），用户就看到"同一段东西分两张卡、
   // 内容大量重复"。一卡一游标 + appendNote 的 seq 去重彻底消除这个重叠窗口。
   function scanCard(agent, card, eventsArg) {
-    // eventsArg：watcher 每轮已经取过快照就直接复用（审查 LOW#2110：热路径不要取两次）
+    // eventsArg：watcher 每轮已经取过快照就直接复用（审查 审查项：热路径不要取两次）
     const events = eventsArg || sessionEvents(agent.session)
     const from = Number.isFinite(card.cursor) ? card.cursor : 0
     let changed = false
@@ -3315,7 +3339,7 @@ export function apply(ctx) {
           if (tool) {
             if (tool.status === 'running') card.pendingTools = Math.max(0, Number(card.pendingTools || 0) - 1)
             const block = event.data.message.content && event.data.message.content[0]
-            // 🔴 #1277 实流取证（2026-10-16 staging 真实事件钉死）：harness 把失败标记写在**消息层**
+            // 🔴 内部记录 实流取证（2026-10-16 staging 真实事件钉死）：harness 把失败标记写在**消息层**
             //    event.data.message.isError，content[0] 块里没有 isError 字段——旧判据只看 block.isError
             //    ⇒ 真实工具失败全被记成 completed，G3 旁路一个字节都不投（静默漏报，正是本单要治的病）。
             //    两处任一为 true 即判失败，兼容未来标记下放回块形态。
@@ -3324,12 +3348,12 @@ export function apply(ctx) {
             if (tool.status === 'failed') {
               tool.error = toolResultText(event.data.message)
                 || (event.data.error && event.data.error.code ? 'code ' + event.data.error.code : '失败')
-              // G3 员工会话失败旁路上报（#514）：先在扫描处做精确 workspace 门禁；
+              // G3 员工会话失败旁路上报（内部记录）：先在扫描处做精确 workspace 门禁；
               // reportG3Failure() 仍会重复门禁，防止未来出现绕过扫描器的直接调用。
               const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
               if (isG3OkrWorkspace({ env: process.env, cwd })) reportG3Failure(agent, tool)
             } else {
-              // G3 恢复钩子（#2331 第⑦层）：同 workspace+工具此前有已投递失败（30 分钟窗内）
+              // G3 恢复钩子（内部记录 第⑦层）：同 workspace+工具此前有已投递失败（30 分钟窗内）
               // ⇒ 本次成功即自然上报恢复。门禁与失败侧同源（外层精确门禁＋decide 内二道门禁）；
               // 无失败登记时 decideG3RecoveryReport 返回 null，本分支零副作用。
               const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
@@ -3380,6 +3404,22 @@ export function apply(ctx) {
       if (st === 'running') return true
       return true
     } catch { return true }
+  }
+
+  // 「这个会话现在**真的**在跑一轮吗」——专门给 /switch 的"能不能切"判定用。
+  // 为什么不能直接用 agentIsRunning（2026-11-16 实测）：「切换卡片能看到其他会话的名称，
+  // 但是就切换不过去，显示不能切换」。根因：agentIsRunning 对 `status` 缺失一律按**在跑**
+  // （那是给"防双驱/防误封卡"的保守兜底），而宿主里**已加载但空闲**的会话 status 常常就是
+  // undefined ⇒ 整张会话卡上每一行都被判成 🟡 不能切。
+  // 这里的口径相反：只有**明确在跑**（status==='running' 或本桥 activeTurns 里有它这一轮）
+  // 才算占用；其余"活着但空闲"的会话允许接管——接管走 resolveAgent 的 live 复用腿，上下文不丢。
+  function sessionIsRunning(agent, sessionId) {
+    try {
+      if (!agent) return false
+      if (String(agent.status || '') === 'running') return true
+      const key = String(sessionId || (agent && agent.id) || '')
+      return Boolean(key) && activeTurns.has(key)
+    } catch { return false }
   }
 
   // 0.7.20：找"这个会话当前那张还在跑的卡"（本代 watcher ∪ 跨代 registry 都查）。
@@ -3451,7 +3491,7 @@ export function apply(ctx) {
     // 封口前**必须补扫**（与普通回合 runTurn 的 catch-up scan 同源）：
     // 目标轮的收尾话语（"进度（第 N 轮）…"）几乎与轮结束同时到达，
     // watcher 一拍（300ms）常常来不及镜像 → 不补扫就会只剩工具记录、
-    // 一句话都没有（维护者 2026-09-16 反馈，取证：会话里 seq 有整段文字，卡上 notes=0）。
+    // 一句话都没有（2026-09-16 反馈，取证：会话里 seq 有整段文字，卡上 notes=0）。
     try { scanCard(agent, card) } catch (error) {
       console.log('[fs] goal catch-up scan failed: ' + String(error && error.message || error))
     }
@@ -3475,7 +3515,7 @@ export function apply(ctx) {
     // status='sealed' → 目标模式下同样"看不出为什么不动了"。失败标记只认上游显式 reason。
     const failure = turnFailureReason(sessionEvents(agent.session), openedAt || 0)
     if (failure && !closing.text) {
-      // 中台 #2216：可见性按档位降级。自动轮（目标轮／回执轮）没有当轮入站身份，
+      // 内部记录：可见性按档位降级。自动轮（目标轮／回执轮）没有当轮入站身份，
       //   取该 agent **最近一次入站**记进身份表的 actor；拿不到＝fail-closed 统一话术。
       card.blocks.push({
         type: 'message',
@@ -3508,7 +3548,7 @@ export function apply(ctx) {
     //   完全看不到它。于是 15s 后的镜像轮询把这个 already-delivered 的回合当成「GUI 回合」，
     //   用 `💬 正文` 再把同一段话发一遍 —— 真机实证（web.log）：
     //     `auto card sealed … kind=notice … closing_len=930`
-    //     `mirror: GUI turn reply -> chat oc_ebe4ef87b len=930`   ← 同一段、差 3 行
+    //     `mirror: GUI turn reply -> chat oc_<redacted> len=930`   ← 同一段、差 3 行
     //   所以桥的每一处投递收尾都必须推进镜像基线（runTurn 一处 + 这里一处）。
     try {
       const seq = mirrorTurnEndSeq(sessionEvents(agent.session))
@@ -3518,7 +3558,7 @@ export function apply(ctx) {
 
   function startCardWatcher(agent, card, bot, chatId, onTableBudget) {
     const entry = { agent, card, bot, chatId, stop: null }
-    // #1685（维护者 2026-10-18 在 需求 拍方案 1）：把「超限就换卡」的处置挂到**卡对象**上，
+    // 内部记录（2026-10-18 在 配套改动 拍方案 1）：把「超限就换卡」的处置挂到**卡对象**上，
     //   供 syncCard 在真正发送的前一刻调用。这些调用点本来就已经把同一个回调传进 watcher，
     //   挂在卡上比给每个 syncCard 调用点（全文件 37 处）再加一个参数改动面小得多。
     card.onSizeBudget = onTableBudget
@@ -3537,10 +3577,10 @@ export function apply(ctx) {
     const timer = setInterval(() => {
       if (card.sealing) return
       try {
-        // 表格额度换卡（维护者 2026-09-16 方案）：飞书单卡硬上限 5 张表（ErrCode 11310）。
+        // 表格额度换卡（2026-09-16 方案）：飞书单卡硬上限 5 张表（ErrCode 11310）。
         // 本卡已用满且**还有新事件待镜像**时，先换一张新卡 —— 旧卡的表格原样留在旧卡，
         // 新事件由新卡接续（新卡游标 = 旧卡游标，不丢不重）。这样永远不降级表格。
-        // 审查 LOW#2110：这段现在**每次 300ms 轮询**都会走到 ⇒ 快照只取一次（下面 scanCard 复用），
+        // 审查 审查项：这段现在**每次 300ms 轮询**都会走到 ⇒ 快照只取一次（下面 scanCard 复用），
         // 且小卡不做 JSON.stringify（体积检查先按块数粗筛）。
         const pendingNow = sessionEvents(agent.session)
         if (typeof onTableBudget === 'function') {
@@ -3551,8 +3591,8 @@ export function apply(ctx) {
             if (cardTableCount(card) >= CARD_MAX_TABLES) { onTableBudget('tables'); return }
             // ② 元素/体积额度（实测：200 元素、载荷 ~198.5 KB 通过）⇒ **换卡续写**：
             //    旧卡正文原样保留＋一行说明，新卡从旧卡游标接续（不重放、不丢、不重）。
-            //    这样"过程文字默认可见"与"绝不撞上限"同时成立（维护者 2026-10-03 口径）。
-            //    ⚠ #1685（需求 方案 1 ＋ 缺陷 A/F）：这把尺量的是 `rulerBlocks(card)`——stable 下就是
+            //    这样"过程文字默认可见"与"绝不撞上限"同时成立（2026-10-03 口径）。
+            //    ⚠ 内部记录（配套改动 方案 1 ＋ 缺陷 A/F）：这把尺量的是 `rulerBlocks(card)`——stable 下就是
             //      渲染层真会发出去的那些块（工具块只存 toolIds、不含文本），所以只能当**省渲染的粗筛**；
             //      权威判定在发送前一刻按将发出的完整载荷判（syncCard 内，同一 'size' 处置）。
             //      下面那行日志只作排障线索：夹具 12g/12h **不解析它**——拿被测代码自报的护栏日志当证据
@@ -3666,7 +3706,7 @@ export function apply(ctx) {
               : '⏳ 上游已经 ' + mins + ' 分钟**没有回包**（模型侧卡住／网络慢，不是卡片坏了，'
                 + '也不是我在埋头干活）。这一轮还挂着：发 /stop 结束它，或者直接再说一句都行。'
                 + '（同一轮最多提醒 ' + DSH_STALL_NOTICE_MAX + ' 次，之后不再刷屏。）'
-            // P2（审查 MED#1841）：sendPlainText 是"先取 token/传图再 POST"的异步链，
+            // P2（审查 审查项）：sendPlainText 是"先取 token/传图再 POST"的异步链，
             // 同步紧跟着换卡的话，两条请求顺序不保证 ⇒ 新卡可能落在提示**上方**（正是要修的症状）。
             // ⇒ 必须 **.then() 链在发送成功之后**再换卡。
             // 0.7.21（独立审查 MEDIUM）：**额度也在发送成功之后才扣** —— 原先发送前就 +1，
@@ -3700,10 +3740,10 @@ export function apply(ctx) {
       clearInterval(timer)
       liveCardWatchers.delete(entry)
       if (liveCardRegistry.get(String(agent.id)) === entry) liveCardRegistry.delete(String(agent.id))
-      // #1685：watcher 停了，这张卡就没有换卡处置可调了 ⇒ 撤挂，别让 syncCard 调到已失效的闭包
+      // 内部记录：watcher 停了，这张卡就没有换卡处置可调了 ⇒ 撤挂，别让 syncCard 调到已失效的闭包
       if (card.onSizeBudget === onTableBudget) card.onSizeBudget = null
     }
-    // 0.7.8 不变式（维护者 2026-10-03 报障「换了新卡，旧卡也一直在更新」）：
+    // 0.7.8 不变式（2026-10-03 报障「换了新卡，旧卡也一直在更新」）：
     //   同一个 agent（＝同一条会话）同一时刻**只允许一个 watcher**。旧实现只做
     //   liveCardRegistry.set(agent.id, entry) —— 那是**覆盖登记**，旧 watcher 仍在跑，
     //   两张卡各自扫**同一条**事件流 ⇒ 两张卡同步长。
@@ -3761,7 +3801,7 @@ export function apply(ctx) {
     //    abort 发生在 dispose **之后** ~40ms（agent 生命周期 effect 被拆 ⇒
     //    agent-loop `machine.cancel({kind:'disposed'})`），那时本代 watcher 已经停了 ⇒ 抓不到。
     //    这里只留"有哪些回合在跑"的线索，由**新实例**播报（见 announceReloadInterrupts）。
-    // 0.7.16（审查 MED#2）：**dispose 一进来就置位**（不依赖是否还有活跃回合）——此后本代一切卡片推送
+    // 0.7.16（审查 审查项）：**dispose 一进来就置位**（不依赖是否还有活跃回合）——此后本代一切卡片推送
     // （封口 / 新建的结论卡 / 换卡 / 入队后才执行的任务体）全部拦截；新代闭包旗=false 不受影响。
     generationDisposed = true
     console.log('[fs] dispose(热重载): 本代已标记 disposed（此后本代一切卡片推送被拦截）')
@@ -3847,13 +3887,13 @@ export function apply(ctx) {
     old.sealing = true
     old.status = 'sealed'
     dropWorkingPlaceholder(old)
-    // 0.7.9（维护者 2026-10-03 ③）：指路语写在**旧卡**（读者就在这张卡上）；新卡干净起步。
+    // 0.7.9（2026-10-03 ③）：指路语写在**旧卡**（读者就在这张卡上）；新卡干净起步。
     old.blocks.push({
       type: 'message',
       text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
     })
     try { void syncCard(entry.bot, entry.chatId, old, true).catch(() => { }) } catch { }
-    // 0.7.10（独立审查 LOW#7044）：**不设** rotatedThisTurn —— 该标志只在 runTurn 收尾时读，
+    // 0.7.10（独立审查 审查项）：**不设** rotatedThisTurn —— 该标志只在 runTurn 收尾时读，
     // 而这条（热重载续卡）路径不经过那个判定 ⇒ 设了也是**死存**，反而让人以为"这里会抑制结论卡"。
     try { void syncCard(entry.bot, entry.chatId, fresh, true).catch(() => { }) } catch { }
     entry.card = fresh
@@ -3866,7 +3906,7 @@ export function apply(ctx) {
   }
 
   // 封口前把卡上被 `MAX_NOTE_CHARS`(500) 截断的**过程正文**按 seq 从会话事件里还原成完整正文。
-  // 由来（维护者 2026-10-02）：「我发信息给你，若你刚好在应答的时候，你会直接截断掉需要打印结果
+  // 由来（2026-10-02）：「我发信息给你，若你刚好在应答的时候，你会直接截断掉需要打印结果
   // 的那些回复的内容，导致我看不到」—— 插话会换卡，旧卡就此封口，而新卡游标从当前位置起
   // 不重放 ⇒ 旧卡上那 500 字就是 维护者 能看到的全部。2026-10-04 起两处共用（runTurn 的 split
   // 与接管卡的 splitAdoptedCard），所以抽成函数，不复制第二份逻辑。
@@ -3993,7 +4033,7 @@ export function apply(ctx) {
       }
       if (caughtUp) card.lastEventAt = Date.now()
       // 只在**真的欠一次推送**时才强推：内容进卡的时刻(lastScannedAt) 晚于 推送成功的时刻(lastPushedAt)。
-      //   旧代一切正常 ⇒ 两个时刻相等 ⇒ 不推（无脑重推会让卡面内容重复，维护者 2026-10-04 独立审查 HIGH#1）。
+      //   旧代一切正常 ⇒ 两个时刻相等 ⇒ 不推（无脑重推会让卡面内容重复，2026-10-04 独立审查 HIGH#1）。
       const unpushed = Number(card.lastScannedAt || 0) > Number(card.lastPushedAt || 0)
       if (caughtUp || unpushed) {
         try { void syncCard(entry.bot, entry.chatId, card, true).catch(() => { }) } catch { }
@@ -4015,7 +4055,7 @@ export function apply(ctx) {
   // 由来（有出处）：0.4.20 曾在 dispose 时把旧卡就地封口并留一行
   //   `♻️ 插件已热重载：本卡停止更新，后续内容见新的卡片。`（CHANGELOG 0.4.20）；
   // 0.4.22 改成"续卡"（新实例接管同一张卡）时把这行删了 ⇒ 之后热重载打断回合变成**完全无声**：
-  // abort 被当正常收尾（卡片 status=sealed），一个字都不解释。维护者 2026-10-02 追问"为什么现在没了"。
+  // abort 被当正常收尾（卡片 status=sealed），一个字都不解释。2026-10-02 追问"为什么现在没了"。
   // 抓法：上一代在 dispose 时留线索（见 dispose 钩子 ⓪），本代在**有 bot 之后**播报 ——
   //   不看"谁先跑"的竞态，也不依赖旧实例的 watcher 还活着。
   // 边界：只对"重载时确实有回合在跑"的情况播报（线索为空 ⇒ 不发任何东西，杜绝噪声）；
@@ -4104,7 +4144,7 @@ export function apply(ctx) {
         const bot = bots.get(String((item && item.appId) || '')) || Array.from(bots.values())[0]
         if (!bot) continue
         notified.set(sessionId, Date.now())
-        // 0.7.20（维护者 2026-10-04 拍定）：**先判真实情况，再按情况说话**。
+        // 0.7.20（2026-10-04 拍定）：**先判真实情况，再按情况说话**。
         //   旧实现无条件发"上一轮被打断，我已自动让它接着做"，并且真的注入一条假消息（见下方删除说明）。
         const state = reviveCardForChat(sessionId, chatId, bot)
         // 2026-10-05（维护者 定的分界）：mirrored / revived ＝ 还能继续 ⇒ 只写回**原卡**，不另发；
@@ -4159,7 +4199,7 @@ export function apply(ctx) {
   //   ② **配置无效 ≠ 挂载丢失**：registry 报「预设不在册」(agent-preset/not-found) 时打一条
   //      CRIT 说明并登记该会话，让 ensurePresetTools **拒绝**为它自动重建（修法 2）——重建既
   //      救不回预设（配置没改就还是查无此名），又要烧掉一次自动重建额度、还把员工历史隔离一次；
-  //   ③ 挂载结果里能拿到的**预设 id / 预设声明的工具名**登记到 bot，供 #771 判定按「该 bot
+  //   ③ 挂载结果里能拿到的**预设 id / 预设声明的工具名**登记到 bot，供 内部记录 判定按「该 bot
   //      实际挂载的预设」来问，不再凭硬编码的单个招牌键（修法 1 的主判据）。
   const PRESET_MOUNT_INFO_MAX = 200   // 每个会话一条，超上限从头清（防长跑进程无界增长）
   let presetServiceMissingWarned = false   // 修法 5：服务不在的日志每进程只报一次（防每条消息刷一行）
@@ -4186,7 +4226,7 @@ export function apply(ctx) {
       }
       return
     }
-    // 0.8.5（中台 #171 per-bot 预设）：bot 配置 `agentPreset` ⇒ 按 id 挂载；
+    // 0.8.5（内部记录 per-bot 预设）：bot 配置 `agentPreset` ⇒ 按 id 挂载；
     // 不写 ⇒ undefined ⇒ registry 回落全局默认（registry `mount(ctx, id?)` 官方通道，
     // `id ?? defaultId`——行为与旧版一字不动）。id 不存在 ⇒ registry 抛
     // agent-preset/not-found ⇒ 走下方 catch：日志可见、**不静默回落**（回落会把
@@ -4234,10 +4274,10 @@ export function apply(ctx) {
     }
   }
 
-  // #560 同族修法（0.8.20 段①）：默认模型退避与绑定读回原先**只长在 create 腿**，
+  // 内部记录 同族修法（0.8.20 段①）：默认模型退避与绑定读回原先**只长在 create 腿**，
   // resume/switch 腿既不读回也不留痕 ⇒ 生产绝大多数轮次（走 resume）根本没有 binding 行，
   // 「首条到底绑没绑上模型」平时物理不可观测。抽成共用件，两腿同口径。
-  // retry 只给 create 腿开：#350 的退避是给「宿主头几拍服务还没注册」这个启动竞态用的；
+  // retry 只给 create 腿开：内部记录 的退避是给「宿主头几拍服务还没注册」这个启动竞态用的；
   //   resume 腿的触发条件是「本进程还没这个会话的句柄」＝重启后每条会话的首个入站，
   //   而入站回合按 bot 串行（bot.chain），在这里空等 1.5 秒会把同 bot 的其它会话一起顶住，
   //   而它换不来任何信息——本单的牙齿是读回留痕，不是重试。
@@ -4284,7 +4324,7 @@ export function apply(ctx) {
   // 会话实际落在哪个工作区：显式 override > bot.cfg.workspace > 当前工作区根。
   // 🔴 2026-11-05（维护者 报「出错新建会话后，旧会话在 DSH GUI 里不见了」）：这个值必须跟会话条目
   //   一起落盘（persistChats 的 cwd 字段），重建会话时再继承回来。否则重建只能退回 cfg.workspace
-  //   —— bot 的 workspace 一经改过（实证：P:\Qoder\work → P:\work），新旧会话就分属两个 GUI 工作区
+  //   —— bot 的 workspace 一经改过（实证：旧盘符路径 → 新盘符路径），新旧会话就分属两个 GUI 工作区
   //   分组，旧会话在列表里"凭空消失"，只能去 sessions 目录里翻（实证：237 个旧会话被移进
   //   sessions-archive\20261105-oldzone\--P-Qoder-work--）。
   function effectiveSessionCwd(bot, cwdOverride) {
@@ -4297,16 +4337,16 @@ export function apply(ctx) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents service unavailable')
     const cfg = bot.cfg
-    // 中台 #350（维护者 报障：/new 后首条消息没绑定模型，第二条才正常）：agentDefaultModel
+    // 内部记录（维护者 报障：/new 后首条消息没绑定模型，第二条才正常）：agentDefaultModel
     // 在宿主头几拍可能还没就绪（与下方 C6 校验 MEDIUM#7 注释同证），defaultAgentOptions()
     // 偶发拿不到 ⇒ agents.create 不带 agentOptions ⇒ 会话无模型选择落库，首条请求落
     // fallback。按工单建议三步：①短暂退避重试（3×500ms）；②重试后仍拿不到 ⇒ 区分两种
     // 情形——服务整个不在＝异常环境 fail-loud 抛错（调用方给用户回执，不许静默建无模型
     // 会话）；服务在但无默认选择＝宿主语义允许回落，按旧行为继续＋醒目留痕；
     // ③创建后读回校验落库并打日志（saveSelection 无门、补写做不到——见
-    // verifyDefaultModelLanded 的记录；留痕即 #339 探针：卡上写 X 实际用 Y 即复现证据）。
+    // verifyDefaultModelLanded 的记录；留痕即 内部记录 探针：卡上写 X 实际用 Y 即复现证据）。
     const agentOptions = await agentOptionsWithRetry('创建', true, true)
-    // #E10 出生即挂工作区（维护者 2026-11-07 拍板方案A）：cwd 与 meta.cwd 同源同值，attach 的
+    // #E10 出生即挂工作区（2026-11-07 确定方案A）：cwd 与 meta.cwd 同源同值，attach 的
     // realpath 全等校验（dsh-workspace entity.js:80）必过；attachSessionToWorkspace 内部
     // 全 try/catch fail-open，挂载失败绝不影响创建本身。失败形态＝日志 workspace registry
     // attach skipped，会话照旧能用、只是落 GUI「未分组」。
@@ -4331,7 +4371,7 @@ export function apply(ctx) {
       ...(agentOptions ? { agentOptions } : {}),
       setup: (agentCtx) => mountStandardPreset(bot, agentCtx, sessionId),
     })
-    // 与 create 腿对称的读回（#560 判据可达性）：这一行以前不存在，
+    // 与 create 腿对称的读回（内部记录 判据可达性）：这一行以前不存在，
     // 所以"resume 后首条没模型"只能靠新建会话的偶然样本去抓。
     logModelBinding('resume', sessionId, handle && handle.agent)
     // #E10 恢复腿同补挂载：cwdHint 须是非空字符串才采用（4629 调用点历史上传的第三参
@@ -4345,7 +4385,7 @@ export function apply(ctx) {
   }
 
   // ---- 空回复自愈：就地恢复 + 交接摘要（2026-11-05 · 桥自愈-上下文交接）------------
-  // 实证故障（维护者 判「桥必须改」）：私聊 oc_36ed7c029a778c13f01823ba439a6ca6 的长会话
+  // 实证故障（判「桥必须改」）：私聊 oc_<redacted> 的长会话
   //   fs-main-mw0o5n0p（11-03 建、当天 13 万字级设计讨论）在 11-05 14:08 被旧自愈逻辑判
   //   「本轮无产出」⇒ splice 掉绑定、新建空会话 fs-main-mw35addq ⇒ 整条上下文断线，只能人工
   //   从磁盘会话文件里捞回来。三条口径（缺一不闭环）：
@@ -4433,14 +4473,14 @@ export function apply(ctx) {
       }
       chats.set(chatId, {
         sessions, activeIndex,
-        // #771 熔断计数挂在 **chat 记录**上进落盘，不挂在会话条目上：heal（空回复自愈）会
+        // 内部记录 熔断计数挂在 **chat 记录**上进落盘，不挂在会话条目上：heal（空回复自愈）会
         // **换掉当前 active 条目**（旧实现是 splice 掉再 push；2026-11-05 起改为 push 新条目、
         // 旧条目保留、只移动 active —— 见 handleInbound 自愈块），per-entry 计数要么被抹平、
         // 要么跟着被保留的旧条目一起失效 ＝ 熔断形同虚设（2026-10-17 全量冒烟 N3 实测：第二次仍重建，日志两条）。
         // 旧 state 没这个字段 ⇒ 0。
         remounts: Number(record && record.remounts) || 0,
       })
-      // 0.7.19（审查 MED#1-B）：把落盘的 chat 类型恢复回内存 —— 热重载/重启后 chatKinds 是
+      // 0.7.19（审查 审查项-B）：把落盘的 chat 类型恢复回内存 —— 热重载/重启后 chatKinds 是
       // 空的，没有这步「群 ⇒ 恒 stable」只能靠下一条真消息自愈；无入站的主动推卡（goal/自动轮卡、
       // 换卡）在恢复前会按 cfg（缺省 full）渲染，把过程叙述泄露给群（用例 69 实测红）。
       // 旧 state 没有 kind 字段 ⇒ 不写 ⇒ 与旧行为一致（等下一条带 chat_type 的入站补上）。
@@ -4479,11 +4519,11 @@ export function apply(ctx) {
           //   当前 cfg.workspace ⇒ 旧会话在 GUI 列表里消失（实证见 effectiveSessionCwd 处注释）。
           cwd: s.cwd,
         })),
-        // #771 熔断计数（挂 chat 级，见 loadChats :3725-3731 的说明）：0 次不写字段，
+        // 内部记录 熔断计数（挂 chat 级，见 loadChats :3725-3731 的说明）：0 次不写字段，
         // 与 kind/peer 同规则（undefined 被 JSON 丢弃）；跨进程重启靠它继续拦住第二次重建。
         remounts: Number(chat.remounts) > 0 ? Number(chat.remounts) : undefined,
         active: active ? active.id : (chat.sessions[0] ? chat.sessions[0].id : 'main'),
-        // 0.7.19（审查 MED#1-B）：chat 类型随 chats 一起落盘（undefined 会被 JSON 丢弃 ⇒
+        // 0.7.19（审查 审查项-B）：chat 类型随 chats 一起落盘（undefined 会被 JSON 丢弃 ⇒
         // 没记过的 chat 不写字段）。kind 只在 bot.chatKinds 里，persistChats 的 9 个调用点
         // 都传 bot ⇒ 这里直接读。用例 68 锚这个字段。
         kind: bot.chatKinds && bot.chatKinds.get(chatId)
@@ -4499,9 +4539,9 @@ export function apply(ctx) {
     writeState(bot.cfg.appId, state)
   }
 
-  // ---- #771 根治 B：resume/revive 腿挂载检测（2026-10-14，staging 落码待审批上产）----
-  // 生产实证（中台 #771）：hr bot 接管旧会话后 journal 照打「preset mounted」，但被接管
-  // 会话的模型目录缺 preset 工具（jlog 7/7 reason=resume；#557 修正诊断进一步实证新会话
+  // ---- 内部记录 根治 B：resume/revive 腿挂载检测（2026-10-14，staging 落码待审批上产）----
+  // 生产实证（内部记录）：hr bot 接管旧会话后 journal 照打「preset mounted」，但被接管
+  // 会话的模型目录缺 preset 工具（jlog 7/7 reason=resume；内部记录 修正诊断进一步实证新会话
   // 同样可能缺）。检测手段：宿主 tools 服务按 agent 视角查 'read'（tool-fs 的招牌工具，
   // 三张 preset 都声明）——不可见即挂载丢失。
   // 保守边界：探测自身异常（服务不在/接口变化）⇒ 不判缺失不重建，只留日志——误杀好会话
@@ -4512,7 +4552,7 @@ export function apply(ctx) {
   //   **一个都看不见**才判挂载丢失（看见任意一个即放行，避免把「预设本来就没有某个键」误杀）。
   //   拿不到集合时（宿主 registry 不声明工具名／旧夹具只提供 get）走保守兜底：**对所有 bot**——
   //   默认预设与专用预设一视同仁——退回 0.8.15 的招牌键探针 DEFAULT_PRESET_SIGNATURE_TOOLS
-  //   （tool-fs 的读文件工具，标准预设必然声明）。#1689 裁决（维护者 2026-10-17 选 1）：实测生产与
+  //   （tool-fs 的读文件工具，标准预设必然声明）。内部记录 裁决（2026-10-17 选 1）：实测生产与
   //   staging 宿主 AgentPreset 均无工具集合字段 ⇒ 主判据 declared 恒空必落兜底，若专用预设在此
   //   不判定就等于把 0.8.15 已有的自动重建保护从 hr bot 身上撤掉（保护面倒退）；退回探针后误杀
   //   代价＝「预设本来没招牌键」的 bot 被判缺失一次，由重建腿的 chat 级熔断限「每聊天最多一次」。
@@ -4555,7 +4595,7 @@ export function apply(ctx) {
         + ' 个工具按 agent 视角**全部不可见** ⇒ 判挂载丢失 session=' + String(sessionId || '-'))
       return true
     }
-    // 兜底判据（#1689 选 1 收口）：拿不到声明集合 ⇒ 不分默认/专用预设，一律退回 0.8.15
+    // 兜底判据（内部记录 选 1 收口）：拿不到声明集合 ⇒ 不分默认/专用预设，一律退回 0.8.15
     //   招牌键探针——保护面不倒退（专用预设 bot 也保住自动重建）。误杀代价＝「预设本来没有
     //   招牌键」的 bot 被判缺失一次，由重建腿 chat 级熔断限「每聊天最多一次」。
     //   CRIT 在**判出缺失**时每次留痕：这是异常路径（正常 bot 探针可见），频率＝故障频率，
@@ -4571,7 +4611,7 @@ export function apply(ctx) {
 
   // 探测失败（缺工具）⇒ 自动重建一个全新 dedicated 会话替换当前条目（chat 指针/落盘同步
   // 更新）。重建失败 ⇒ 带病放行原 agent 并留日志（收发至少还通）。只挂 resolveAgent 统一
-  // 出口（入站消息主路径）；/switch 的手工 resume 腿本轮不动（影响面收窄，见单 #771）。
+  // 出口（入站消息主路径）；/switch 的手工 resume 腿本轮不动（影响面收窄，见单 内部记录）。
   //
   // 🔴 单次熔断（2026-10-16 止血，本函数原缺）：真病灶（宿主按 agent 视角的行级可见性分叉，
   //   或该 bot 用的是不含 tool-fs 的 preset）并没有被本函数治好——重建出来的新会话照样探不到
@@ -4704,7 +4744,7 @@ export function apply(ctx) {
   //        denote_text**（`张三 /stop`，连 `@` 都没有）；
   //     ② PC 端 post 富文本的 `at`/`person` 元素没有 key 字段 ⇒ 还原成 `@名字 /stop`。
   //   ⇒ 三种形态都参加匹配：占位符 / `@名字` / **裸名字且紧跟 `/`**（切法见下面第十七轮
-  //   LOW#4 —— 同一起始位置取**最长**匹配，不是「先命中先切」）。
+  //   审查项 —— 同一起始位置取**最长**匹配，不是「先命中先切」）。
   //   第三档为什么要限制紧跟 `/`：不限制就会把 `张三 你好` 这类正文的名字剥掉。
   //   🔴 但"紧跟 `/`"本身**不足以**保证安全 —— 认不出的命令（`@张三/李四 今天值班`）
   //   照样会被判成命令，而命令分支过去是**无条件 return** ⇒ 消息被静默吞。那一条由
@@ -4714,7 +4754,7 @@ export function apply(ctx) {
   //   把非命令读成命令」，实际 `张三 你好` 剥掉名字后首字符不是 `/`，`splitCommand`
   //   本来就返回 undefined —— 那一例无论有没有守卫都无害，真正会出事的是紧跟 `/`
   //   而命令名不认识的那一类（判据要写对，否则后人会照着错的理由加回缺陷）。
-  //   🔴 第十七轮门槛 LOW#4（核对为真）：**按名单顺序先命中先切**会踩「名字互为前缀」——
+  //   🔴 第十七轮门槛 审查项（核对为真）：**按名单顺序先命中先切**会踩「名字互为前缀」——
   //   正文 `@张三丰 /stop`、mentionList 里 `张三` 排在 `张三丰` 前面时，`张三` 这一档先
   //   命中 ⇒ 切成 `丰 /stop` ⇒ 后面谁都匹配不上 ⇒ 命令判成普通消息（用户视角：说了没执行，
   //   只是多回一句）。占位符同理（`@_user_1` 是 `@_user_12` 的前缀，@ 满 10 人以上的群会踩）。
@@ -4751,7 +4791,7 @@ export function apply(ctx) {
     return prefix
   }
 
-  // 🔴 第四十九轮 LOW#1（核对为真）：**刹车清单必须有唯一来源**。入站派发尾队列（#65 附件下载
+  // 🔴 第四十九轮 审查项（核对为真）：**刹车清单必须有唯一来源**。入站派发尾队列（#65 附件下载
   //   排队）原来只豁免 `/stop`，而 handleCommand 的 `isManageCmd` 认 `/plan off`、`/goal`（无参＝
   //   查状态）、`/goal pause` 同为"随叫随到"——两套判据并存＝目标跑着、附件正挂在下载里时
   //   `/goal pause` 排在它后面，锁车论证（第三十六/三十四轮）当场失效。判据收成这一个函数，
@@ -4774,7 +4814,7 @@ export function apply(ctx) {
     return body
   }
 
-  // ---- 把命令失败回注给 agent（维护者 2026-10-01：「报错能不能直接知道、提醒到 agent？」）----
+  // ---- 把命令失败回注给 agent（2026-10-01：「报错能不能直接知道、提醒到 agent？」）----
   // 背景：斜杠命令（/compact、/goal…）是在**会话链之外**处理的 —— 命令炸了，用户看到一句报错，
   // 而 agent 完全不知道（它那一轮早结束了）。真机事故：`/compact` 报 TypeError，
   // agent 直到 维护者 把错误贴过来才知道 → 属于"能自愈却等用户救"。
@@ -4808,7 +4848,7 @@ export function apply(ctx) {
     }
   }
 
-  // 🔴 第二十七轮门槛 LOW#8（核对为真）：p2p 白名单判据此前在**四处**各抄一份写法
+  // 🔴 第二十七轮门槛 审查项（核对为真）：p2p 白名单判据此前在**四处**各抄一份写法
   //   （handleCommand 私聊边界 / askApprovalCard / approverChatFor / exit_plan_mode 接管），
   //   口径同一、字面各异——连审六轮每次都在担心漂移，这次收成唯一入口。
   //   语义＝**fail-closed 白名单**：只有 bot 的 chatKinds 里**明确记为 p2p** 的会话才算私聊；
@@ -4819,12 +4859,12 @@ export function apply(ctx) {
       && bot.chatKinds.get(String(chatId)) === 'p2p'
   }
 
-  // 🔒 第二十八轮门槛 LOW#6：私聊边界受理范围的**唯一清单**。
-  // 🔴 第四十二轮门槛 LOW#5（核对为真，口径更正）：本表判据不是"会产出可点卡片"——
+  // 🔒 第二十八轮门槛 审查项：私聊边界受理范围的**唯一清单**。
+  // 🔴 第四十二轮门槛 审查项（核对为真，口径更正）：本表判据不是"会产出可点卡片"——
   //   /switch 也渲染可点卡（工作区/会话卡）却不在表中（confirmed 群里 stable 模式对它是
   //   纯文本拒答，卡泄漏不可达，维持不收编）。真口径＝**会改动本会话模型/计划/目标**的
   //   动作才进这张表。
-  // 🔴 第三十三轮门槛 LOW#2（注释口径修正，维持不合并的裁决）：受闸命令的"名册"实际分散在
+  // 🔴 第三十三轮门槛 审查项（注释口径修正，维持不合并的裁决）：受闸命令的"名册"实际分散在
   //   **四处**（本表 · MODE_SWITCH 开关位 · COMMAND_CAPABILITY 能力名映射 · CAPABILITY_KEYS
   //   总闸白名单）＋CAPABILITY_LABELS 一处文案表——旧注释写"三处"少报了一处，本身就是
   //   注释漂移。为什么不合并成单张注册表：四张表的**维度不同**（是否发卡/开关键名/能力名/
@@ -4836,7 +4876,7 @@ export function apply(ctx) {
   async function handleCommand(bot, chat, chatId, cmd) {
     const resolved = resolveCommandName(cmd.name)
     if (!resolved) return false
-    // 🔒 私聊边界（维护者 2026-10-06：「卡片只在私聊去做审核、切换模型这些动作」）：
+    // 🔒 私聊边界（2026-10-06：「卡片只在私聊去做审核、切换模型这些动作」）：
     //   需要**真人点按钮**的动作（切模型／目标模式／计划审批卡）不在群聊发卡 —— 这一条同时把
     //   "谁能点"的身份问题从根上关掉：群里随便一个人翻到卡就能替会话主人切模型/批计划。
     // 🔴 第二十五轮门槛 MEDIUM#1（核对为真）：原来是**黑名单**（只拒确认过的群）⇒ 类型未知的
@@ -4855,25 +4895,25 @@ export function apply(ctx) {
     //   同一个洞。**resume 是"开车"不是"刹车"**：它不该有锁车论证（火车已停，拦着不亏），
     //   收回后与建目标同规——私聊边界+开关+能力闸逐一过（卡片口 8572 早就在 goalEnabled
     //   之后，命令/卡片两通道口径就此对齐）。
-    // 🔴 第二十六轮门槛 LOW#3：嵌套三元改 if/else。
+    // 🔴 第二十六轮门槛 审查项：嵌套三元改 if/else。
     // 🔴 第二十七轮门槛 MEDIUM#2（核对为真）：**分类判据必须钉"原样大小写"，不是 lowercase**——
     //   执行侧 `cmd.arg !== 'off'` / `cmd.arg === 'off'`（3837/3853）是**大小写敏感**的，
     //   旧写法 `/plan OFF` 会被我判成刹车而绕过私聊边界+开关+能力闸，落进执行侧却按
     //   「带正文 ⇒ 进计划模式并起回合」处理＝绕过整批闸门去**开车**。goal 侧 harness 的
     //   大小写语义本机不可证（命令包不在本地），同口径从严：只认原样小写子命令是刹车，
     //   大写形式一律先过闸门（群里想刹车就好好打小写——刹车入口不丢，只是不惯着大小写漂移）。
-    //   第二十八轮 LOW#5：同因删掉了 lowercase 化的 `cmdWord` 死声明——留着它，下一个改这段的人
+    //   第二十八轮 审查项：同因删掉了 lowercase 化的 `cmdWord` 死声明——留着它，下一个改这段的人
     //   很可能把它当活判据接回去，大小写绕闸当场复发。
     const rawArg = String(cmd.arg || '').trim()
     // 🔴 第三十六轮门槛 MEDIUM：豁免面收窄——clear/edit 已移出（改动目标本体＝受闸动作）。
     // 🔴 第四十轮门槛 MEDIUM：resume 也已移出（重新开跑＝开车，不是刹车，见上方判据注）。
-    // 🔴 第四十九轮 LOW#1：判据本体移到 `isBrakeSubcommand`（与入站尾队列共用，见其注释）。
+    // 🔴 第四十九轮 审查项：判据本体移到 `isBrakeSubcommand`（与入站尾队列共用，见其注释）。
     const isManageCmd = isBrakeSubcommand(resolved, rawArg)
-    // 🔴 第四十二轮门槛 LOW#4（核对为真）：原来 `Boolean(bot) &&` 把 bot 缺失洗成
+    // 🔴 第四十二轮门槛 审查项（核对为真）：原来 `Boolean(bot) &&` 把 bot 缺失洗成
     //   "notP2p=false ⇒ 闸整个跳过"＝与本函数头注释立的 fail-closed 口径**相反**
     //   （isP2pChat 对 falsy bot 本就返回 false，五个兄弟消费点都是裸用法）。去掉包装。
     const notP2p = !isP2pChat(bot, chatId)
-    // 🔴 第二十八轮门槛 LOW#6：受这道边界的命令清单收**唯一来源**——原来内联枚举、
+    // 🔴 第二十八轮门槛 审查项：受这道边界的命令清单收**唯一来源**——原来内联枚举、
     //   MODE_SWITCH、COMMAND_CAPABILITY 三处各写各的，加减开关位时漏改一处就静默少一道闸。
     if (!isManageCmd && notP2p && P2P_GATE_COMMANDS.indexOf(resolved) >= 0) {
       console.log('[fs] 私聊边界拒绝: /' + resolved + ' 非确认私聊不受理（群或类型未知都不发卡） chat=' + String(chatId))
@@ -4902,7 +4942,7 @@ export function apply(ctx) {
         + '启用后本人还需通过能力审批。')
       return true
     }
-    // 🔒 能力闸（维护者 2026-10-06：「所有的功能开关我来批准，批准以后就入表」）：
+    // 🔒 能力闸（2026-10-06：「所有的功能开关我来批准，批准以后就入表」）：
     //   这四类动作按**人**查 `capability_grants.json`，没有有效授权＝拒 + 发起申请。
     //   总闸 `capabilityGuard` 关时 `requireCapability` 直接放行（＝与今日行为一字不差）。
     //   命令路径拿不到 `evt`（两个调用点都在事件链上分流走了），所以发言人在入站时已记进
@@ -4910,13 +4950,13 @@ export function apply(ctx) {
     const COMMAND_CAPABILITY = { model: 'model', goal: 'goal', plan: 'plan' }
     const wantCap = COMMAND_CAPABILITY[resolved]
     if (wantCap && !isManageCmd) {
-      // 🔴 第四十轮门槛 LOW#5（核对为真）：写入侧 noteChatPeer 与 isP2pChat 都用 String(chatId)
+      // 🔴 第四十轮门槛 审查项（核对为真）：写入侧 noteChatPeer 与 isP2pChat 都用 String(chatId)
       //   归一，这里却拿原值查——非串 chatId 一旦流到 ⇒ 静默查空 ⇒ 把有授权的人误拒成
       //   "认不出你的身份"。读取侧同口径归一。
       const peerKey = String(chatId)
       const peerOu = String((bot && bot.chatPeers && bot.chatPeers.get(peerKey)) || '')
       const peerUnion = String((bot && bot.chatPeerUnions && bot.chatPeerUnions.get(peerKey)) || '')
-      // 🔴 第三十六轮门槛 LOW#4：传 getter，roster 解析推迟到总闸判开之后（关＝零 I/O 零新日志）。
+      // 🔴 第三十六轮门槛 审查项：传 getter，roster 解析推迟到总闸判开之后（关＝零 I/O 零新日志）。
       if (requireCapability(bot, chatId,
         () => ({ open_id: peerOu, union_id: peerUnion, name: rosterNameFor(bot, peerOu, peerUnion) }),
         wantCap, 'cmd:/' + resolved)) return true
@@ -4927,7 +4967,7 @@ export function apply(ctx) {
       return true
     }
     if (resolved === 'model') {
-      // 维护者 2026-10-02：「飞书上切换不了模型，你现在能发个卡片给我选择吗」
+      // 2026-10-02：「飞书上切换不了模型，你现在能发个卡片给我选择吗」
       const agent = await commandAgent(bot, chat)
       if (!agent) {
         await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /model。')
@@ -4938,7 +4978,7 @@ export function apply(ctx) {
       if (target && target.error) {
         // 🔴 这一条日志服务**两种**失败（多命中＝名字有但含糊／零命中＝名字不在清单／
         //   清单为空＝无从判断），原来只写「没这个名字」⇒ 按它筛 journal 会把含糊事件
-        //   误判成"名字不存在"（第二十一轮门槛 LOW#1，核对为真）。arg 留**原文**不消毒：
+        //   误判成"名字不存在"（第二十一轮门槛 审查项，核对为真）。arg 留**原文**不消毒：
         //   消毒只面向出站正文，取证不能被消毒污染（与「日志留宿主原文」同一条口径）。
         console.log('[fs] /model 文字档无法解析: arg=' + arg + ' → ' + target.error.replace(/\n/g, ' | '))
         await sendPlainText(bot, chatId, target.error)
@@ -4947,9 +4987,9 @@ export function apply(ctx) {
       if (target) {
         try {
           const sel = await switchModelForAgent(agent, target.provider, target.model)
-          // 🔴 中台 #124：回执四分支——**「✅ 已切换」只允许出现在"默认值落地已验证"的场合**
+          // 🔴 内部记录：回执四分支——**「✅ 已切换」只允许出现在"默认值落地已验证"的场合**
           //   （验收标准 D）；未落地就明说「只对下一条生效、默认值未写入」并给下一步。
-          // 🔴 第四十七轮 LOW#3：四分支判据树收进 modelSwitchReceipt（文案见该函数注释）。
+          // 🔴 第四十七轮 审查项：四分支判据树收进 modelSwitchReceipt（文案见该函数注释）。
           const rcText = modelSwitchReceipt(sel)
           await sendPlainText(bot, chatId, rcText.text)
         } catch (error) {
@@ -5053,7 +5093,7 @@ export function apply(ctx) {
         await sendPlainText(bot, chatId, '当前没有可用会话：先发一条普通消息建立会话，再 /goal <目标>。')
         return true
       }
-      // 目标模式（维护者 2026-09-16）：走与 /plan 同一条命令通道 —— command-goal 插件
+      // 目标模式（2026-09-16）：走与 /plan 同一条命令通道 —— command-goal 插件
       // 已在 `commands` 注册表登记 /goal，能正确处理 <目标>|pause|resume|clear|edit。
       const line = cmd.arg ? '/goal ' + cmd.arg : '/goal'
       let handled = false
@@ -5081,7 +5121,7 @@ export function apply(ctx) {
         return true
       }
       if (!cmd.arg || /^(pause|resume|clear|edit)(\s|$)/iu.test(cmd.arg)) {
-        // 🔴 第四十一轮门槛 LOW#7（措辞跟上归闸）：pause 是刹车随叫随到；resume/clear/edit
+        // 🔴 第四十一轮门槛 审查项（措辞跟上归闸）：pause 是刹车随叫随到；resume/clear/edit
         //   改动运行（第四十轮 MEDIUM 起与建目标同规），提示里讲清前提，别把人引进取缔路径。
         await sendPlainText(bot, chatId, '用法：/goal <目标> ｜ /goal（查看状态）｜ /goal pause ｜ /goal resume ｜ /goal clear ｜ /goal edit <新目标>（resume/clear/edit 需目标开关开启、本人获批且在私聊进行）')
         return true
@@ -5096,7 +5136,7 @@ export function apply(ctx) {
       return true
     }
     if (resolved === 'compact') {
-      // 压缩上下文（维护者 2026-10-01 要求）：harness 的 `@deepseek-ai/dsh-command-compact`
+      // 压缩上下文（2026-10-01 要求）：harness 的 `@deepseek-ai/dsh-command-compact`
       // 已在 `commands` 注册表登记 `/compact`（无参数，内部走 `compaction.compactNow`）。
       // ⚠️ 已知前置条件：**agent 必须空闲**，否则上游返回 busy
       //   （"this process has an active compaction, or the agent is not idle"）。
@@ -5144,7 +5184,7 @@ export function apply(ctx) {
         .split('\n')[0].replace(/\s+/g, ' ').trim()
       if (nameArg.length > NEW_NAME_MAX) {
         // 补一行留痕（0.8.20 段①）：这条拒绝原先只发飞书回执、零 console.log，
-        // 事后查 journal 会误判成"/new 没进命令支"——本次 #560 取证就绕了这段弯路。
+        // 事后查 journal 会误判成"/new 没进命令支"——本次 内部记录 取证就绕了这段弯路。
         console.log('[fs] /new rejected: session name too long (' + nameArg.length
           + ' chars, limit ' + NEW_NAME_MAX + '), previous session untouched')
         await sendPlainText(bot, chatId,
@@ -5181,7 +5221,7 @@ export function apply(ctx) {
         }
       }
       const sessionId = 'fs-main-' + Date.now().toString(36)
-      // 中台 #350 fail-loud 回执：createDedicated 对「默认模型服务不可用」会抛错，
+      // 内部记录 fail-loud 回执：createDedicated 对「默认模型服务不可用」会抛错，
       // 这里不能让命令无响应——捕住并原样告诉用户（回执文案带根因，维护者 可直接照着处置）。
       let handle
       try {
@@ -5198,11 +5238,11 @@ export function apply(ctx) {
       // 2026-10-02：回复必须用校验后的 nameArg，**不能用 cmd.arg** ——
       // cmd.arg 是整段压平文本（splitCommand 连换行一起压成空格）。
       // 只改 label 不改这里，就会出现「状态表里名字是对的、回复里还是一整段」的割裂
-      //（维护者 实测：label=「[名称] 新建会话」，回复却回了全部 10 行）。
-      // 🔴 中台 #496/#497（维护者 2026-10-12 指出本入口漏改）：/new 是「创建新会话」的
+      //（实测：label=「[名称] 新建会话」，回复却回了全部 10 行）。
+      // 🔴 内部记录/内部记录（2026-10-12 指出本入口漏改）：/new 是「创建新会话」的
       // 最常用入口，卡面/回复**同样**按 维护者 定稿三行格式给工作区与模型（0.8.10 只改了
       // /switch 三个出口，漏了这里）。/new 不传 cwd ⇒ 用 bot 默认工作区；新会话还没跑过
-      // 请求 ⇒ currentModelOf 走全局默认，正是「下一条消息会用的模型」（#497 口径）。
+      // 请求 ⇒ currentModelOf 走全局默认，正是「下一条消息会用的模型」（内部记录 口径）。
       const newCwd = String((bot.cfg && bot.cfg.workspace) || '')
       let newModel = null
       try { newModel = currentModelOf(liveAgentForChat(chat)) } catch { }
@@ -5240,7 +5280,7 @@ export function apply(ctx) {
         const flags = []
         if (r.current) flags.push('当前')
         else if (r.inChat) flags.push('本聊天')
-        if (r.live) flags.push('🟡 运行中')
+        if (r.running) flags.push('🟡 跑着呢')
         // 摘要与主名不同才另起一行（没标题时会退化用 label/id，那种情况也不重复显示）
         const extra = (r.summary && r.summary !== base)
           ? '\n     <font color=\'grey\'>' + r.summary + '</font>' : ''
@@ -5250,6 +5290,11 @@ export function apply(ctx) {
       if (titleChanged) { try { persistChats(bot, bot.chats) } catch { /* 落盘失败不影响展示 */ } }
       const head = '**工作区**：' + ws.title + '　`' + (ws.path || '?') + '`'
         + (wsIndex >= 0 ? '（第 ' + (wsIndex + 1) + ' 个，共 ' + wsRows.length + ' 个）' : '（未在注册表里）')
+        // 与二级卡片同口径：截断时如实说明总数，别把"列出来的条数"当成"一共这么多"。
+        + (Number(rows.candidateCount) > rows.length
+          ? '\n<font color=\'grey\'>该工作区共 ' + rows.candidateCount + ' 个会话，这里按最近活跃列前 '
+            + rows.length + ' 个（另有 ' + (rows.candidateCount - rows.length) + ' 个更早的未列出）</font>'
+          : '')
       const tail = (rows.length && wsIndex >= 0)
         ? '发 `/switch ' + (wsIndex + 1) + ' <序号>` 接管 ｜ `/switch ' + (wsIndex + 1) + ' new` 新建 ｜ `/switch` 换工作区'
         : '发 `/switch` 换工作区'
@@ -5425,7 +5470,7 @@ export function apply(ctx) {
   }
 
   // 「`mentioned_type` 这个值算不算一个 agent（bot/应用）」——🔴 **两处口径必须同源**
-  // （第十三轮门槛 LOW#4）：明细行原来只把 `'bot'` 当 bot、`'app'` 落进 `user`，而
+  // （第十三轮门槛 审查项）：明细行原来只把 `'bot'` 当 bot、`'app'` 落进 `user`，而
   // `mentionIsOtherAgent` 认 `'bot'` 与 `'app'` ⇒ 同一个字段在本文件里被读成两种意思。
   // 真机取证：bot 发消息时 `mentioned_type` 实测为 `'bot'`（见上方 P0-3 注释），`'app'`
   // 是同族值（应用维度回调），两者都不是自然人。
@@ -5518,7 +5563,7 @@ export function apply(ctx) {
   }
 
   // ==== 0.8.4 A5/A6：能力审批表 `capability_grants.json` ================================
-  // 维护者 2026-10-06 原话：「这个身份他有没有获得审批。可能去读一个表，如果他有这一个能力的
+  // 2026-10-06 原话：「这个身份他有没有获得审批。可能去读一个表，如果他有这一个能力的
   //   审批的情况下，他就有这个功能。**如果现在不是这么实现的话，就不行**」
   //   ＋「所有的功能开关我来批准，批准以后就入表，批准的有效期我可以在卡片上面选，
   //     默认是今天/1个月/6个月」＋「审批有效期完了之后，就发个提醒告诉这个人『审批已过期』，
@@ -5527,10 +5572,10 @@ export function apply(ctx) {
   //   本地开发机各有一份同结构副本；路径全部由 `FS_CONFIG_DIR`/`configDir()` 驱动（A17）。
   // 🔒 总闸 `capabilityGuard` **默认关**（维护者：「身份闸先全关，我要验证的时候挑一个账号来做验证」）：
   //   关＝不查表（与今日行为一致，部署 0.8.4 不会把任何人锁在外面）；
-  //   开＝查表，**查不到 / 已过期 / 表读不出 ⇒ 一律拒**（fail-closed，维护者 2026-10-04「宁愿拒绝」）。
+  //   开＝查表，**查不到 / 已过期 / 表读不出 ⇒ 一律拒**（fail-closed，2026-10-04「宁愿拒绝」）。
   const CAPABILITY_KEYS = ['model', 'goal', 'plan', 'approval']
   const CAPABILITY_LABELS = { model: '切换模型', goal: '目标模式', plan: '计划模式', approval: '答复审批单' }
-  // 有效期三档（维护者 指定的三档，默认 `today`）。`today` 按**服务器本地时区**的当天 23:59:59 到期。
+  // 有效期三档（按需求确定的三档，默认 `today`）。`today` 按**服务器本地时区**的当天 23:59:59 到期。
   const GRANT_TERMS = { today: '今天', month: '1 个月', halfyear: '6 个月' }
   const GRANT_TERM_KEYS = ['today', 'month', 'halfyear']
 
@@ -5606,7 +5651,7 @@ export function apply(ctx) {
   }
   function grantExpired(row, atMs) {
     const exp = Date.parse(String((row && row.expires_at) || ''))
-    // 🔴 第二十四轮门槛 LOW#5：漏传时基的调用点会让 `exp <= undefined`（NaN 比较）恒假 ⇒
+    // 🔴 第二十四轮门槛 审查项：漏传时基的调用点会让 `exp <= undefined`（NaN 比较）恒假 ⇒
     //   过期判定被**静默关闭**（fail-open）——正是上一轮 sweep 踩过的坑，从签名上堵死。
     const now = Number.isFinite(atMs) ? atMs : Date.now()
     return !Number.isFinite(exp) || exp <= now   // 没有可用到期时间＝视为已过期（fail-closed）
@@ -5620,13 +5665,13 @@ export function apply(ctx) {
     return false
   }
   function findActiveGrant(person, capability, atMs) {
-    // 🔴 第四十二轮门槛 LOW#6（核对为真，**判不修**——人级口径正是本批裁决原文）：匹配
+    // 🔴 第四十二轮门槛 审查项（核对为真，**判不修**——人级口径正是本批裁决原文）：匹配
     //   不带 app_id ＝ 有意为之。开关与表的分工在 handleCommand 开关闸注释里写死：
-    //   开关问"这个 bot 有没有这项功能"，表问"**这个人**有没有"（维护者 2026-10-06：
+    //   开关问"这个 bot 有没有这项功能"，表问"**这个人**有没有"（2026-10-06：
     //   「所有的功能开关我来批准，批准以后就入表」）。同租户 union_id 跨应用稳定、审批
     //   出口同一人 ⇒ 人在 A bot 获批在 B bot 同效是**预期行为**，逐 bot 收紧属口径变更
     //   （要改先改裁决），不是漏洞。row.app_id 只作审批来源留痕，不参与判权。
-    // 🔴 第四十三轮门槛 LOW#3（核对为真）：原来把 loadGrants 的 readFailed 丢掉——瞬时
+    // 🔴 第四十三轮门槛 审查项（核对为真）：原来把 loadGrants 的 readFailed 丢掉——瞬时
     //   读失败（EACCES/EMFILE）被当成"没批过"：既给申请人发"还没获批"，又向审批人**新起
     //   一张批了也存不进去**的申请卡（recordCapabilityGrant 在 readFailed 时中止入库）。
     //   把标志带给判定方，读失败单立拒因、不发申请。
@@ -5661,12 +5706,12 @@ export function apply(ctx) {
   //   标记从内存 Set 改存**行本身**（`notified` 字段随表持久化）：过期行永不从表里删，
   //   内存集合要么无限涨、要么（全清/逐出）让被丢的 id 每 30 分钟被再提醒一遍——契约照样破。
   //   存行里 ⇒ 集合与表同界、重启后也不重发（比原口径「重启后最多再提醒一次」更严），逐出逻辑整个不需要了。
-  // 🔴 第二十五轮门槛 LOW#1（核对为真）：标记时机再收紧一步——**发送 resolve 之后**才写行并落盘。
+  // 🔴 第二十五轮门槛 审查项（核对为真）：标记时机再收紧一步——**发送 resolve 之后**才写行并落盘。
   //   发送是异步的：网络/接口瞬失也先标＝提醒被永久吞掉（24 轮修的同步形态在异步支路的残留）。
   //   `inFlightNotices` 只圈住"在途"窗口防并发重发（代内闭包，重启自然清空）。
   const inFlightNotices = new Set()
   function sweepExpiredGrants(nowMs) {
-    // 🔴 第五十二轮 LOW#3（核对后**不加守卫**，理由写在这里）：本行故意只取 `rows`。
+    // 🔴 第五十二轮 审查项（核对后**不加守卫**，理由写在这里）：本行故意只取 `rows`。
     //   门槛建议补 `if (readFailed) return`，但那条**危害链在本函数里不成立**：顶快照
     //   `rows` 只用于**遍历**，打标落盘走的是 then 内 `const fresh = loadGrants()` 重读
     //   ＋`fresh.readFailed` 守卫（第三十二轮 MEDIUM#1 已钉，见本函数 then 内那段注释）⇒ 即使
@@ -5709,7 +5754,7 @@ export function apply(ctx) {
           //   改法：then 内**重读表**、按 id 翻标记——读-改-写落在同一个同步片内，不留交错窗口。
           // 🔴 第三十二轮门槛 MEDIUM#1（核对为真）：重读**失败**（readFailed）时表内容是假的空 ⇒
           //   继续 writeGrants 等于"一次瞬时 I/O 错误清空全部授权"。中止本次打标，留给下一窗。
-          //   行查无同理：本表只增不删（第二十七轮 LOW#6 口径），"读成功但没有这行"＝异常，
+          //   行查无同理：本表只增不删（第二十七轮 审查项 口径），"读成功但没有这行"＝异常，
           //   宁可不写也不把来路不明的快照落盘。
           const fresh = loadGrants()
           if (fresh.readFailed) {
@@ -5724,7 +5769,7 @@ export function apply(ctx) {
           }
           target.notified = true
           if (!writeGrants(fresh.rows).ok) {
-            // 🔴 第三十六轮门槛 LOW#2（核对为真）：原来写「重启后重发一次」**低估了自己**——
+            // 🔴 第三十六轮门槛 审查项（核对为真）：原来写「重启后重发一次」**低估了自己**——
             //   标记没落盘＝盘上还是 notified:false，而**每一拍** sweep（30 分钟定时器 + 能力
             //   拒绝时的惰性清扫）都从盘上重读 ⇒ 提醒会**逐窗重发**，直到某次写成功为止。
             //   行为本身是对的（送达优先、宁重发不漏发），错的是注释；按真实语义改写。
@@ -5739,7 +5784,7 @@ export function apply(ctx) {
         })
         .finally(() => { inFlightNotices.delete(row.id) })
     }
-    // 第二十七轮 LOW#3：原来的 `sent` 计数是死码——两处调用点（requireCapability 顺带扫、
+    // 第二十七轮 审查项：原来的 `sent` 计数是死码——两处调用点（requireCapability 顺带扫、
     //   30 分钟定时器）都不看返回值；"发了几条"的观测价值已经由每行一条
     //   `capability expired notice: …` 留痕承担。删。
   }
@@ -5762,7 +5807,7 @@ export function apply(ctx) {
     const union = String((op && op.union_id) || '')
     if (!ou && !union) return ''
     const name = rosterNameFor(bot, ou, union)
-    // 🔴 截断分支同样要 `ou || union`（2026-10-05 门槛第十一轮 LOW#3）：原来写死
+    // 🔴 截断分支同样要 `ou || union`（2026-10-05 门槛第十一轮 审查项）：原来写死
     //   `ou.slice(0, 8)` ⇒ 回调只带 union_id 时得到**空串**，卡面/日志渲染成
     //   `[点击者 未署名|]` —— 这一支的目的本来就是"留一个截断 id"，全丢掉等于没留。
     const idTag = full ? (ou || union) : (ou || union).slice(0, 8)
@@ -5939,7 +5984,7 @@ export function apply(ctx) {
     //   里的 `@all` 后面跟 `.` 会命中，被展开成一次**真·@ 全体**。左侧同理挡掉 `x@all`。
     // 🔴 `@[文本](链接)` 是 markdown 链接、不是 @ 人名 ⇒ 加 `(?![[(])` 让它在跟着
     //   `(`/`[`（引用式链接）时整条不匹配，保留原文，别把链接文字吃掉。
-    //   🔴 第十一轮 LOW#4：`@「」` 这一支原来**没有左边界**（另两支都有），
+    //   🔴 第十一轮 审查项：`@「」` 这一支原来**没有左边界**（另两支都有），
     //     `x@「张三」`/`mail@「张」` 照样命中 ⇒ 和这一轮刚立的"左右都要边界"自相矛盾，
     //     幽灵 @ 的风险只堵掉了两支。三支一律补 `(?<![\w$])`。
     //   🔴 第十五轮门槛 LOW（核对为真）：`@all` 的右边界原来只排 `[A-Za-z0-9_]`，
@@ -5947,7 +5992,7 @@ export function apply(ctx) {
     //     **一次真·@ 全体**（出站 @ 是唤醒对方 bot 入站事件的扳机，误触发=群广播）。
     //     注释里"邮箱 foo@all.com 被右边界挡下"的说法也不准确：那一例其实由**左边界**挡下。
     //     右边界收紧为 `(?![\w.\-])`：`@all` 后面只要还跟着 **ASCII** 字母/数字/下划线/点/
-    //     连字符就不是一个独立 token（第十七轮 LOW#1 纠正措辞：`\w` 不含中文，原写「字母」
+    //     连字符就不是一个独立 token（第十七轮 审查项 纠正措辞：`\w` 不含中文，原写「字母」
     //     是过度声称）。**中文相邻刻意不挡**，判据是**哪一类误判更常发生**：紧邻 ASCII 标识符
     //     字符 ⇒ 这个 `@all` 属于那个标识符（`@all-hands`/`@all.png`/`@all_x`），不是广播指令；
     //     紧邻中文 ⇒ 是「广播指令 + 正文」的普通写法（本产品中文-first、多数人在 @ 后不打
@@ -6052,7 +6097,7 @@ export function apply(ctx) {
   }
 
   // ---- P0-6（0.8.0）群门**可选**接力通道 ----------------------------------------
-  // 🔴 默认 self_only = 现状一字不动（维护者 2026-10-04 防互刷裁决不被推翻：实测两个 bot
+  // 🔴 默认 self_only = 现状一字不动（2026-10-04 防互刷裁决不被推翻：实测两个 bot
   //   同群 5 分钟刷出 3666 条事件）。只有 bot 配置/群白名单显式 opt-in 才放宽。
   // 互刷三层防线（**仅**对经 relay 转发的 bot 来源消息计数，人来源消息不吃预算）：
   //   ① 配对预算：90s 内同一 (发送方→本 bot) 接力 >3 条 ⇒ 冻结该配对 10 分钟 + 留痕；
@@ -6143,7 +6188,7 @@ export function apply(ctx) {
     return true
   }
 
-  // 0.7.9 P6（维护者 2026-10-03：转发卡片给 bot "没反应"；协作信箱 15:20 TASK 同）：
+  // 0.7.9 P6（2026-10-03：转发卡片给 bot "没反应"；协作信箱 15:20 TASK 同）：
   //   转发进来的卡片是 msg_type='interactive'，extractText() 拿不到正文 ⇒ 旧实现走到
   //   handleInbound 的 `if (!text.trim()) return` **静默丢弃**（只留一个表情）。
   //   这个函数把卡片 JSON 里的可读文字**递归抠出来**当正文（去重、限长），抠不到则由调用方回可见提示。
@@ -6175,7 +6220,7 @@ export function apply(ctx) {
       // **带 tag 的元素**，旧实现只抠纯文字 ⇒ "卡片内容的 @ 其他 agent 看不到"。
       const tg = typeof node.tag === 'string' ? node.tag : ''
       if (tg === 'at' || tg === 'person' || tg === 'mention') {
-        // 名字只认字符串（第十三轮门槛 LOW#3）：富节点里 `user_name`/`name` 偶见对象形态，
+        // 名字只认字符串（第十三轮门槛 审查项）：富节点里 `user_name`/`name` 偶见对象形态，
         // 拼进送 agent 的会话文本就成 `@[object Object]`（agent 拿它去认人必然认不出）。
         let nm = ''
         if (typeof node.user_name === 'string') nm = node.user_name
@@ -6185,7 +6230,7 @@ export function apply(ctx) {
       }
       if (tg === 'button' || tg === 'action' || tg === 'select_person' || tg === 'overflow' || tg === 'date_picker') {
         const t = node.text
-        // 名字同样只认字符串（第十三轮 LOW#3 的同一族，第十五轮门槛 LOW 补上这一支）：
+        // 名字同样只认字符串（第十三轮 审查项 的同一族，第十五轮门槛 LOW 补上这一支）：
         //   富节点偶见 `name` 是对象形态，拼进会话文本就成 `【按钮/控件】[object Object]`。
         let inner = typeof node.name === 'string' ? node.name : ''   // 三元的最后一档才是兜底：先给默认值，再逐条覆盖（不用嵌套三元）
         if (typeof t === 'string') inner = t
@@ -6204,7 +6249,7 @@ export function apply(ctx) {
       for (const k of ['content', 'text', 'title', 'name', 'user_name', 'file_name', 'tag_name', 'label']) {
         if (typeof node[k] === 'string') push(node[k])
       }
-      // 0.7.10（独立审查 MED#3150 修正）：**必须含 body/header** —— schema 2.0 卡片把元素放在
+      // 0.7.10（独立审查 审查项 修正）：**必须含 body/header** —— schema 2.0 卡片把元素放在
       // `body.elements`（本插件自己发出去的卡就是这个形状）⇒ 少了这两个键，**转发我们自己的卡**
       // 仍然什么都抠不到、只能回"读不到正文"，等于 P6 没修好 维护者 报的那条。
       for (const k of ['body', 'header', 'elements', 'fields', 'columns', 'items', 'message_list', 'content', 'title', 'children', 'elements_list']) {
@@ -6238,7 +6283,7 @@ export function apply(ctx) {
     return '.bin'
   }
 
-  // 🔴 中台 #65（维护者 2026-10-08 拍板「赶紧修，这功能不能坏」）：post 富文本（PC 端"文字+文件
+  // 🔴 中台 #65（2026-10-08 确定「赶紧修，这功能不能坏」）：post 富文本（PC 端"文字+文件
   //   同一条消息"）里的 file/img/media 元素带 file_key/image_key，旧链只认整条消息是
   //   file/image/audio/media ⇒ 有文字时**附件整段静默丢**（员工发考勤表+一句说明＝agent 只见字）。
   //   这个函数把 post 内容树里的附件抠出来（按出现顺序），交 handleInbound 逐个走既有下载链。
@@ -6264,7 +6309,7 @@ export function apply(ctx) {
     return out
   }
 
-  // 🔴 第五十一轮 LOW#5（核对为真）：落盘说明的**行前缀**是生产者（downloadAndSaveResource /
+  // 🔴 第五十一轮 审查项（核对为真）：落盘说明的**行前缀**是生产者（downloadAndSaveResource /
   //   withDownloadBail / downloadInboundFile）与消费者（commandAttachmentReceipt 按前缀筛
   //   "哪些行要发给 维护者 看"）之间的**隐式契约**——措辞一改，消费者就静默丢行（最坏全丢），
   //   等于 #65 那条"命令口看不见附件"从文案漂移里复发。前缀在这里单源，两边都用它拼。
@@ -6285,7 +6330,7 @@ export function apply(ctx) {
       const token = await tenantAccessToken(bot, bot.cfg.appId, bot.cfg.appSecret)
       const url = 'https://open.feishu.cn/open-apis/im/v1/messages/' + encodeURIComponent(messageId)
         + '/resources/' + encodeURIComponent(key) + '?type=' + type
-      // #1533：资源下载也带有限时限（60s 宽限，与上传同口径）。排队路径另有
+      // 内部记录：资源下载也带有限时限（60s 宽限，与上传同口径）。排队路径另有
       // withDownloadBail 的可见失败兜底（默认 15s 先到先报）；这里的 deadline 保证
       // 挂死的连接本身最终会被掐断，不再无限占用。超时被外层 catch 转成⚠️回执。
       const res = await fetchWithDeadline(url,
@@ -6355,7 +6400,7 @@ export function apply(ctx) {
   }
 
   async function downloadInboundFile(bot, evt) {
-    // 🔴 第四十八轮 LOW#2（核对为真）：原来整个函数套一层 catch，文案与
+    // 🔴 第四十八轮 审查项（核对为真）：原来整个函数套一层 catch，文案与
     //   downloadAndSaveResource 自己的 catch **逐字相同**——而那个核已自护（下载/写盘
     //   失败自己回⚠️说明），外层唯一可达的异常只有 `JSON.parse(evt.content)`。
     //   按真实故障面收窄到解析这一步：两份同字面的兜底文案并成一处，将来改一处不会漏另一处。
@@ -6472,11 +6517,11 @@ export function apply(ctx) {
     if (key) eventSeen.delete(key)
   }
 
-  // 🔴 第五十轮 LOW#5（核对为真）：上面的窥探**只认"已经认领过的"**，而认领发生在下游
+  // 🔴 第五十轮 审查项（核对为真）：上面的窥探**只认"已经认领过的"**，而认领发生在下游
   //   handleInbound/steer（5342/5382）。0.8.4 把 post 附件改成"先下载完再派发"之后，认领被推到
   //   下载完成**之后**（最长可达整个有界窗口）⇒ 重投的第二份落在"第一份还在下载"这个窗口里，
   //   窥到的是 false、照样再下一遍（多一份 -2 重复文件＋误导的 `inbound file saved` 日志），
-  //   正是第四十七轮 LOW#5 要消灭的形状（那条修法只在"下载完才派发"之前有效）。
+  //   正是第四十七轮 审查项 要消灭的形状（那条修法只在"下载完才派发"之前有效）。
   //   补一个**在飞标记**：入队即登记，与只读窥探并联判定。
   // 🔴 第五十一轮 MEDIUM#2（核对为真）：原来在任务 `finally` 里"派发完就释放"是**错的**——
   //   `dispatchParsedInbound` 只把 handleInbound **排进** bot.chain（命令支/提问支甚至根本不排），
@@ -6542,8 +6587,8 @@ export function apply(ctx) {
     if (!entry || !entry.agent || typeof entry.agent.steer !== 'function') return false
     // ── D5（P1.5 身份注入）· 插话路径也要注入（否则插话进来的那条没有 actor）─────
     //    身份只来自 `evt.sender.sender_id.open_id`（服务端给的、伪造不了）；
-    //    认不出**不弹卡片、不问姓名**（维护者 2026-10-04）；
-    //    拿不到身份 ⇒ 拒绝（维护者 2026-10-04 裁决：**无表就拒** —— 执行不了总比资料泄露好）。
+    //    认不出**不弹卡片、不问姓名**（2026-10-04）；
+    //    拿不到身份 ⇒ 拒绝（2026-10-04 裁决：**无表就拒** —— 执行不了总比资料泄露好）。
     //    🔒 开关 `identityGuard` **默认关**（上游用户不一定需要这个功能）⇒ 关了跳过全部身份逻辑。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
@@ -6561,7 +6606,7 @@ export function apply(ctx) {
         console.log('[fs] identity(steer) resolve failed (ignored): ' + String(error && error.message || error))
       }
     } else {
-      // #2626 · 需求 方案A 第一步「插件传真实身份」：关闸＝不判权（2026-10-30 开关矩阵），
+      // 内部记录 · 配套改动 方案A 第一步「插件传真实身份」：关闸＝不判权（2026-10-30 开关矩阵），
       //   但入站事件权威字段（evt.sender.sender_id，飞书服务端填、伪造不了）仍记进本轮上下文，
       //   供 tools/execute 关闸净化支覆写/剔除「模型自报身份」。actor=null 不判权、不查表。
       //   仅当事件**带 sender** 才落记录：合成轮（inject-context 等 _internal 无 sender）不覆写，
@@ -6593,7 +6638,7 @@ export function apply(ctx) {
         id: 'fs-' + evt.message_id,
         role: 'user',
         // P0-2/P0-3：发送方明细 + @ 对象明细只进会话文本，不进卡片。
-        // #2591：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，插话路径）。
+        // 内部记录：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，插话路径）。
         content: [{ type: 'text', text: label + text + senderMark.footer + (evt.mentionFooter || '') + quote + rulingHintFor(bot, text) }],
         source: { kind: 'user' },
       })
@@ -6641,7 +6686,7 @@ export function apply(ctx) {
     if (!chatId) return
     // 入站去重：飞书长连接是 at-least-once，重连后会重投未 ack 的事件；
     // 进程内也可能有两份 helper 订阅同一 app。没有去重时同一条消息会跑两整轮、
-    // 产出两张内容相同的卡（2026-09-15 维护者 反馈"同一段东西分两个卡片发"）。
+    // 产出两张内容相同的卡（2026-09-15 用户反馈"同一段东西分两个卡片发"）。
     // #E12（2026-11-07）：再叠一层**事件幂等**（`header.event_id`）—— message_id 判重
     //   只能拦"同一条消息"，拦不住"同一 event 换了信封"的形态；两层都留痕、都带通道。
     if (isDuplicateInbound(bot, evt.message_id)) {
@@ -6655,7 +6700,7 @@ export function apply(ctx) {
     bot.lastChatId = chatId
     // 0.7.17（两模式）：记录 chat 类型（入站事件自带的 chat_type，p2p|group）——
     // 群判据**不信 oc_ 前缀**（2030：飞书单聊与群聊都用 oc_）⇒ 群一律 stable（见 resolveCardMode）。
-    // 0.7.19（审查 MED#1-A）：**只在事件真的带 chat_type 时写** —— 内部合成事件（cardfail 报错通知 /
+    // 0.7.19（审查 审查项-A）：**只在事件真的带 chat_type 时写** —— 内部合成事件（cardfail 报错通知 /
     // 热重载自动续跑）没有这个字段，旧写法 `|| 'p2p'` 会把**已知的群记录覆盖成 p2p** ⇒ 群降级 full
     // ⇒ 过程叙述暴露给群里的员工（用例 66 实测红）。
     if (!bot.chatKinds) bot.chatKinds = new Map()
@@ -6670,11 +6715,11 @@ export function apply(ctx) {
     //   （postAttachmentsApplied 旗）⇒ 这里再抠＝**同一附件下载第二遍**。只有直接喂进
     //   handleInbound 的 post（内部重放等）才由本支兜住。
     if (inboundType === 'post' && !evt.postAttachmentsApplied) {
-      // 🔴 中台 #65（维护者 2026-10-08「赶紧修，这功能不能坏」）：PC 端**文字+文件同一条消息**是
+      // 🔴 中台 #65（2026-10-08「赶紧修，这功能不能坏」）：PC 端**文字+文件同一条消息**是
       //   post 富文本，旧实现只在正文为空时才走附件下载 ⇒ 有文字时内嵌 file/img/media 静默丢
       //   （员工发考勤表带一句说明＝agent 只见字不见表）。post 一律抠附件（有无文字都抠），
       //   逐个走整条附件消息的同一条下载链（downloadAndSaveResource），落盘说明拼进正文。
-      //   🔴 第四十八轮 LOW#3：这条落盘说明同时记进 evt.postAttachmentNotes —— 内部入口的
+      //   🔴 第四十八轮 审查项：这条落盘说明同时记进 evt.postAttachmentNotes —— 内部入口的
       //   命令分支也要能补可见回执（与真机入口同一个字段、同一个函数）。
       let internalAttNotes = ''
       for (const att of extractPostAttachments(evt.content)) {
@@ -6694,7 +6739,7 @@ export function apply(ctx) {
       //   旧实现**静默丢弃** ⇒ 维护者「转发卡片到 dsh，没反应」。
       const kind = String((evt && (evt.msg_type || evt.message_type)) || 'unknown')
       const salvaged = salvageTextFromRich(evt)
-      // 中台 #510（维护者 2026-10-12 报障「转发卡片 agent 读不出，说版本要升级」）：
+      // 内部记录（2026-10-12 报障「转发卡片 agent 读不出，说版本要升级」）：
       //   飞书对 **JSON 2.0 卡片**在转发/跨会话场景做**服务端转译**——消息通道里落的不是原卡，
       //   而是一张「通用火箭占位图 +『请升级至最新版本客户端，以查看内容』」的替身卡
       //   （机器实证 2026-10-12：转发卡与 bot 直发 2.0 卡在 IM 历史/单条 API 里都是同一替身形状，
@@ -6702,7 +6747,7 @@ export function apply(ctx) {
       //   agent ⇒ agent 复述「版本要升级」（错误归因）。识别到替身特征短语 ⇒ 改喂**诚实说明**，
       //   不再把占位当正文；正常卡（有真内容）照走 salvage，不受影响。
       if (salvaged && salvaged.indexOf('请升级至最新版本客户端') >= 0) {
-        // #515 存档反查（维护者 2026-10-12 拍板「做」）：占位替身与原卡**同一条 message_id**
+        // 内部记录 存档反查（2026-10-12 确定「做」）：占位替身与原卡**同一条 message_id**
         //（只有「转发」会生成新 id）⇒ 同桥发出的卡在这里能按 id 查回全文，直接把原文喂给
         // agent —— 群里/会话里 bot 互发卡片的场景由此完整可读。查不到（跨桥、外部卡、转发件）
         // 才退回诚实说明。反查失败绝不影响后续流程（全程在既有 try 语义内）。
@@ -6744,11 +6789,11 @@ export function apply(ctx) {
     //（否则 /plan 会被跑两遍），直接接着建卡。
     let commandHold = holdFromEvent || null
     if (cmd && !commandHold) {
-      // 🔴 第四十八轮 LOW#3（同上）：内部入口的命令分支同样不消费带附件的正文 ⇒ 同一条
+      // 🔴 第四十八轮 审查项（同上）：内部入口的命令分支同样不消费带附件的正文 ⇒ 同一条
       //   可见回执在这里也补一次（真机入口的命令分支由 dispatchParsedInbound 那份负责；
       //   命令起回合时 commandHold 已置位 ⇒ 不会双发）。
       commandAttachmentReceipt(bot, chatId, evt)
-      // 🔴 第五十轮 LOW#3：占位 chat + 当场落盘**收成单源** ensureCommandChat（与真机事件
+      // 🔴 第五十轮 审查项：占位 chat + 当场落盘**收成单源** ensureCommandChat（与真机事件
       //   入口共用同一条实现，判据/留痕口径见函数头注释）。
       const chat = ensureCommandChat(bot, chatId, 'command')
       const handled = await handleCommand(bot, chat, chatId, cmd).catch((error) => {
@@ -6763,7 +6808,7 @@ export function apply(ctx) {
 
     // A pending user-question (ask_user_question / plan review) is answered
     // by the next plain message in this chat (F-04).
-    // 审查 LOW#1555：插件**自己注入**的系统提示（卡片失败回执 / 热重载续跑）不是用户回答 ——
+    // 审查 审查项：插件**自己注入**的系统提示（卡片失败回执 / 热重载续跑）不是用户回答 ——
     // 否则"有提问卡挂着"时它会被当成回答吃掉，Agent 永远收不到那份回执。
     const pendingQ = (evt && evt._internal) ? undefined : pendingQuestions.get(qKey(chatId, bot))
     if (pendingQ) {
@@ -6794,7 +6839,7 @@ export function apply(ctx) {
       const dropped = bot.droppedLegacyIds && bot.droppedLegacyIds.get(chatId)
       const droppedId = Array.isArray(dropped) && dropped.length > 0
         ? String(dropped[dropped.length - 1] || '') : ''
-      // #771 熔断额度必须**跨「chat 对象重建」保留**：heal 失败支路（旧实现 splice 掉条目、
+      // 内部记录 熔断额度必须**跨「chat 对象重建」保留**：heal 失败支路（旧实现 splice 掉条目、
       // createDedicated 又抛错；2026-11-05 起条目不再删，但「sessions 为空 ⇒ 整个 chat 对象重建」
       // 这条路径仍在）会把额度归零 ⇒ 每条入站又能各重建一次（审查 2026-10-17 第 3 条）。
       chat = { sessions: [], activeIndex: 0, remounts: Number(chat && chat.remounts) || 0 }
@@ -6869,11 +6914,11 @@ export function apply(ctx) {
       }
     }
 
-    // #1105 日期锚：本轮消息是否带锚在此一次性判定（同日去重由状态保证）；
+    // 内部记录 日期锚：本轮消息是否带锚在此一次性判定（同日去重由状态保证）；
     // runTurn 内 heal 重试复用同一 text ⇒ 不会二次计数。
     // 🔴 commandHold（/plan <正文>／/goal <正文> 这类「命令把正文投进会话、由命令腿起回合」的形态）
     //   ⇒ 本轮走 skipSend，带锚的那条 message 从不 send：此时**不许消耗当天的锚额度**，
-    //   否则命令轮之后该 chat 当天余下所有消息都无锚（#1105 的验收整天落空）。
+    //   否则命令轮之后该 chat 当天余下所有消息都无锚（内部记录 的验收整天落空）。
     const dateAnchor = commandHold ? '' : dateAnchorFor(bot, chatId)
     // 2026-10-01：拿到飞书 agent 的第一时间就把提问水位线挂到它自己的 scope 上。
     bindFeishuAgentQuestions(agent)
@@ -6892,13 +6937,13 @@ export function apply(ctx) {
       }
     } catch { /* 标题只是展示信息，取不到不影响任何流程 */ }
 
-    // ── D5（P1.5 身份注入 · 按人判）· 维护者 2026-10-04 定的三条 ───────────────────
+    // ── D5（P1.5 身份注入 · 按人判）· 2026-10-04 定的三条 ───────────────────
     //  ① 身份【只】来自这里：`event.sender.sender_id.open_id` —— 飞书服务端填的，**伪造不了**；
     //     正文里任何 "[飞书 ou_…]" 都只是旁证（用户能仿造同样的文本），**授权一律不读它**。
-    //  ② 认不出**不弹卡片、不问姓名** —— 维护者 原话：
+    //  ② 认不出**不弹卡片、不问姓名** —— 需求原文：
     //     「不弹卡片啊，你现在都不会认不出人，而且这个链路已经通了，应该直接 ai 处理啊，
     //       为什么还是想着人来介入」⇒ 认人只需 open_id 一个字段。
-    //  ③ 🔴 **表不可达 ＝ 认不出 ⇒ 拒（不再放行）** —— 维护者 2026-10-04 裁决原话：
+    //  ③ 🔴 **表不可达 ＝ 认不出 ⇒ 拒（不再放行）** —— 2026-10-04 裁决原话：
     //     「**无表就拒应该是最好的，最稳的。因为你执行不了，总比资料泄露好吧**」。
     //     ⚠️ 本条注释原先写的是"表不在本机时记一条日志并**放行**" —— 那是**裁决之前**的旧行为。
     //     实现已经改成 fail-closed（下面 `store.set` **无条件执行** ⇒ 工具侧拿到 `rec` 且 `actor=null`
@@ -6909,7 +6954,7 @@ export function apply(ctx) {
     //     所以正常的"认不出"走的就是 deny 这条路。
     const openId = evt.sender && evt.sender.sender_id && evt.sender.sender_id.open_id || ''
     let identityActor = null
-    // 🔒 身份闸门开关：**默认关**（上游用户不一定需要；维护者 2026-10-04）⇒ 关了跳过全部身份逻辑，零开销。
+    // 🔒 身份闸门开关：**默认关**（上游用户不一定需要；2026-10-04）⇒ 关了跳过全部身份逻辑，零开销。
     if (bot.cfg && bot.cfg.identityGuard) {
       try {
         const idc = identityCtx(bot.cfg.workspace || workspaceRoot())
@@ -6924,7 +6969,7 @@ export function apply(ctx) {
         console.log('[fs] identity resolve failed (ignored): ' + String(error && error.message || error))
       }
     } else {
-      // #2626 · 需求 方案A 第一步：同插话路径——关闸不判权，但入站权威值入上下文，
+      // 内部记录 · 配套改动 方案A 第一步：同插话路径——关闸不判权，但入站权威值入上下文，
       //   tools/execute 关闸净化支据此覆写/剔除模型自报身份（绝不原样转发冒充值）。
       //   仅当**带 sender** 才落记录（合成轮 _internal 无 sender 不覆写，保留上一真实轮真值；
       //   带 sender 但形状非法 ⇒ 空真值 ⇒ 后续调用走剔除支 fail-closed）。
@@ -6957,7 +7002,7 @@ export function apply(ctx) {
     //   每次卡片失败都**必然**吃一发 `99992354 … Invalid ids: [cardfail-…]`（实测原样见
     //   staging `e2e-20261018-1685/02-positive-0817-journal.log:750`）。代价两条：白烧一次 API 额度
     //   （07-飞书API额度与最小调用口径）、日志里多一条与真实故障混在一起的 ERR 噪声（按 ERR 计数的巡检会虚报）。
-    //   只做"不打字提示"，不改注入本身——#1105 的 E4b ★ 判据要求合成轮照样带日期锚，那条路径在此之后。
+    //   只做"不打字提示"，不改注入本身——内部记录 的 E4b ★ 判据要求合成轮照样带日期锚，那条路径在此之后。
     const emoji = (bot.cfg.reactionEmoji && String(bot.cfg.reactionEmoji).trim()) || 'OnIt'
     let reactionId
     if (emoji && emoji !== 'none' && !(evt && evt._internal)) {
@@ -6993,8 +7038,8 @@ export function apply(ctx) {
       const message = {
         id: 'fs-' + messageId,
         role: 'user',
-        // #1105：日期锚拼在当轮消息最前（同日已注时为空串，追加式不回写历史）。
-        // #2591：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，常规路径）。
+        // 内部记录：日期锚拼在当轮消息最前（同日已注时为空串，追加式不回写历史）。
+        // 内部记录：疑似 维护者 裁决口径词 ⇒ 尾部追加中台同步闸提醒（rulingHintFor，常规路径）。
         // 桥自愈-上下文交接（2026-11-05）：`opts.prefix`＝旧会话交接摘要，只在**自愈重建**那一次
         //   重试上传入；与日期锚共用同一个"拼在最前"的通道（比走 /feishu/admin/inject-context
         //   外挂 HTTP 更小：同步、不另起回合、不依赖共享 token）。
@@ -7005,9 +7050,9 @@ export function apply(ctx) {
       card.footerMode = 'bare'         // A 方案：过程卡只留裸状态，状态栏归结论卡
       card.cursor = seqBefore          // 本卡只消费本轮开始之后的事件
       card.blocks.push({ type: 'message', text: '正在工作中…' })
-      const turnStartedAt = Date.now() // 结论是否独立成卡要用到本轮耗时（维护者 2026-10-01 B 方案）
+      const turnStartedAt = Date.now() // 结论是否独立成卡要用到本轮耗时（2026-10-01 B 方案）
       let stopCardWatcher = null       // 在 send() 之前就必须存在（见下方登记顺序注释）
-      // 表格额度换卡（维护者 2026-09-16 方案）：飞书单卡最多 5 张表，满额时**不降级表格**，
+      // 表格额度换卡（2026-09-16 方案）：飞书单卡最多 5 张表，满额时**不降级表格**，
       // 而是把旧卡封住（表格留在旧卡），后续内容写到一张新卡上。
       // 与 split() 的唯一差别：新卡游标 = 旧卡**当前**游标 → 触发换卡的待处理事件落到新卡，
       // 既不丢也不重（split() 是答题专用，它把游标设到事件末尾，会跳过待处理事件）。
@@ -7019,7 +7064,7 @@ export function apply(ctx) {
         stopCardWatcher()
         card.status = 'sealed'
         dropWorkingPlaceholder(card)
-        // 0.7.9（维护者 2026-10-03 ③）：指路语写在**旧卡**（读者就在这张卡上）；**新卡不带任何指路语**。
+        // 0.7.9（2026-10-03 ③）：指路语写在**旧卡**（读者就在这张卡上）；**新卡不带任何指路语**。
         card.blocks.push({
           type: 'message',
           text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
@@ -7053,7 +7098,7 @@ export function apply(ctx) {
           if (stopCardWatcher) stopCardWatcher()
           card.status = 'sealed'
           card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
-          // 🔴 维护者 2026-10-02：「我发信息给你，若你刚好在应答的时候，你会**直接截断掉**
+          // 🔴 2026-10-02：「我发信息给你，若你刚好在应答的时候，你会**直接截断掉**
           // 需要打印结果的那些回复的内容，导致我看不到」。
           // 机理：插话会 split 换卡 ⇒ 旧卡就此封口；而旧卡上镜像的过程话语是 **note**，
           // 建卡时限长 `MAX_NOTE_CHARS`(500) 截断；新卡游标从**当前位置**起、不重放旧内容；
@@ -7074,7 +7119,7 @@ export function apply(ctx) {
           // 新卡游标 = 当前事件位置：split 之前的内容**已经**在旧卡上，绝不能再重放一遍
           // （旧实现的 seal 前补扫从 seqBefore 重放整轮，造成新卡与旧卡内容大面积重复）。
           fresh.cursor = sessionEvents(turnAgent.session).length
-          // 新卡第一块就是醒目提示（维护者 2026-10-02：插话要"新开卡片"，他这句话要在新卡上）
+          // 新卡第一块就是醒目提示（2026-10-02：插话要"新开卡片"，他这句话要在新卡上）
           if (notice && notice.fresh) fresh.blocks.push(notice.fresh)
           fresh.blocks.push({ type: 'message', text: '继续处理中…' })
           card = fresh
@@ -7155,12 +7200,12 @@ export function apply(ctx) {
       // （smoke 7 重复文本、smoke 12 六张表并成一张卡，两次都是这么踩到的）。
       const spokenBlocks = []
       const spokenSeqs = new Set()
-      // 0.7.10（独立审查 MED#3677）：删掉 `crossedTool` —— 0.7.9 把"跨过工具调用继续收"改成
+      // 0.7.10（独立审查 审查项）：删掉 `crossedTool` —— 0.7.9 把"跨过工具调用继续收"改成
       // **跨过第一个工具调用就 break**，该变量再也不会被赋成 true（死代码 + 与注释自相矛盾）。
       for (let i = events.length - 1; i >= seqBefore; i--) {
         const event = events[i]
         if (!event) continue
-        // 0.7.9（维护者 2026-10-03 ②）：**跨过第一个工具调用就停** —— 结论只取"最后一段连续叙述"，
+        // 0.7.9（2026-10-03 ②）：**跨过第一个工具调用就停** —— 结论只取"最后一段连续叙述"，
         // 不再把整轮过程话语 join 进 reply（否则结论卡会夹带过程卡的文字）。
         if (event.type === 'tool/call' || event.type === 'tool/result') {
           // 0.7.13（TODO-0710 #2）：**末尾连续的工具事件先跳过**（还没收集到文本时 continue）——
@@ -7197,7 +7242,7 @@ export function apply(ctx) {
       const lastSeq = replySeqs.length > 0 ? replySeqs[replySeqs.length - 1] : undefined
       // 一个字都没说出来时，卡面**必须**说清为什么（2026-09-21 用户原话：「它不会提示我欠费，
       // 它不会把报错信息报出来，就直接显示说"本轮没有回复"」）：
-      //   ① 有上游失败标记 → **按调用者档位**给原因（中台 #2216：L3+ 简明人话、
+      //   ① 有上游失败标记 → **按调用者档位**给原因（内部记录：L3+ 简明人话、
       //      L1/L2 或认不出身份＝统一话术＋ALERT 告警；原始报文只进日志，不进对话框）
       //   ② 没有失败标记  → 明说"原因未上报"，**不再**留下一句干巴巴的占位符
       const notSpoken = lastSeq === undefined
@@ -7217,10 +7262,10 @@ export function apply(ctx) {
         + ' card=' + (card.token || '-') + ' blocks=' + card.blocks.length
         + ' reply=' + JSON.stringify(String(reply).slice(0, 160)))
       card.blocks = card.blocks.filter((b) => !(b.type === 'message' && b.text === '正在工作中…'))
-      // 维护者 2026-10-01 B 方案：本轮"有工具调用"或"耗时 ≥ 10s" ⇒ **结论独立成一张新卡**。
+      // 2026-10-01 B 方案：本轮"有工具调用"或"耗时 ≥ 10s" ⇒ **结论独立成一张新卡**。
       // 依据：飞书只对**新消息**提醒；卡片原地 PATCH 不会二次提醒 ⇒ 长任务做完时用户收不到信号。
       // 结论卡是新的消息 ⇒ 有提醒；过程卡封口当"工作日志"（结论从它身上摘掉，避免重复）。
-      // 维护者 2026-10-01 B 方案（修正版）：**只按耗时**判定 —— 「有工具调用」那条已删掉，
+      // 2026-10-01 B 方案（修正版）：**只按耗时**判定 —— 「有工具调用」那条已删掉，
       // 因为它对几乎每一轮都成立（实测 12 秒的短任务也被分卡，维护者 当场反馈）。
       const elapsedMs = Date.now() - turnStartedAt
       const splitMinMs = conclusionSplitMinMs(bot)
@@ -7274,7 +7319,7 @@ export function apply(ctx) {
       // 分卡时它只是过程卡 ⇒ 保持 bare（状态栏由下面新开的结论卡承担）。
       if (!splitConclusion) card.footerMode = 'full'
       let replaced = false
-      // 🔴 维护者 2026-10-03 P0（真机理，代码实证）：这里原先把 `replySeqs` 覆盖的 note **从过程卡删掉**
+      // 🔴 2026-10-03 P0（真机理，代码实证）：这里原先把 `replySeqs` 覆盖的 note **从过程卡删掉**
       //    （`card.blocks.filter(...)`），而 `replySeqs` 是"从末尾往前扫、**跨过工具调用继续收**"
       //    得来的 ⇒ 一轮里被收进去的叙述可能覆盖**整轮** ⇒ 过程卡被清空成一句指路、
       //    那些文字全部出现在结论卡里。维护者 的验收①是"过程卡的文字和步骤**不动**" ⇒
@@ -7284,7 +7329,7 @@ export function apply(ctx) {
         card.blocks.push({ type: 'message', text: '✅ 本轮已完成，结论见上方卡片。' })
         replaced = true
       } else if (splitConclusion) {
-        // 0.7.14（维护者 指定 TASK v3「一条回复发两张卡」· B3 总纲）：**把结论段从过程卡搬走** ——
+        // 0.7.14（按需求确定 TASK v3「一条回复发两张卡」· B3 总纲）：**把结论段从过程卡搬走** ——
         //   恢复本函数上方英文注释的原设计（promote the last note … so the reply is not duplicated）。
         //   0.7.5 P0 的「绝不删块」防的是**过程叙述被清空**；0.7.9 收紧后 replySeqs 只含最后那段
         //   连续答复、碰不到过程叙述 ⇒ 搬走它不再有副作用。只移 replySeqs 命中的 note，
@@ -7297,20 +7342,20 @@ export function apply(ctx) {
       } else if (replySeqs.length > 0) {
         // 0.7.17（stable seal）：渲染层隐藏镜像 note ⇒ 去重失去意义；整条答复直接作为 message 上卡
         //（结论可见 = V2）。full 模式走原去重逻辑，一字不改（下方 else 全体原样保留）。
-        // 0.7.19（审查 LOW#2）：**当场重解析，不读 card.mode** —— 那是上一次 sync 存下的值，
+        // 0.7.19（审查 审查项）：**当场重解析，不读 card.mode** —— 那是上一次 sync 存下的值，
         // 而紧随其后的渲染（buildCardPayload）每次都会重解析；两帧之间 cfg/chatKinds 变了就错位：
         // seal 按 stable 推了 reply、渲染却按 full 画 ⇒ 同段答复显示两次（反向则答复消失）。
         if (resolveCardMode(bot, chatId) === 'stable') {
           card.blocks.push({ type: 'message', text: reply })
           replaced = true
         } else {
-        // 🔴 0.7.9（维护者 2026-10-03 ②「过程卡文字突然消失」）：**只追加，绝不覆盖 note、绝不删块**。
+        // 🔴 0.7.9（2026-10-03 ②「过程卡文字突然消失」）：**只追加，绝不覆盖 note、绝不删块**。
         //    旧实现在这里把 replySeqs 命中的 note 覆盖成整段 reply、其余同批 note 全删 ——
         //    而 replySeqs 是"从末尾往前扫、跨过工具调用继续收"得来的（见上方 L3563-3579），
         //    一轮里它能覆盖**整轮**叙述 ⇒ 过程卡的分步叙述被吞成一段（就是"文字消失"的观感）。
         //    这一分支的触发面比 0.7.5 修的分卡路径更宽：**所有 <30s 回合、纯旁白回合、notSpoken 回合**
         //    都走这里（conclusionEligible = !notSpoken && !narrationOnlyTurn && elapsed>=30s）。
-        // 0.7.10（独立审查 MED#3799 修正）：**不能按"整段相等"判重** —— 镜像 note 走 appendNote 时会被
+        // 0.7.10（独立审查 审查项 修正）：**不能按"整段相等"判重** —— 镜像 note 走 appendNote 时会被
         //   `clipNoteText(…, MAX_NOTE_CHARS=500)` 处理，而它**不是纯截断**：它在 500 字附近**按换行切**、
         //   去掉尾部表格行、**补一个 `…`**、还可能把被切掉的 🎯 目的行**前置**到 note 开头 ⇒ 剪过的 note
         //   **不是 reply 的前缀**（我第一版用 startsWith 判，仍然失配 —— 自查时当场发现并改掉）。
@@ -7324,16 +7369,16 @@ export function apply(ctx) {
           while (i < n && a[i] === b[i]) i++
           return i
         }
-        // 0.7.11（独立审查 0.7.10：HIGH#3823 / MED#3825 / MED#3819，逐条核对 0 误报）三处修正：
+        // 0.7.11（独立审查 0.7.10：HIGH#3823 / 审查项 / 审查项，逐条核对 0 误报）三处修正：
         // ① 「整段已在卡上」（公共前缀 = 整段）必须**显式**判「无需追加」，不受 120 阈值闸限制 ——
         //    否则 <120 字的短回复整段重追加（**最高频**路径，恰是本去重要消灭的重复，HIGH#3823）。
         // ② 归一化会折叠空白（\n\n→空格、首尾 trim）⇒ 归一化长度 ≠ 原文长度；切原文必须用
-        //    「归一化下标 → 原文下标」映射（normWithMap 的 ends），不能拿归一化长度直接 slice（MED#3825）。
+        //    「归一化下标 → 原文下标」映射（normWithMap 的 ends），不能拿归一化长度直接 slice（审查项）。
         // ③ clipNoteText 会把被截掉的 🎯 目的行**前置**到镜像 note 开头（见上方 missing 分支：
         //    `missing… + '\n' + clipped`，0.7.10 注释写"补回末尾"系笔误）⇒ 比较前两侧都要剥掉
-        //    前置 🎯 行，否则"🎯 在末尾"的长回复（smoke 28 形状）公共前缀 = 0，整段重追加（MED#3819）。
+        //    前置 🎯 行，否则"🎯 在末尾"的长回复（smoke 28 形状）公共前缀 = 0，整段重追加（审查项）。
         // 安全阀：凡这次"不再追加"的部分（前置行、已展示前缀）必须逐段确认真的在卡上；
-        // 任何一段查不到 ⇒ 放弃去重整段照发 —— 宁可重复，不可丢字（维护者 红线）。
+        // 任何一段查不到 ⇒ 放弃去重整段照发 —— 宁可重复，不可丢字（维护者 关键约束）。
         // 0.7.12（审查 2m+3low 全收）：归一化单一信源（normWithMap 兼供 note 侧）/ onCard 整行比较 /
         //   严格判空 / WS_RE 提升。
         const LEADING_PURPOSE_RE = /^(?:[^\S\n]*(?:[-*][^\S\n]*)?🎯[^\n]*(?:\n|$))+/
@@ -7367,7 +7412,7 @@ export function apply(ctx) {
         const noteTexts = card.blocks.filter((b) => b && typeof b.text === 'string' && b.text).map((b) => b.text)
         const onCard = (line) => {
           const t = line.trim()
-          // 0.7.12（审查 MED#3853）：**整行**比较 —— 子串命中会把"卡上有更长的行"误当"这条短目的行已展示"，
+          // 0.7.12（审查 审查项）：**整行**比较 —— 子串命中会把"卡上有更长的行"误当"这条短目的行已展示"，
           // 在非镜像巧合路径上从尾部丢字（违反"宁可重复，不可丢字"）。
           return Boolean(t) && noteTexts.some((tx) => tx.split('\n').some((l) => l.trim() === t))
         }
@@ -7482,7 +7527,7 @@ export function apply(ctx) {
     let turn = await runTurn(commandHold && commandHold.agent ? commandHold.agent : agent, leadOpts)
     // 会话级损坏（v4 格式校验拒收等 SessionFormatError 族）⇒ 写入通道已坏、**每轮必炸**，
     // 重建会话正是正解——不得走下面的「上游报错不自愈」分支（2026-10-19 BA 池实锤：
-    // 该 skip 让坏会话永远不自愈，同一报错反复出现；中台 #2009/#2010）。
+    // 该 skip 让坏会话永远不自愈，同一报错反复出现；内部记录/内部记录）。
     const sessionCorruptFailure = Boolean(turn.failure
       && /format v4 message|SessionFormatError|session format/i.test(turn.failure.message))
     if (!turn.hadOutput && turn.failure && !sessionCorruptFailure) {
@@ -7547,7 +7592,7 @@ export function apply(ctx) {
             + ') — keeping the failed turn as-is, will not create yet another session')
         } else {
           // 原因用上游给的真实原因（有的话），不再一律猜「可能被 dsh 重启打断」。
-          // 中台 #2216：这句同样进员工对话框 ⇒ 走档位闸（L3+ 人话短语；其余统一话术，
+          // 内部记录：这句同样进员工对话框 ⇒ 走档位闸（L3+ 人话短语；其余统一话术，
           //   原文只进日志——封口那行 `turn sealed` 已带 failure= 全文，ALERT 也在 runTurn 打过）。
           const why = failedTurn.failure
             ? safeFailureReasonForViewer(failedTurn.failure, identityActor, guardOn)
@@ -7759,7 +7804,7 @@ export function apply(ctx) {
   //   尾段。普通路径与 post 附件下载完成后的续派发**共用同一实现**——两条腿一旦各写一份，
   //   就是第 16 轮那条"两个入口口径不一致"温床的本体复制。text 在此重算：优先取
   //   evt.textRendered（mention 还原/post 落盘说明都由调用方写进这个字段）。
-  // 🔴 第四十八轮 LOW#3（核对为真，两入口共用）：命令通道**不消费 evt.textRendered**
+  // 🔴 第四十八轮 审查项（核对为真，两入口共用）：命令通道**不消费 evt.textRendered**
   //   （只吃锚点剥出的 cmd），/plan、/goal 起回合时还走 skipSend 连正文都不重投 ⇒
   //   post 内嵌附件的落盘说明在命令通道两头都不露＝#65 的"静默丢附件"从命令口复发。
   //   补一条可见文字回执；没附件时整条跳过（不给普通命令加噪声）。
@@ -7775,9 +7820,9 @@ export function apply(ctx) {
     })
   }
 
-  // 🔴 第五十轮 LOW#3（核对为真）：两个命令入口（内部 handleInbound / 真机事件
+  // 🔴 第五十轮 审查项（核对为真）：两个命令入口（内部 handleInbound / 真机事件
   //   dispatchParsedInbound）原来**各抄一份**「占位 chat 建出来 + 当场落盘」，只差局部变量名
-  //   和日志串——正是本批次到处在消灭的"两个入口口径不一致"温床（第四十五轮 LOW#1 当时就是
+  //   和日志串——正是本批次到处在消灭的"两个入口口径不一致"温床（第四十五轮 审查项 当时就是
   //   分别补在两处的）。收成单源：以后改一处不会漏另一处。
   //   为什么必须当场落盘：审批人**第一条消息就是 /help 这类不起回合的命令**时，noteChatPeer
   //   的即时 flush 发生在 chat 建出来之前 ⇒ peer 只在内存、重启即丢、审批卡找不回私聊。
@@ -7798,6 +7843,55 @@ export function apply(ctx) {
     return chat
   }
 
+  // [RC-004-F085-20261117] 评价追问回复路由：发卡程序经 inject-context 声明过回填通道的用户，
+  //   其下一条 p2p 纯文本由桥以**桥侧真值 sender_open_id**（入站事件服务端字段，模型在会话里
+  //   拿不到——RC-004 v2 注入路线的结构性缺口）优先调 v2 evaluation_chat：
+  //     非空回复 ⇒ sendPlainText 回执用户（「已记录」闭环），登记消费；
+  //     空回复（v2 无话可说＝无待答轮次）⇒ 不劫持，消息按原链进 agent，登记消费；
+  //     端点失败/超时 ⇒ 降级原链＋日志留痕，登记放回（TTL 兜底，注入上下文兜底模型面）。
+  //   防误伤三闸：仅 p2p＋仅 text＋仅登记命中（未登记用户/群聊/富文本/合成 _internal 消息零影响）；
+  //   同步 take 防 same-拍双 claim；命令分支与待答问分支在本函数之前已各自 return（优先级：命令＞
+  //   待答卡＞回填路由＞steer/普通链）。
+  function maybeRouteEvalChat(bot, evt, text) {
+    if (evt._internal) return false                       // 合成消息（注入/cardfail 等）永不路由
+    if (String(evt.chat_type || '') !== 'p2p') return false
+    if (String(evt.message_type || '') !== 'text') return false
+    if (!text || !String(text).trim()) return false
+    const sender = evt.sender && evt.sender.sender_id
+    const openId = sender && sender.open_id
+    if (!openId) return false
+    const entry = evalRoutes.take(bot.cfg.appId, openId)
+    if (!entry) return false
+    console.log('[fs] evalchat route claimed chat=' + evt.chat_id + ' open=' + String(openId).slice(0, 10)
+      + ' tag=' + entry.tag)
+    bot.chain = bot.chain.then(async () => {
+      let r = null
+      try {
+        r = await callEvalChat(entry, openId, text)
+      } catch (error) {
+        console.log('[fs] evalchat route call error: ' + String(error && error.message || error))
+      }
+      const act = decideRouteAction(r)
+      if (act.hijack) {
+        console.log('[fs] evalchat route receipt chat=' + evt.chat_id + ' tag=' + entry.tag)
+        try { await sendPlainText(bot, evt.chat_id, act.reply) } catch (error) {
+          console.log('[fs] evalchat route receipt send failed: ' + String(error && error.message || error))
+        }
+        return
+      }
+      if (act.consume) {
+        console.log('[fs] evalchat route empty reply (no pending ask), degrade to agent: tag=' + entry.tag)
+      } else {
+        evalRoutes.reinsert(entry)
+        console.log('[fs] evalchat route endpoint failed, degrade to agent (entry kept, ttl bounded): tag=' + entry.tag)
+      }
+      return handleInbound(bot, evt)
+    }).catch((error) => {
+      console.log('[fs] handler error: ' + String(error && error.stack || error))
+    })
+    return true
+  }
+
   function dispatchParsedInbound(bot, evt) {
     const text = typeof evt.textRendered === 'string' ? evt.textRendered : extractText(evt.content)
     const cmd = evt.textCommandAnchor ? splitCommand(evt.textCommandAnchor) : undefined
@@ -7813,12 +7907,12 @@ export function apply(ctx) {
     //   「提问卡 → 插话 → chain」的普通通道，既不会把已知命令执行两遍，也不改变已知命令的行为。
     if (cmd && resolveCommandName(cmd.name)) {
       const chatId = evt.chat_id
-      // 🔴 第四十八轮 LOW#3（核对为真）：命令分支**不消费 textRendered**（它只吃锚点剥出的 cmd），
+      // 🔴 第四十八轮 审查项（核对为真）：命令分支**不消费 textRendered**（它只吃锚点剥出的 cmd），
       //   /plan、/goal 起回合时更是走 skipSend 连正文都不重投 ⇒ post 的落盘说明在命令通道
       //   两头都不露＝#65 要消灭的"静默丢附件"从命令口复发。补一条**可见文字回执**，
       //   两个入口（真机事件 / 内部 handleInbound）各调同一个函数，口径单源。
       commandAttachmentReceipt(bot, chatId, evt)
-      // 🔴 第五十轮 LOW#3：与内部入口**同一条**实现（原来两处逐字节重复，只差日志串）。
+      // 🔴 第五十轮 审查项：与内部入口**同一条**实现（原来两处逐字节重复，只差日志串）。
       const chat = ensureCommandChat(bot, chatId, 'event')
       // 2026-10-01 修复①（真实入口）：命令**可能在会话里起一个真回合**（/plan <正文>）。
       // 那种情况绝不能在这里 return —— 要落回 handleInbound 走「建卡 → 等回合 → 封口」，
@@ -7853,6 +7947,9 @@ export function apply(ctx) {
       sendPlainText(bot, chatId, '✅ 已收到你的回答。').catch(() => {})
       return
     }
+    // [RC-004-F085-20261117] 待答问之后、steer 之前：被追问面试官的回复优先走回填路由（见
+    //   maybeRouteEvalChat 头注；返回 true＝已被路由/领取，不再进 agent 链）。
+    if (maybeRouteEvalChat(bot, evt, text)) return
     // 回合进行中 ⇒ 直接插话（steer），不再排到 bot.chain 后面等整轮跑完。
     // 见 steerActiveTurn：只有「活跃回合 + 普通消息」才走这条，其余（含无活跃回合）
     // 一律落回原来的串行链，行为不变。
@@ -7999,7 +8096,7 @@ export function apply(ctx) {
           }
         }
       }
-      // 0.7.19（审查 MED#1-C）：**早记 chat 类型** —— 命令（/switch 等）在 handleInbound 之前
+      // 0.7.19（审查 审查项-C）：**早记 chat 类型** —— 命令（/switch 等）在 handleInbound 之前
       // 就从这条链分流走了（`!outcome.turnStarted` 直接 return，见下方 then），永远走不到
       // handleInbound 里的记录 ⇒ 热重载后群的第一条命令必然绕过 stable 门禁（fail-open，
       // 用例 67 实测红：/switch 在群里照常出切换卡）。与 handleInbound 同款守卫：带字段才写。
@@ -8031,7 +8128,7 @@ export function apply(ctx) {
       }
       evt.textCommandAnchor = commandAnchor(rawText, mentionList)
       // 改造⑤：登记 维护者 这条消息，便于他之后引用自己的消息时也能带上下文
-      rememberMessage(evt.message_id, '维护者 的消息：' + String(text || '(非文本消息)'))
+      rememberMessage(evt.message_id, '用户的消息：' + String(text || '(非文本消息)'))
       // 🔴 第四十六轮 MEDIUM#2（核对为真）：handleHelperMessage 是**同步函数**，而 post 附件抠取
       //   只落在 handleInbound ⇒ 入口「提问回答」（6469 一带）与「回合进行中插话」（steer）两支
       //   在它之前 return ⇒ 回合/提问挂着时收到「文字+文件」的 post，附件照样静默丢——正是 #65
@@ -8039,7 +8136,7 @@ export function apply(ctx) {
       //   evt.textRendered，再交 dispatchParsedInbound **原样走原分流**——绕链语义不变，只晚一次下载。
       const evPostAtts = String(evt.msg_type || evt.message_type || '') === 'post'
         ? extractPostAttachments(evt.content) : []
-      // 🔴 第四十八轮 LOW#1（核对为真）：post 附件把派发推到了异步（下载完才 dispatch），
+      // 🔴 第四十八轮 审查项（核对为真）：post 附件把派发推到了异步（下载完才 dispatch），
       //   而同一拍 drain 里**后到的普通消息仍是同步先派发** ⇒ 提问挂着时，带附件的那条真回答
       //   会被后到的普通文字抢先消费（答案错挂到人头上）。修法：入站派发按 bot 排一条
       //   **到达顺序尾队列**。豁免＝刹车/管理类命令（`/stop`、`/plan off`、`/goal`、
@@ -8063,11 +8160,11 @@ export function apply(ctx) {
         bot.inboundDispatchTail = next
       }
       if (evPostAtts.length) {
-        // 🔴 第四十七轮 LOW#5（核对为真）：飞书长连接是 at-least-once（同 app 还可能两 helper 并订），
+        // 🔴 第四十七轮 审查项（核对为真）：飞书长连接是 at-least-once（同 app 还可能两 helper 并订），
         //   去重的"认领"发生在下游 handleInbound/steer ⇒ 重投的 post 事件原来会**先重复下载一遍**
         //   （落一份 -2 重复文件＋误导的 inbound file saved 日志）才被下游判重丢。用**无副作用**的
         //   窥探先判：见过就地整条丢（与下游判重同一判据、同一留痕口径）。
-        // 🔴 第五十轮 LOW#5（核对为真）：认领被本轮的"先下载再派发"推到了下载**之后** ⇒ 光窥探
+        // 🔴 第五十轮 审查项（核对为真）：认领被本轮的"先下载再派发"推到了下载**之后** ⇒ 光窥探
         //   "已认领"盖不住"第一份还在下载"这个窗口，判据换成 `inboundBusy`（已认领 ∪ 在飞）。
         if (inboundBusy(bot, evt.message_id)) {
           console.log('[fs] duplicate inbound skipped (pre-download): ' + String(evt.message_id || ''))
@@ -8079,7 +8176,7 @@ export function apply(ctx) {
         const inFlightKey = markInboundInFlight(bot, evt.message_id)
         let augmented = text
         let attNotes = ''
-        // 🔴 第四十八轮 LOW#1：派发点在尾队列任务里**只出现一次**（第四十七轮 MEDIUM#2 的
+        // 🔴 第四十八轮 审查项：派发点在尾队列任务里**只出现一次**（第四十七轮 MEDIUM#2 的
         //   dispatchedOnce 旗标随之删除——排队后不存在"catch 罩住 dispatch 再补一刀"的形状）。
         //   下载链自己包 try：断链只丢落盘说明，文字照常放行。
         enqueueInbound(async () => {
@@ -8097,7 +8194,7 @@ export function apply(ctx) {
               }
             }
             evt.textRendered = augmented
-            // 🔴 第四十八轮 LOW#3（核对为真）：命令分支只吃锚点剥出的 cmd，**不消费 textRendered** ⇒
+            // 🔴 第四十八轮 审查项（核对为真）：命令分支只吃锚点剥出的 cmd，**不消费 textRendered** ⇒
             //   落盘说明在命令通道两头都不露（agent 没收到、维护者 也看不到；/plan <正文>+附件 更明显：
             //   起回合走 skipSend，正文里的"已保存到"永远不会送进会话）。单列一个字段供命令支补回执。
             evt.postAttachmentNotes = attNotes
@@ -8165,7 +8262,7 @@ export function apply(ctx) {
 
   // ---- approval cards (dsh approval/request -> Feishu card with buttons) -----
   const pendingApprovals = new Map()     // token -> record { bot, chatId, request, settle, timer, cardId }
-  // 2026-09-16 维护者 反馈：3 分钟太短，人常常不在手机前，卡就自动过期被拒了（实测拦掉一条
+  // 2026-09-16 用户反馈：3 分钟太短，人常常不在手机前，卡就自动过期被拒了（实测拦掉一条
   // 正常的 git push）。改为 10 分钟；卡片文案由本常量推导，别再写死数字（原来文案里
   // 硬编码了"3 分钟"，改常量不改文案会自相矛盾）。
   const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
@@ -8269,7 +8366,7 @@ export function apply(ctx) {
   function approvalResultCardPayload(toolName, label, originalElements) {
     const status = '**' + String(label) + '**\n_' + settledStamp() + '_'
     if (Array.isArray(originalElements) && originalElements.length) {
-      // J：正文留着，只换按钮行（维护者 2026-10-03）
+      // J：正文留着，只换按钮行（2026-10-03）
       return {
         config: { wide_screen_mode: true, update_multi: true },
         header: { title: { tag: 'plain_text', content: '🔒 需要你的确认' }, template: 'blue' },
@@ -8300,7 +8397,7 @@ export function apply(ctx) {
       console.log('[fs] approval card updated in place: '
         + String((record.request && record.request.toolName) || '') + ' -> ' + String(label))
     } catch (error) {
-      // 审查 MED#3724：就地更新失败时卡上**按钮还在**、但 token 已被 settle 清掉 ⇒ 再点就是
+      // 审查 审查项：就地更新失败时卡上**按钮还在**、但 token 已被 settle 清掉 ⇒ 再点就是
       // "点了没反应"。补一条纯文本回执（与提问卡/审批单卡两条路一致）：总要有人告诉用户"记下了"。
       console.log('[fs] approval card update failed: ' + String(error && error.message || error))
       const chatId = record.chatId || bot.lastChatId || ''
@@ -8316,20 +8413,20 @@ export function apply(ctx) {
   }
 
   function askApprovalCard(bot, chatId, request) {
-    // 🔒 审批单只在私聊（维护者 2026-10-06：「审批单只能私聊，不能发群。这就直接解决了身份的问题了」）：
+    // 🔒 审批单只在私聊（2026-10-06：「审批单只能私聊，不能发群。这就直接解决了身份的问题了」）：
     //   群里的审批卡＝任何翻到这条消息的人都能点"允许一次"，等于把审批权发给全群。
     //   判据只认入站事件带回来的 `chat_type`（拿不到＝不按会话猜，与两模式那处同源）。
     // 🔴 第二十三轮门槛 MEDIUM#5（核对为真）：原来是**黑名单**（只拒确认过的群）⇒ 类型未知
     //   的会话（kind 没记过/旧状态恢复时没有该字段）会被当成合法私聊，审批卡进群。与本批
     //   `approverChatFor` 的白名单同口径：**只认已确认为 p2p 的会话**（fail-closed）。
-    //   第二十七轮 LOW#8：判据收进唯一入口 `isP2pChat`（本函数是四处消费点之一）。
+    //   第二十七轮 审查项：判据收进唯一入口 `isP2pChat`（本函数是四处消费点之一）。
     if (!isP2pChat(bot, chatId)) {
       console.log('[fs] approval refused (chat not known p2p): kind='
         + String((bot && bot.chatKinds && bot.chatKinds.get(String(chatId))) || '未知')
         + ' tool=' + String(request.toolName) + ' chat=' + String(chatId) + ' ⇒ 审批单只在私聊发')
       void sendPlainText(bot, chatId,
         '⚠️ 这一步需要审批，但**审批单只发在已确认的私聊会话**（群里谁都能点；会话类型没确认过＝不敢发）。请在私聊里继续这个操作。').catch(() => {})
-      // 🔴 第三十轮门槛 LOW#3（核对为真）：这里原来回 'rejected'，与**真人点拒绝**同一个值 ⇒
+      // 🔴 第三十轮门槛 审查项（核对为真）：这里原来回 'rejected'，与**真人点拒绝**同一个值 ⇒
       //   预执行审批钩子把"没发过卡"误报成"用户在飞书拒绝"（8906 的映射按 'rejected' 判拒绝）。
       //   改用框架词表内的 'unavailable'：dsh-user-approval/lib/index.js 文档口径「an answerer that
       //   cannot produce a decision yields 'unavailable' (fail closed)」——拒绝语义不变（仍不放行），
@@ -8403,7 +8500,7 @@ export function apply(ctx) {
       // 🔴 第二十二轮门槛 MEDIUM#5（核对为真）：判据必须是**白名单**不是黑名单 ——
       //   原来只排 `kind==='group'`，kind 未知（会话从没带 chat_type 入站过）的会话会被当私聊，
       //   审批卡（申请人＋能力＋批准按钮）就可能整张发进群，正撞 B1「审批只私聊」的裁决反面。
-      if (!isP2pChat(bot, chatId)) continue   // 第二十七轮 LOW#8：同走唯一入口
+      if (!isP2pChat(bot, chatId)) continue   // 第二十七轮 审查项：同走唯一入口
       return chatId
     }
     return ''
@@ -8443,7 +8540,7 @@ export function apply(ctx) {
     //   无需节流；会话尚未建立时这次 flush 只刷别的 chat，本 chat 由建会话路径的
     //   persistChats 带上 peer（届时 map 里已有值）。
     if (prevOu !== String(ou) || prevUn !== String(un || '')) {
-      // 🔴 第四十七轮 LOW#4（核对为真）：persistChats 是**同步全量写盘**——群里发言人交替
+      // 🔴 第四十七轮 审查项（核对为真）：persistChats 是**同步全量写盘**——群里发言人交替
       //   ⇒ 旧写法每条消息一次阻塞写。按消费方分档：p2p 是审批人契约（approverChatFor）的
       //   消费侧，必须即时落盘；群侧 peer/union 只服务 C7 重启后显示名（越早越好、非硬契约），
       //   合并成旗标由既有节拍**一拍一次**统一刷（正确性不变，写盘次数封顶）。
@@ -8463,7 +8560,7 @@ export function apply(ctx) {
   //   周期节拍（正常路径）与生命周期清理（热重载/停机）。原来只有前者 ⇒ 最后一次节拍之后、
   //   dispose 之前换的发言人会被静默丢弃（`peerFlushPending` 挂在被丢弃的 bot 对象上），
   //   C7 重启后显示名就停在旧人。清理里补一刷，写盘失败按节拍同口径留痕、不阻塞停机。
-  // 🔴 第五十轮 LOW#4（核对为真）：旗标**只在写成功之后**才清——原来先清后写，写盘一抛就
+  // 🔴 第五十轮 审查项（核对为真）：旗标**只在写成功之后**才清——原来先清后写，写盘一抛就
   //   "旗标已落、盘上没变"，节拍路径还有下一拍可补，停机路径没有下一拍＝那份 peer 永久丢，
   //   与上面立的契约正相反。留着的代价是"写盘恒失败时每拍重刷一次并刷日志"，这是
   //   宁可吵、不可默默丢（与 persistChats 失败必须留痕的既有口径同源）。
@@ -8515,7 +8612,7 @@ export function apply(ctx) {
   }
   function capResultCardPayload(person, capability, statusLine) {
     const label = CAPABILITY_LABELS[capability] || String(capability)
-    // 🔴 第二十九轮门槛 LOW#8（核对为真）：`person` 此前是**收了不渲染**的死参数——
+    // 🔴 第二十九轮门槛 审查项（核对为真）：`person` 此前是**收了不渲染**的死参数——
     //   审批人连办几单分不清这张结果卡对应谁的申请；申请卡打了**申请人**，两张卡同口径
     //   （截断规则照抄申请卡：名字优先，ou_ 只上前 12 位）。
     const who = String((person && person.name)
@@ -8604,7 +8701,7 @@ export function apply(ctx) {
         updateInteractive(bot, record.cardId,
           capResultCardPayload(person, capability, '⏰ 已超时（自动拒绝）')).catch(() => {})
       }
-      // 🔴 第二十九轮门槛 LOW#7（核对为真）：超时是全批**唯一没给申请人交代**的出口——
+      // 🔴 第二十九轮门槛 审查项（核对为真）：超时是全批**唯一没给申请人交代**的出口——
       //   拒绝/批准/投递失败/找不到审批人四条都回了可见回执，唯独这里申请人被告知
       //   "批了我会通知你"后就无限等。同口径补一条超时回执（不作答≠不吭声）。
       if (record.requesterChatId) {
@@ -8633,7 +8730,7 @@ export function apply(ctx) {
   // 闸口本身：**同步**返回 true＝已拦下（回执与申请卡异步发出），false＝放行。
   // 为什么不做成 async：`fs_plan_goal` 那条点击分支是同步代码，为了一个闸门去重构整段
   // （把同步流改成 IIFE）不值得，而且同步判完立刻返回才是这里要的语义。
-  // 🔴 第三十六轮门槛 LOW#4（核对为真）：`person` 允许传 **getter**——名字解析要读
+  // 🔴 第三十六轮门槛 审查项（核对为真）：`person` 允许传 **getter**——名字解析要读
   //   bot_roster（文件系统 I/O＋查无时一条 roster miss 日志），总闸关的通道原来在
   //   **调用方参数里**就把这些做完了，违反「总闸关＝今日行为一字不差」（本函数 6839 行
   //   口径）。改成总闸判过之后才解析，off 路径零 I/O、零新日志。
@@ -8662,7 +8759,7 @@ export function apply(ctx) {
         + ' 到期=' + localTimeOf(grant.expires_at) + ' src=' + String(source))
       return false
     }
-    // 🔴 第四十三轮门槛 LOW#3（核对为真）：表**读不到**≠没批过——不能按"没获批"走发起
+    // 🔴 第四十三轮门槛 审查项（核对为真）：表**读不到**≠没批过——不能按"没获批"走发起
     //   申请的老路（那张卡批了也存不进去：recordCapabilityGrant 在 readFailed 时中止入库），
     //   更不能让审批人吃一张注定失败的卡。单立拒因：只喊重试/修表，不发申请。
     if (readFailed) {
@@ -8681,7 +8778,7 @@ export function apply(ctx) {
     // 🔴 第二十五轮门槛 MEDIUM#2（核对为真）：**同步回执不许承诺"已发给审批人"**——
     //   卡片投递是异步的，sendInteractive 失败时 catch 会再发一条"发不出去"，两条并排＝自相矛盾
     //   （上一轮只修了同步的"找不到审批人"支路，异步支路漏了）。"申请已受理"不承诺送达；
-    //   **成功侧不发追加回执**（第二十七轮 LOW#7 判决：审查核实 .then 实际只落日志、
+    //   **成功侧不发追加回执**（第二十七轮 审查项 判决：审查核实 .then 实际只落日志、
     //   旧注释却许诺"补一条已发到审批人私聊"——按现状修注释。不加回执：再发一条会让申请人
     //   连着吃「受理回执＋送达回执＋批准通知」三条，噪音大于价值；失败侧 catch 已有
     //   "发不出去"可见兜底，语义闭环在"批了我会通知你"上）。
@@ -8695,7 +8792,7 @@ export function apply(ctx) {
     const record = pendingCapRequests.get(token)
     if (!record) {
       console.log('[fs] capability click ignored (no pending request for token): ' + tokenDigest(token))
-      // 🔴 第二十六轮门槛 LOW#8（核对为真）：失效卡的点击不许**只留日志**——30 分钟超时清理
+      // 🔴 第二十六轮门槛 审查项（核对为真）：失效卡的点击不许**只留日志**——30 分钟超时清理
       //   只在 PATCH 成功时才把卡改灰，PATCH 失败 ⇒ 卡还在、记录已没，审批人点「批准」
       //   毫无反应。与 fs_question/fs_plan_goal 同一口径：给点击者可见回执（不作答≠不吭声）。
       if (evtBot && evtChatId) {
@@ -8720,7 +8817,7 @@ export function apply(ctx) {
     }
     if (record.approverChat && evtChatId && evtChatId !== record.approverChat) {
       console.log('[fs] capability click outside approver chat ⇒ 不作答')
-      // 🔴 第二十八轮门槛 LOW#9（核对为真）：能走到这里说明点击者**就是**审批人本人
+      // 🔴 第二十八轮门槛 审查项（核对为真）：能走到这里说明点击者**就是**审批人本人
       //   （卡被转发到别的会话）——兄弟分支全给可见回执，唯独这条静默吞。不作答≠不吭声。
       if (evtBot || record.bot) {
         sendPlainText(evtBot || record.bot, evtChatId,
@@ -8729,7 +8826,7 @@ export function apply(ctx) {
       return true
     }
     const action = String(value.fs_cap_action || '')
-    // 🔴 第二十二轮门槛 LOW#7（核对为真）：原来先删记录再校验 action ⇒ 不认识的动作
+    // 🔴 第二十二轮门槛 审查项（核对为真）：原来先删记录再校验 action ⇒ 不认识的动作
     //   会让卡片永久停在 pending（记录已没了下文，再点只会"no pending request"）。
     //   把校验提到删除之前：不认识的动作＝不作答也不销账，30 分钟超时兜底照常生效。
     if (action !== 'deny' && GRANT_TERM_KEYS.indexOf(action) < 0) {
@@ -8740,7 +8837,7 @@ export function apply(ctx) {
     if (record.timer) clearTimeout(record.timer)
     const bot = evtBot || record.bot
     const finish = (statusLine, patched) => {
-      // 🔴 第四十三轮门槛 LOW#5（核对为真）：PATCH 失败原来**只打一行日志**——此时记录已删、
+      // 🔴 第四十三轮门槛 审查项（核对为真）：PATCH 失败原来**只打一行日志**——此时记录已删、
       //   批准其实已生效，审批人再点只会走 no pending 支路，这一次点击表现为「点了没反应」；
       //   与同文件兄弟站点（updateApprovalCard、fs_question、/model 点击）「改不动就退回纯文本」
       //   一律口径不一致，也违反本批「不作答≠不吭声」。补同款降级。
@@ -8782,8 +8879,8 @@ export function apply(ctx) {
     return true
   }
 
-  // ─── 工作区 / 会话 两级切换（维护者 2026-10-02 定稿 A 方案，与 GUI 同源）────────────
-  // 维护者 原话：「切换会话 = 可以切到**任何一个工作区**；会话列表 = **同一个工作区里面的不同会话**」——
+  // ─── 工作区 / 会话 两级切换（2026-10-02 定稿 A 方案，与 GUI 同源）────────────
+  // 需求原文：「切换会话 = 可以切到**任何一个工作区**；会话列表 = **同一个工作区里面的不同会话**」——
   // 这正是 DSH 自己的模型：**工作区是 `workspaceRegistry` 里的注册实体**
   //（`{path,title,sessionIds[]}`，GUI 侧边栏用的就是它），**会话挂在它下面**（实体的 `sessionIds`）。
   // 旧实现把两个概念混在一张卡里：第③组标题写"其它工作区"，列的其实是"别的工作区里的会话"，
@@ -8794,25 +8891,32 @@ export function apply(ctx) {
   //      底部有「← 返回工作区列表」；
   //   ③ `/list` = **当前工作区的会话**（当前工作区 ＝ 活跃会话的 cwd）。
   // 两个安全约束（写进卡面，不让 维护者 猜）：
-  //  · 正在别处运行的会话（🟡）**不给"接管"** —— DSH 里同一会话被两处同时驱动会写坏历史，
-  //    只允许"在该工作区新建"。
+  //  · **正在跑这一轮**的会话（🟡）不给"接管" —— 同一会话被两处同时驱动会写坏历史。
+  //    注意（2026-11-16 实测纠偏）：判据从"活着（live）"收窄成"真的在跑"
+  //    （见 sessionIsRunning）——"活着但空闲"的会话必须能切，否则整张卡全被挡成"不能切换"。
   //  · "新建"不碰任何旧会话：只是在该工作区开一个全新会话（cwd = 那个工作区），
   //    并**顺手挂进 `workspaceRegistry`**（best-effort）⇒ GUI 侧边栏也立刻看得到它。
   const SWITCH_CARD_TTL_MS = 15 * 60 * 1000
   const SWITCH_SUMMARY_MAX_BYTES = 4 * 1024 * 1024   // 只对小于此体积的日志读"首条消息"当摘要
-  // 摘要显示多少字。维护者 2026-10-04：「摘要不够长啊，能搞长一点吗？」（实测 lens 全是 61 ⇒ 全部撞上限）。
+  // 摘要显示多少字。2026-10-04：「摘要不够长啊，能搞长一点吗？」（实测 lens 全是 61 ⇒ 全部撞上限）。
   // 前缀去掉后正文能显示更多，这里给 120 字（约两行）；要调只改这一个数。
   const SWITCH_SUMMARY_CHARS = 120
-  // 摘要读取的**单条超时**。维护者 2026-10-04 实测：8 条会话里 5 条拿到 `no snapshot …(timeout?)`
+  // 摘要读取的**单条超时**。2026-10-04 实测：8 条会话里 5 条拿到 `no snapshot …(timeout?)`
   //   ⇒ 1.5 秒对"加载整份会话日志"（几十 MB）太短 ⇒ 放宽到 5 秒。
   const SWITCH_SUMMARY_TIMEOUT_MS = 5000
   const SWITCH_WS_LIMIT = 12          // 工作区最多列几个（注册表之外从会话兜底补的也算在里面）
-  const SWITCH_SESS_LIMIT = 12        // 单个工作区的会话最多列几行（卡片行数有上限）
-  const SWITCH_SESS_PAGE = 5          // 维护者 2026-10-02：「只显示 5 个会话，每一页显示 5 个，做一个翻页」
-  const SWITCH_SESS_MAX = 50          // 翻页也只翻最近 50 个（避免为一个工作区读上百条会话）
+  // 单个工作区**最多列多少行会话**，以及一页放几个 —— 两个数现在是同一个值 10。
+  // 2026-11-16 维护者 定稿（原话）：「我的想法是它要能显示最近的10个会话。不用很多，就最近有沟通过
+  // 的10个会话就可以了」⇒ 他要的是**一屏看到最近的 10 个**，不是"再翻一页才看全 10 个"
+  // ⇒ 上限与每页条数一起设成 10（页数恒为 1，翻页按钮自然不再出现）。
+  // 这取代 2026-10-02 那条「每页 5 个、做一个翻页」的旧口径（A22：作废的直接删，不留残句）。
+  // 沿革：11-16 上午先把它从 12（死常量时代的上限）放到 50，维护者 明确"不用很多，10 个就够"
+  // ⇒ 收到 10。排序口径不变：按最近活跃（mtime 倒序，当前会话置顶）。
+  const SWITCH_SESS_PAGE = 10
+  const SWITCH_SESS_MAX = 10
   const pendingSwitchCards = new Map()   // token -> { bot, chatId, wsRows, ws, sessRows, timer }
 
-  // 中台 #529：本桥自建会话 id 形如 `fs-main-mv42umv4`，slice(0,8) 恰好只剩前缀
+  // 内部记录：本桥自建会话 id 形如 `fs-main-mv42umv4`，slice(0,8) 恰好只剩前缀
   // 「fs-main-」——终态卡句子里所有新建会话显示同一串无信息量前缀（真机实拍
   // staging 0.8.9 /switch 1 new）。区分度在尾巴 ⇒ 对该前缀改取尾 8 位；其余 id
   // 维持 slice(0,8) 原样。纯显示层函数：/switch 文字命令序号解析走列表索引、
@@ -8834,8 +8938,8 @@ export function apply(ctx) {
     return parts.length ? parts[parts.length - 1] : '（无工作区）'
   }
 
-  // 维护者 2026-10-12 定稿卡面格式：工作区行括号里给「短路径」——能相对 HOME 缩短就相对
-  // （staging：/srv/app/agents/supervisor ⇒ agents/supervisor），相对不了（跨盘等）原样；
+  // 2026-10-12 定稿卡面格式：工作区行括号里给「短路径」——能相对 HOME 缩短就相对
+  // （staging：`<部署根>/agents/supervisor` ⇒ `agents/supervisor`），相对不了（跨盘等）原样；
   // 反斜杠统一成正斜杠，与 维护者 给的示例同形。纯显示层，比较用大小写不敏感（Windows 盘符）。
   function shortWorkspacePath(cwd) {
     let p = String(cwd || '').replace(/\\/g, '/')
@@ -8947,6 +9051,39 @@ export function apply(ctx) {
     return found
   }
 
+  // 标题的**零 I/O 来源**：宿主投影缓存里本来就存着每个会话的 title（GUI 侧边栏读的就是它）。
+  // 为什么要加（2026-11-16 实测）：「有一些会话它只会显示"会话"然后加一个数字，我要切过去
+  // 它才能显示那会话的标题、会话名称。所以我切过去之前，根本不知道它是什么」——
+  // 老实现只对**前 5 行**同步读日志回填标题（TITLE_BACKFILL_MAX=5），一页 10 行里排在后面的、
+  // 又不在本 chat 绑定里的会话就没有标题，只剩 `会话 N` 这种占位名。
+  // 缓存读是同步的、不碰磁盘（宿主注释写明 `cachedSnapshot` 是 zero-I/O listing read）⇒
+  // 10 行全都能拿到真名，且不给出卡加延迟；缓存没命中才退回读日志头（titleFromLogs）。
+  function cachedTitleFor(meta) {
+    if (!meta || !meta.id) return ''
+    const pick = (block) => {
+      const values = block && block.values
+      const t = values ? (values.title != null ? values.title : values.sessionTitle) : undefined
+      return typeof t === 'string' && t.trim() ? t.trim() : ''
+    }
+    try {
+      const cache = ctx.get('sessionProjectionCache')
+      if (!cache) return ''
+      if (typeof cache.cachedSnapshot === 'function') {
+        const hit = pick(cache.cachedSnapshot(meta, ['title']))
+        if (hit) return hit
+      }
+      // 当前代还没写过 checkpoint 时，退回"上一版 checkpoint 的标题"这口只读提示（宿主明确支持的路径）。
+      if (typeof cache.cachedPredecessorTitle === 'function') {
+        const hit = pick(cache.cachedPredecessorTitle(meta))
+        if (hit) return hit
+      }
+    } catch (error) {
+      console.log('[fs] switch: projection title hint failed for ' + String(meta && meta.id) + ': '
+        + String(error && error.message || error))
+    }
+    return ''
+  }
+
   function liveTitle(agent) {
     try {
       const events = sessionEvents(agent.session)
@@ -8960,13 +9097,47 @@ export function apply(ctx) {
     return ''
   }
 
+  // 会话日志文件的 (size, mtime)：**"最近活跃"的可靠来源**（宿主事件不带墙钟时间，只有文件时间可用）。
+  // 为什么要这条兜底（2026-11-16 实测）：「列表不是按照最后对话的顺序来排序的」——
+  //   原来只走宿主 `sp.locate(meta)`（它按 `meta.cwd` 拼路径）。一旦 loc 拿不到/路径对不上，
+  //   整条链就**静默退回 `meta.createdAt`（创建时间）** ⇒ 列表看起来像"按创建顺序"排的。
+  //   这里补一条自己扫盘的兜底（与 titleFromLogs 同一套 sessions/<proj>/<id>/ 目录约定），
+  //   并缓存 30 秒——/switch 一次最多 10 行，最多 10 次目录扫描。
+  const logFileInfoCache = new Map()     // sessionId -> { at, info }
+  function logFileInfo(sessionId) {
+    const id = String(sessionId || '')
+    if (!id) return undefined
+    const now = Date.now()
+    const hit = logFileInfoCache.get(id)
+    if (hit && now - hit.at < 30000) return hit.info
+    let best
+    try {
+      for (const dir of sessionLogDirs(id)) {
+        let files = []
+        try {
+          files = readdirSync(dir).filter((f) => /^session(\.v\d+)?\.jsonl\.zstd$/.test(f))
+        } catch { continue }
+        for (const f of files) {
+          try {
+            const st = statSync(join(dir, f))
+            if (!best || st.mtimeMs > best.mtime) best = { size: st.size, mtime: st.mtimeMs }
+          } catch { /* 单文件读不到就当没有 */ }
+        }
+      }
+    } catch { /* 目录读不到就当没有 */ }
+    logFileInfoCache.set(id, { at: now, info: best })
+    return best
+  }
+
   function artifactInfo(sp, meta) {
     try {
       const loc = typeof sp.locate === 'function' ? sp.locate(meta) : undefined
-      if (!loc || !loc.path) return undefined
-      const st = statSync(loc.path)
-      return { size: st.size, mtime: st.mtimeMs }
-    } catch { return undefined }
+      if (loc && loc.path) {
+        const st = statSync(loc.path)
+        return { size: st.size, mtime: st.mtimeMs }
+      }
+    } catch { /* locate 拿不到 ⇒ 走下面的扫盘兜底 */ }
+    return logFileInfo(meta && meta.id)
   }
 
   // 读一份会话日志快照（调用方只用 `{ events }`）。
@@ -8988,7 +9159,7 @@ export function apply(ctx) {
         const snap = await sq.readSession(sessionId)
         if (!snap || !Array.isArray(snap.events)) {
           // 诊断：区分「返回 null」「缺 events 字段」「events 不是数组」——三者修法不同。
-          // （维护者 2026-10-04 实测：8 条会话里 5 条拿不到快照，而超时阈值当时只有 1.5 秒。）
+          // （2026-10-04 实测：8 条会话里 5 条拿不到快照，而超时阈值当时只有 1.5 秒。）
           console.log('[fs] switch: readSession odd shape for ' + sessionId
             + ' got=' + (snap === null ? 'null' : typeof snap)
             + (snap && typeof snap === 'object' ? ' keys=' + Object.keys(snap).join('|') : '')
@@ -9031,7 +9202,7 @@ export function apply(ctx) {
           + ' raced=' + (raced === undefined ? 'undefined(timeout?)' : typeof raced))
         return ''
       }
-      // 维护者 2026-10-04 决策：**摘要用【最近一句】，不用第一句** ——
+      // 2026-10-04 决策：**摘要用【最近一句】，不用第一句** ——
       //   ① 会话标题本来就是按开头/主题生成的 ⇒ 摘要再用第一句＝重复；最近一句才互补；
       //   ② 认出会话靠的是"我刚在聊什么" ⇒ 长会话里第一句早忘了，最近一句才是记忆锚点。
       //   实现：**从后往前扫，命中即返回**（即最后一条真实用户消息）。
@@ -9051,7 +9222,7 @@ export function apply(ctx) {
           .replace(/\s+/g, ' ')
           .trim()
         // 去掉【插件自己加的投递前缀】（`[飞书 ou_…] ` / `[飞书 姓名] ` / `[飞书消息] `）——
-        // 那是给人看的标记，**不该占据摘要**（维护者 2026-10-04：「它显示的是飞书开头的那串代码」）。
+        // 那是给人看的标记，**不该占据摘要**（2026-10-04：「它显示的是飞书开头的那串代码」）。
         text = text.replace(/^\[飞书[^\]]*\]\s*/, '')
         // 0.8.0 互认的两条**明细行**（【发送方】/【本条 @ 的对象】）同理只该进模型上下文：
         //   它们被拼进会话文本后会持久化成 user/message，而摘要只剥开头前缀的话，
@@ -9148,7 +9319,10 @@ export function apply(ctx) {
         out.set(id, {
           id,
           cwd: String(meta.cwd || (prev && prev.cwd) || ''),
-          mtime: (info && info.mtime) || (prev && prev.mtime) || Number(meta.createdAt) || 0,
+          // 取**已知信号里的最大时间**，而不是 `||` 链（2026-11-16：任一环缺失就退回 createdAt，
+          // 排序立刻变成"按创建顺序"）。这里 mtime 是真的"最后一次写日志"，永远 ≥ 创建时间。
+          mtime: Math.max(Number((info && info.mtime) || 0), Number((prev && prev.mtime) || 0),
+            Number(meta.createdAt) || 0),
           meta,
           size: info && info.size,
         })
@@ -9173,7 +9347,8 @@ export function apply(ctx) {
         // 于是"没有持久化快照的会话"每次调用都拿到新时间 ⇒ 卡片序号与文字命令
         // `/switch <工作区> <序号>` 重建出来的序号会漂移（同一行指到不同会话）。
         // 我们自己的会话 id 形如 `fs-main-<base36 时间戳>` ⇒ 直接从 id 里还原真实创建时间。
-        mtime: (prev && prev.mtime) || sessionIdTime(id),
+        // 同上：取最大信号，别让"创建时间"盖掉真实的最后活跃时间。
+        mtime: Math.max(Number((prev && prev.mtime) || 0), Number(sessionIdTime(id)) || 0),
         meta: prev && prev.meta,
         size: prev && prev.size,
       })
@@ -9300,14 +9475,23 @@ export function apply(ctx) {
       const mb = Number(b.mtime) || 0
       return (cb - ca) || (mb - ma) || String(a.id).localeCompare(String(b.id))
     })
-    // titleFromLogs 是**同步读盘**（每个项目目录 readdirSync + 读日志头）；旧实现只在"本聊天那几条"
-    // 上用它。这里最多回填 TITLE_BACKFILL_MAX 条，其余留给下面的首条消息摘要（异步）（门槛第二轮 low#6）。
-    const TITLE_BACKFILL_MAX = 5
+    // 标题优先级：活会话内存 > 投影缓存（零 I/O）> 读日志头回填（同步读盘）。
+    // 2026-11-16 修（实测：卡片上只剩「会话 N」占位名，切过去才知道是哪个）：
+    //   ① 先走缓存拿真名，覆盖整页；
+    //   ② 回填额度从写死的 5 提到**整页条数**（SWITCH_SESS_MAX）——旧上限让一页 10 行里后 5 行
+    //      永远拿不到标题。读盘仍有上限（就是这一页的行数），且结果进 logTitleCache 复用。
+    // 排序口径可核对（2026-11-16 维护者 报「不是按最后对话排序」）：把前 12 行的"最近活跃时间"
+    // 打进日志，出问题时能拿它跟真实对话时间对账，不用靠猜。
+    console.log('[fs] switch: recency ' + cands.slice(0, 12)
+      .map((c) => shortSessionId(String(c.id)) + '@' + (fmtClock(Number(c.mtime) || 0) || '-'))
+      .join(' '))
+    const TITLE_BACKFILL_MAX = SWITCH_SESS_MAX
     let backfilled = 0
-    const rows = cands.slice(0, SWITCH_SESS_LIMIT).map((c) => {
+    const rows = cands.slice(0, SWITCH_SESS_MAX).map((c) => {
       const idx = (chat.sessions || []).findIndex((s) => String(s.id) === String(c.id))
       const agent = live.get(String(c.id))
       let title = agent ? liveTitle(agent) : ''
+      if (!title) title = cachedTitleFor(c.meta)
       if (!title && backfilled < TITLE_BACKFILL_MAX) {
         backfilled += 1
         title = titleFromLogs(String(c.id))
@@ -9322,6 +9506,8 @@ export function apply(ctx) {
         inChat: idx >= 0,
         current: idx >= 0 && idx === chat.activeIndex,
         live: Boolean(agent),
+        // 「真的在跑这一轮」——只有它会挡住接管；仅"活着但空闲"不挡（见 sessionIsRunning 注释）。
+        running: sessionIsRunning(agent, String(c.id)),
         title,
         label: idx >= 0 ? String((chat.sessions[idx] && chat.sessions[idx].label) || '') : '',
         mtime: Number(c.mtime) || 0,
@@ -9331,9 +9517,9 @@ export function apply(ctx) {
       }
     })
     // 没标题的补"首条消息"当摘要（认得出是哪一个）；读盘有代价，最多 8 条
-    // 2026-10-04（维护者 选定方案 B）：**改为"所有行都取摘要"** ——
+    // 2026-10-04（按需求选定方案 B）：**改为"所有行都取摘要"** ——
     //   原先是 `filter(r => !r.title)`，只有【没标题】的会话才去读；而 DSH 现在几乎每个会话都有标题
-    //   ⇒ need 恒为空 ⇒ 首条消息摘要**从来没被读过**（维护者 实测：「显示的是标题，但是没有显示会话内容」）。
+    //   ⇒ need 恒为空 ⇒ 首条消息摘要**从来没被读过**（实测：「显示的是标题，但是没有显示会话内容」）。
     //   上限仍是 8 条（读盘开销由它兜住，未变）。
     const need = rows.slice(0, 8)
     if (need.length) {
@@ -9346,6 +9532,9 @@ export function apply(ctx) {
         + ' lens=[' + texts.map((t) => (t ? String(t).length : 0)).join(',') + ']')
       need.forEach((r, i) => { r.summary = texts[i] || '' })
     }
+    // 真实候选总数（可能大于 SWITCH_SESS_MAX）。卡面与 `/list` 用它如实标注"还有多少个没列出来"——
+    // 不许再把截断后的长度当成"这个工作区一共这么多会话"（2026-11-16：卡面恒写 12，实测误导）。
+    rows.candidateCount = cands.length
     return rows
   }
 
@@ -9359,7 +9548,7 @@ export function apply(ctx) {
     const list = buttons || []
     return {
       tag: 'column_set',
-      // 维护者 2026-10-02：「两个按钮要**同一排**，不要分成两行」。
+      // 2026-10-02：「两个按钮要**同一排**，不要分成两行」。
       // 两个按钮时用飞书文档里的 **bisect（二等分）** —— 这是"固定两列并排"的语义；
       // 其它数量退回 stretch。另：不写 background_style（默认值没必要，少一个不确定项）。
       flex_mode: flexMode || (list.length === 2 ? 'bisect' : 'stretch'),
@@ -9379,7 +9568,7 @@ export function apply(ctx) {
     }
   }
 
-  // 维护者 2026-10-02 选定 **一级 F 版式**（在三个候选里挑的）：
+  // 2026-10-02 选定 **一级 F 版式**（在三个候选里挑的）：
   //   每个工作区两行 —— ① 名字 + 会话数（+ 真的有时才显示 🟡 运行中）
   //                     ② 「进入」「新建」两个按钮**并排**（bisect 等分，不会再被挤成省略号）
   //   卡片底部一个「✕ 取消」（撤销整张卡）。
@@ -9421,12 +9610,12 @@ export function apply(ctx) {
     }
   }
 
-  // 二级卡片（维护者 2026-10-02 选定 C 版式 + 当晚三条修改）：
+  // 二级卡片（2026-10-02 选定 C 版式 + 当晚三条修改）：
   //   · 一行一个会话：「序号. 标题 (+状态徽标)」 ｜ 右侧「切换」
   //   · **会话之间加一条分隔线**（维护者：「这样看起来就更好看」）
   //   · **每页 5 个**，底部给「← 上一页 / 下一页 →」（翻页是 PATCH 同一张卡，不弹新卡）
   //   · 底部**只留 返回 / 取消**（新建收回到一级菜单的那个按钮上）
-  // 会话名进按钮前的截断（维护者 2026-10-02：按钮里的文字一旦超长就会被截成省略号）
+  // 会话名进按钮前的截断（2026-10-02：按钮里的文字一旦超长就会被截成省略号）
   const SESSION_NAME_MAX = 16
   function clipSessionName(name) {
     const chars = [...String(name || '')]
@@ -9435,32 +9624,42 @@ export function apply(ctx) {
 
   function buildSessionCard(ws, rows, pageInfo) {
     const info = pageInfo || { page: 0, pages: 1, total: rows.length }
+    // 截断时**必须说出来**（A57 防呆：不许让"只列了一部分"被读成"一共就这么多"）。
+    // 2026-11-16 实测：卡面恒写「12 个会话」，而真实候选可能有上百个 ⇒ 用户以为会话丢了。
+    const candidateCount = Math.max(Number(info.candidateCount) || 0, Number(info.total) || 0)
+    const hidden = candidateCount > info.total ? candidateCount - info.total : 0
+    // 只有真有多页时才写页码：默认 10 个会话一页放得下，卡面不该出现「第 1/1 页」这种噪音。
+    const pageTag = info.pages > 1 ? '（第 ' + (info.page + 1) + '/' + info.pages + ' 页）' : ''
     const elements = [{
       tag: 'markdown',
       content: '**第二步：选会话** —— **' + ws.title + '**'
-        + '　' + info.total + ' 个会话（第 ' + (info.page + 1) + '/' + info.pages + ' 页）'
-        + '\n<font color=\'grey\'>▶ 当前 ｜ 按最近活跃排序 ｜ 🟡 正在别处运行（不能切换）</font>',
+        + '　' + info.total + ' 个会话' + pageTag
+        + (hidden
+          ? '\n<font color=\'grey\'>该工作区共 ' + candidateCount + ' 个会话，这里按最近活跃列前 '
+            + info.total + ' 个（另有 ' + hidden + ' 个更早的未列出）</font>'
+          : '')
+        + '\n<font color=\'grey\'>▶ 当前 ｜ 按最近活跃排序 ｜ 🟡 正在跑这一轮（跑完才能切）</font>',
     }]
     if (!rows.length) {
       elements.push({ tag: 'markdown', content: '（这个工作区还没有会话）' })
     }
-    // 维护者 2026-10-02 选定 **L1 版式**：**会话名直接做成整行按钮**（点名字即切换）。
+    // 2026-10-02 选定 **L1 版式**：**会话名直接做成整行按钮**（点名字即切换）。
     // 为什么不是"左名字 + 右按钮"：真机实测（K1 左边只 3 个字）也会被渲染成**上下两行** ——
     // 手机端「文字 + 按钮」同行排不了，而**纯按钮行**能并排（K4 并排）。所以让按钮自己承载名字。
     rows.forEach((row, j) => {
       const n = j + 1
       const what = clipSessionName(row.title || row.summary || row.label || '（未命名会话）')
-      // 2026-10-04（维护者 选定方案 B）：**标题在按钮上，首条消息摘要另起一行灰色小字**。
+      // 2026-10-04（按需求选定方案 B）：**标题在按钮上，首条消息摘要另起一行灰色小字**。
       //   原实现是 `title || summary` 二选一 ⇒ 标题非空时永远看不到摘要（维护者：「没有显示会话内容」）。
       //   出卡前会经 sanitizeCardElements → sanitizeMarkdownForFeishu 统一清洗 ⇒ 这里不必手工转义。
       const sub = row.summary ? '<font color=\'grey\'>' + clipSessionName(row.summary) + '</font>' : ''
-      const blocked = row.live && !row.inChat && !row.current
+      const blocked = row.running && !row.inChat && !row.current
       if (j > 0) elements.push({ tag: 'hr' })      // 维护者：会话之间要分隔线
       if (blocked) {
         // 不能切换的行**不给按钮**（给了只会点出一句"不能接管"），用一行文字写清
         elements.push({
           tag: 'markdown',
-          content: n + '. **' + what + '**　<font color=\'grey\'>🟡 正在别处运行，不能切换</font>'
+          content: n + '. **' + what + '**　<font color=\'grey\'>🟡 正在跑这一轮，跑完再切</font>'
             + (sub ? '\n' + sub : ''),
         })
         return
@@ -9513,9 +9712,17 @@ export function apply(ctx) {
     record.page = p
     record.sessRows = rows
     const hadCard = Boolean(record.cardId)
-    const cardId = await pushSwitchCard(bot, chatId, record, buildSessionCard(wsRef, rows, { page: p, pages, total }))
+    const cardId = await pushSwitchCard(bot, chatId, record, buildSessionCard(wsRef, rows, {
+      page: p,
+      pages,
+      total,
+      // candidateCount 挂在数组上（buildSessionRows 写入）：真实候选总数，用于卡面如实标注被截断。
+      candidateCount: Number((all && all.candidateCount) || 0) || total,
+    }))
     console.log('[fs] /switch session card ' + (hadCard ? 'updated' : 'sent') + ': ws=' + wsRef.path
-      + ' page=' + (p + 1) + '/' + pages + ' total=' + total + ' card=' + String(cardId || ''))
+      + ' page=' + (p + 1) + '/' + pages + ' total=' + total
+      + ' candidates=' + (Number((all && all.candidateCount) || 0) || total)
+      + ' card=' + String(cardId || ''))
     return cardId
   }
 
@@ -9526,7 +9733,7 @@ export function apply(ctx) {
     return record
   }
 
-  // ---- 卡片**原地更新**（维护者 2026-10-02 实测：「这卡片就不能更新吗？我点了一下，它会弹一张新卡片出来。
+  // ---- 卡片**原地更新**（2026-10-02 实测：「这卡片就不能更新吗？我点了一下，它会弹一张新卡片出来。
   // 我切换个会话，就可能弹三四个卡片，然后按返回还继续弹新的卡片」）--------------------------
   // 卡片当然能更新 —— 本插件早就在这么干（提问卡、流式卡都是 PATCH 同一条消息）。
   // 原来我把"进入工作区 / 返回 / 结果提示"全写成"发一张新卡" ⇒ 切一次会话能弹三四张。
@@ -9549,7 +9756,7 @@ export function apply(ctx) {
   }
 
   // 操作结果也**写回同一张卡**（不再另发一条纯文本）。
-  // 🔴 维护者 2026-10-02：「切换完了之后，你画蛇添足搞一个返回按钮干什么？切换了，你就直接的卡，
+  // 🔴 2026-10-02：「切换完了之后，你画蛇添足搞一个返回按钮干什么？切换了，你就直接的卡，
   //    那个卡片就是已切换就行了，就不要有一个返回按钮啊。他再切换的时候就再输入命令了」
   //    ⇒ 结果卡＝**终态卡：不带任何按钮**；要再切换就重新发 `/switch`。
   //    （旧写法是"结果卡上保留『← 回到工作区列表』"，已被上面这句话推翻 ⇒ 直接删，不留旧锚。）
@@ -9590,7 +9797,7 @@ export function apply(ctx) {
     return rows[n]
   }
 
-  // 「取消」＝撤销整张卡（维护者 2026-10-02 要求）。优先**删消息**；删不掉就 PATCH 成一张"已取消"小卡，
+  // 「取消」＝撤销整张卡（2026-10-02 要求）。优先**删消息**；删不掉就 PATCH 成一张"已取消"小卡，
   // 至少不会留一张还能点的旧卡在那儿。
   async function cancelSwitchCard(bot, chatId, record) {
     const gone = (record && record.cardId) ? await deleteMessage(bot, record.cardId) : false
@@ -9651,20 +9858,20 @@ export function apply(ctx) {
       if (typeof feedback === 'function') { await feedback(text, kind || 'ok'); return }
       await sendPlainText(bot, chatId, text)
     }
-    // 中台 #496/#497（维护者 2026-10-11 飞书）：切换终态卡上要**直接看到**「这个会话在哪个工作区、
+    // 内部记录/内部记录（2026-10-11 飞书）：切换终态卡上要**直接看到**「这个会话在哪个工作区、
     // 下一条消息用什么模型」——不能只藏在句子里，且必须写具体模型名（禁止只写「默认」）。
     // 拼进 say 的文本 ⇒ 点卡路径（buildSwitchResultCard 的 markdown）与文字命令路径
     // （sendPlainText）拿到的是同一份内容，不会各改各的。取数沿用 :1619 既有纪律：
     // 读不到的行整行不出现，且取数失败绝不影响切换本身（try 包住）。
     // 模型取 currentModelOf ⇒ pending→lastUsed→全局默认，正是「下一条消息实际会用的那个」。
-    // 🔴 卡面格式 维护者 2026-10-12 定稿（三行，覆盖 0.8.9 初版的长句+来源小字写法）：
+    // 🔴 卡面格式 2026-10-12 定稿（三行，覆盖 0.8.9 初版的长句+来源小字写法）：
     //   **新建会话并切换成功**
     //   🗂 工作区：**supervisor**（路径:agents/supervisor）
     //   🤖 模型：zai-coding-cn/**glm-5.3-flash**
-    // 具体模型名（provider/model）照旧必写（#497 口径不变）；来源小字按 维护者 定稿从卡面移除
-    //（展开面板 detail 里的来源行保留，#339 探针口径不丢）。
-    const switchBody = (title) => {
-      const lines = ['**' + title + '**']
+    // 具体模型名（provider/model）照旧必写（内部记录 口径不变）；来源小字按 维护者 定稿从卡面移除
+    //（展开面板 detail 里的来源行保留，内部记录 探针口径不丢）。
+    const switchBody = (title, sessionName) => {
+      const lines = ['**' + title + '**']; const name = String(sessionName || '').trim(); if (name) lines.push('💬 会话：**' + name.slice(0, 60) + '**')
       if (cwd) lines.push('🗂 工作区：**' + workspaceLeaf(cwd) + '**（路径:' + shortWorkspacePath(cwd) + '）')
       let m = null
       try { m = currentModelOf(liveAgentForChat(chat)) } catch { }
@@ -9675,7 +9882,7 @@ export function apply(ctx) {
     }
     if (mode === 'new') {
       const sessionId = 'fs-main-' + Date.now().toString(36)
-      // 中台 #350 fail-loud 回执：创建失败（如默认模型服务不可用）必须让点卡的人看到原因，
+      // 内部记录 fail-loud 回执：创建失败（如默认模型服务不可用）必须让点卡的人看到原因，
       // 不能静默吞掉只留日志。
       let handle
       try {
@@ -9697,22 +9904,32 @@ export function apply(ctx) {
       persistChats(bot, bot.chats)
       await attachSessionToWorkspace(row, sessionId)
       console.log('[fs] /switch new session ' + sessionId + ' cwd=' + cwd)
-      await say(switchBody('新建会话并切换成功'))
+      await say(switchBody('新建会话并切换成功',
+        (chat.sessions[chat.activeIndex] || {}).label))
       return
     }
     const idx = chat.sessions.findIndex((s) => String(s.id) === String(row && row.sessionId))
     if (idx >= 0) {
       chat.activeIndex = idx
       persistChats(bot, bot.chats)
-      await say(switchBody('已切换到会话「' + (chat.sessions[idx].label || shortSessionId(row.sessionId)) + '」'))
+      await say(switchBody('已切换会话',
+        chat.sessions[idx].title || chat.sessions[idx].label || row.title || shortSessionId(row.sessionId)))
       return
     }
-    if (row.live) {
-      await say('🟡 这个会话**正在别处运行**，不能同时接管（会把同一份历史写坏）。'
-        + '等它结束再来；或者重新发 `/switch`，在该工作区用「新建」开一个新会话。', 'warn')
+    if (row.running) {
+      await say('🟡 这个会话**正在跑这一轮**，不能同时接管（会把同一份历史写坏）。'
+        + '等它这一轮结束再来；或者重新发 `/switch`，在该工作区用「新建」开一个新会话。', 'warn')
       return
     }
-    const handle = await resumeDedicated(bot, row.sessionId, cwd || row.workspace || row.path)
+    // 2026-11-16 实测：点一个"空闲"会话报
+    // `session "…" is already owned by an active write handle`。
+    // 原因：那个会话在本进程里**已经有活的写句柄**（GUI 打开过／开机恢复过），宿主拒绝再 resume。
+    // 正确做法不是报错也不是退回"不能切换"，而是**直接接管这个活句柄**——
+    // 同一进程内共享同一个 session 对象，回合由宿主串行执行，历史不会被写坏。
+    const liveAgentForTakeover = liveAgentsById().get(String(row.sessionId))
+    const handle = liveAgentForTakeover
+      ? { agent: liveAgentForTakeover, via: 'live' }
+      : await resumeDedicated(bot, row.sessionId, cwd || row.workspace || row.path)
     chat.sessions.push({
       id: String(row.sessionId),
       label: row.title || row.summary || shortSessionId(row.sessionId),
@@ -9724,12 +9941,14 @@ export function apply(ctx) {
     chat.activeIndex = chat.sessions.length - 1
     persistChats(bot, bot.chats)
     await attachSessionToWorkspace(row, row.sessionId)
-    console.log('[fs] /switch takeover session ' + row.sessionId + ' cwd=' + cwd)
-    await say(switchBody('会话接管成功'))
+    console.log('[fs] /switch takeover session ' + row.sessionId
+      + ' via=' + (liveAgentForTakeover ? 'live' : 'resume') + ' cwd=' + cwd)
+    await say(switchBody('会话接管成功',
+      row.title || row.summary || row.label || shortSessionId(row.sessionId)))
   }
 
   async function handleSwitchAction(bot, chatId, value) {
-    // 0.7.19（审查 LOW#4）：F6 的 stable 门禁原来只拦**文字命令** /switch —— 这里是切换卡的
+    // 0.7.19（审查 审查项）：F6 的 stable 门禁原来只拦**文字命令** /switch —— 这里是切换卡的
     // **按钮回调**，同一能力的另一入口，stable 下同样拒绝（正常路径拿不到切换卡，但
     // fail-open 场景曾经放行过一次 ⇒ 按钮路径必须自己也有一道门，不能依赖上游没漏）。
     if (resolveCardMode(bot, chatId) === 'stable') {
@@ -9802,7 +10021,7 @@ export function apply(ctx) {
     await feedback('这张卡片已过期，重新发 `/switch` 再选一次。', 'warn')
   }
 
-  // ---- /model：飞书侧切换模型（维护者 2026-10-02）---------------------------------
+  // ---- /model：飞书侧切换模型（2026-10-02）---------------------------------
   // 飞书原本切不了模型（只有 GUI 有那个面板）。语义与 GUI **同源**，不自己发明。
   // 🔴 2026-10-05 把这段口径按**宿主源码 + 本机运行日志**重写（原来写的两条都不成立，
   //   属于 A24「无出处的断言」：把内部类的方法当成了服务方法，于是代码恒走兜底、恒报成功）：
@@ -9831,7 +10050,7 @@ export function apply(ctx) {
   }
 
   // 「当前模型」读**会话投影**，不读全局默认。
-  // 🔴 维护者 2026-10-05 取证（output/dsh-install/web.log）：点了三次卡片，卡上的
+  // 🔴 2026-10-05 取证（output/dsh-install/web.log）：点了三次卡片，卡上的
   //   `current=` 三次都是 `{"provider":"zai","model":"GLM-4.5-Air"}` —— 正是 profile 里
   //   `agent-default-model` 配的全局默认值。原来这里先试 `sessionController.selectionFor(agent)`，
   //   而 `selectionFor` 长在**内部** `ApiSessionAgentController`（`this.agents`）上，
@@ -9849,9 +10068,9 @@ export function apply(ctx) {
         ? sp.stateOf(session, 'modelSelection') : undefined
       const sel = st && (st.pending || st.lastUsed)
       if (sel && sel.provider) {
-        // source（中台 #497）：这个值从哪层来的 —— pending＝本会话已选还没用上、
+        // source（内部记录）：这个值从哪层来的 —— pending＝本会话已选还没用上、
         // lastUsed＝本会话上一条真用的、default＝全局默认。终态卡拿它当小字，
-        // 给 #339（新会话模型注入不稳）当探针：卡上写 X 实际用 Y 即复现证据。
+        // 给 内部记录（新会话模型注入不稳）当探针：卡上写 X 实际用 Y 即复现证据。
         return { provider: sel.provider, model: sel.model, source: st.pending ? 'pending' : 'lastUsed' }
       }
     } catch { }
@@ -9871,7 +10090,7 @@ export function apply(ctx) {
     return ''
   }
 
-  // 🔴 维护者 2026-10-05：「自动视图（卡上写作 `X + 自动识图`）先把它删掉」。
+  // 🔴 2026-10-05：「自动视图（卡上写作 `X + 自动识图`）先把它删掉」。
   // 取证（本机 dsh web 日志 output/dsh-install/web.log）：一张 /model 卡列出 8 段
   //   `deepseek-official=2, mimo-vision=1, zai-coding-cn-vision=3, deepseek-vision=2,
   //    mimo=1, zai-coding-cn=3, zai=1, zai-vision=1`
@@ -9929,10 +10148,10 @@ export function apply(ctx) {
   let defaultModelEmptyTries = 0
   // 空清单重试封顶：按 DRAIN_INTERVAL(500ms) 一拍 ≈ 30 秒；到点落旗不再 hammer 宿主。
   const C6_EMPTY_CATALOG_MAX_TRIES = 60
-  // 🔴 第三十轮门槛 LOW#4（核对为真）：本函数挂在 DRAIN_INTERVAL(500ms) 每拍上，而
+  // 🔴 第三十轮门槛 审查项（核对为真）：本函数挂在 DRAIN_INTERVAL(500ms) 每拍上，而
   //   `defaultModelChecked` 要等 `listModelChoices()`（网络）**之后**才落旗——宿主一慢，
   //   多个调用就会重叠、并发打 listModelChoices。加 in-flight 闸：上一拍没回来就跳过。
-  //   （`!cur` 分支维持不封顶＝第二十七轮 LOW#5 裁决：它只读本地状态、不发网络请求，
+  //   （`!cur` 分支维持不封顶＝第二十七轮 审查项 裁决：它只读本地状态、不发网络请求，
   //   每拍 O(1)；加上面的闸后重叠请求也不可能发生，无需再为它设 latch——latch 反而
   //   会重新引入第二十二轮 MEDIUM#7 的"服务晚就绪⇒校验永久关闭"问题。）
   let defaultModelInFlight = false
@@ -10018,7 +10237,7 @@ export function apply(ctx) {
           + hits.slice(0, 8).map((c) => '/model ' + c.provider + '/' + c.model).join('\n'),
       }
     }
-    // 🔴 零命中要再分一刀（第二十一轮门槛 LOW#3，核对为真）：`listModelChoices()` 把
+    // 🔴 零命中要再分一刀（第二十一轮门槛 审查项，核对为真）：`listModelChoices()` 把
     //   「整表失败」和「逐个 provider 失败」都吞成空数组 ⇒ 空清单时的"没找到"是**无依据的断言**
     //   （A24：我没查过清单，凭什么说清单里没有），而且 `sampleChoicePath([])` 会给出
     //   字面量 `provider/model` 当示例——那正是本批 #47B 要消灭的占位符。
@@ -10052,7 +10271,7 @@ export function apply(ctx) {
   // （`dsh-llm` 只在**单个 provider 内**去重并抛 INVALID_CATALOG，跨 provider 不去重），
   // 宿主 GUI 因此按 provider 分组渲染（`dsh-api-session-controller/lib/types/catalog.js`
   // 的 buildModelCatalog 返回 kind='group' + group.name）。本卡早期把这些**拉平成一层按钮、
-  // 标题只写 model 名** ⇒ 维护者 2026-10-05 实测「模型名称重复了两次」。改法与 GUI 同源：
+  // 标题只写 model 名** ⇒ 2026-10-05 实测「模型名称重复了两次」。改法与 GUI 同源：
   // 一个 provider 一段，段标题给 provider 显示名，按钮 value 仍是 provider|model（切换逻辑不动）。
   function groupChoicesByProvider(choices) {
     // 段标题直接进 lark_md 的 `**…**`，而 `providerName` 来自宿主 `listProviders()` 的
@@ -10104,7 +10323,7 @@ export function apply(ctx) {
     return { config: { wide_screen_mode: true, update_multi: true }, elements }
   }
 
-  // 切换结果**写回同一张卡**（维护者 2026-10-05：「点击了，卡片不懂但是发一条提示，卡片应该更新成
+  // 切换结果**写回同一张卡**（2026-10-05：「点击了，卡片不懂但是发一条提示，卡片应该更新成
   // 已经切换到XX模型的提示，不是另外发卡片」）—— 与 /switch 的 buildSwitchResultCard 同口径：
   // 终态卡**不带任何按钮**，要再切就重发 `/model`。
   // 形状跟着本卡走 1.0（`header` + 顶层 `elements`，与审批单卡同源、已在生产验证），
@@ -10142,7 +10361,7 @@ export function apply(ctx) {
     return choices
   }
 
-  // 🔴 维护者 2026-10-05：「我在这个卡片里面去切换模型，现在切换失败的，就是没有切换成功过」。
+  // 🔴 2026-10-05：「我在这个卡片里面去切换模型，现在切换失败的，就是没有切换成功过」。
   // 取证（本机 dsh web 日志 output/dsh-install/web.log，三次真实点击）：
   //   `[fs] /model click: zai|GLM-4.5-Air … agent=fs-main-muv8bkcg`
   //   `[fs] /model: append(model/selection) zai/GLM-4.5-Air agent=fs-main-muv8bkcg`
@@ -10161,12 +10380,12 @@ export function apply(ctx) {
   //   真正改到活 agent 上、顺带存默认；不可用时抛 `session/model-unavailable`
   //   ⇒ 成功/失败都是**宿主说了算**，本函数不再有"看起来成功了"的分支。
   //   兜底 append 直接删掉：留着它就等于留一条永远报喜不报忧的路（A25／假绿灯）。
-  // 🔴 中台 #124（维护者 2026-10-07 裁决：**桥必须保证切换落地持续生效，不许推给宿主线**）：
+  // 🔴 内部记录（2026-10-07 裁决：**桥必须保证切换落地持续生效，不许推给宿主线**）：
   //   宿主 selectModel 内部分两半（dsh-api-session-controller/lib/index.js:720-748）——
   //   ① selectForNextRequest（改"下一条请求"，会话级一次性）② agentDefaultModel.saveSelection
   //   （写 profile 默认值，这半才是"永久"）。本机取证：②会**静默不执行**（3 次切换 profile
   //   一次没写；dsh-agent-default-model/lib/index.js:53-66 两处 early-return 不打字）。
-  //   ⇒ 光信 selectModel 的返回，就是"下一条生效、之后跳回默认"的 #124 现象本身。
+  //   ⇒ 光信 selectModel 的返回，就是"下一条生效、之后跳回默认"的 内部记录 现象本身。
   //   桥侧兜底闭环：selectModel 返回后**回读** `currentSelection()`（读的是配置引用，写完
   //   热更跟上才算落地）；短轮询没等到 ⇒ 桥**直存** `saveSelection`（宿主同款入口，有界 4 秒）
   //   再回读；仍未落地 ⇒ 回执**如实**「只对下一条生效、默认值未写入」＋留痕（验收标准 D），
@@ -10203,7 +10422,7 @@ export function apply(ctx) {
       + ' session=' + String(agent.id)
       + (effort === undefined ? '' : ' effort=' + String(effort))
       + (out.confirmed ? '' : '（宿主响应里没有 selected，回显的是请求值）'))
-    // #124 落地校验（回读→直存→再回读），结果并进返回值供两条通道回执分支使用。
+    // 内部记录 落地校验（回读→直存→再回读），结果并进返回值供两条通道回执分支使用。
     const pf = await verifyDefaultModelLanded(out.provider, out.model, effort)
     console.log('[fs] /model: 默认值落地 ' + (pf.persisted ? 'ok' : 'FAIL')
       + ' ' + String(out.provider) + '/' + String(out.model) + '：' + pf.persistDetail)
@@ -10238,10 +10457,10 @@ export function apply(ctx) {
     }
   }
 
-  // #124 落地校验的参数：宿主自己的 ② 半写完后 profile 热更要一点时间 ⇒ 先短轮询；
+  // 内部记录 落地校验的参数：宿主自己的 ② 半写完后 profile 热更要一点时间 ⇒ 先短轮询；
   //   等不到才桥直存（写同值幂等无害）；直存给 4 秒上界（保存队列疑似卡死时不无限悬回执）。
   //   最坏 ~0.6s + 4s + 1s，全部有界（A19）。
-  //   #560 续段（2026-10-19）：直存写 profile 会触发宿主配置热更事务，撞上插件 HMR
+  //   内部记录 续段（2026-10-19）：直存写 profile 会触发宿主配置热更事务，撞上插件 HMR
   //   热重载事务时宿主按嵌套保护拒收（「transactions cannot be nested」）——保护是瞬时的，
   //   对这一种报错退避一次重试；别的报错照旧如实带回，不掩盖。
   const DM_LAND_POLL_TRIES = 3
@@ -10334,7 +10553,7 @@ export function apply(ctx) {
     }
   }
 
-  // 🔴 第四十七轮 LOW#3（核对为真）：confirmed×persisted 四分支回执原来文字档/卡片档**各抄一份**，
+  // 🔴 第四十七轮 审查项（核对为真）：confirmed×persisted 四分支回执原来文字档/卡片档**各抄一份**，
   //   且尾巴已开始分叉（重试引导一句两处措辞不同）——本批反复修的"两入口口径不一致"同款。
   //   收成一个判据树：kind/text＝文字档（自含、带 ✅/⚠️ 前缀），card＝卡片档（终态卡标题已带灯，
   //   正文不带前缀）。文案逐字照搬现状，只挪位置不改字面（历史轮钉过的断言字面不动）。
@@ -10401,7 +10620,7 @@ export function apply(ctx) {
   // 那条新消息带着同一个 `value`，在那边点一下照样能答掉原会话这张单。
   // ⇒ 两个判据都要：token 认卡，`record.chatId` 认会话。命中不一致时**可见地**拒绝
   //   （不许静默吞点击，与 stale 卡那条同口径）。
-  // 🔴 第十一轮 LOW#5：`bot` 由调用方传**连接自带的 `evtBot`**。原来这里用
+  // 🔴 第十一轮 审查项：`bot` 由调用方传**连接自带的 `evtBot`**。原来这里用
   //   `findBotForChat(chatId)` 猜"哪个 bot 来说这句拒绝" —— 正是本次改动在点击者取数
   //   上刚否掉的同源形状（单实例多 bot 同群 ⇒ 返回该群配置里的第一个 bot），
   //   拿错应用身份发消息 = 又造一次 0.7.22 坑 2。传不到才降级去猜。
@@ -10455,11 +10674,11 @@ export function apply(ctx) {
       }
       return
     }
-    // Model-switch buttons (the /model card) — 维护者 2026-10-02；2026-10-05 改成原地更新同一张卡。
+    // Model-switch buttons (the /model card) — 2026-10-02；2026-10-05 改成原地更新同一张卡。
     if (value.fs_model !== undefined) {
       const chatId = data && data.context && data.context.open_chat_id
       // 🔴 用**收到这条事件的那个 bot**（连接自带），不按会话猜：单实例多 bot 同群时
-      //   `findBotForChat(chatId)` 只返回该群配置里的第一个 bot（第六轮 LOW／第十一轮 LOW#5 同源形状）。
+      //   `findBotForChat(chatId)` 只返回该群配置里的第一个 bot（第六轮 LOW／第十一轮 审查项 同源形状）。
       //   这次尤其要命 —— 下面要 PATCH 的正是**这个 bot 自己发出去的那条卡片消息**，
       //   拿别的应用身份去 PATCH 必被拒（消息不属于它），表现就是"点了卡片不动"。
       // 🔴 第二十轮门槛 LOW（核对为真）：原来这里还挂着 `|| (chatId ? findBotForChat(chatId) : undefined)`，
@@ -10488,7 +10707,7 @@ export function apply(ctx) {
           '⚠️ 切换模型只应答**私聊**里这张卡的点击（群里/类型没确认过的会话不作答）。卡若被转发过，请回原私聊操作。').catch(() => {})
         return
       }
-      // 维护者 2026-10-05：「卡片应该更新成已经切换到XX模型的提示，不是另外发卡片」
+      // 2026-10-05：「卡片应该更新成已经切换到XX模型的提示，不是另外发卡片」
       //   ⇒ 成功/失败都 PATCH 这一张；只有拿不到 message_id 或 PATCH 被拒时才退回发文本
       //   （绝不允许"点了没反应"）。
       const replyInCard = async (kind, message) => {
@@ -10513,7 +10732,7 @@ export function apply(ctx) {
         //   （中台 #53 的原始症状就是"卡上谁点都算数"）。
         if (requireCapability(ownerBot, chatId, () => personFromOperator(ownerBot, data),
           'model', 'card:fs_model')) {
-          // 🔴 第三十七轮门槛 LOW#6（核对为真）：requireCapability 的 deny() 内部已给本会话
+          // 🔴 第三十七轮门槛 审查项（核对为真）：requireCapability 的 deny() 内部已给本会话
           //   发**同义文字回执**，这里再补一张 warn 卡＝一次点击两条可见消息，且四条兄弟
           //   卡片通道（fs_form/fs_plan_goal/fs_approval）都只 return——口径独此一处歪。
           //   对齐兄弟：拦下＝不作答，理由以文字回执为准（回执文案里本来就写了原因）。
@@ -10528,9 +10747,9 @@ export function apply(ctx) {
         }
         try {
           const sel = await switchModelForAgent(agent, provider, model)
-          // 🔴 中台 #124：卡片通道与文字通道**同一套四分支口径**——终态卡标题的 ✅
+          // 🔴 内部记录：卡片通道与文字通道**同一套四分支口径**——终态卡标题的 ✅
           //   （replyInCard 'ok'）只允许出现在"默认值落地已验证"的场合。
-          //   🔴 第四十七轮 LOW#3：判据树与文字档共用 modelSwitchReceipt，不再各抄一份。
+          //   🔴 第四十七轮 审查项：判据树与文字档共用 modelSwitchReceipt，不再各抄一份。
           const rcCard = modelSwitchReceipt(sel)
           await replyInCard(rcCard.kind, rcCard.card)
         } catch (error) {
@@ -10585,7 +10804,7 @@ export function apply(ctx) {
       if (cardClickOutsideOriginChat(record, chatId, evtBot)) return
       // 🔴 第三十三轮门槛 MEDIUM#3（核对为真）：`approval` 能力闸此前**只接了 fs_approval 一条口**
       //   （8695 处），兄弟通道——审批单卡（fs_form/fs_choice，代码自述「审批单卡」）——漏接：
-      //   总闸开着时，点审批单＝替别人拍板一次权限决定，与答复审批单是同一种权力。同口径补闸，
+      //   总闸开着时，点审批单＝替别人确定一次权限决定，与答复审批单是同一种权力。同口径补闸，
       //   source 用 `card:fs_form` 留痕（capabilityGuard 默认关时 requireCapability 直接放行）。
       if (requireCapability(evtBot || record.bot, chatId,
         () => personFromOperator(evtBot || record.bot, data), 'approval', 'card:fs_form')) return
@@ -10766,7 +10985,7 @@ export function apply(ctx) {
       // so the rest of the turn must continue on a NEW card below it
       // (2026-09-08 维护者 report). Do this before resolve() so post-answer
       // narration lands on the fresh card.
-      // 2026-10-01（维护者 回归红线）：入站轮**和**自动轮（回执/目标轮）都必须换新卡 ——
+      // 2026-10-01（维护者 回归关键约束）：入站轮**和**自动轮（回执/目标轮）都必须换新卡 ——
       // 旧实现只查 activeTurns，自动轮点了按钮内容会继续写在旧卡上（用户看到"点了没动"）。
       splitLiveCardAfterAnswer(record.agentId)
       // P2（0.8.0 互认）：`ask_user_question` 的返回整份 JSON.stringify 给 agent
@@ -10827,7 +11046,7 @@ export function apply(ctx) {
 
   // Answer dsh approval/request for agents owned by this plugin's Feishu chats;
   // everything else (GUI sessions etc.) delegates via next().
-  // 2026-10-02（维护者 实测后定）：**只挂根级不够**。只要浏览器端连着，
+  // 2026-10-02（实测后定）：**只挂根级不够**。只要浏览器端连着，
   // dsh-api-remotes 的 forwarded waterfall（lib/index.js:215-232）会先把请求转给
   // GUI 客户端，**只有远端不接时才 next()** ⇒ 根级监听永远轮不到。
   // 实证：维护者 把权限改成 workspace-write 后，越权升级那次（06:0x）日志里
@@ -10890,7 +11109,7 @@ export function apply(ctx) {
   //   它负责写 `approval/asked` / `approval/decided` 审计对，绝不能绕过。
   //   重载安全：包装只装一次，`decide` 这个 relay 每次 apply 都被重新赋值，
   //   因此 HMR 后不会指向上一代插件的旧状态。
-  // 红线：非飞书会话（GUI / 子代理）一律 return null 交回原逻辑，绝不吞别人的审批。
+  // 关键约束：非飞书会话（GUI / 子代理）一律 return null 交回原逻辑，绝不吞别人的审批。
   const FS_APPROVAL_BRIDGE = globalThis.__fsApprovalBridge
     || (globalThis.__fsApprovalBridge = { decide: null, original: null, service: null })
 
@@ -10961,7 +11180,7 @@ export function apply(ctx) {
 
   installApprovalBridge()
 
-  // ---- 审批前置拦截：把"审计类 ask"搬到飞书（2026-09-16 维护者 拍板）--------------------
+  // ---- 审批前置拦截：把"审计类 ask"搬到飞书（2026-09-16 经评审确定）--------------------
   // 为什么要自己拦：审计插件返回 {kind:"ask"} 后，主程序走它自己的 `ctx.approval`
   // （PC 一次性提示），**绕开**我们已有的 `approval/request` 卡片链路 —— 实机日志已验证：
   // 5 次 `sentinel: ask`（01:49 / 05:50 / 05:55 / 05:56×2）**没有一次**走到 approval/request，
@@ -10975,7 +11194,7 @@ export function apply(ctx) {
   const APPROVAL_ON_FEISHU = !/^(0|false|off|no)$/i.test(String(process.env.DSH_FEISHU_APPROVAL ?? '1').trim())
   // 需要确认的两类（**故意收窄**：只拦"外发数据"和"工作区外写入"，避免把常用操作都拦下来）
   //
-  // 2026-09-16 收窄（维护者 拍板）：原正则尾部的 `nc ` 是**两个字母加一个空格**，
+  // 2026-09-16 收窄（经评审确定）：原正则尾部的 `nc ` 是**两个字母加一个空格**，
   // 太短，极易在多行命令拼接后误命中，把纯读操作判成"联网/外发命令"并弹审批卡；
   // 维护者 未及时点 → 命令直接被拒（实测白费一轮排查）。
   // 现处理：
@@ -11072,7 +11291,7 @@ export function apply(ctx) {
         return pass()
       }
       console.log('[fs] approval ' + outcome + ' on Feishu — denying: ' + String(exec && exec.name))
-      // 🔴 第三十轮门槛 LOW#3：'unavailable'＝**根本没发卡**（非确认私聊被拒发，上面已自发说明），
+      // 🔴 第三十轮门槛 审查项：'unavailable'＝**根本没发卡**（非确认私聊被拒发，上面已自发说明），
       //   不得误报成"用户在飞书拒绝"；真拒绝才是 'rejected'。
       const denyWho = { rejected: '拒绝', unavailable: '的会话不是已确认的私聊（审批单没发出去）' }
       return { kind: 'deny', reason: '用户在飞书' + (denyWho[String(outcome)] || '未在时限内确认') + '：' + reason }
@@ -11197,7 +11416,7 @@ export function apply(ctx) {
 
   // Question card (option rows). 2026-10-01（改造④，维护者 定稿 A4）：
   // 飞书**按钮文字只能是 plain_text、单行、≤100 字符**（官方 JSON 2.0 文档），
-  // 把选项做成按钮必然被截断成 `…`（维护者 实测"按钮上面全部都是显示三个点"）。
+  // 把选项做成按钮必然被截断成 `…`（实测"按钮上面全部都是显示三个点"）。
   // 改法：选项**正文**交给 markdown（自动换行、无长度限制），按钮只负责"选这一项"；
   // 每选项一行分栏，`flex_mode:'stretch'` ⇒ 宽屏并排、**窄屏自动上下堆叠**（按钮占整行，不可能被挤）。
   // 同时**去掉旧的 5 个按钮上限**：布局不再依赖 action 行的容量，选项再多也不会被静默丢弃。
@@ -11277,7 +11496,7 @@ export function apply(ctx) {
   //   · 飞书 2.0 按钮**没有绿色**（官方枚举 default / primary / danger / text / primary_text /
   //     danger_text / primary_filled / danger_filled / laser）⇒「绿」只能落在**绿底块**上：
   //     column.background_style='green-50'（区块背景语义，本仓 steer 提示已在用同一套色板）；
-  //   · 两个按钮**同一排**（flex_mode:'bisect' 两等分）—— 维护者 2026-10-02 定的口径；
+  //   · 两个按钮**同一排**（flex_mode:'bisect' 两等分）—— 2026-10-02 定的口径；
   //   · 文案固定 2 字（窄列按钮超过 2 字会被截成省略号，见 smoke 用例 48）；
   //   · 回调**协议不动**：仍是 { fs_question, fs_option }，回传 harness 的仍是原 label
   //     （Approve / Keep planning，由 buildQuestionAnswer 负责中文别名映射）。
@@ -11399,7 +11618,7 @@ export function apply(ctx) {
   //   用户点了没反应、AI 那头干等到 30 分钟超时）。token 是 randomUUID，本身就是唯一键。
   //   代价是这张表不再天然有界 ⇒ 与 recentQuestions 同一套 TTL + 上限回收。
   function rememberAnsweredForm(token) { rememberBounded(recentForms, token) }
-  // 操作按钮（2026-10-03 维护者 真机反馈：**只要两个** —— 「✍️ 我要改」已删，有意见直接回消息）。
+  // 操作按钮（2026-10-03 真机反馈：**只要两个** —— 「✍️ 我要改」已删，有意见直接回消息）。
   const FORM_ACTIONS = [
     { label: '✅ 采纳', choice: '采纳', type: 'primary' },
     { label: '❌ 驳回', choice: '驳回', type: 'danger' },
@@ -11425,9 +11644,9 @@ export function apply(ctx) {
   function approvalFormCardPayload(form, token) {
     const f = (form && typeof form === 'object') ? form : {}
     const elements = []
-    // 字段区（2026-10-03 维护者 真机反馈）：
+    // 字段区（2026-10-03 真机反馈）：
     //   · **短值**（单号 / 置信度…）⇒ `div + fields(is_short:true)` 两列并排，省地方；
-    //   · **长值**（变更类型 / 证据来源…）⇒ **单独一行**（挤在框里读不了，维护者 原话"因为它是长文本，
+    //   · **长值**（变更类型 / 证据来源…）⇒ **单独一行**（挤在框里读不了，需求原文"因为它是长文本，
     //     不要在那个框里面"）。
     //   判定：字段显式给 `short: true/false` 就听它的；没给就按"值是否短且单行"自动判。
     const meta = (Array.isArray(f.meta) ? f.meta : []).filter((p) => p && (p.label || p.value))
@@ -11486,7 +11705,7 @@ export function apply(ctx) {
       elements.push({ tag: 'markdown', content: '**' + s.title + '**' })
       elements.push({ tag: 'markdown', content: s.body })
     }
-    // 操作行（2026-10-03 维护者 真机反馈）：**不要「⑥ 操作」这行标题**，按钮也**只留两个** ——
+    // 操作行（2026-10-03 真机反馈）：**不要「⑥ 操作」这行标题**，按钮也**只留两个** ——
     //   `采纳`(primary 蓝) / `驳回`(danger 红)。「✍️ 我要改」已删（维护者 要提意见直接回消息即可）。
     elements.push({ tag: 'hr' })
     elements.push({
@@ -11569,7 +11788,7 @@ export function apply(ctx) {
     // 🔴 第三十三轮门槛 MEDIUM#3（核对为真）：审批单是 `askApprovalCard` 的**兄弟通道**，
     //   维护者 裁决口径「审批单只发在已确认的私聊会话，群里谁都能点」——fs_approval 那条有
     //   isP2pChat 闸，这条一直漏着：群里触发 / 工具指定群 chatId 时整张审批单卡（采纳/驳回）
-    //   发进群，任何群成员一点就替会话主人拍板。同判据（fail-closed）补闸，且不作答≠不吭声：
+    //   发进群，任何群成员一点就替会话主人确定。同判据（fail-closed）补闸，且不作答≠不吭声：
     //   给该会话一句可见回执。返回带 refused 标记，工具落点据此给 agent 明确拒绝理由。
     if (!isP2pChat(bot, chatId)) {
       console.log('[fs] approval form refused (chat not known p2p): kind='
@@ -11629,7 +11848,7 @@ export function apply(ctx) {
     })
   }
 
-  // 文字回答后把问题卡**就地改成「✅ 已收到」态**（2026-10-02 维护者 实测：原先只有**按钮**路径
+  // 文字回答后把问题卡**就地改成「✅ 已收到」态**（2026-10-02 实测：原先只有**按钮**路径
   // 会更新卡片，文字回答后卡片原封不动 ⇒ 按钮仍可点、点了报
   // 「question button: record not found for chat …」，用户以为没生效）。
   // 复用按钮路径同一套 payload 与 recentQuestions 登记。
@@ -11668,7 +11887,7 @@ export function apply(ctx) {
         //   ——不能报成"未操作"（那会让 agent 以为卡发出去了只是没人点）。
         console.log('[fs] approval form answered: ' + String(q0.id || '') + ' -> '
           + (choice || (out && out.refused ? '（非确认私聊拒发）' : '（未操作）')))
-        // 🔴 第三十四轮门槛 LOW#2（核对为真）：嵌套三元违反仓规（「嵌套三元改 if/else」），
+        // 🔴 第三十四轮门槛 审查项（核对为真）：嵌套三元违反仓规（「嵌套三元改 if/else」），
         //   先把无点击时的兜底措辞摊平（文案逐字不变，111/113 断言钉的是值）。
         let fallbackNote = '（未操作）'
         if (out && out.refused) fallbackNote = '（审批单只在已确认私聊发，这张卡没发出去）'
@@ -11753,7 +11972,7 @@ export function apply(ctx) {
   //    · 非飞书回合（没有 chat owner：GUI／子代理／定时轮）  ⇒ pass-through（**不许锁死 维护者 自己的电脑**）
   //    · 飞书回合 ＋ 有 actor                              ⇒ overwrite（**这才是 A3 的真正落点**）
   //    · 飞书回合 ＋ 无 actor（**表在不在都一样**）          ⇒ deny ＋ ALERT
-  //        ↑ **维护者 2026-10-04 裁决：「无表就拒…执行不了总比资料泄露好」**；救急走主 A 准 / SSH 修表
+  //        ↑ **2026-10-04 裁决：「无表就拒…执行不了总比资料泄露好」**；救急走主 A 准 / SSH 修表
   //
   //  ⚠️ 两个【已踩过】的坑，别再犯：
   //  ① `identityCtx()` 必须能拿到工作区 —— 它在 `apply()` 外，拿不到里面的 `workspaceRoot`；
@@ -11764,10 +11983,10 @@ export function apply(ctx) {
   ctx.on('tools/execute', async (exec, next) => {
     try {
       const owner = findChatForAgent(exec.agent)
-      // 🔒 开关 `identityGuard` **默认关**（上游用户不一定需要这个功能；维护者 2026-10-04 定）
+      // 🔒 开关 `identityGuard` **默认关**（上游用户不一定需要这个功能；2026-10-04 定）
       //    ⇒ 关着就**不做判权**（不查身份表、不拒回合——2026-10-30 开关矩阵：开发机/web gui 禁开，
       //       全拒＝把 维护者 自己的电脑锁死，违 2026-10-04 裁决）。
-      //    ⚠️ 但 #2626（需求 方案A 第一步「插件传真实身份」）：关闸≠放任模型自报身份过关——
+      //    ⚠️ 但 内部记录（配套改动 方案A 第一步「插件传真实身份」）：关闸≠放任模型自报身份过关——
       //       飞书回合的工具入参里出现严格身份键（open_id/union_id/person_id/sender_open_id/
       //       sender_union_id）时，一律用**桥侧真值**（入站事件 sender_id，服务端填、伪造不了）覆写，
       //       无真值可核 ⇒ 剔除（fail-closed：判不了不转发，工具如实报缺参数，好过带冒充值执行）。
@@ -11818,7 +12037,7 @@ export function apply(ctx) {
       const rec = identityCtx(workspaceRoot()).store.get(exec.agent.id)
       // 🔒 K3-GAP（C1）：有 owner 但 store 无记录 ⇒ **fail-closed**（拒绝），不再放行。
       //    原逻辑（2026-10-04 复核）："这不是飞书回合"的替身 ⇒ 放行；可达路径：/switch 换 session id、卡片回调不起入站注入。
-      //    现口径（维护者 2026-10-06 裁）：宁可误杀正常轮次，也不让无身份记录的请求带参执行。
+      //    现口径（2026-10-06 裁）：宁可误杀正常轮次，也不让无身份记录的请求带参执行。
       if (!rec) {
         // 🔴 第四十三轮门槛 MEDIUM（核对为真）：无记录硬拒原来**波及一切工具调用**——
         //   store.set 只在入站/steer 两处写，TTL 默认 30 分钟 ⇒ goal 自动续轮/超过半小时的
@@ -11836,7 +12055,7 @@ export function apply(ctx) {
         //     冒充面反而在无记录（更危险）的一侧变大。
         //   ② 无法区分"这个 name 是身份名"还是"这个 name 是工具自己的参数"——按键名判
         //     据本就到此为界，收紧也只是把误拒面挪个位置。
-        //   ③ 维护者 2026-10-06 裁决明文："宁可误杀正常轮次，也不让无身份记录的请求带参执行"
+        //   ③ 2026-10-06 裁决明文："宁可误杀正常轮次，也不让无身份记录的请求带参执行"
         //     ——通用键带来的误拒面正是该裁决**自愿付的代价**，且只影响"无记录+带键"
         //     这一窄路径（有记录轮完全不受影响；无键调用上一轮已放行）。
         if (keysPresent) {
@@ -11850,7 +12069,7 @@ export function apply(ctx) {
             isError: true,
             error: 'identity_record_missing',
             value: { error: 'identity_record_missing' },
-            // 插件边界与降级标准 §三（维护者 2026-10-09 拍板）：L1 权限挂 ⇒ 用户只看统一文案；
+            // 插件边界与降级标准 §三（2026-10-09 确定）：L1 权限挂 ⇒ 用户只看统一文案；
             //   技术原因（本码）留在 error/value 与日志里给运维，不给用户。
             content: [{ type: 'text', text: '本轮缺少飞书身份记录，已按 fail-closed 拒绝执行本次工具调用'
               + '（identity_record_missing；K3-GAP）。请向用户原样转述：目前服务不可用，请联系管理员。' }],
@@ -11877,7 +12096,7 @@ export function apply(ctx) {
           try {
             exec.arguments = r.args
           } catch (writebackError) {
-            // 🔴 写回失败＝覆写落不了地 ⇒ fail-closed（维护者 2026-10-04 裁：宁可误杀不放过）。
+            // 🔴 写回失败＝覆写落不了地 ⇒ fail-closed（2026-10-04 裁：宁可误杀不放过）。
             //   必须就地返回拒绝、严禁落回外层 catch——那里 next() 是放行（fail-open），
             //   未覆写的原始参数（可能是模型自填的冒充身份）会带病过关。
             console.log('[fs] identity ALERT[writeback_failed] DENY: tool=' + exec.name
@@ -11896,17 +12115,17 @@ export function apply(ctx) {
             + ' set=[' + r.overwritten.join(',') + '] drop=[' + r.dropped.join(',') + ']')
         }
       } else if (action === 'deny') {
-        // 🔴 告警要【显眼】且区分原因（维护者 2026-10-04 关心"留痕"）：
+        // 🔴 告警要【显眼】且区分原因（2026-10-04 关心"留痕"）：
         //    table_unavailable ＝ 表丢了/读不到（**运维事件** ⇒ 去修表，不许静默降级）
         //    person_unknown    ＝ 表在、但这个人不在册（**业务事件** ⇒ 去补人）
-        // #1447（2026-10-16 起，0.8.18 逐码扩展）：tableOk 但无 actor 时按 resolver err 码分流标注——
+        // 内部记录（2026-10-16 起，0.8.18 逐码扩展）：tableOk 但无 actor 时按 resolver err 码分流标注——
         //   job_not_granted（岗位缺册 ⇒ 去补岗册）/ unknown_status（状态门 ⇒ 查状态）/
         //   person_unknown（真表外人 ⇒ 去补人）。原「tableOk 但无 actor 一律 person_unknown」
         //   使身份表缺人与岗位缺册不可分辨（修表后 person_unknown 告警 8 条实为两人岗位缺册，
-        //   G9 #1361 甄别因此假立项）。err 带前缀形态（如 map_unreadable:…）用 includes 归类；
+        //   G9 内部记录 甄别因此假立项）。err 带前缀形态（如 map_unreadable:…）用 includes 归类；
         //   前缀异常形态落 person_unknown 与原语义一致。
-        // #1447 口径扩展（0.8.18，CHANGELOG 0.8.17 条②挂账件）：resolver 的表类/状态类错误码
-        //   从前全落 person_unknown ⇒ 运维事件被带去「补人」方向（#1130 同族）。逐码给独立标签，
+        // 内部记录 口径扩展（0.8.18，CHANGELOG 0.8.17 条②挂账件）：resolver 的表类/状态类错误码
+        //   从前全落 person_unknown ⇒ 运维事件被带去「补人」方向（内部记录 同族）。逐码给独立标签，
         //   person_unknown 仍作兜底（unknown_person 与未登记形态语义不变），fail-closed 与用户文案一字不改。
         const errStr = String(rec.err || '')
         const why = rec.tableOk === false ? 'table_unavailable'
@@ -11924,7 +12143,7 @@ export function apply(ctx) {
         // 工单1364（案1，2026-10-15）：DENY 行附 resolver 错误码原文 —— tableOk=true 只说明
         //   stat 到文件，表 EACCES/EPERM 读不了时 why 仍是 person_unknown（语义未改），
         //   err 原文里的 `map_unreadable:表存在但不可读…` 是排查者区分「补人 vs 修权限」的依据
-        //   （#1130 实证：只有 person_unknown 会把方向带偏）。
+        //   （内部记录 实证：只有 person_unknown 会把方向带偏）。
         console.log('[fs] identity ALERT[' + why + '] DENY: tool=' + exec.name
           + ' agent=' + exec.agent.id + ' tableOk=' + rec.tableOk
           + (rec.err ? ' resolver_err=' + rec.err : ''))
@@ -11934,8 +12153,8 @@ export function apply(ctx) {
           isError: true,
           error: 'identity_unresolved',
           value: { error: 'identity_unresolved' },
-          // 插件边界与降级标准 §三（维护者 2026-10-09 拍板）：L1 权限挂（表不可达 table_unavailable /
-          //   人不在册 person_unknown）⇒ fail-closed 不变（维护者 2026-10-04 裁决），但用户文案统一；
+          // 插件边界与降级标准 §三（2026-10-09 确定）：L1 权限挂（表不可达 table_unavailable /
+          //   人不在册 person_unknown）⇒ fail-closed 不变（2026-10-04 裁决），但用户文案统一；
           //   内部区分只留在 why 与日志留痕里。
           content: [{ type: 'text', text: '身份未通过校验，已拒绝执行本次工具调用（identity_unresolved）。'
             + '请向用户原样转述，不要展开技术细节：目前服务不可用，请联系管理员。' }],
@@ -11949,7 +12168,7 @@ export function apply(ctx) {
     return next()
   })
  
-  // 红线：非飞书会话（GUI／子代理）一律 next()，绝不吞别人的提问。
+  // 关键约束：非飞书会话（GUI／子代理）一律 next()，绝不吞别人的提问。
   ctx.on('tools/execute', async (exec, next) => {
     if (exec.name !== 'exit_plan_mode') return next()
     const owner = findChatForAgent(exec.agent)
@@ -11958,7 +12177,7 @@ export function apply(ctx) {
     //   这类**真人点按钮**的卡，与 askApprovalCard/approverChatFor/命令边界同一条 B1 口径——
     //   只进**已确认为 p2p** 的会话。GUI 把群会话拖进计划模式时不接管（next() 走原生通道），
     //   否则群里任何成员都能替会话主人批计划/开目标（capabilityGuard 默认关时更是无闸）。
-    //   第二十七轮 LOW#8：判据同走唯一入口 `isP2pChat`。
+    //   第二十七轮 审查项：判据同走唯一入口 `isP2pChat`。
     if (!isP2pChat(owner.bot, owner.chatId)) {
       console.log('[fs] exit_plan_mode 不接管：会话非确认私聊（不往群里投可点审批卡） chat='
         + String(owner.chatId))
@@ -12053,7 +12272,7 @@ export function apply(ctx) {
     }
   })
 
-  // 中台 #330②（插件边界与降级标准 §三 L2「工具挂」，维护者 2026-10-09 拍板）：工具失败时
+  // 内部记录②（插件边界与降级标准 §三 L2「工具挂」，2026-10-09 确定）：工具失败时
   // 给**模型**看到的返回文字追加引导语——如实告知「该工具暂时不可用」、凭自身知识回答
   // 必须声明未经工具/数据核实、禁止假装成功。只认 `isError === true` 的结构化失败
   // （g9-tools 形态：失败返回错误文本不抛异常），成功结果一字不动；包装失败绝不吞结果
@@ -12090,7 +12309,7 @@ export function apply(ctx) {
   // 修法：把监听**同时**挂到 agent 自己的 scope（agent.ctx.on；Agent 接口里
   // readonly ctx: Context 就是 Cordis Context，dsh-api-remotes 也用它做 scope 载体）
   // —— 同一条水位线上里层 scope 先于根级执行，于是飞书会话的提问先落到我们手上；
-  // 非飞书 agent 依旧 next() 交回，绝不吞别人的提问（红线，smoke 42 守着）。
+  // 非飞书 agent 依旧 next() 交回，绝不吞别人的提问（关键约束，smoke 42 守着）。
   function handleUserQuestionRequest(request, next, hop) {
     const agent = request && request.agent
     const questions = Array.isArray(request && request.questions) ? request.questions : []
@@ -12113,7 +12332,7 @@ export function apply(ctx) {
     //   （词面「计划已写好」），判据也必须是同一个 isP2pChat。
     //   ⚠️ 只闸 plan-review 这一种：普通提问卡是群协作的既有功能（用例 85/88/89 的转交提问），
     //   全量设闸会把群里合法的提问一并打死。
-    // 🔴 第四十二轮门槛 LOW#6（核对为真）：局部布尔原来叫 `isPlanReview`，把 9104 的
+    // 🔴 第四十二轮门槛 审查项（核对为真）：局部布尔原来叫 `isPlanReview`，把 9104 的
     //   同名 helper **遮蔽**整段函数体——今天没调用点所以不是活 bug，但下一个在这里
     //   想用 helper 的人会拿到布尔当场 TypeError。局部改名，helper 名让出来。
     const planReviewGate = kind === 'plan-review'
@@ -12230,13 +12449,13 @@ export function apply(ctx) {
         console.log('[fs] card relay drain failed: ' + String(error && error.message || error))
       }
       // C6：默认模型 vs 宿主清单的一次性校验（清单就绪前每拍重试，就绪即定旗不再查）。
-      // 🔴 第四十五轮 LOW#2（核对为真）：原来空 catch 吞掉**一切**异常——本函数只自护
+      // 🔴 第四十五轮 审查项（核对为真）：原来空 catch 吞掉**一切**异常——本函数只自护
       //   try/finally，若 currentModelOf/listModelChoices 将来抛错会**静默**每拍重跑、
       //   校验永远不落地且日志无痕。与上方兄弟 drainCardRelay 同口径：失败要留痕。
       checkDefaultModelAgainstCatalog().catch((error) => {
         console.log('[fs] default-model catalog check failed: ' + String(error && error.message || error))
       })
-      // 🔴 第四十七轮 LOW#4（核对为真）：群侧 peer 变化只置旗标（见 noteChatPeer），
+      // 🔴 第四十七轮 审查项（核对为真）：群侧 peer 变化只置旗标（见 noteChatPeer），
       //   消费方就是这一拍——一拍一次合并写，替代原来「换发言人即全量同步写盘」。
       flushPendingPeerChanges()
     }, DRAIN_INTERVAL)
@@ -12261,9 +12480,9 @@ export function apply(ctx) {
       // 🔴 第四十九轮 LOW（核对为真）：停机/热重载前补最后一刷群侧 peer，
       //   否则「最后一拍之后换的发言人」随 bots.clear() 一起丢（见 flushPendingPeerChanges 注）。
       flushPendingPeerChanges()
-      // 🔴 第五十二轮 LOW#4（核对后**不清** `pendingCapRequests`，理由写在这里）：那批 30 分钟
+      // 🔴 第五十二轮 审查项（核对后**不清** `pendingCapRequests`，理由写在这里）：那批 30 分钟
       //   一次性定时器跨代仍会触发，但它做的是**终态交代**——把审批卡改成「已超时（自动拒绝）」
-      //   并给申请人发一条超时回执（第二十九轮 LOW#7 钉的就是"超时不许吭声消失"这条契约）。
+      //   并给申请人发一条超时回执（第二十九轮 审查项 钉的就是"超时不许吭声消失"这条契约）。
       //   清掉它 ⇒ 申请人无限等待、卡停在"还能点"的样子；不清 ⇒ 卡被标成超时，而新代收到
       //   同一张卡的点击本来就走"卡已过期"分支（批不进去），旧 `bot` 对象走 HTTP 改卡/发消息
       //   仍然有效（`proc.kill()` 杀的是宿主进程，不影响飞书 OpenAPI 调用）。
@@ -12287,8 +12506,8 @@ export function apply(ctx) {
 
   // ---- [RC-004-20261023] 外部上下文注入端点 ----------------------------------
   // 用途：G5 评价追问卡等「程序主动发卡」场景——发卡程序发卡成功后调用本端点，向该用户
-  //   与 bot 的会话注入一条系统上下文（handleInbound 合成消息，_internal 同先例 #3952/#2823），
-  //   让模型带着上下文接住用户的后续回复（维护者 2026-10-23 拍板方向，需求卡 G5 RC-004 v2）。
+  //   与 bot 的会话注入一条系统上下文（handleInbound 合成消息，_internal 同先例 内部记录/内部记录），
+  //   让模型带着上下文接住用户的后续回复（2026-10-23 确定方向，需求卡 G5 RC-004 v2）。
   // 鉴权：共享 token（env FEISHU_INJECT_TOKEN；未配置＝端点整体停用，fail-closed）；
   //   外层另有宿主 web 的同源/basic auth（生产 nginx）。
   // 取会话：遍历各 bot 的 chatPeers（chatId→open_id，入站时记录）反查该 open_id 最近会话；
@@ -12316,6 +12535,25 @@ export function apply(ctx) {
       if (hit) break
     }
     if (!hit) return respondJson(res, 404, { ok: false, message: 'no session for open_id (never chatted)' })
+    // [RC-004-F085-20261117] 注入即声明回填通道：载荷带 route_* ⇒ 登记「该用户下一条 p2p 文本
+    //   优先调 route_endpoint」（见 maybeRouteEvalChat）。登记不依赖下面 handleInbound 注入是否
+    //   成功（通道是主路径，注入是降级兜底）；token 只进内存不落日志。
+    let routeRegistered = false
+    if (body.route_endpoint !== undefined) {
+      const v = sanitizeRoutePayload(body)
+      if (!v.ok) {
+        console.log('[fs] evalchat route register rejected: ' + v.reason + ' tag=' + tag)
+      } else if (!isAllowedEndpoint(v.route.endpoint)) {
+        console.log('[fs] evalchat route register rejected: endpoint not allowed (loopback/allowlist only) tag=' + tag)
+      } else {
+        evalRoutes.register({ appId: hit.bot.cfg.appId, openId, endpoint: v.route.endpoint,
+          token: v.route.token, tag, ttlMs: v.route.ttlMs })
+        routeRegistered = true
+        console.log('[fs] evalchat route registered app=' + String(hit.bot.cfg.appId).slice(0, 10)
+          + ' open=' + String(openId).slice(0, 10) + ' tag=' + tag
+          + ' ttl_s=' + Math.round(v.route.ttlMs / 1000))
+      }
+    }
     const seq = ((hit.bot._ctxSeq = (hit.bot._ctxSeq || 0) + 1)).toString(36)
     const injectId = 'ctxin-' + Date.now().toString(36) + '-' + seq + (tag ? '-' + tag : '')
     console.log('[fs] context inject queued chat=' + hit.chatId + ' id=' + injectId + ' tag=' + tag)
@@ -12326,7 +12564,8 @@ export function apply(ctx) {
       _internal: true,   // 内部系统上下文，不是用户在回答提问卡（同 cardfail 先例）
       content: JSON.stringify({ text }),
     }).catch(() => {})
-    respondJson(res, 200, { ok: true, appId: hit.bot.cfg.appId, chat_id: hit.chatId, inject_id: injectId })
+    respondJson(res, 200, { ok: true, appId: hit.bot.cfg.appId, chat_id: hit.chatId,
+      inject_id: injectId, route_registered: routeRegistered })
   })
   // ---- [/RC-004-20261023] ----------------------------------------------------
   registerRoute('/feishu/admin/config', async (req, res) => {
@@ -12395,7 +12634,7 @@ export function apply(ctx) {
       }
       const chatId = typeof args.chatId === 'string' && args.chatId.length > 0 ? args.chatId : undefined
       // 2026-09-15 修复：对话进行中不要另发一条消息。
-      // 实测（维护者 反馈"同一段东西分两个卡片发"）：agent 在回答时调用了 feishu_send，
+      // 实测（用户反馈"同一段东西分两个卡片发"）：agent 在回答时调用了 feishu_send，
       // 把同一段回复主动发了一遍；紧接着这段内容又作为最终回复进了流式卡
       // → 用户看到两张卡片、内容重复。飞书对话的回复本来就会自动显示在卡片上，
       // 所以"目标 chat 正是当前活跃 turn"时应当跳过，并明确告诉 agent 不需要它。
@@ -12461,7 +12700,7 @@ export function apply(ctx) {
         const atSpec = typeof args.at === 'string' ? args.at.trim() : ''
         if (atSpec) {
           const toks = atSpec.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean)
-            // 🔴 第十一轮 LOW#6：token 组装要**剥掉控制字符和方括号再 trim**。原来只剥
+            // 🔴 第十一轮 审查项：token 组装要**剥掉控制字符和方括号再 trim**。原来只剥
             //   `[`/`]` ⇒ 名字里带换行时拼出的 `@[...]` 违反 expandAtTokens
             //   的 `@[^\]\n]{1,60}` 语法，**整条不匹配**：@ 静默没展开、原文照发，
             //   连「（未能 @ 出：X）」那句声明都不会出现（比声明失败更糟的是无声失败）。
@@ -12693,7 +12932,7 @@ export function apply(ctx) {
   //       → 过程话语内联、工具折叠面板、状态行、表格换卡全部照旧生效
   //   · idle → seal 该卡并写「✅ 本轮结束」
   // 开关：环境变量 DSH_FEISHU_GOAL_CARDS=0 全局关；per-bot 配置 notifyGoalRounds:false 单独关。
-  // 范围（维护者 拍板）：**只报目标轮**（精确匹配 source.kind==='goal'），不报其它自动回合，噪声最低。
+  // 范围（经评审确定）：**只报目标轮**（精确匹配 source.kind==='goal'），不报其它自动回合，噪声最低。
   const GOAL_CARDS_ON = String(process.env.DSH_FEISHU_GOAL_CARDS ?? '1').trim() !== '0'
   // 2026-09-21 新增：**后台回执轮**（子代理／后台 job 完成通知把模型唤醒继续干活）也要上卡。
   // 这一类轮次没有飞书入站消息 ⇒ 旧实现没有任何卡承接 ⇒ 维护者 在飞书里看不到"我在继续干活"，
@@ -12768,7 +13007,7 @@ export function apply(ctx) {
       state.stop()
       state.card.status = 'sealed'
       dropWorkingPlaceholder(state.card)
-      // 0.7.9（维护者 2026-10-03 ③）：指路语写在旧卡；新卡干净起步。
+      // 0.7.9（2026-10-03 ③）：指路语写在旧卡；新卡干净起步。
       state.card.blocks.push({
         type: 'message',
         text: oldText || (reason === 'size' ? rotateNoticeSize() : ROTATE_NOTICE_TABLES),
@@ -12776,7 +13015,7 @@ export function apply(ctx) {
       void syncCard(bot, chatId, state.card, true).catch(() => {})
       const fresh = makeCardState(agent, state.card)
       fresh.cursor = carry
-      // 0.7.10（独立审查 LOW#7044）：**不设** rotatedThisTurn —— 自动卡换卡不经过 runTurn 的收尾判定（死存）。
+      // 0.7.10（独立审查 审查项）：**不设** rotatedThisTurn —— 自动卡换卡不经过 runTurn 的收尾判定（死存）。
       state.card = fresh
       void syncCard(bot, chatId, fresh, true).catch(() => {})
       state.stop = startCardWatcher(agent, fresh, bot, chatId, rotate)
@@ -12809,9 +13048,9 @@ export function apply(ctx) {
     return state
   }
 
-  // ---- 子代理回执「到点即播报」（改造①，维护者 2026-10-01 定稿）--------------------
+  // ---- 子代理回执「到点即播报」（改造①，2026-10-01 定稿）--------------------
   // 旧实现只在 `agent/status === 'running'` 那一拍回扫"最后一条 user/message"，
-  // 而回执要等 `turn/start` **之后**才写进会话 ⇒ 判成普通回合 ⇒ 不开卡（维护者 实测"没弹"）。
+  // 而回执要等 `turn/start` **之后**才写进会话 ⇒ 判成普通回合 ⇒ 不开卡（实测"没弹"）。
   // 反向样本（DSH-BA）：回执已落盘却被**下一轮**误认 ⇒ 偶尔"撞对"发卡，但归因/时机不可靠。
   // 现在改为**直接盯事件本身**：1s 轮询各飞书会话的事件尾部，命中
   // `user/message` + `source.kind === 'subagent-settled'` 就立刻播报 —— 与父回合状态无关。
@@ -12874,7 +13113,7 @@ export function apply(ctx) {
   }
 
   // 把回执**并进**一张已经在跑的卡（不新增消息）。
-  // 维护者 2026-10-01：「它弹出来以后就一直沉在活跃卡片的下面，这样不好看」——
+  // 2026-10-01：「它弹出来以后就一直沉在活跃卡片的下面，这样不好看」——
   // 独立消息永远排在**创建时刻**的位置，而上面那张卡还在原地 PATCH ⇒ 通知会被"钉"在下面像块贴纸。
   // 所以只要有活跃卡，就并进去；只有会话真的空闲时才发独立通知。
   function mergeNoticeIntoCard(card, bot, chatId, line, tag, agentId) {
@@ -12985,10 +13224,10 @@ export function apply(ctx) {
     }
   })
 
-  // 2026-10-01（维护者 回归红线）：**用户点过卡片之后，后续内容一律写到新卡上。**
+  // 2026-10-01（维护者 回归关键约束）：**用户点过卡片之后，后续内容一律写到新卡上。**
   // 旧实现只在 `activeTurns`（飞书**入站**轮）里找 split；自动轮（回执轮/目标轮）不在那张表里
   // ⇒ 点完按钮，内容却继续写进他已经划过去的那张旧卡 ⇒ 用户观感＝"我点了，它却没动"。
-  // 维护者 原话：「我看到的最后一条消息就是你给我选择的东西……你在旧卡片上面持续的去新增」。
+  // 需求原文：「我看到的最后一条消息就是你给我选择的东西……你在旧卡片上面持续的去新增」。
   function makeAutoCardEntry(agent, bot, chatId, state, kind) {
     const entry = {
       card: state.card,
@@ -13038,14 +13277,14 @@ export function apply(ctx) {
 
   // 答题后统一找"当前该被冻结的那张卡"：入站轮优先，其次自动轮。
   // 两条路都找不到时**明确留痕**（不再静默跳过 —— 静默跳过正是这次回归的根因）。
-  // 维护者 2026-10-03：「这种卡片一直在最底部，有问题 —— 发了以后就自动换新卡，不能一直在最底。」
+  // 2026-10-03：「这种卡片一直在最底部，有问题 —— 发了以后就自动换新卡，不能一直在最底。」
   //   侧消息（看门狗/失败提示等**另发的**消息）会把"还在跑的那张卡"留在它上面，后续更新全写在上方，
-  //   用户看到的是最底下那条提示、以为我们停了。与"插话必须换卡"同源（维护者 2026-10-02）⇒
+  //   用户看到的是最底下那条提示、以为我们停了。与"插话必须换卡"同源（2026-10-02）⇒
   //   发完侧消息就把该会话正在跑的卡**换到下面新卡继续**（旧卡就地封口＋一行说明、正文原样保留）。
   //   复用答题/插话那套 `entry.split()`：新卡游标 = 当前事件位 ⇒ 不重放、不丢。
   // 2026-10-05（维护者 定的分界：**还能不能继续**）：还能继续的状态提示**只写回原卡**、不另发消息。
   //   · 为什么不发也安全：它还在工作 ⇒ 收尾一定会更新/发结论卡 ⇒ 那本身就是通知
-  //     （维护者 原话：「他还在工作，就一定会发结论卡，我等着结论卡就有提示了」）。
+  //     （需求原文：「他还在工作，就一定会发结论卡，我等着结论卡就有提示了」）。
   //   · 用 notice 块（醒目、不参与 cardTableCount、不进结论摘要）—— 正好是「状态行」该有的隔离性。
   //   · 定位方式与 rotateLiveCardForChat 同源（activeTurns → autoCards → liveCardRegistry），
   //     但**不换卡**：只 push 一行后 sync。
@@ -13081,7 +13320,7 @@ export function apply(ctx) {
   function rotateLiveCardForChat(chatId, label) {
     const text = label || SIDE_NOTICE_OLD
     try {
-      // ⚠️ 审查 MED#7069：**不能**用 `entry.split()` —— 那是"答题路径"语义（新卡游标 = 事件末尾），
+      // ⚠️ 审查 审查项：**不能**用 `entry.split()` —— 那是"答题路径"语义（新卡游标 = 事件末尾），
       //    会**跳过还没镜像的事件**；换卡路径（rotateTables/rotate）用的是 carry = 旧卡当前游标，
       //    才满足"不重放、不丢"。所以这里调 entry.rotate()。
       // 🔴 0.7.21（HIGH-1）：`entry.rotate` 是**登记那一代的闭包** —— 外代的调了就废（推送被代际旗
@@ -13096,7 +13335,7 @@ export function apply(ctx) {
         console.log('[fs] side notice -> live card rotated: chat=' + chatId + ' kind=turn')
         return true
       }
-      // ⚠️ 审查 MED#7063：看门狗/失败提示**也会**从自动卡（目标轮/回执轮）的 watcher 发出 ⇒
+      // ⚠️ 审查 审查项：看门狗/失败提示**也会**从自动卡（目标轮/回执轮）的 watcher 发出 ⇒
       //    那些轮同样要覆盖，否则症状照旧（且不许静默）。
       for (const [key, entry] of autoCards.entries()) {
         if (!entry || String(entry.chatId || '') !== String(chatId || '')) continue
@@ -13222,7 +13461,7 @@ export function apply(ctx) {
     }
   })
 
-  // 🔴 第三十轮门槛 LOW#5（核对为真）：字段名由 config 冒号形式改为 cfg_path。旧写法让冒烟 105a 的
+  // 🔴 第三十轮门槛 审查项（核对为真）：字段名由 config 冒号形式改为 cfg_path。旧写法让冒烟 105a 的
   //   「非卡站点白名单」必须锚定这行日志的**字面文本**——这行任何改写/拆行都会联动假红。
   //   改名后本行不再含该词，105a 交叉核对回归纯行为判据，与启动日志解耦。
   console.log('[fs] bridge active. cfg_path: ' + configPath())

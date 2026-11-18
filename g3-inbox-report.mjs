@@ -1,10 +1,10 @@
-// g3-inbox-report.mjs — G3 员工会话「工具调用失败」接入收件箱（#514 / D38=需求 路径A）
+// g3-inbox-report.mjs — G3 员工会话「工具调用失败」接入收件箱（内部记录 / D38=内部记录 路径A）
 // 纯逻辑模块，独立自测：`node g3-inbox-report.mjs --selftest`
 // index.js 只在 scanCard 的 tool/result failed 分支调 reportG3Failure()，复用现有 300ms
 // 扫描（CARD_POLL_INTERVAL），不新增轮询、不注册任何 agent 工具（员工面零命令能力）。
 //
-// 接口契约：内部工程/G10-收件箱/INTERFACE.md I3-G3 ＋ WO-38（接口约定单）：
-//   只投 需求 六个脱敏元数据（agent/tool/occurred_at/exit_status/error_category/short_summary），
+// 接口契约：内部接口文档 I3-G3 ＋ 接口约定单：
+//   只投 内部记录 六个脱敏元数据（agent/tool/occurred_at/exit_status/error_category/short_summary），
 //   不带会话正文、工具参数、凭证；脱敏/五段详情/0600/冷却合并/fallback 由 G10 受控入口
 //   inbox_signal.py::post_g3_failure 统一负责（经 G3 侧 wrapper 调用，spawn 细节见 index.js）。
 //
@@ -34,7 +34,7 @@ export function normalizeCwd (value) {
 }
 
 // 错误归类（WO-38 枚举五类；工具调用失败只落两档）：
-// 权限类命中 ⇒ 「权限被拒」——🔴 只归类，不改写、不重试、不自动申请权限（红线：自动加权限＝自涨权限）。
+// 权限类命中 ⇒ 「权限被拒」——🔴 只归类，不改写、不重试、不自动申请权限（关键约束：自动加权限＝自涨权限）。
 // 其余一律「失败-运行错」——不猜更细的分类（错误类型是开放集，环节字段才是有限集）。
 const PERMISSION_HINT_RE = /permission\s*denied|access\s*denied|forbidden|\b403\b|权限不足|权限被拒|没有权限|无权限|拒绝访问/i
 export function classifyError (errorText) {
@@ -80,7 +80,7 @@ export function isG3OkrWorkspace ({ env, cwd }) {
 const recentReports = new Map()
 
 // ---------------------------------------------------------------------------
-// 恢复钩子（#2331 第二件，G10 生产段四件之第⑦层）：失败投递后，同 workspace+工具
+// 恢复钩子（内部记录 第二件，G10 生产段四件之第⑦层）：失败投递后，同 workspace+工具
 // 后续成功调用时自然上报恢复，关联原 event_id。
 // 关联机制的关键事实：G10 入口 inbox_signal.post_g3_failure 的 event_id 是
 // 六字段 [agent, tool, occurred_at, exit_status, error_category, short_summary]
@@ -171,7 +171,7 @@ export function reportG3Failure (agent, tool, envOverride) {
     ]
     const childEnv = { ...env, AIAD_INBOX_ROOT: decision.root }
     if (decision.fallback) childEnv.AIAD_INBOX_FALLBACK = decision.fallback
-    // 恢复钩子登记（#2331 第⑦层）：失败已投递 ⇒ 记下六字段，等同工具后续成功自然关联。
+    // 恢复钩子登记（内部记录 第⑦层）：失败已投递 ⇒ 记下六字段，等同工具后续成功自然关联。
     const recoveryKey = normalizeCwd(header.cwd) + '|' + decision.tool
     pendingRecoveries.set(recoveryKey, {
       agent: decision.agent,
@@ -204,7 +204,7 @@ export function reportG3Failure (agent, tool, envOverride) {
 // 非 null = 待投递恢复载荷（含回传给 wrapper 的**原失败**六字段——event_id 由 Python 侧重算）。
 export function decideG3RecoveryReport ({ env, cwd, toolName, nowMs }) {
   const e = env || {}
-  // 门禁与失败侧同源：workspace 白名单＋写入根（空 ⇒ 全局关闭，零触发红线不变）。
+  // 门禁与失败侧同源：workspace 白名单＋写入根（空 ⇒ 全局关闭，零触发关键约束不变）。
   const normCwd = normalizeCwd(cwd)
   if (!isG3OkrWorkspace({ env: e, cwd: normCwd })) return null
   const root = String(e.AIAD_INBOX_ROOT || '').trim()
@@ -282,8 +282,8 @@ function selftest () {
   const ok = (cond, label) => {
     if (cond) { console.log('  [OK] ' + label) } else { failed += 1; console.log('  [FAIL] ' + label) }
   }
-  const allow = '/srv/app/agents/analyst:/srv/app/agents/okr'
-  const base = { env: { AIAD_G3_REPORT_CWD_ALLOW: allow, AIAD_INBOX_ROOT: '/opt/scripts/inbox' }, cwd: '/srv/app/agents/analyst', toolName: 'query_orders', errorText: 'boom', nowMs: 1000 }
+  const allow = '/srv/example/agents/analyst:/srv/example/agents/okr'
+  const base = { env: { AIAD_G3_REPORT_CWD_ALLOW: allow, AIAD_INBOX_ROOT: '/opt/scripts/inbox' }, cwd: '/srv/example/agents/analyst', toolName: 'query_orders', errorText: 'boom', nowMs: 1000 }
 
   console.log('── 1) 默认零触发（其他 bot 写入为零的机器保证）──')
   ok(decideG3FailureReport({ ...base, env: {} }) === null, '白名单未注入 ⇒ null（全局关闭）')
@@ -292,12 +292,12 @@ function selftest () {
   ok(decideG3FailureReport({ ...base, cwd: '' }) === null, 'cwd 拿不到 ⇒ null（fail-closed）')
 
   console.log('── 2) 命中与路径形态无关 ──')
-  ok(decideG3FailureReport({ ...base, cwd: '/srv/app/agents/okr/' }) !== null, '白名单项带尾斜杠书写、cwd 命中 ⇒ 放行')
-  const hit = decideG3FailureReport({ ...base, cwd: '\\srv\\aiad\\agents\\analyst' })
+  ok(decideG3FailureReport({ ...base, cwd: '/srv/example/agents/okr/' }) !== null, '白名单项带尾斜杠书写、cwd 命中 ⇒ 放行')
+  const hit = decideG3FailureReport({ ...base, cwd: '\\srv\\example\\agents\\analyst' })
   ok(hit !== null, 'Windows 反斜杠 cwd 规范化后命中 ⇒ 放行')
   ok(hit && hit.agent === 'analyst', 'agent 名取 cwd 尾段')
   ok(hit && hit.exitStatus === 'failed' && hit.tool === 'query_orders' && hit.root === '/opt/scripts/inbox', 'payload 关键字段（exit_status/tool/root）')
-  ok(decideG3FailureReport({ ...base, cwd: '/srv/app/agents/okr-extra' }) === null, 'workspace 前缀相似但非精确项 ⇒ 拒绝')
+  ok(decideG3FailureReport({ ...base, cwd: '/srv/example/agents/okr-extra' }) === null, 'workspace 前缀相似但非精确项 ⇒ 拒绝')
   ok(decideG3FailureReport({
     ...base,
     env: { ...base.env, AIAD_G3_REPORT_CWD_ALLOW: 'C:\\aiad\\okr;C:\\aiad\\other' },
@@ -334,7 +334,7 @@ function selftest () {
   const d1 = decideG3FailureReport({ ...base, nowMs: 3000 })
   ok(d1 !== null, '失败判定放行（供恢复登记）')
   if (d1) {
-    pendingRecoveries.set('/srv/app/agents/analyst|query_orders', {
+    pendingRecoveries.set('/srv/example/agents/analyst|query_orders', {
       agent: d1.agent, tool: d1.tool, occurredAt: d1.occurredAt,
       exitStatus: d1.exitStatus, errorCategory: d1.errorCategory,
       shortSummary: d1.shortSummary, reportedAt: 3000,
@@ -346,11 +346,11 @@ function selftest () {
   ok(rec1 && rec1.failedExitStatus === 'failed' && rec1.failedErrorCategory === '失败-运行错', '原失败 exit_status/error_category 原样回传')
   ok(decideG3RecoveryReport({ ...base, toolName: 'query_orders', nowMs: 5000 }) === null, '恢复一次性（第二次 ⇒ null，不重复关联）')
   ok(decideG3RecoveryReport({ ...base, toolName: 'other_tool', nowMs: 5000 }) === null, '不同工具名 ⇒ null（不跨工具误配）')
-  ok(decideG3RecoveryReport({ env: {}, cwd: '/srv/app/agents/analyst', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 1：白名单未注入 ⇒ null（零触发红线不变）')
-  ok(decideG3RecoveryReport({ env: { AIAD_G3_REPORT_CWD_ALLOW: allow }, cwd: '/srv/app/agents/analyst', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 2：INBOX_ROOT 未注入 ⇒ null')
+  ok(decideG3RecoveryReport({ env: {}, cwd: '/srv/example/agents/analyst', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 1：白名单未注入 ⇒ null（零触发红线不变）')
+  ok(decideG3RecoveryReport({ env: { AIAD_G3_REPORT_CWD_ALLOW: allow }, cwd: '/srv/example/agents/analyst', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 2：INBOX_ROOT 未注入 ⇒ null')
   ok(decideG3RecoveryReport({ ...base, cwd: 'P:\\Qoder\\work', toolName: 'query_orders', nowMs: 5000 }) === null, '门禁 3：cwd 不在白名单 ⇒ null（其他 workspace 零写入）')
   // 过窗：登记 30 分钟前的失败，成功不再关联（防久远失败被无关成功误配）。
-  pendingRecoveries.set('/srv/app/agents/analyst|query_orders', {
+  pendingRecoveries.set('/srv/example/agents/analyst|query_orders', {
     agent: 'analyst', tool: 'query_orders', occurredAt: 'old', exitStatus: 'failed',
     errorCategory: '失败-运行错', shortSummary: 'old', reportedAt: 1000,
   })

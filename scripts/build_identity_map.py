@@ -10,7 +10,7 @@
 - 凭证一律不写进映射表（app_id/ou_/union_id 是标识符不是凭证）
 
 ────────────────────────────────────────────────────────────────────────────
-2026-10-04 修改记录（改：<home-maintainer>，经 维护者 当日改派「身份表归我」）
+2026-10-04 修改记录（改：<home-maintainer>，经 CM 当日改派「身份表归我」）
 原作者：<original-author>（01:14 首版，md5 215afec955f685fc19241f90a7f8ee9d）
 改前备份：<deploy-dir>/build_identity_map.py.bak-20261004-0127-before-home-fix
 
@@ -143,7 +143,7 @@ def migrate_contract_v12(m):
        残留人级 grants 不会被新版 resolve_actor 读到，留着只会误导排障）。
     ② 旧裸名限期键整体改名 `extra_grants_until`（值原样搬运）——
        🔴 不搬 ＝ 第 3 层限期数据【静默失效】（新版只读新键 ⇒ 永远空 dict），V2 点名的失效模式。
-    ③ 补 `is_cm` 默认 False（契约 §2.1；维护者 本人一行由人工/主数据置 true）。
+    ③ 补 `is_cm` 默认 False（契约 §2.1；CM 本人一行由人工/主数据置 true）。
     返回 (迁移人数, 限期搬运条数)。
     """
     n_people = 0

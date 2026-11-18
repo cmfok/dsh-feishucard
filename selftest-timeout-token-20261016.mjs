@@ -1,4 +1,4 @@
-// #1532/#1533 自测（2026-10-16）——只依赖 Node 内建模块，不启桥本体。
+// 内部记录/内部记录 自测（2026-10-16）——只依赖 Node 内建模块，不启桥本体。
 // 方法：从 index.js **原文**抽出真实的 fetchWithDeadline/httpJson/tokenDigest 源码，
 // 用 new Function 以真实 fetch/AbortSignal/createHash 注入求值后直测（不是抄副本）；
 // 另做源码级静态断言（无整串令牌直出日志、外呼全部走带时限包装器）。

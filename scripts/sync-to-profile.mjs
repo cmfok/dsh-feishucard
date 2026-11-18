@@ -9,13 +9,14 @@
 // 0.2.0 while the source was at 0.3.0.
 //
 // Usage:
-//   node scripts/sync-to-profile.mjs                 # sync into the default profile
+//   node scripts/sync-to-profile.mjs                 # sync into the default profile（拷完自动触发重组）
 //   node scripts/sync-to-profile.mjs --dry-run       # show what would change
 //   node scripts/sync-to-profile.mjs --profile <dir>  # explicit profile directory
+//   node scripts/sync-to-profile.mjs --no-trigger     # 只拷文件，不触发 profile 重新组合（排障用）
 //
 // Exit code 0 = copy is byte-identical to source for every shipped file.
 // Exit code 1 = FAIL: byte mismatch after copy, stale files on --dry-run, OR
-//   dependency invariant broken (中台 #1735, fail-closed): the version Node
+//   dependency invariant broken (内部记录, fail-closed): the version Node
 //   actually resolves for every `dependencies` entry at the deployed entry
 //   must equal its package.json lock value — otherwise nothing is deployed.
 // Exit code 3 = REFUSED: the target is already a link to the source (see below).
@@ -24,7 +25,7 @@
 // （junction / symlink ＝ 免重启部署方案 A），那么 target 就是源码目录本身：
 // 再跑本脚本会把 `.bak` 备份写进源码目录、并对自己做无意义拷贝 ⇒ 直接拒绝执行。
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -70,7 +71,7 @@ const sameReal = (() => {
     return process.platform === 'win32' ? t.toLowerCase() === s.toLowerCase() : t === s
   } catch { return false }
 })()
-// ── 依赖不变式机器断言（中台 #1735，fail-closed）──────────────────────────
+// ── 依赖不变式机器断言（内部记录，fail-closed）──────────────────────────
 // 「装机后实装版本必须等于 package.json 锁值」：以部署入口为锚、用 Node 自己
 // 的解析规则查**运行时真正会加载到的那份**依赖（链接形态锚＝源码根、实体
 // 副本形态锚＝profile 里的副本 —— realpath 一律给出真实加载目录），实装
@@ -97,8 +98,8 @@ if (!dryRun && (isLink || sameReal)) {
     // 若 target 本身就是实体目录、只是 realpath 恰好等于源码根（例如两者就是同一条路径），
     // 那就没有链接可删，"删掉该链接"会把人带沟里。
     console.error(isLink
-      ? '[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 维护者 授权后重启 dsh web。'
-      : '[sync]   若要退回实体副本：把它换成独立副本（或改用指向源码的链接）→ 重跑本脚本 → 经 维护者 授权后重启 dsh web。')
+      ? '[sync]   若要退回实体副本：删掉该链接 → 重跑本脚本 → 经 CM 授权后重启 dsh web。'
+      : '[sync]   若要退回实体副本：把它换成独立副本（或改用指向源码的链接）→ 重跑本脚本 → 经 CM 授权后重启 dsh web。')
   } else {
     // 2026-10-02 代码审查 low#1：链接指向的是**别处**时，"link to the source"是错的，
     // 而照旧建议"删掉该链接"可能毁掉一个刻意搭的暂存检出 —— 先把真实目标打出来再让人决定。
@@ -110,7 +111,7 @@ if (!dryRun && (isLink || sameReal)) {
 
 const md5 = (file) => createHash('md5').update(readFileSync(file)).digest('hex')
 
-// #1735 依赖不变式断言体：逐个生产依赖比对「锁值 vs 实装」。
+// 内部记录 依赖不变式断言体：逐个生产依赖比对「锁值 vs 实装」。
 // 实装的查法＝require.resolve（createRequire 以 baseDir/index.js 为锚）：
 // resolve 到哪份 node_modules，运行时就加载哪份 —— 这是装机结果的最诚实读数。
 // 子路径 '<pkg>/package.json' 被 exports 字段挡住时，退回解析 main 入口再向上
@@ -194,7 +195,7 @@ for (const r of stale) {
     console.error('[sync] SKIP (not in source): ' + r.rel)
     continue
   }
-  // 2026-10-18 #1735 自测踩出（既有缺陷，绿向装机路径被挡）：全新装机时
+  // 2026-10-18 内部记录 自测踩出（既有缺陷，绿向装机路径被挡）：全新装机时
   // 目标侧没有 scripts/ 子目录，copyFileSync 直接 ENOENT。真实 profile 因
   // 历史装机已建过目录而从未暴露。建目录是幂等的，已有目录不受影响。
   mkdirSync(dirname(r.dst), { recursive: true })
@@ -209,11 +210,49 @@ for (const r of rows) {
   const same = md5(r.src) === md5(r.dst)
   if (!same) { bad += 1; console.error('[sync] MISMATCH after copy: ' + r.rel) }
 }
+// ---- 触发一次 profile 重新组合（2026-11-16：这才是本机「热重载」真正的开关）----------------
+// 为什么需要（实测取证，别删这段，删了下一个接手的人会重复踩）：
+//   宿主 HMR 的 `root` 只监听**源码目录**（日志：`hmr watching [ 'P:/work/dsh-feishucard' ]`），
+//   而运行时加载的是 profile 里的**实体副本**（pnpm 对 file: 依赖做真目录拷贝）⇒ 改源码产生的
+//   文件事件映射不到任何已加载模块，等于空转；这也解释了"改源码没反应"的老结论。
+//   宿主导读（@deepseek-ai/dsh-hmr README.zh「热重载的边界」）写明：HMR 还会在**profile 重新
+//   组合**时替换"profile 目录下磁盘文件已变"的插件——"不要求通过 root 监听源码"。
+//   于是本脚本拷完文件后，改写 patch 里的一行标记注释 ⇒ 触发重组 ⇒ 新副本被换上去，**不用重启**。
+//   实证：2026-11-16 12:54:46 手工改一行注释后，日志出现
+//   `[fs] plugin apply #4 v0.8.37 md5=8f81dabb` + 六路 helper 重连，全程未重启 dsh web。
+const RECOMPOSE_MARKER = /^# hmr-sync-trigger: .*$/m
+function triggerRecompose() {
+  const patch = join(profileDir, 'cordis.patch.yml')
+  if (!existsSync(patch)) return { ok: false, why: 'profile 里没有 cordis.patch.yml：' + patch }
+  let text = ''
+  try { text = readFileSync(patch, 'utf8') } catch (e) { return { ok: false, why: '读不到 patch：' + String(e && e.message || e) } }
+  const line = '# hmr-sync-trigger: ' + new Date().toISOString() + '（sync 自动写入，用于触发 profile 重新组合）'
+  // 用**同一行**反复改写（不追加），避免 patch 文件随每次同步无限变长。
+  const next = RECOMPOSE_MARKER.test(text)
+    ? text.replace(RECOMPOSE_MARKER, line)
+    : (text.endsWith('\n') ? text + line + '\n' : text + '\n' + line + '\n')
+  try { writeFileSync(patch, next, 'utf8') } catch (e) { return { ok: false, why: '写不进 patch：' + String(e && e.message || e) } }
+  return { ok: true, patch }
+}
+
 console.log(bad === 0 ? '[sync] OK: deployed copy is byte-identical to source' : '[sync] FAIL: ' + bad + ' file(s) mismatch')
 if (bad === 0) {
-  // 🔴 2026-10-01 维护者 明令「禁止随意重启」：sync 之后改动是**待生效**，
-  // 只有 维护者 明确授权才重启（见 ~/.dsh/AGENTS.md ①-补）。
-  console.log('[sync] 改动已进入「待生效」队列：需 维护者 授权重启后才会生效（不许自行重启）。')
+  const noTrigger = process.argv.includes('--no-trigger')
+  const changed = stale.filter((r) => r.state !== 'missing-in-source').length
+  if (noTrigger || changed === 0) {
+    console.log(noTrigger
+      ? '[sync] 已按 --no-trigger 跳过重组触发：本次改动**未生效**，下次重组或重启后才会载入。'
+      : '[sync] 没有需要更新的文件 ⇒ 无需触发重组，线上副本本来就是最新的。')
+  } else {
+    const r = triggerRecompose()
+    if (r.ok) {
+      console.log('[sync] 已触发 profile 重新组合（改写 ' + r.patch + ' 里的标记注释）')
+      console.log('[sync] 预期：几秒内 HMR 换上新副本，飞书桥日志出现 `plugin apply #N v<版本> md5=…` + helper 重连。')
+      console.log('[sync] 若日志里 30 秒内**没有** plugin apply ⇒ 这次退化为「待生效」，需 CM 授权重启（不许自行重启）。')
+    } else {
+      console.log('[sync] ⚠ 重组触发失败（' + r.why + '）⇒ 本次改动为「待生效」，需 CM 授权重启。')
+    }
+  }
 } else {
   // 2026-10-02 代码审查 medium#1：原来这一行**无条件**打印 ⇒ 复验失败的同步也会被读成
   // "进队列了、重启就生效"，等于把失败伪装成成功。失败必须显式说"没部署"。

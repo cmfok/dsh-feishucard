@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * identityGuard 机器开关矩阵合规检测（维护者 2026-10-30 裁决的回归检测）
+ * identityGuard 机器开关矩阵合规检测（2026-10-30 裁决的回归检测）
  *
  * 用法：
  *   node scripts/check-identityguard-scope.mjs <scope> <config.json> [config2.json ...]
