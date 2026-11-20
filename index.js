@@ -5480,11 +5480,26 @@ export function apply(ctx) {
   }
 
   // 明细行：**只**拼进送 agent 的会话文本，绝不进卡片（守 B3/B4 用例 61/57）。
-  // 🔴 id 在这里【不截断】（2026-10-05 中台 HOME#DSH 实证）：agent 拿这两个明细去调 contact API
-  //    反查身份，截断的 id 必然 99992351 invalid id。截断只适用于卡片与日志 —— 会话文本是给
+  // 🔴 id 在这里【不截断】：agent 拿这两个明细去调 contact API 反查身份，
+  //    截断的 id 必然 invalid id。截断只适用于卡片与日志 —— 会话文本是给
   //    agent 的输入，不是给用户看的面子；卡片那一侧仍由用例 85/93 钉死「不带 id」。
-  function mentionFooter(list) {
+  // 🔴 2026-11-21（需求原文：「权限模式根本没开，这些信息其实 agent 是不用知道的呀」）：
+  //    两条明细行**只在权限模式（`identityGuard`）开着时生成**；关着闸就一个飞书 id 都不给，
+  //    否则 agent 拿到 id 唯一能做的就是去通讯录反查——正是关闸时最不该发生的事。
+  function identityGuardOn(bot) {
+    return Boolean(bot && bot.cfg && bot.cfg.identityGuard)
+  }
+
+  function mentionFooter(list, bot) {
     if (!list || !list.length) return ''
+    if (!identityGuardOn(bot)) {
+      // 关闸：被 @ 的是谁、是人是机器仍要说（不然 agent 不知道这句话在对谁讲），但不带 id。
+      const bare = []
+      for (const m of list) {
+        bare.push('@' + (m.name || '未署名') + '(' + (mentionedTypeIsAgent(m.type) ? 'bot' : 'user') + ')')
+      }
+      return '\n' + MENTION_FOOTER_TAG + bare.join('；') + '\n'
+    }
     const seg = []
     for (const m of list) {
       const who = m.name || '未署名'
@@ -5807,7 +5822,11 @@ export function apply(ctx) {
     const union = String((op && op.union_id) || '')
     if (!ou && !union) return ''
     const name = rosterNameFor(bot, ou, union)
-    // 🔴 截断分支同样要 `ou || union`（2026-10-05 门槛第十一轮 审查项）：原来写死
+    // 🔴 2026-11-21（与【发送方】同一口径）：权限模式关着 ⇒ **回给 agent 的那一份也只留名字、
+    //   不带 id**。关闸不判权，id 塞给 agent 只能拿去通讯录反查。卡片/日志那一侧照旧截断，
+    //   那是给人排查用的，不喂模型。
+    if (full && !identityGuardOn(bot)) return '[点击者 ' + (name || '未署名') + ']'
+    // 🔴 截断分支同样要 `ou || union`：原来写死
     //   `ou.slice(0, 8)` ⇒ 回调只带 union_id 时得到**空串**，卡面/日志渲染成
     //   `[点击者 未署名|]` —— 这一支的目的本来就是"留一个截断 id"，全丢掉等于没留。
     const idTag = full ? (ou || union) : (ou || union).slice(0, 8)
@@ -6084,6 +6103,12 @@ export function apply(ctx) {
     const openId = typeof sid.open_id === 'string' ? sid.open_id : ''
     const unionId = typeof sid.union_id === 'string' ? sid.union_id : ''
     if (!openId && !unionId) return { label: '[飞书消息] ', footer: '' }
+    // 🔴 2026-11-21（需求原文：「权限模式根本没开，这些信息其实 agent 是不用知道的呀」）：
+    //    **权限模式关着 ⇒ 飞书身份一条都不进上下文**。关闸语义本来就是「不判权、不查身份表」，
+    //    可 id 照旧贴给 agent —— 它唯一能做的就是拿去调通讯录反查，正好是没开权限模式时最不该
+    //    发生的事；顺带还常年输出 `name=用户` 这种零信息量的噪声行。开闸照旧贴完整 id
+    //    （身份体系在跑，agent 认人/反查才有意义）；卡片那一侧不受影响（本来就一个字都不带 id）。
+    if (!identityGuardOn(bot)) return { label: '[飞书消息] ', footer: '' }
     const kind = String(sender.sender_type || '') === 'bot' ? 'bot' : 'user'
     const who = (identityActor && identityActor.name)
       || rosterNameFor(bot, openId, unionId)
@@ -8124,7 +8149,7 @@ export function apply(ctx) {
       if (mentionList.length) {
         text = renderMentions(rawText, mentionList)
         evt.textRendered = text
-        evt.mentionFooter = mentionFooter(mentionList)
+        evt.mentionFooter = mentionFooter(mentionList, bot)
       }
       evt.textCommandAnchor = commandAnchor(rawText, mentionList)
       // 改造⑤：登记 维护者 这条消息，便于他之后引用自己的消息时也能带上下文
